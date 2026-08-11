@@ -47,7 +47,9 @@ from sglang.kernels.ops.quantization.fp8_group_major_quant_ue8m0 import (
 )
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
+    sglang_per_token_quant_fp8,
 )
+from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -113,6 +115,12 @@ from sglang.srt.layers.moe.utils import (
     should_skip_post_experts_all_reduce,
     uses_per_rank_fused_shared_slots,
 )
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsLinearMethod,
+)
+from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    CompressedTensorsW8A8Fp8,
+)
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import (
     Mxfp8DenseGemmBackend,
@@ -124,6 +132,8 @@ from sglang.srt.layers.quantization.mxfp8_input import (
     deepgemm_pair_takes_flashinfer,
     zero_deepgemm_mxfp8_scale_rows,
 )
+from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
+from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8LinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -296,7 +306,17 @@ def wo_a_fp8_gemm_enabled(quant_config: Optional[QuantizationConfig]) -> bool:
     """The fp8 wo_a absorb GEMM (DeepGEMM fp8_einsum, aiter mxscale) takes 128x128
     block scales, and on ROCm V4.1's 32x32 where _hip allows it; any other layout
     dequantizes wo_a to bf16 at load."""
-    if not (_FP8_WO_A_GEMM and isinstance(quant_config, Fp8Config)):
+    if not _FP8_WO_A_GEMM:
+        return False
+    if _is_sail and quant_config is not None:
+        # Keep target formats with their own loader/processor contracts on the
+        # existing path. The SAIL block einsum below expects 128x128 scales.
+        if quant_config.get_name() in ("expert_pack", "quark", "modelslim"):
+            return False
+        if isinstance(quant_config, Fp8Config):
+            return quant_config.weight_block_size in (None, [128, 128])
+        return True
+    if not isinstance(quant_config, Fp8Config):
         return False
     block = quant_config.weight_block_size
     return block == [128, 128] or (
@@ -1098,6 +1118,7 @@ class MqaAttentionBase(nn.Module):
             wo_a_quant_config = quant_config
         else:
             wo_a_quant_config = None
+        self.quant_config = quant_config
 
         self.fuse_wqa_wkv = fuse
         self.wo_a_fp8 = fp8
@@ -1146,7 +1167,13 @@ class MqaAttentionBase(nn.Module):
             parallel_group="attn_tp",
             **({} if quantize_wo_a else {"params_dtype": torch.bfloat16}),
         )
-        if quantize_wo_a:
+        if quantize_wo_a and (
+            not _is_sail
+            or (
+                isinstance(quant_config, Fp8Config)
+                and quant_config.weight_block_size is not None
+            )
+        ):
             assert hasattr(self.wo_a, "weight_scale_inv"), (
                 "FP8 quant_config must create weight_scale_inv"
             )
@@ -1156,7 +1183,7 @@ class MqaAttentionBase(nn.Module):
             self.wo_a._dsv4_npu_arch35_mxfp8_wo_a = True
             self.wo_a._dsv4_num_groups = self.n_local_groups
             self.wo_a._dsv4_o_lora_rank = self.o_lora_rank
-        elif fp8:
+        elif fp8 and hasattr(self.wo_a, "weight_scale_inv"):
             self.wo_a.weight_scale_inv.format_ue8m0 = _FP8_WO_A_UE8M0
             # wo_a is quantized but never *applied* through its quant method:
             # the absorb GEMM in forward() reads .weight / .weight_scale_inv and
@@ -1168,6 +1195,10 @@ class MqaAttentionBase(nn.Module):
             # in place (same shape, dtype and strides) and makes this GEMM
             # return noise.
             self.wo_a.keep_plain_weight_layout = True
+        elif fp8 and _is_sail:
+            assert hasattr(self.wo_a, "weight_scale"), (
+                "FP8 quant_config must create weight_scale"
+            )
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
             self.hidden_size,
@@ -2676,6 +2707,65 @@ class MQALayer(MqaAttentionBase):
             return mhc.AttnOutput(pad_with_zero_rows(out.partial, x.shape[0]))
         return pad_with_zero_rows(out, x.shape[0])
 
+    def _get_wo_a_channel_einsum_args(
+        self, G: int, R: int, D: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, int, int]]:
+        # Lazy-build the (weight, scale, recipe) for fp8_einsum on the
+        # channelwise FP8 path. (block-FP8 doesn't come through here.)
+        #
+        # Channelwise stores wo_a transposed:
+        #   wo_a.weight       : qweight.t()         -> [D, G*R], non-contig
+        #   wo_a.weight_scale : scale.t().contig()  -> [1, G*R]
+        # We restore weight to [G, R, D], reshape scale to [G, R, 1], and
+        # set recipe[2]=D (contract-block size; channelwise == full row,
+        # not the 128 used by block-FP8).
+        #
+        # Lazy on first forward (not post_load_weights): the quant hook
+        # may run again after post_load_weights (hot reload, draft copy,
+        # offloader requant), so this is the safest snapshot point.
+        # .clone() decouples the cache from later in-place writes.
+        wo_a = self.wo_a
+        cached = getattr(wo_a, "_einsum_args_cache", None)
+        if cached is not None:
+            return cached
+
+        w = wo_a.weight.data
+        assert w.shape == (D, G * R), (
+            f"channelwise wo_a.weight expected ({D}, {G * R}), got {tuple(w.shape)}"
+        )
+        weight_3d = w.t().contiguous().clone().view(G, R, D)
+
+        ws = wo_a.weight_scale.data
+        assert ws.numel() == G * R, (
+            f"channelwise weight_scale expected {G * R} elems, "
+            f"got shape {tuple(ws.shape)}"
+        )
+        scale = ws.reshape(G * R).contiguous().clone().view(G, R, 1)
+
+        recipe = (1, 1, D)
+
+        out = (weight_3d, scale, recipe)
+        wo_a._einsum_args_cache = out
+        return out
+
+    def _refresh_wo_a_channel_einsum_args(self) -> None:
+        cached = getattr(self.wo_a, "_einsum_args_cache", None)
+        if cached is None:
+            return
+        weight, scale, _ = cached
+        G, R, D = weight.shape
+        current = self.wo_a.weight.data
+        # load_weights calls post_load_weights before quant-method processing;
+        # a reused module may therefore expose the checkpoint's [G*R, D] layout
+        # or the processed [D, G*R] transpose. Refresh graph-owned caches in place.
+        if current.shape == (G * R, D) and current.is_contiguous():
+            current = current.view_as(weight)
+        else:
+            assert current.shape == (D, G * R)
+            current = current.t().reshape_as(weight)
+        weight.copy_(current)
+        scale.copy_(self.wo_a.weight_scale.data.reshape_as(scale))
+
     def forward(
         self,
         x: torch.Tensor,
@@ -3066,7 +3156,80 @@ class MQALayer(MqaAttentionBase):
 
             o = o.view(o.shape[0], self.n_local_groups, -1)
 
-            if fuse_rope_wo_a:
+            # Exclusive chain branch: the wo_a absorb einsum must run exactly
+            # once. If this PPU dispatch is hoisted out as a standalone `if`
+            # before the chain, the generic `_FP8_WO_A_GEMM` branch below also
+            # fires on the already-absorbed [T, G, R] output and crashes
+            # viewing the weight (rank mistaken for the head dim).
+            if self.wo_a_fp8 and _is_sail:
+                import deep_gemm
+
+                T, G, D = o.shape
+                R = self.o_lora_rank
+                if isinstance(self.wo_a.quant_method, Fp8LinearMethod) and (
+                    self.quant_config.weight_block_size is not None
+                ):
+                    o_fp8, o_s = sglang_per_token_group_quant_fp8(
+                        o.reshape(T * G, D).contiguous(),
+                        group_size=128,
+                    )
+                    output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
+                    deep_gemm.fp8_einsum(
+                        "bhr,hdr->bhd",
+                        (o_fp8.view(T, G, D), o_s.view(T, G, -1)),
+                        (
+                            self.wo_a.weight.view(G, R, D),
+                            self.wo_a.weight_scale_inv.data,
+                        ),
+                        output,
+                        recipe=(1, 1, 128),
+                    )
+                # rely on deep_gemm commit "[DeepGemm] : add int8 einsum"
+                # w8a8 int8 and w4a8 int8 both use int8_einsum
+                elif isinstance(self.wo_a.quant_method, W8A8Int8LinearMethod):
+                    wo_a_weight_3d, wo_a_scale, wo_a_recipe = (
+                        self._get_wo_a_channel_einsum_args(G, R, D)
+                    )
+                    o_int8, o_s = per_token_quant_int8(o.reshape(T * G, D).contiguous())
+                    output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
+                    deep_gemm.int8_einsum(
+                        "bhr,hdr->bhd",
+                        (o_int8.view(T, G, D), o_s.view(T, G, -1)),
+                        (wo_a_weight_3d, wo_a_scale),
+                        output,
+                        recipe=wo_a_recipe,
+                    )
+                elif isinstance(
+                    self.wo_a.quant_method, (Fp8LinearMethod, W8A8Fp8LinearMethod)
+                ) or (
+                    isinstance(self.wo_a.quant_method, CompressedTensorsLinearMethod)
+                    and isinstance(self.wo_a.scheme, CompressedTensorsW8A8Fp8)
+                ):
+                    wo_a_weight_3d, wo_a_scale, wo_a_recipe = (
+                        self._get_wo_a_channel_einsum_args(G, R, D)
+                    )
+                    o_fp8, o_s = sglang_per_token_quant_fp8(
+                        o.reshape(T * G, D).contiguous()
+                    )
+                    output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
+                    deep_gemm.fp8_einsum(
+                        "bhr,hdr->bhd",
+                        (o_fp8.view(T, G, D), o_s.view(T, G, -1)),
+                        (wo_a_weight_3d, wo_a_scale),
+                        output,
+                        recipe=wo_a_recipe,
+                    )
+                else:
+                    quant_name = type(self.wo_a.quant_method).__name__
+                    scheme_obj = getattr(self.wo_a, "scheme", None)
+                    scheme_name = (
+                        type(scheme_obj).__name__ if scheme_obj is not None else "None"
+                    )
+                    raise NotImplementedError(
+                        f"Unsupported wo_a quant_method on PPU: quant_method={quant_name}, scheme={scheme_name}"
+                    )
+                o = output
+            elif fuse_rope_wo_a:
                 wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
                 out = fused_rope_wo_a_bf16(
                     o,
@@ -5294,11 +5457,14 @@ class DeepseekV4ForCausalLM(nn.Module):
                 attn.wo_a.weight_scale_inv.format_ue8m0 = False
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
-        if self.wo_a_fp8:
+        # PPU keeps wo_a weight scales in the correct layout already; skip setup.
+        if self.wo_a_fp8 and not _is_sail:
             self._setup_fp8_wo_a_scales(is_nextn)
 
         for module in self.modules():
             if isinstance(module, MQALayer):
+                if _is_sail:
+                    module._refresh_wo_a_channel_einsum_args()
                 module.setup_mega_attention()
 
         if is_nextn:
@@ -5418,7 +5584,7 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         if _is_sail:
             if quant_config and quant_config.get_name() == "fp8":
-                if (
+                if quant_config.weight_block_size is None or (
                     quant_config.is_fp4_experts
                     and not quant_config.dequant_fp4_to_fp8
                     and "mlp.experts" in name
@@ -5576,12 +5742,16 @@ class DeepseekV4ForCausalLM(nn.Module):
                     (self.wo_a_fp8 or self.use_npu_arch35_mxfp8_wo_a)
                     and name.endswith(".wo_a.weight")
                     and loaded_weight.dtype != torch.float8_e4m3fn
+                    and not (_is_sail and loaded_weight.dtype == torch.int8)
                 ):
                     raise ValueError(
                         f"FP8 wo_a is enabled but {name} has "
                         f"dtype {loaded_weight.dtype}, expected "
-                        "torch.float8_e4m3fn. This checkpoint does not provide "
-                        "a supported fp8-quantized wo_a."
+                        "torch.float8_e4m3fn"
+                        + (" or torch.int8 (PPU)" if _is_sail else "")
+                        + ". This checkpoint does not provide "
+                        "a supported fp8-quantized wo_a; rerun with "
+                        "SGLANG_OPT_FP8_WO_A_GEMM=0."
                     )
                 try:
                     use_async_loading = should_async_load(loaded_weight)
