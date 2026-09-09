@@ -2154,6 +2154,8 @@ class Envs:
     SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # Opt in to the separate MLA K-cache CUDA quantizer.
+    SGLANG_OPT_USE_CUDA_MLA_K_CACHE_QUANT = EnvBool(False)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================
