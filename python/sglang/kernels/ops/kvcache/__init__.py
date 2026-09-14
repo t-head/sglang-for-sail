@@ -86,6 +86,15 @@ del _mod, _fn
 
 register_kernel(
     KernelSpec(
+        op="kvcache.dsv4_get_k_and_s",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.kvcache.dsv4_main_kv_store:GetKAndS.execute",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="kvcache.store_fp4_index_k_cache",
         backend=KernelBackend.TRITON,
         target=(
