@@ -214,6 +214,8 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
 
 def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     """Validate DeepSeek V4 context-parallel configuration."""
+    from sglang.srt.utils.device import is_sail
+
     cfg = resolving_view(server_args)
     if not cfg.enable_prefill_cp:
         return
@@ -267,9 +269,17 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         assert cfg.attn_dp_size == 1, (
             "For round-robin split mode, dp attention is not supported."
         )
-        assert cfg.tp_size <= 8, (
-            "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
-        )
+        if is_sail():
+            if cfg.tp_size > 8:
+                logger.warning(
+                    f"Context parallel with tp_size={cfg.tp_size} (> 8) bypasses "
+                    "the legacy CP size limit on SAIL. Verify the actual topology "
+                    "and cross-machine precision before deployment."
+                )
+        else:
+            assert cfg.tp_size <= 8, (
+                "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+            )
     supported_a2a_backends = ("none", "deepep", "megamoe", "mori", "ascend_ops")
     if cfg.moe_a2a_backend not in supported_a2a_backends:
         raise ValueError(
