@@ -61,3 +61,23 @@ if _is_cuda or _is_hip:
         weights = out * n_heads_inv_sqrt
         weights = weights.unsqueeze(-1) * q_scale * softmax_scale
         return weights
+
+    def _scale_head_gate_no_q_scale_graph_fake_impl(
+        weights_raw: torch.Tensor,
+        n_heads_inv_sqrt: float,
+        softmax_scale: float,
+    ) -> torch.Tensor:
+        return torch.empty(
+            (weights_raw.shape[0], weights_raw.shape[1], 1),
+            dtype=torch.float32,
+            device=weights_raw.device,
+        )
+
+    @register_custom_op(fake_impl=_scale_head_gate_no_q_scale_graph_fake_impl)
+    def scale_head_gate_no_q_scale_graph(
+        weights_raw: torch.Tensor,
+        n_heads_inv_sqrt: float,
+        softmax_scale: float,
+    ) -> torch.Tensor:
+        weights = weights_raw * n_heads_inv_sqrt
+        return (weights.unsqueeze(-1) * softmax_scale).to(torch.float32)
