@@ -178,7 +178,7 @@ srt_sail = [
   "acext>=1.1.0",
   "cuda-python>=13.0",
   "deep_ep",
-  "deep_gemm",
+  "deep_gemm>=1.1.0",
   "flash-attention-for-sail",
   "flashinfer-for-sail",
   "flashmla-for-sail",
