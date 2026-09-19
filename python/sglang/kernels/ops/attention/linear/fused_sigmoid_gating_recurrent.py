@@ -12,9 +12,9 @@ from sglang.srt.utils import (
     is_cuda,
     is_gfx95_supported,
     is_hip,
-    is_sail,
     is_sm90_supported,
 )
+from sglang.srt.utils.device import is_sail
 from sglang.srt.utils.log_utils import print_info_once
 
 _is_hip = is_hip()
@@ -809,6 +809,12 @@ def fused_sigmoid_gating_delta_rule_update(
             retrieve_parent_token,
         )
         return output
+
+    if is_sail() and envs.SGLANG_SAIL_FLA_CUDA.get():
+        print_info_once(
+            "PPU SAIL CUDA FLA does not expose KDA lower_bound/ReplaySSM ring "
+            "semantics; using the community Triton recurrent kernel."
+        )
 
     print_info_once(
         f"USE Community SGLang Triton Kernel: fused_sigmoid_gating_delta_rule_update_kernel"

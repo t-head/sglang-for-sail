@@ -29,7 +29,7 @@ from sglang.srt.layers.attention.linear.utils import (
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
-from sglang.srt.utils.device import is_gfx95_supported
+from sglang.srt.utils.device import is_gfx95_supported, is_sail
 from sglang.srt.utils.log_utils import rank0_log
 
 # KDA always uses the triton causal_conv1d_fn (no CUDA override).
@@ -109,6 +109,17 @@ class KDAKernelDispatcher:
         prefill_backend: LinearAttnKernelBackend,
         verify_backend: LinearAttnKernelBackend,
     ):
+        if is_sail():
+            requested = (decode_backend, prefill_backend, verify_backend)
+            if any(not backend.is_triton() for backend in requested):
+                rank0_log(
+                    "PPU KDA requires Triton kernels; overriding decode, prefill, "
+                    "and verify backends to triton."
+                )
+            decode_backend = LinearAttnKernelBackend.TRITON
+            prefill_backend = LinearAttnKernelBackend.TRITON
+            verify_backend = LinearAttnKernelBackend.TRITON
+
         self.verify_backend = verify_backend
         self.prefill_backend = prefill_backend
         triton_kernel = TritonKDAKernel()
