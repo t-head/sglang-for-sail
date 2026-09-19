@@ -66,10 +66,12 @@ from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
 )
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.utils import add_prefix, is_npu, is_sail
 from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
 
 logger = logging.getLogger(__name__)
+
+_is_sail = is_sail()
 
 _PAD_NUM_HEADS = 64
 
@@ -318,7 +320,9 @@ class DSparkAttention(MqaAttentionBase):
 
         if q_padded is not None:
             q = q_padded
-        attn_sink = self._local_attn_sink()
+        # PPU expects the full sink and slices it per TP rank itself; feeding it
+        # the rank-local (64-padded) sink would slice twice.
+        attn_sink = self.attn_sink if _is_sail else self._local_attn_sink()
 
         o = attn_backend.forward(
             q=q,
