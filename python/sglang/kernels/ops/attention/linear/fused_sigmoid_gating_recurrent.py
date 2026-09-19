@@ -798,8 +798,9 @@ def fused_sigmoid_gating_delta_rule_update(
 
     if is_sail() and envs.SGLANG_SAIL_PLA_CUDA.get():
         info_once(
-            "PPU SAIL CUDA PLA does not expose KDA lower_bound/ReplaySSM ring "
-            "semantics; using the community Triton recurrent kernel."
+            "Using the Triton recurrent kernel for this call: the PLA "
+            "fused_sigmoid_gating_delta_rule_forward_k_last adapter requires "
+            "lower_bound=None and cache_ring=False."
         )
 
     info_once(
