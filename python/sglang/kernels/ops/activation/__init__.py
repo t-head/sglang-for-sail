@@ -98,6 +98,21 @@ class SiluAndMulOp(BaseFusedOp):
 
 _SILU_AND_MUL = register_fused_op(SiluAndMulOp(), __name__, "_SILU_AND_MUL")
 
+# SAIL CUDA-compatible JIT; entry points enforce the vendor intrinsic guard.
+for _name in (
+    "silu_and_mul_post_quant_mxfp4",
+    "silu_and_mul_post_per_token_quant_fp8",
+    "silu_and_mul_masked_post_quant_mxfp4",
+):
+    register_kernel(
+        KernelSpec(
+            op=f"activation.{_name}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.activation.silu_mul_quant:{_name}",
+            capabilities=CUDA_ONLY,
+        )
+    )
+
 
 def silu_and_mul(
     input: torch.Tensor, out: Optional[torch.Tensor] = None

@@ -20,6 +20,15 @@ _HIP = frozenset({CapabilityRequirement.HIP})
 
 register_kernel(
     KernelSpec(
+        op="moe.mask_topk_ids_to_int64",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.dsv4:mask_topk_ids_to_int64",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="moe.shared_expert_gate",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.moe.shared_expert_gate:shared_expert_gate",
