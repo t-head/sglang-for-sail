@@ -165,6 +165,8 @@ def get_default_target_flags(arch: CompileArch | None = None) -> List[str]:
 
 @cache_once
 def is_arch_support_pdl() -> bool:
+    if is_sail_runtime():
+        return False
     return current_arch().supports_pdl
 
 

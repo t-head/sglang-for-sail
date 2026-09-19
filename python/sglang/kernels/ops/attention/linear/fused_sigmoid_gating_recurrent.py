@@ -14,8 +14,8 @@ from sglang.srt.utils import (
     is_hip,
     is_sail,
     is_sm90_supported,
-    logger,
 )
+from sglang.srt.utils.log_utils import print_info_once as info_once
 
 _is_hip = is_hip()
 _is_gfx95 = is_gfx95_supported()
@@ -768,7 +768,7 @@ def fused_sigmoid_gating_delta_rule_update(
     ):
         from fla import fused_sigmoid_gating_delta_rule_forward_k_last
 
-        logger.info_once(
+        info_once(
             f"USE PPU SAIL CUDA FLA kernel: fused_sigmoid_gating_delta_rule_forward_k_last"
         )
 
@@ -796,7 +796,13 @@ def fused_sigmoid_gating_delta_rule_update(
         )
         return output
 
-    logger.info_once(
+    if is_sail() and envs.SGLANG_SAIL_FLA_CUDA.get():
+        info_once(
+            "PPU SAIL CUDA FLA does not expose KDA lower_bound/ReplaySSM ring "
+            "semantics; using the community Triton recurrent kernel."
+        )
+
+    info_once(
         f"USE Community SGLang Triton Kernel: fused_sigmoid_gating_delta_rule_update_kernel"
     )
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
