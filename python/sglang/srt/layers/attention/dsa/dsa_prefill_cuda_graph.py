@@ -160,6 +160,7 @@ def pcg_dsa_indexer_prefill_split(
         q_fp8, weights = dsa_indexer_hip.fp4_prefill_q(indexer, query, x)
     elif (
         _is_cuda
+        and not indexer.use_int8
         and indexer.bf16_head_gate
         and indexer.skip_rope
         and indexer.head_dim == indexer.block_size == 128
@@ -175,7 +176,12 @@ def pcg_dsa_indexer_prefill_split(
             query, gate, indexer.softmax_scale, indexer.scale_fmt
         )
     else:
-        q_fp8, q_scale = indexer._quantize_query(query, act_quant)
+        if indexer.use_int8:
+            from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
+
+            q_fp8, q_scale = per_token_quant_int8(query.contiguous())
+        else:
+            q_fp8, q_scale = indexer._quantize_query(query, act_quant)
         # Reuse the compiled head-gate util shared with the eager path.
         weights = (  # same head-gate choice as the eager CP branch
             indexer._scale_head_gates(weights_raw, q_scale)
