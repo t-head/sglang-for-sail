@@ -405,3 +405,11 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+
+register_kernel(
+    KernelSpec(
+        op="moe.eplb_add_to_row",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.eplb_stats:add_to_row",
+    )
+)

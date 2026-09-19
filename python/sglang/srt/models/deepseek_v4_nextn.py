@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import prime_rope_cos_sin
 from sglang.srt.hardware_backend.npu.utils import (
     use_npu_arch35_mxfp8_wo_a,
@@ -202,35 +203,36 @@ class DeepseekV4ModelNextN(nn.Module):
             # decoder layer reads the memoized gather instead of re-gathering.
             prime_rope_cos_sin([self.decoder.self_attn], forward_batch, positions)
 
-        if _is_cuda:
-            residual_batch.start(forward_batch)
-            try:
-                hidden_states = self.decoder(
+        with get_global_expert_distribution_recorder().disable_this_region():
+            if _is_cuda:
+                residual_batch.start(forward_batch)
+                try:
+                    hidden_states = self.decoder(
+                        positions=positions,
+                        hidden_states=hidden_states,
+                        forward_batch=forward_batch,
+                        input_ids=input_ids,
+                        input_ids_global=input_ids_global,
+                    )
+                    hidden_states = residual_batch.read_output(
+                        hidden_states, forward_batch, hc_boundary.FinalRead(), None
+                    )
+                finally:
+                    residual_batch.clear(forward_batch)
+            else:
+                hidden_states, residual, post, comb = self.decoder(
                     positions=positions,
                     hidden_states=hidden_states,
                     forward_batch=forward_batch,
                     input_ids=input_ids,
                     input_ids_global=input_ids_global,
                 )
-                hidden_states = residual_batch.read_output(
-                    hidden_states, forward_batch, hc_boundary.FinalRead(), None
-                )
-            finally:
-                residual_batch.clear(forward_batch)
-        else:
-            hidden_states, residual, post, comb = self.decoder(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                input_ids=input_ids,
-                input_ids_global=input_ids_global,
-            )
-            if residual is not None:
-                # NextN has a single decoder layer, so no later layer can consume a
-                # deferred fused hc_post state.
-                hidden_states = self.decoder.hc_post(
-                    hidden_states, residual, post, comb
-                )
+                if residual is not None:
+                    # NextN has a single decoder layer, so no later layer can consume a
+                    # deferred fused hc_post state.
+                    hidden_states = self.decoder.hc_post(
+                        hidden_states, residual, post, comb
+                    )
 
         pre_hc_head = hidden_states.flatten(1)
 
@@ -284,6 +286,11 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        # Not support EPLB in NextN model
+        return {}
 
     @torch.no_grad()
     def forward(
