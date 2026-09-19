@@ -11,7 +11,8 @@ import triton.language as tl
 from sglang.kernels.ops.attention.fla.op import exp
 from sglang.kernels.ops.attention.fla.utils import input_guard
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_cuda, is_sail
+from sglang.srt.utils import is_cuda
+from sglang.srt.utils.device import is_sail
 from sglang.srt.utils.log_utils import print_info_once, print_warning_once
 
 
@@ -388,7 +389,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     NV = triton.cdiv(V, BV)
     grid = (NV, B * HV)
     if is_sail() and envs.SGLANG_SAIL_FLA_CUDA.get() and initial_state.is_contiguous():
-        from fla import (
+        from pla.decode import (
             fused_sigmoid_gating_delta_rule_forward_k_last_packed,
         )
 

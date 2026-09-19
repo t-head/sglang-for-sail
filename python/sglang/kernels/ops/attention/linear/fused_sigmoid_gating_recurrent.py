@@ -780,7 +780,7 @@ def fused_sigmoid_gating_delta_rule_update(
             )
         )
     ):
-        from fla import fused_sigmoid_gating_delta_rule_forward_k_last
+        from pla.decode import fused_sigmoid_gating_delta_rule_forward_k_last
 
         print_info_once(
             f"USE PPU SAIL CUDA FLA kernel: fused_sigmoid_gating_delta_rule_forward_k_last"
