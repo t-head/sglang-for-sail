@@ -101,6 +101,38 @@ def prebuild_deepep_v2_buffer(*, model) -> None:
             return
 
 
+def maybe_warmup_eplb_cpp_extensions(
+    *, model_config: ModelConfig, is_draft_worker: bool
+) -> None:
+    if not get_exec().moe.enable_eplb_async or is_draft_worker:
+        return
+
+    from sglang.srt.eplb import eplb_algorithms
+    from sglang.srt.eplb.cpp_async_runtime import warmup_eplb_async_runtime_cpp
+    from sglang.srt.eplb.cpp_deepseek import warmup_eplb_deepseek_cpp
+    from sglang.srt.eplb.cpp_expert_location import warmup_eplb_expert_location_cpp
+    from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+
+    config = ModelConfigForExpertLocation.from_model_config(model_config)
+    if config is None:
+        return
+
+    logger.info("Warming up EPLB C++ extensions.")
+    warmup_eplb_expert_location_cpp()
+    algorithm = eplb_algorithms.compute_algorithm(
+        raw_algorithm=get_exec().moe.eplb_algorithm,
+        num_groups=config.num_groups,
+        num_nodes=get_parallel().nnodes,
+    )
+    if algorithm in [
+        eplb_algorithms.EplbAlgorithm.deepseek,
+        eplb_algorithms.EplbAlgorithm.deepseek_hierarchical,
+    ]:
+        warmup_eplb_deepseek_cpp()
+    if get_exec().moe.enable_eplb_async:
+        warmup_eplb_async_runtime_cpp()
+
+
 def init_lplb_solvers(*, model_config: ModelConfig) -> None:
     """Initialize per-layer LPLB solvers from current expert location metadata."""
     from sglang.srt.runtime_context import get_parallel
@@ -174,3 +206,50 @@ def check_quantized_moe_compatibility(
                 f"where moe_tp_size is equal to tp_size ({tp_size}) divided by ep_size ({moe_ep_size}). "
                 f"You can fix this by setting arguments `--tp` and `--ep` correctly."
             )
+
+
+def create_eplb_async_host_mirror(*, model_config: ModelConfig, is_draft_worker: bool):
+    from sglang.srt.eplb.eplb_async_host_mirror import (
+        EPLBAsyncHostMirrorManager,
+        set_global_eplb_async_host_mirror_manager,
+    )
+
+    manager = None
+    if get_exec().moe.enable_eplb_async and not is_draft_worker:
+        manager = EPLBAsyncHostMirrorManager(
+            model_config=model_config,
+            node_rank=get_parallel().node_rank,
+            num_nodes=get_parallel().nnodes,
+        )
+    if not is_draft_worker:
+        set_global_eplb_async_host_mirror_manager(manager)
+    return manager
+
+
+def create_expert_location_updater(*, is_draft_worker: bool):
+    from sglang.srt.eplb.expert_location_updater import (
+        ExpertLocationUpdater,
+        set_global_expert_location_updater,
+    )
+
+    updater = ExpertLocationUpdater(
+        enable_async=get_exec().moe.enable_eplb_async and not is_draft_worker
+    )
+    if not is_draft_worker:
+        set_global_expert_location_updater(updater)
+    return updater
+
+
+def prepare_eplb_async_layers(*, updater, model, is_draft_worker: bool) -> None:
+    if get_exec().moe.enable_eplb_async and not is_draft_worker:
+        updater.prepare_async_layers(
+            getattr(model, "routed_experts_weights_of_layer", None)
+        )
+
+
+def build_eplb_async_host_mirror(*, manager, model) -> None:
+    if manager is None:
+        return
+    weights = getattr(model, "routed_experts_weights_of_layer", None)
+    if weights:
+        manager.build_from_loaded_model(weights)

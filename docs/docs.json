@@ -966,6 +966,7 @@
               "docs/advanced_features/kv_cache_sharing",
               "docs/advanced_features/dcp",
               "docs/advanced_features/expert_parallelism",
+              "docs/advanced_features/eplb_async",
               "docs/advanced_features/paged_experts",
               "docs/advanced_features/engram",
               "docs/advanced_features/lora",

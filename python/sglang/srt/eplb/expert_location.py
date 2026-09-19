@@ -25,7 +25,13 @@ import torch
 import torch.distributed
 import torch.nn.functional as F
 
+from sglang.srt.eplb import eplb_algorithms
+from sglang.srt.eplb.cpp_deepseek import rebalance_experts_cpp
+from sglang.srt.eplb.cpp_expert_location import (
+    compute_logical_to_rank_dispatch_physical_map_cpp,
+)
 from sglang.srt.runtime_context import (
+    get_buffer,
     get_device,
     get_exec,
     get_parallel,
@@ -56,6 +62,14 @@ def _compute_elastic_expert_layout(
     return (
         num_local_physical_experts * effective_ep_size,
         num_local_physical_experts,
+    )
+
+
+def _copy_to_device_if_needed(tensor: torch.Tensor, device: str) -> torch.Tensor:
+    if str(tensor.device) == device:
+        return tensor
+    return tensor.to(
+        device, non_blocking=tensor.device.type == "cpu" and tensor.is_pinned()
     )
 
 
@@ -173,6 +187,8 @@ class ExpertLocationMetadata:
             physical_to_logical_map=physical_to_logical_map,
             logical_to_all_physical_map=logical_to_all_physical_map,
             moe_ep_rank=moe_ep_rank,
+            physical_to_logical_map_cpu=None,
+            logical_to_all_physical_map_cpu=None,
         )
 
     @staticmethod
@@ -198,28 +214,66 @@ class ExpertLocationMetadata:
         num_groups = model_config_for_expert_location.num_groups
         num_nodes = 1 if use_flat_topology else get_parallel().nnodes
 
-        from sglang.srt.eplb import eplb_algorithms
+        algorithm = eplb_algorithms.compute_algorithm(
+            raw_algorithm=get_exec().moe.eplb_algorithm,
+            num_groups=num_groups,
+            num_nodes=num_nodes,
+        )
+        use_async_deepseek_cpp = get_exec().moe.enable_eplb_async and algorithm in [
+            eplb_algorithms.EplbAlgorithm.deepseek,
+            eplb_algorithms.EplbAlgorithm.deepseek_hierarchical,
+        ]
 
-        physical_to_logical_map, logical_to_all_physical_map, expert_count = (
-            eplb_algorithms.rebalance_experts(
-                tokens_per_expert=logical_count,
-                num_physical_experts=num_physical_experts,
-                num_local_physical_experts=num_physical_experts // common["ep_size"],
-                num_groups=num_groups,
-                num_nodes=num_nodes,
-                algorithm=eplb_algorithms.compute_algorithm(
-                    raw_algorithm=get_exec().moe.eplb_algorithm,
-                    num_groups=num_groups,
-                    num_nodes=num_nodes,
+        if use_async_deepseek_cpp:
+            logical_count = logical_count.sum(dim=0)
+            logical_count_pin = get_buffer(
+                f"eplb.logical_count:{tuple(logical_count.shape)}:{logical_count.dtype}",
+                lambda: torch.empty(
+                    logical_count.shape,
+                    dtype=logical_count.dtype,
+                    device="cpu",
+                    pin_memory=True,
                 ),
             )
-        )
+            logical_count_pin.copy_(logical_count)
+            logical_count = logical_count_pin
+
+            physical_to_logical_map, logical_to_all_physical_map, expert_count = (
+                rebalance_experts_cpp(
+                    weight=logical_count,
+                    num_replicas=num_physical_experts,
+                    num_groups=num_groups,
+                    num_nodes=num_nodes,
+                    num_gpus=common["ep_size"],
+                    enable_hierarchical=(
+                        algorithm == eplb_algorithms.EplbAlgorithm.deepseek_hierarchical
+                    ),
+                )
+            )
+        else:
+            physical_to_logical_map, logical_to_all_physical_map, expert_count = (
+                eplb_algorithms.rebalance_experts(
+                    tokens_per_expert=logical_count,
+                    num_physical_experts=num_physical_experts,
+                    num_local_physical_experts=num_physical_experts
+                    // common["ep_size"],
+                    num_groups=num_groups,
+                    num_nodes=num_nodes,
+                    algorithm=algorithm,
+                )
+            )
 
         return ExpertLocationMetadata._init_raw(
             ep_size=common["ep_size"],
             physical_to_logical_map=physical_to_logical_map.to(get_device().device),
             logical_to_all_physical_map=logical_to_all_physical_map.to(
                 get_device().device
+            ),
+            physical_to_logical_map_cpu=(
+                physical_to_logical_map if use_async_deepseek_cpp else None
+            ),
+            logical_to_all_physical_map_cpu=(
+                logical_to_all_physical_map if use_async_deepseek_cpp else None
             ),
         )
 
@@ -272,6 +326,8 @@ class ExpertLocationMetadata:
         physical_to_logical_map: torch.Tensor,
         logical_to_all_physical_map: torch.Tensor,
         moe_ep_rank: Optional[int] = None,
+        physical_to_logical_map_cpu: Optional[torch.Tensor] = None,
+        logical_to_all_physical_map_cpu: Optional[torch.Tensor] = None,
     ):
 
         _, num_physical_experts = physical_to_logical_map.shape
@@ -286,11 +342,30 @@ class ExpertLocationMetadata:
             logical_to_all_physical_map != -1, dim=-1
         )
 
+        # For different EPLB algorithms, the physical_to_logical_map and
+        # logical_to_all_physical_map_padded may be on GPU or CPU.
+        # We avoid redundant .cpu() calls to minimize data transfer overhead.
+        if physical_to_logical_map_cpu is None:
+            physical_to_logical_map_cpu = physical_to_logical_map.cpu()
+        if logical_to_all_physical_map_cpu is None:
+            logical_to_all_physical_map_cpu = logical_to_all_physical_map_padded.cpu()
+        else:
+            logical_to_all_physical_map_cpu = F.pad(
+                logical_to_all_physical_map_cpu,
+                (0, num_physical_experts - logical_to_all_physical_map_cpu.shape[-1]),
+                value=-1,
+            )
+        logical_to_all_physical_map_cpu = (
+            logical_to_all_physical_map_cpu.pin_memory()
+            if get_exec().moe.enable_eplb_async
+            else logical_to_all_physical_map_cpu.clone()
+        )
+
         return ExpertLocationMetadata(
             physical_to_logical_map=physical_to_logical_map,
-            physical_to_logical_map_cpu=physical_to_logical_map.cpu(),
+            physical_to_logical_map_cpu=physical_to_logical_map_cpu,
             logical_to_all_physical_map=logical_to_all_physical_map_padded,
-            logical_to_all_physical_map_cpu=logical_to_all_physical_map_padded.cpu(),
+            logical_to_all_physical_map_cpu=logical_to_all_physical_map_cpu,
             logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid,
             ep_size=ep_size,
             logical_to_rank_dispatch_physical_map=(
@@ -349,6 +424,28 @@ class ExpertLocationMetadata:
             else:
                 to_physical_map.copy_(self.logical_to_all_physical_map)
                 logical_count.copy_(self.logical_to_all_physical_map_num_valid)
+
+    def iter_metadata_field_pairs(self, other: ExpertLocationMetadata):
+        for field in [
+            "physical_to_logical_map",
+            "physical_to_logical_map_cpu",
+            "logical_to_all_physical_map",
+            "logical_to_all_physical_map_cpu",
+            "logical_to_all_physical_map_num_valid",
+            "logical_to_rank_dispatch_physical_map",
+        ]:
+            current_field = getattr(self, field)
+            next_field = getattr(other, field)
+            assert (current_field is None) == (next_field is None)
+            if current_field is not None:
+                yield current_field, next_field
+        # Captured MegaGate kernels hold these int32 buffers as well as the
+        # canonical metadata. Update them in the same per-layer transaction.
+        for algorithm, current_maps in self._mega_gate_maps.items():
+            for current_field, next_field in zip(
+                current_maps, other.mega_gate_maps(algorithm), strict=True
+            ):
+                yield current_field, next_field
 
     # -------------------------------- usage ------------------------------------
 
@@ -409,6 +506,30 @@ class ExpertLocationMetadata:
         # Every replica on every rank: logical_to_all_physical_map may narrow the
         # dispatch candidates to one replica, but the loaders must fill every slot.
         return (cpu_map[layer_id] == logical_expert_id).nonzero().flatten().tolist()
+
+    def get_physical_to_logical_map_cpu_layer(self, layer_id: int) -> torch.Tensor:
+        return self.physical_to_logical_map_cpu[layer_id]
+
+    def get_physical_to_logical_map_layer(self, layer_id: int) -> torch.Tensor:
+        return self.physical_to_logical_map[layer_id]
+
+    def get_logical_to_all_physical_map_cpu_layer(self, layer_id: int) -> torch.Tensor:
+        return self.logical_to_all_physical_map_cpu[layer_id]
+
+    def get_logical_to_all_physical_map_layer(self, layer_id: int) -> torch.Tensor:
+        return self.logical_to_all_physical_map[layer_id]
+
+    def get_logical_to_all_physical_map_num_valid_layer(
+        self, layer_id: int
+    ) -> torch.Tensor:
+        return self.logical_to_all_physical_map_num_valid[layer_id]
+
+    def get_logical_to_rank_dispatch_physical_map_layer(
+        self, layer_id: int
+    ) -> Optional[torch.Tensor]:
+        if self.logical_to_rank_dispatch_physical_map is None:
+            return None
+        return self.logical_to_rank_dispatch_physical_map[layer_id]
 
 
 def format_expert_location_layout(
@@ -653,6 +774,53 @@ def compute_logical_to_rank_dispatch_physical_map(
     ep_rank: int,
     seed: int = 42,
 ):
+
+    if not get_exec().moe.enable_eplb_async or not _prefer_same_node_experts():
+        return _compute_logical_to_rank_dispatch_physical_map_python(
+            logical_to_all_physical_map, ep_size, num_physical_experts, ep_rank, seed
+        )
+    logical_to_all_physical_map_cpu = logical_to_all_physical_map.to("cpu")
+
+    num_gpus_per_node = get_parallel().ep_size // get_parallel().nnodes
+    try:
+        logical_to_rank_dispatch_physical_map = (
+            compute_logical_to_rank_dispatch_physical_map_cpp(
+                logical_to_all_physical_map_cpu,
+                ep_size=ep_size,
+                num_physical_experts=num_physical_experts,
+                ep_rank=ep_rank,
+                num_gpus_per_node=num_gpus_per_node,
+                seed=seed,
+            )
+        )
+    except Exception as exc:
+        logger.warning(
+            "Falling back to Python EPLB dispatch-map builder due to C++ extension error: %s",
+            exc,
+        )
+        logical_to_rank_dispatch_physical_map = (
+            _compute_logical_to_rank_dispatch_physical_map_python(
+                logical_to_all_physical_map=logical_to_all_physical_map_cpu,
+                ep_size=ep_size,
+                num_physical_experts=num_physical_experts,
+                ep_rank=ep_rank,
+                seed=seed,
+            )
+        )
+
+    return _copy_to_device_if_needed(
+        logical_to_rank_dispatch_physical_map, str(logical_to_all_physical_map.device)
+    )
+
+
+def _compute_logical_to_rank_dispatch_physical_map_python(
+    logical_to_all_physical_map: torch.Tensor,
+    ep_size: int,
+    num_physical_experts: int,
+    ep_rank: int,
+    seed: int = 42,
+):
+    from sglang.srt.runtime_context import get_parallel
 
     r = random.Random(seed)
 

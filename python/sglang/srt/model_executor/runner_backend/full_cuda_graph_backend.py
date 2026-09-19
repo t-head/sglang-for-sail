@@ -163,6 +163,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         for warmup_step in range(2):
             self._device_module.synchronize()
             self._tp_group.barrier()
+            self._cuda_graph_runner.model_runner.on_eplb_async_capture_start()
             with self._precarve.measure():
                 output = forward_fn()
             if self._reuse_output_buffer and warmup_step == 1:
@@ -200,6 +201,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             graph_pool_capture_scope(),
             graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream),
         ):
+            self._cuda_graph_runner.model_runner.on_eplb_async_capture_start()
             self._precarve.mint()
             out = forward_fn()
             if self._reuse_output_buffer:

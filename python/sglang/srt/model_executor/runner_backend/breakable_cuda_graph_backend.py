@@ -138,6 +138,8 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         for _ in range(2):
             self._device_module.synchronize()
             self._tp_group.barrier()
+            # give owner to GPU before forward
+            self._model_runner.on_eplb_async_capture_start()
             with self._precarve.measure():
                 warmup_out = forward_fn()
             if post_warmup_hook is not None:
@@ -168,6 +170,8 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 stream=self._capture_stream,
             ),
         ):
+            # give owner to GPU before forward
+            self._model_runner.on_eplb_async_capture_start()
             self._precarve.mint()
             if self._debug_eager:
                 # The whole forward runs as one eager break that writes the

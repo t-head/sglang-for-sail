@@ -763,6 +763,37 @@ def handle_elastic_ep(server_args: Any):
 
 def handle_eplb_and_dispatch(server_args: Any):
     cfg = resolving_view(server_args)
+    if cfg.enable_eplb_async:
+        assert cfg.enable_eplb, (
+            "EPLB async requires --enable-eplb and --enable-eplb-async to be "
+            "passed together."
+        )
+        assert cfg.device == "cuda", "EPLB async is only supported on CUDA."
+        assert cfg.elastic_ep_backend is None, (
+            "EPLB async is incompatible with elastic EP."
+        )
+        # The [1/n] runtime releases layer ownership from the DeepEP
+        # low-latency combine path and numbers mirror shards by world rank.
+        assert cfg.moe_a2a_backend == "deepep" and cfg.deepep_mode == "low_latency", (
+            "EPLB async currently requires --moe-a2a-backend deepep "
+            "and --deepep-mode low_latency."
+        )
+        assert cfg.pp_size == 1 and cfg.dp_size == 1 and cfg.ep_size == cfg.tp_size, (
+            "EPLB async currently requires PP=1, DP=1 and EP=TP so mirror "
+            "world ranks coincide with expert ranks."
+        )
+        assert not cfg.enable_two_batch_overlap, (
+            "EPLB async does not support interleaved two-batch layer ownership."
+        )
+        assert not cfg.enable_torch_compile, (
+            "EPLB async currently supports eager, full and breakable CUDA graphs."
+        )
+        envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.set(True)
+        envs.SGLANG_WARMUP_TIMEOUT.set(3600)
+
+        if envs.SGLANG_PROFILE_NVTX.get():
+            envs.SGLANG_EPLB_RUNTIME_NVTX.set(True)
+
     if cfg.enable_eplb and (cfg.expert_distribution_recorder_mode is None):
         declare_resolution(
             server_args,
