@@ -20,7 +20,6 @@ if _is_cuda or _is_musa:
     )
 
 import triton.language as tl
-from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
 
 from sglang.srt.utils import get_device_sm
 
@@ -2288,6 +2287,8 @@ def moe_ep_deepgemm_preprocess(
             hidden_states, scale = per_token_quant_int8(hidden_states)
         elif output_dtype == torch.uint8:
             # mxfp4
+            from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
+
             hidden_states, scale = downcast_to_mxfp(hidden_states, torch.uint8, axis=1)
         elif output_dtype == torch.bfloat16:
             scale = None
