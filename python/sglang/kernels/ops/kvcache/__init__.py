@@ -11,10 +11,19 @@ from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
-from sglang.kernels.spec import KernelBackend, KernelSpec
+from sglang.kernels.spec import CUDA_ONLY, KernelBackend, KernelSpec
 
 if TYPE_CHECKING:
     import torch
+
+register_kernel(
+    KernelSpec(
+        op="kvcache.dequantize_k_cache_paged_dsv4",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.kvcache.dsv4_dequant:dequantize_k_cache_paged_cuda",
+        capabilities=CUDA_ONLY,
+    )
+)
 
 register_kernel(
     KernelSpec(
