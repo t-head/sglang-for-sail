@@ -49,8 +49,8 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
-    is_sail,
 )
+from sglang.srt.utils.device import is_sail
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.deepep import (
@@ -321,8 +321,7 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     use_int8: bool = False
     use_mxfp4: bool = False
     use_int4_w4a16: bool = False
-    # Marlin-packed MXFP4 weights with BF16 activations. Raw E8M0 scale
-    # bytes select the PPU MXFP4 W4A16 kernel variant.
+    # PPU MXFP4 W4A16: legacy VALU or direct MMA, selected by weight layout.  # codespell:ignore
     use_mxfp4_w4a16: bool = False
     per_channel_quant: bool = False
     w13_scale: Optional[torch.Tensor] = None
@@ -479,7 +478,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     hidden_states = self._run_fp4_contiguous_gemm(
                         runner_input, quant_info, running_state
                     )
-                elif quant_info.use_int4_w4a16:
+                elif quant_info.use_int4_w4a16 or (
+                    _is_sail and quant_info.use_mxfp4_w4a16
+                ):
                     hidden_states = self._run_int4_contiguous_gemm(
                         runner_input, quant_info, running_state
                     )
@@ -507,7 +508,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     hidden_states = self._run_masked_fp4_gemm(
                         runner_input, quant_info, running_state
                     )
-                elif quant_info.use_int4_w4a16:
+                elif quant_info.use_int4_w4a16 or (
+                    _is_sail and quant_info.use_mxfp4_w4a16
+                ):
                     hidden_states = self._run_masked_int4_gemm(
                         runner_input, quant_info, running_state
                     )
@@ -518,6 +521,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 if topkid_pushed:
                     th_nvtx_range_pop()
                 th_nvtx_range_pop()
+
         return DeepGemmRunnerOutput(hidden_states=hidden_states)
 
     def _run_contiguous_gemm(
@@ -1091,7 +1095,24 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
-        if _is_sail:
+        if _is_sail and self.config.activation == "situ":
+            down_input_fp4 = torch.empty(
+                (all_tokens, N // 4),
+                device=gateup_output.device,
+                dtype=torch.uint8,
+            )
+            down_input_scale = torch.empty(
+                (N // 128, all_tokens),
+                device=gateup_output.device,
+                dtype=torch.uint16,
+            )
+            self._apply_situ_and_mul(
+                gateup_output,
+                down_input_fp4,
+                down_input_scale=down_input_scale,
+            )
+            down_input_scale = down_input_scale.t()
+        elif _is_sail:
             down_input_fp4, down_input_scale = silu_and_mul_post_quant_mxfp4(
                 gateup_output, swiglu_limit=self.swiglu_limit
             )
@@ -1122,6 +1143,58 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         return down_output
 
+    def _apply_situ_and_mul(
+        self,
+        gateup_output: torch.Tensor,
+        down_input: torch.Tensor,
+        masked_m: Optional[torch.Tensor] = None,
+        down_input_scale: Optional[torch.Tensor] = None,
+        expected_m: Optional[int] = None,
+    ) -> None:
+        from sglang.kernels.ops.activation import situ_and_mul, situ_and_mul_masked
+
+        beta = self.config.gemm1_alpha if self.config.gemm1_alpha is not None else 4.0
+        linear_beta = self.config.gemm1_clamp_limit
+        if down_input_scale is not None:
+            from sglang.kernels.ops.activation import (
+                situ_and_mul_masked_post_quant_mxfp4,
+                situ_and_mul_post_quant_mxfp4,
+            )
+
+            if masked_m is None:
+                situ_and_mul_post_quant_mxfp4(
+                    gateup_output,
+                    down_input,
+                    down_input_scale,
+                    beta,
+                    linear_beta,
+                )
+            else:
+                situ_and_mul_masked_post_quant_mxfp4(
+                    gateup_output,
+                    down_input,
+                    down_input_scale,
+                    masked_m,
+                    beta,
+                    linear_beta,
+                    self.config.top_k,
+                    expected_m,
+                )
+            return
+
+        if masked_m is None:
+            situ_and_mul(gateup_output, down_input, beta, linear_beta)
+        else:
+            situ_and_mul_masked(
+                gateup_output,
+                down_input,
+                masked_m,
+                beta,
+                linear_beta,
+                self.config.top_k,
+                expected_m,
+            )
+
     def _run_int4_contiguous_gemm(
         self,
         runner_input: DeepGemmRunnerInput,
@@ -1137,7 +1210,14 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if all_tokens <= 0:
             return hidden_states.bfloat16()
 
+        use_ppu_w4a16_mma = (
+            _is_sail
+            and quant_info.use_mxfp4_w4a16
+            and quant_info.w13_weight.dtype == torch.uint8
+        )
         N = quant_info.w2_weight.size(1) * 32
+        if use_ppu_w4a16_mma:
+            N = quant_info.w13_weight.size(1)
         K = hidden_states_shape[1]
 
         w13_weight_quant = (quant_info.w13_weight, quant_info.w13_scale)
@@ -1167,7 +1247,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             device=gateup_output.device,
             dtype=torch.bfloat16,
         )
-        _legacy_silu_and_mul(gateup_output.view(-1, N), down_input)
+        if self.config.activation == "situ":
+            self._apply_situ_and_mul(gateup_output.view(-1, N), down_input)
+        else:
+            _legacy_silu_and_mul(gateup_output.view(-1, N), down_input)
         del gateup_output
 
         down_output = torch.empty(
@@ -1796,7 +1879,25 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             swiglu_limit_arg = self.swiglu_limit
 
         # Act
-        if _is_sail:
+        if _is_sail and self.config.activation == "situ":
+            down_input = torch.empty(
+                (num_groups, m, n // 4),
+                device=hidden_states_device,
+                dtype=torch.uint8,
+            )
+            down_input_scale = torch.empty(
+                (num_groups, n // 128, m),
+                device=hidden_states_device,
+                dtype=torch.uint16,
+            )
+            self._apply_situ_and_mul(
+                gateup_output,
+                down_input,
+                masked_m=masked_m,
+                down_input_scale=down_input_scale,
+                expected_m=expected_m,
+            )
+        elif _is_sail:
             down_input, down_input_scale = silu_and_mul_masked_post_quant_mxfp4(
                 gateup_output,
                 masked_m,
@@ -1893,7 +1994,12 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         # GroupGemm-0
         num_groups, m, k = hidden_states.shape
+        use_ppu_w4a16_mma = (
+            _is_sail and quant_info.use_mxfp4_w4a16 and w13_weight.dtype == torch.uint8
+        )
         n = w2_weight.size(1) * 32
+        if use_ppu_w4a16_mma:
+            n = w13_weight.size(1)
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
@@ -1917,7 +2023,12 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
-        silu_and_mul_masked_fwd(gateup_output, down_input, masked_m)
+        if self.config.activation == "situ":
+            self._apply_situ_and_mul(
+                gateup_output, down_input, masked_m, expected_m=expected_m
+            )
+        else:
+            silu_and_mul_masked_fwd(gateup_output, down_input, masked_m)
         del gateup_output
 
         # GroupGemm-1
