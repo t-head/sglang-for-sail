@@ -197,6 +197,7 @@ def downcast_to_mxfp4(
     src_tensor: torch.Tensor,
     axis: int,
     round_up: bool = True,
+    enable_fused_moe: bool = False,
 ):
     """Convert src tensor to MXFP4 (packed e2m1 uint8) with preprocessed E8M0 scales.
 
@@ -207,6 +208,8 @@ def downcast_to_mxfp4(
         src_tensor: Input tensor (bf16/fp16/fp32).
         axis:       Quantization axis.
         round_up:   True for ROUND_UP scale mode, False for ROUND_DOWN.
+        enable_fused_moe: Emit row-major packed scales for gather-read GEMM;
+            the default retains the column-major nopad layout.
 
     Returns:
         (out_quant_tensor, out_scale):
@@ -243,9 +246,17 @@ def downcast_to_mxfp4(
         N = kernel_src.shape[0]  # flattened outer dim
 
         # Scale output: [S_groups_pairs, N] uint16 contiguous (transposed layout)
-        kernel_scale = torch.empty(
-            (S_groups_pairs, N), dtype=torch.uint16, device=src_tensor.device
-        )
+        if not enable_fused_moe:
+            kernel_scale = torch.empty(
+                (S_groups_pairs, N), dtype=torch.uint16, device=src_tensor.device
+            )
+            kernel_scale_stride = kernel_scale.stride()
+        else:
+            # Scale output: [N, S_groups_pairs] uint16 contiguous for fused_moe
+            kernel_scale = torch.empty(
+                (N, S_groups_pairs), dtype=torch.uint16, device=src_tensor.device
+            )
+            kernel_scale_stride = (kernel_scale.stride(1), kernel_scale.stride(0))
 
         BLOCK_OUT = 32
         BLOCK_QUANT = 128
@@ -260,7 +271,7 @@ def downcast_to_mxfp4(
             kernel_quant,
             *kernel_quant.stride(),
             kernel_scale,
-            *kernel_scale.stride(),
+            *kernel_scale_stride,
             kernel_src,
             *kernel_src.stride(),
             N,
@@ -274,7 +285,11 @@ def downcast_to_mxfp4(
 
         # Reshape scale from [S_pairs, N] to logical [..., S_pairs]
         batch_shape = src_tensor.shape[:-1]
-        out_scale = kernel_scale.t().reshape(*batch_shape, S_groups_pairs)
+        out_scale = (
+            kernel_scale.t().reshape(*batch_shape, S_groups_pairs)
+            if not enable_fused_moe
+            else kernel_scale.reshape(*batch_shape, S_groups_pairs)
+        )
     else:
         batch_shape = src_tensor.shape[:-1]
         out_scale = torch.empty(
