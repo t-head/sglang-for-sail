@@ -31,11 +31,13 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.kernels.jit.utils.common import is_sail_runtime as is_sail
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 SUPPORTED_HEADS = {3, 6, 8, 12, 16}
+SAIL_SUPPORTED_HEADS = {12, 24, 48, 96}
 _CONV_STATE_W = 3  # kernel width 4 -> 3 cached tokens
 
 
@@ -64,16 +66,39 @@ def covered(
     packed [T, 3*H*128] qkv rows, transposed [slots, 3, 3*H*128] conv pool, fp32
     [slots, H, 128, 128] ssm pool (inner-contiguous, any slot pitch — the
     kernel reads the real slot stride), one token per request."""
-    from sglang.kernels.jit.utils.common import is_sail_runtime
-
-    if is_sail_runtime():
-        return False
-
     if ssm_states.ndim < 4:
         return False
     H, V, K = ssm_states.shape[-3:]
+    if is_sail():
+        seg = H * 128
+        return (
+            H in SAIL_SUPPORTED_HEADS
+            and V == 128
+            and K == 128
+            and mixed_qkv.ndim == 2
+            and mixed_qkv.shape[-1] == 3 * seg
+            and a.shape == (mixed_qkv.shape[0], seg)
+            and b.shape == (mixed_qkv.shape[0], H)
+            and onorm_g.shape == (mixed_qkv.shape[0], seg)
+            and conv_states.ndim == 3
+            and conv_states.shape[-2:] == (3, 3 * seg)
+            and mixed_qkv.dtype in (torch.bfloat16, torch.float16)
+            and all(x.dtype == mixed_qkv.dtype for x in (a, b, conv_states, onorm_g))
+            and ssm_states.dtype == torch.float32
+            and cache_indices.dtype == torch.int32
+            and cache_indices.shape == (mixed_qkv.shape[0],)
+            and cache_indices.is_contiguous()
+            and mixed_qkv.stride(-1) == 1
+            and onorm_g.stride(-1) == 1
+            and conv_states.stride(-1) == 1
+            and conv_states.stride(-2) == 3 * seg
+            and ssm_states.stride(-1) == 1
+            and ssm_states.stride(-2) == K
+            and ssm_states.stride(-3) == V * K
+        )
     if H not in SUPPORTED_HEADS:
         return False
+
     seg = H * 128
     conv_dim = 3 * seg
     if mixed_qkv.ndim != 2 or mixed_qkv.shape[-1] != conv_dim:
@@ -132,6 +157,8 @@ def kda_fused_decode(
     scale: float,
     onorm_eps: float,
     lower_bound: Optional[float] = None,
+    fused_weight: Optional[torch.Tensor] = None,
+    actual_batch_size: Optional[int] = None,
 ) -> torch.Tensor:
     """In-place fused decode step: shifts `conv_states` and updates
     `ssm_states` rows selected by `cache_indices` (rows < 0 are padded
@@ -141,6 +168,41 @@ def kda_fused_decode(
     B = mixed_qkv.shape[0]
     H = ssm_states.shape[-3]
     seg = H * 128
+
+    if is_sail():
+        if actual_batch_size is None:
+            actual_batch_size = B
+        if not 0 <= actual_batch_size <= B:
+            raise ValueError(f"Invalid actual_batch_size={actual_batch_size} for B={B}")
+        output_shape = (1, B, H, 128)
+        out = (
+            mixed_qkv.new_empty(output_shape)
+            if actual_batch_size == B
+            else mixed_qkv.new_zeros(output_shape)
+        )
+        if actual_batch_size == 0:
+            return out
+        from pla.decode.kda import fused_kda_decode_mega_forward
+
+        fused_kda_decode_mega_forward(
+            x=mixed_qkv[:actual_batch_size],
+            weight=fused_weight,
+            bias=conv_bias,
+            conv_state=conv_states.transpose(-1, -2),
+            raw_g=a[:actual_batch_size].reshape(1, actual_batch_size, H, 128),
+            raw_beta=b[:actual_batch_size].unsqueeze(0),
+            a_log=A_log,
+            dt_bias=dt_bias,
+            state_indices=cache_indices[:actual_batch_size],
+            state=ssm_states,
+            out=out[:, :actual_batch_size],
+            lower_bound=lower_bound,
+            output_gate=onorm_g[:actual_batch_size].reshape(actual_batch_size, H, 128),
+            norm_weight=onorm_weight,
+            norm_eps=onorm_eps,
+        )
+        return out
+
     out = torch.empty((B, seg), dtype=torch.bfloat16, device=mixed_qkv.device)
     _jit_kda_fused_decode_module().run(
         mixed_qkv,

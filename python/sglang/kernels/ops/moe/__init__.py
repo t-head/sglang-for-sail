@@ -267,7 +267,6 @@ register_kernel(
     )
 )
 
-
 # Public entry points inventoried by logical operator group (RFC #29630).
 register_kernel(
     KernelSpec(

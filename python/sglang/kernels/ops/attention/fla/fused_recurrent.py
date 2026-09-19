@@ -388,7 +388,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     grid = (NV, B * HV)
     from sglang.srt.utils.log_utils import print_info_once, print_warning_once
 
-    if is_sail() and envs.SGLANG_SAIL_FLA_CUDA.get() and initial_state.is_contiguous():
+    if is_sail() and envs.SGLANG_SAIL_PLA_CUDA.get() and initial_state.is_contiguous():
         from pla.decode import (
             fused_sigmoid_gating_delta_rule_forward_k_last_packed,
         )
@@ -410,7 +410,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
             False,
         )
         print_info_once(
-            f"USE PPU SAIL CUDA FLA kernel: fused_sigmoid_gating_delta_rule_forward_k_last_packed"
+            f"USE PPU SAIL CUDA PLA kernel: fused_sigmoid_gating_delta_rule_forward_k_last_packed"
         )
         print_warning_once(
             f"Note: SAIL FLA kernel use HARD-CODE Softplus value:20!! Check if the community Triton implementation modifies softplus numerical values."
