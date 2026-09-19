@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location_updater import get_global_expert_location_updater
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.token_dispatcher.base import (
@@ -28,7 +29,7 @@ from sglang.srt.layers.moe.utils import (
     get_deepep_output_dtype,
     is_tbo_enabled,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     get_bool_env_var,
     get_cuda_version,
@@ -821,6 +822,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self.device_module = torch.get_device_module()
         self.quant_config = {}
 
+        self._masked_m_cache = None
+
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
@@ -879,9 +882,12 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         hook() if self.return_recv_hook else event.current_stream_wait()
 
-        get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
-            masked_m
-        )
+        if get_exec().moe.enable_eplb_async:
+            self._masked_m_cache = masked_m
+        else:
+            get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
+                masked_m
+            )
 
         if isinstance(hidden_states, tuple):
             hidden_states, hidden_states_scale = hidden_states
@@ -993,7 +999,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             hidden_states,
             topk_ids,
             topk_weights,
+            masked_m_cache=self._masked_m_cache,
         )
+        self._masked_m_cache = None
         return hidden_states, event, hook
 
     def combine_b(self, hidden_states, event, hook):
@@ -1013,6 +1021,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
+        masked_m_cache: Optional[torch.Tensor] = None,
     ):
         buffer = self._get_buffer()
         overlap_args = self.overlap_args
@@ -1052,6 +1061,22 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 return_recv_hook=self.return_recv_hook,
                 **overlap_args_dict,
             )
+            # Run add_row_kernel and set_cpu_stage after DeepEP combine.
+            # The actual stream behaviour is controlled by the environment
+            # variable SGLANG_EPLB_KERNEL_OVERLAP_WITH_COMBINE:
+            #   True  – kernels are dispatched to separate streams
+            #           (gather_stream / async_eplb_stream), allowing overlap
+            #           with subsequent operations.
+            #   False – kernels run directly on the current stream (default),
+            #           avoiding extra inter-stream sync but executing
+            #           sequentially with combine.
+            if masked_m_cache is not None:
+                get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
+                    masked_m_cache
+                )
+            updater = get_global_expert_location_updater()
+            if updater is not None:
+                updater.set_cpu_stage()
 
         self.packed_recv_count = self.handle = None
         return combined_hidden_states, event, hook

@@ -121,7 +121,11 @@ class TestMegaMoEPrefillRecorder(unittest.TestCase):
 
         idle_with_global_prefill = _batch(ForwardMode.IDLE, any_prefill=True)
         self.assertTrue(should_advance_eplb_counter(idle_with_global_prefill))
-        manager.on_forward_pass_end()
+        with patch(
+            "sglang.srt.eplb.eplb_manager.get_exec",
+            return_value=SimpleNamespace(moe=SimpleNamespace(enable_eplb_async=False)),
+        ):
+            manager.on_forward_pass_end()
         self.assertEqual(advances, [1])
 
     def test_prefill_only_arm_is_inert_off_rocm(self):
