@@ -115,9 +115,13 @@ class TestWaterfillEPLB(CustomTestCase):
         )
 
         def fake_eplb_postprocess(
-            ids, expert_location_dispatch_info, num_token_non_padded
+            ids,
+            expert_location_dispatch_info,
+            num_token_non_padded,
+            cast_to_int64=False,
         ):
-            return ids + 1
+            result = ids + 1
+            return result.to(torch.int64) if cast_to_int64 else result
 
         with (
             patch.object(topk_module, "_is_cuda", True),
@@ -158,9 +162,13 @@ class TestWaterfillEPLB(CustomTestCase):
         )
 
         def fake_eplb_postprocess(
-            ids, expert_location_dispatch_info, num_token_non_padded
+            ids,
+            expert_location_dispatch_info,
+            num_token_non_padded,
+            cast_to_int64=False,
         ):
-            return ids + 1
+            result = ids + 1
+            return result.to(torch.int64) if cast_to_int64 else result
 
         with (
             patch.object(topk_module, "_is_cuda", True),
