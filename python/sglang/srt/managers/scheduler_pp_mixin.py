@@ -229,6 +229,14 @@ class SchedulerPPMixin:
                     if cur_batch:
                         self._pp_send_proxy_to_next_stage(result)
 
+                # Order the last stage's next-slot communication after this forward.
+                if (
+                    self.enable_pp_last_stage_stream_ordering
+                    and self.pp_group.is_last_rank
+                    and cur_batch
+                ):
+                    self.device_module.current_stream().wait_event(self.launch_event)
+
                 self.pp_outputs = next_pp_outputs
                 if cur_batch:
                     self._pp_apply_war_barrier()
@@ -657,6 +665,9 @@ class SchedulerPPMixin:
         self.send_output_work = []
         self.send_proxy_requires_forward_fence = False
         self.launch_event = None
+        self.enable_pp_last_stage_stream_ordering = (
+            envs.SGLANG_PP_LAST_STAGE_STREAM_ORDERING.get()
+        )
         self.pp_proxy_recv_event = None
         self.pp_send_done_event = None
         # With SGLANG_PP_COMM_OVERLAP, PP tensor sends/recvs run on a dedicated
