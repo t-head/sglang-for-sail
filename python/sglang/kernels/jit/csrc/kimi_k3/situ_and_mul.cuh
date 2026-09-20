@@ -29,13 +29,29 @@ namespace sglang {
 
 namespace kimi_k3 {
 
-/// One SiTU element.
+SGL_DEVICE float situ_tanhf(float x) {
+#if defined(__HGGC_ARCH__)
+  return __ppu_tanhf(x);
+#else
+  return tanhf(x);
+#endif
+}
+
+SGL_DEVICE float situ_sigmoidf(float x) {
+#if defined(__HGGC_ARCH__)
+  return __ppu_sgmdf(x);
+#else
+  return device::activation::sigmoid(x);
+#endif
+}
+
+/// One SiTU element; non-SAIL uses the target activation helper.
 template <bool kHasLinearBeta>
 SGL_DEVICE float situ_activate(float g, float u, float beta, float inv_beta, float linear_beta, float inv_linear_beta) {
-  const float gate_out = beta * tanhf(g * inv_beta) * device::activation::sigmoid(g);
+  const float gate_out = beta * situ_tanhf(g * inv_beta) * situ_sigmoidf(g);
   float up_out;
   if constexpr (kHasLinearBeta) {
-    up_out = linear_beta * tanhf(u * inv_linear_beta);
+    up_out = linear_beta * situ_tanhf(u * inv_linear_beta);
   } else {
     up_out = u;
   }
