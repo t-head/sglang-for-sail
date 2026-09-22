@@ -67,7 +67,7 @@ class TestGlm52Mxfp4Fp8DsaCpFlashmla(GSM8KMixin, CustomTestCase):
             "--disable-custom-all-reduce",
             "--enforce-disable-flashinfer-allreduce-fusion",
             "--disable-shared-experts-fusion",
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "16",
             "--disable-prefill-cuda-graph",
         ]

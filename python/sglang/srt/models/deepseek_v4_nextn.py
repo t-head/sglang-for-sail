@@ -14,6 +14,7 @@ from sglang.srt.hardware_backend.npu.utils import (
 )
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
+    is_dsa_enable_prefill_cp,
 )
 from sglang.srt.layers.cp.utils import (
     is_cp_active,
@@ -273,6 +274,13 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
         self.use_npu_arch35_mxfp8_wo_a = use_npu_arch35_mxfp8_wo_a(quant_config)
         self.num_fused_shared_experts = get_num_fused_shared_experts()
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        if self.dsa_enable_prefill_cp:
+            self.cp_rank = get_parallel().attn_cp_rank
+            self.cp_size = get_parallel().attn_cp_size
+        else:
+            self.cp_rank = None
+            self.cp_size = None
 
         self.model = DeepseekV4ModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -299,6 +307,8 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        # The runner prepares CP metadata and shards speculative hidden
+        # states together with inputs; never reindex the local metadata here.
         hidden_states, pre_hc_head = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
             input_ids,
