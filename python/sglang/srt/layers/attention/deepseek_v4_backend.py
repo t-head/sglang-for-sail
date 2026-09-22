@@ -62,7 +62,10 @@ from sglang.srt.layers.attention.base_attn_backend import (
     SharedReadEnds,
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
-from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+from sglang.srt.layers.attention.dsa.utils import (
+    can_dsa_prefill_cp_interleave,
+    dsa_use_prefill_cp,
+)
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
     FusedCompressMetadata,
@@ -3044,8 +3047,10 @@ class DeepseekV4AttnBackend(
         cp_active = is_cp_active(forward_batch)
         cp_sparse_prefill = (
             cp_active
-            and self.is_dsv41
-            and get_platform().is_sm90
+            and (
+                (self.is_dsv41 and get_platform().is_sm90)
+                or (is_sail() and can_dsa_prefill_cp_interleave(forward_batch))
+            )
             and not self.mega_attn
             and self.token_to_kv_pool.request_window is None
             and isinstance(

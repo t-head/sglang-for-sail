@@ -1490,8 +1490,14 @@ class DeepseekSparseAttnBackend(
                 )
                 kpool_inputs.full_seqlens_expanded = seqlens_expanded
 
-            if can_dsa_prefill_cp_interleave(forward_batch):
-                strategy = get_cp_strategy()
+            # Launch flags alone do not prove a live strategy owns this batch.
+            # Rewrite the request metadata only through the bound V2 strategy.
+            strategy = (
+                get_cp_strategy()
+                if can_dsa_prefill_cp_interleave(forward_batch)
+                else None
+            )
+            if strategy is not None:
                 seqlens_expanded = strategy.shard_local_tokens(seqlens_expanded)
                 extend_seq_lens_cpu, extend_seq_lens, bs_idx_cpu, bs_idx = (
                     strategy.shard_per_request(extend_seq_lens_cpu, extend_seq_lens)
