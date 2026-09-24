@@ -11,11 +11,11 @@ from __future__ import annotations
 import logging
 from bisect import bisect_right
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.model_overrides.deepseek_v4 import (
     DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO,
 )
@@ -396,7 +396,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         effective_num_layers = (
             num_layers
-            if kvc.server_args.enable_hisparse
+            if get_memory().enable_hisparse
             else get_glm_dsa_layer_split_effective_num_layers(kvc, num_layers)
         )
 
@@ -490,16 +490,21 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             )
             num_indexer_kv = num_sparse - num_indexer_k_only
 
-            kv_heads = model_config.get_num_kv_heads(get_parallel().attn_tp_size)
+            kv_heads = model_config.get_num_kv_heads(tp_size, dcp_size)
             head_dim = model_config.head_dim
             indexer_head_dim = sparse_cfg["sparse_index_dim"]
             indexer_dtype_size = torch._utils._element_size(
                 get_minimax_sparse_index_dtype(
                     fp8_attn_gemm=m3_fp8_attn_gemm_enabled(
-                        resolving_view(kvc.server_args)
+                        SimpleNamespace(
+                            kv_cache_dtype=kvc.kv_cache_dtype_str,
+                            attention_backend=get_exec().kernel.attention_backend,
+                        )
                     ),
                     kv_cache_dtype=kvc.kv_cache_dtype,
                     model_dtype=kvc.model_dtype,
+                    model_config=model_config,
+                    page_size=kvc.pool_page_size,
                 )
             )
 
