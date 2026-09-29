@@ -1355,16 +1355,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         A replicated (``sharded=False``) forward keeps the full DP-group count.
         """
-        from sglang.srt.layers.dp_attention import require_mlp_tp_gather
-
         if self.global_num_tokens_cpu is not None:
-            # DP / MLP-sync path: per-DP padded width.
-            if require_mlp_tp_gather():
-                num_tokens_per_dp = self.global_num_tokens_cpu[
-                    dp_slot_in(self.global_num_tokens_cpu)
-                ]
-            else:
-                num_tokens_per_dp = self.global_num_tokens_cpu[0]
+            # The scheduler owns this sequence's replica layout. A draft can
+            # narrow attention widths and change require_mlp_tp_gather(), but
+            # dp_slot_in retains the target's scoped slot (or zero for length 1).
+            num_tokens_per_dp = self.global_num_tokens_cpu[
+                dp_slot_in(self.global_num_tokens_cpu)
+            ]
         else:
             # Pure TP+SP: local input width.
             num_tokens_per_dp = self._forward_num_tokens()
