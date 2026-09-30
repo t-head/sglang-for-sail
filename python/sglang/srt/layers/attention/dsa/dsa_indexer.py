@@ -918,7 +918,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     @torch.compile(dynamic=True)
     def _scale_head_gates(self, weights_raw: torch.Tensor, q_scale: torch.Tensor):
         weights = weights_raw * self.n_heads**-0.5
-        return weights.unsqueeze(-1) * q_scale * self.softmax_scale
+        weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
+        # bf16_indexer passes q_scale=1 (python scalar), so the result stays
+        # bf16; DeepGEMM mqa_logits requires fp32 weights. The quant paths
+        # already promote to fp32 via the fp32 q_scale tensor.
+        return weights.to(torch.float32)
 
     @torch.compile(dynamic=True)
     def _scale_head_gates_no_q_scale(self, weights_raw: torch.Tensor):
@@ -936,7 +940,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 kw = tiny_gemm_bf16(x, self._wk_gate_weight)
             else:
                 kw = torch.mm(x, self._wk_gate_weight.t())
-        return kw.split([self.head_dim, self.n_heads], dim=-1)
+        key, weights_raw = kw.split([self.head_dim, self.n_heads], dim=-1)
+        if is_sail():
+            return key.contiguous(), weights_raw.contiguous()
+        return key, weights_raw
 
     def _aiter_fused_fp8_active(self, forward_batch: ForwardBatch) -> bool:
         if not self.use_aiter_fused_fp8_writer:
@@ -1559,6 +1566,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if (
             not self.use_fp4
             and not self.use_int8
+            and not self.bf16_indexer
             and not _is_fp8_fnuz
             and out_cache_loc is not None
             and not dsa_shards_index_k()
@@ -3100,7 +3108,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if self.bf16_indexer or self.use_int8:
             assert dcp_size == 1
             index_k, index_k_scale = (
-                (key, None) if self.bf16_indexer else per_token_quant_int8(key)
+                (key.reshape(-1, key.shape[-1]).contiguous(), None)
+                if self.bf16_indexer
+                else per_token_quant_int8(key)
             )
             pool.set_index_k_scale_buffer(
                 layer_id=layer_id,
@@ -3344,10 +3354,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
         elif (
             self.use_dsa_indexer_fusion
+            and not self.bf16_indexer
             and not in_piecewise_or_breakable_cuda_graph
             and forward_batch.attn_cp_metadata is None
         ) or (
             self._wk_gate_weight is not None
+            and not self.bf16_indexer
             and (
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
