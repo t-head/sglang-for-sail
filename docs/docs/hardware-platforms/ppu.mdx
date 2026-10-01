@@ -1,0 +1,79 @@
+---
+title: "T-Head PPU (SAIL)"
+description: "Detect the SAIL runtime and verify the PPU platform identity."
+tag: "Experimental"
+---
+
+T-Head PPU exposes a CUDA-compatible PyTorch interface through the SAIL
+software stack. SGLang identifies this platform as `ppu` while keeping the
+PyTorch device type `cuda`.
+
+<Info>
+  This integration establishes platform identity and device operations.
+  PPU kernel builds, dependency packaging, attention and quantization backends,
+  graph support, and end-to-end inference validation are separate follow-up work.
+</Info>
+
+## Prerequisites
+
+Use a Linux PPU environment with the vendor's matching SAIL SDK, driver, and
+PyTorch build. See the [SAIL SDK release notes](https://help.aliyun.com/zh/document_detail/3030339.html)
+for the vendor software stack.
+
+Automatic detection requires both:
+
+- A non-empty `PPU_SDK` environment variable supplied by the SAIL environment.
+- A visible CUDA-compatible PyTorch device with `torch.version.hip is None`.
+
+Keep the vendor-provided `PPU_SDK` value. Setting this variable on an NVIDIA
+host does not install SAIL or provide PPU kernels.
+
+## Verify platform selection
+
+Run this command with the PPU environment's Python and this checkout on
+`PYTHONPATH`, from the repository root:
+
+```bash
+PYTHONPATH=python python - <<'PY'
+import os
+import torch
+from sglang.srt.platforms import current_platform
+
+print("PPU_SDK:", os.getenv("PPU_SDK"))
+print("PyTorch:", torch.__version__)
+print("Platform:", current_platform.device_name)
+print("Device type:", current_platform.device_type)
+print("CUDA-compatible:", current_platform.is_cuda_alike())
+
+assert current_platform.is_ppu(), "PPU platform was not selected; check the SAIL environment and visible devices."
+print("Device:", current_platform.get_device_name(torch.cuda.current_device()))
+PY
+```
+
+You should see `Platform: ppu`, `Device type: cuda`, and the PPU device name.
+Use `torch.device("cuda", device_id)` to address a PPU. `ppu` is a SGLang
+platform identity, not a PyTorch device type.
+
+Installed [platform plugins](/docs/hardware-platforms/plugin) retain priority.
+With no active plugin, `SGLANG_USE_CPU_ENGINE=1` selects the CPU platform before
+PPU detection. Without a non-empty `PPU_SDK` marker, the existing CUDA, ROCm,
+NPU, and XPU selection paths remain available.
+
+## Run the platform unit tests
+
+These tests mock device availability and require no PPU or NVIDIA hardware.
+Use an existing SGLang development environment with PyTorch and pytest:
+
+```bash
+PYTHONPATH=python python -m pytest \
+  test/registered/unit/platforms/test_platform_interface.py \
+  test/registered/unit/platforms/test_ppu_platform.py -q
+```
+
+The tests cover platform selection, CUDA-compatible device operations, CPU
+override and plugin precedence, unavailable devices, ROCm exclusion, and
+existing runtime-helper behavior. Device compilation, model accuracy, and
+inference performance still require real PPU validation.
+
+Follow the [upstream PPU roadmap](https://github.com/sgl-project/sglang/issues/37519)
+for the remaining build and runtime integration work.

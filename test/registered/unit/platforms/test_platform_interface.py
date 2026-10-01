@@ -93,6 +93,7 @@ _PLATFORM_IDENTITY = [
     (PlatformEnum.NPU, "npu", "npu", "is_npu"),
     (PlatformEnum.TPU, "tpu", "tpu", "is_tpu"),
     (PlatformEnum.MPS, "mps", "mps", "is_mps"),
+    (PlatformEnum.PPU, "ppu", "cuda", "is_ppu"),
 ]
 
 # is_cuda_alike test data: (enum, name, dtype, expected)
@@ -100,6 +101,7 @@ _CUDA_ALIKE = [
     (PlatformEnum.CUDA, "cuda", "cuda", True),
     (PlatformEnum.ROCM, "rocm", "hip", True),
     (PlatformEnum.MUSA, "musa", "musa", True),
+    (PlatformEnum.PPU, "ppu", "cuda", True),
     (PlatformEnum.CPU, "cpu", "cpu", False),
     (PlatformEnum.NPU, "npu", "npu", False),
 ]
@@ -116,7 +118,7 @@ class TestDeviceMixin(CustomTestCase):
                 self.assertTrue(getattr(mixin, method)())
 
     def test_is_cuda_alike(self):
-        """is_cuda_alike is True for CUDA/ROCM/MUSA, False otherwise."""
+        """CUDA-compatible platforms include PPU without changing device type."""
         for enum_val, name, dtype, expected in _CUDA_ALIKE:
             with self.subTest(enum=enum_val.name):
                 mixin = _make_device_mixin(enum_val, name, dtype)

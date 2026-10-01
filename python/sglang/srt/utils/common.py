@@ -152,8 +152,13 @@ builtins.FP8_E4M3_MIN = FP8_E4M3_MIN
 
 
 @lru_cache(maxsize=1)
+def is_ppu() -> bool:
+    return current_platform.is_ppu()
+
+
+@lru_cache(maxsize=1)
 def is_cuda():
-    return torch.cuda.is_available() and torch.version.cuda is not None
+    return (torch.cuda.is_available() and torch.version.cuda is not None) or is_ppu()
 
 
 @lru_cache(maxsize=1)
