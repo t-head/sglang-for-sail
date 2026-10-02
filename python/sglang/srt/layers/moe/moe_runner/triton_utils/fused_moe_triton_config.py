@@ -4,6 +4,7 @@ import functools
 import json
 import logging
 import os
+from copy import deepcopy
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -40,6 +41,7 @@ def get_config_file_name(
     block_shape: Optional[int] = None,
     per_channel_quant: bool = False,
     down_moe: bool = False,
+    version: int = 1,
 ) -> str:
     device_name = get_device_name().replace(" ", "_")
     dtype_selector = "" if not dtype else f",dtype={dtype}"
@@ -48,7 +50,8 @@ def get_config_file_name(
     )
     per_channel_quant_selector = ",per_channel_quant=True" if per_channel_quant else ""
     down_moe_selector = "_down" if down_moe else ""
-    return f"E={E},N={N},device_name={device_name}{dtype_selector}{block_shape_selector}{per_channel_quant_selector}{down_moe_selector}.json"
+    version_str = f",version={version}" if version > 1 else ""
+    return f"E={E},N={N},device_name={device_name}{dtype_selector}{block_shape_selector}{per_channel_quant_selector}{down_moe_selector}{version_str}.json"
 
 
 @functools.lru_cache
@@ -60,6 +63,7 @@ def get_moe_configs(
     block_k: Optional[int] = 0,
     per_channel_quant: bool = False,
     down_moe: bool = False,
+    version: int = 1,
 ) -> Optional[Dict[int, Any]]:
     """
     Return optimized configurations for the fused MoE kernel.
@@ -75,6 +79,10 @@ def get_moe_configs(
         )
         return None
 
+    if os.environ.get("DISABLE_MOE_CONFIG", "0") == "1":
+        logger.warning("We have disabled fused moe config loading.")
+        return None
+
     # First look up if an optimized configuration is available in the configs
     # directory
     json_file_name = get_config_file_name(
@@ -84,6 +92,7 @@ def get_moe_configs(
         [block_n, block_k],
         per_channel_quant,
         down_moe=down_moe,
+        version=version,
     )
 
     # We found that using the fused_moe_kernel config from Triton 3.1.0 with Triton 3.2.0 results in negative performance gains,
@@ -271,6 +280,7 @@ def try_get_optimal_moe_config(
     block_shape: Optional[List[int]] = None,
     per_channel_quant: bool = False,
     return_down_config: bool = False,
+    version: int = 1,
 ):
     from sglang.srt.layers.moe.moe_runner.triton_utils import get_config
 
@@ -292,6 +302,7 @@ def try_get_optimal_moe_config(
             block_k,
             per_channel_quant=per_channel_quant,
             down_moe=False,
+            version=version,
         )
 
         if configs:
@@ -303,7 +314,7 @@ def try_get_optimal_moe_config(
             config = get_default_config(
                 M, E, N, w1_shape[2], top_k, dtype, is_marlin, block_shape
             )
-        if return_down_config:
+        if return_down_config and version == 1:
             down_configs = get_moe_configs(
                 E,
                 N,
@@ -312,6 +323,7 @@ def try_get_optimal_moe_config(
                 block_k,
                 per_channel_quant=per_channel_quant,
                 down_moe=True,
+                version=version,
             )
             if down_configs:
                 down_config = down_configs[
@@ -321,6 +333,14 @@ def try_get_optimal_moe_config(
                 max_block_m = max(
                     [cfg["BLOCK_SIZE_M"] for cfg in down_configs.values()]
                 )
+    config = deepcopy(config)
+    if "UP" in config:
+        use_valu = config.get("USE_VALU", False)
+        down_config = dict(config["DOWN"], USE_VALU=use_valu)
+        config = dict(config["UP"], USE_VALU=use_valu)
+    elif down_config is not None:
+        down_config = deepcopy(down_config)
+
     if return_down_config:
         if (
             down_config is not None
