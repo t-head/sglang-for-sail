@@ -14,6 +14,7 @@ from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import PlatformCapabilities, SRTPlatform
 
 _ZW_TAG = "ZW"
+_ZW810E_NAME = "ZW810E"
 
 
 @lru_cache(maxsize=1)
@@ -40,3 +41,6 @@ class SailSRTPlatform(SailDeviceMixin, SRTPlatform):
         piecewise_graph=True,
         supports_pynccl=True,
     )
+
+    def is_zw810e(self) -> bool:
+        return _ZW810E_NAME in self.get_device_name()
