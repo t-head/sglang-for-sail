@@ -89,6 +89,9 @@ def flash_mla_with_kvcache(
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
     kv_format: Optional[str] = None,
+    *,
+    use_legacy: bool = True,
+    heads_per_group: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run FlashMLA decode attention on SAIL.
 
@@ -103,6 +106,11 @@ def flash_mla_with_kvcache(
     if kv_format not in (None, "V32"):
         raise NotImplementedError(
             f"SAIL FlashMLA does not support explicit KV layout {kv_format!r}."
+        )
+
+    if not use_legacy or heads_per_group:
+        raise NotImplementedError(
+            "SAIL FlashMLA requires the legacy KV layout without token packing."
         )
 
     if softmax_scale is None:
@@ -141,6 +149,8 @@ def flash_mla_sparse_fwd(
     d_v: int = 512,
     attn_sink: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
+    *,
+    use_legacy: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sparse prefill attention on SAIL.
 
@@ -148,6 +158,9 @@ def flash_mla_sparse_fwd(
     """
     if _import_error is not None:
         raise _IMPORT_ERROR from _import_error
+
+    if not use_legacy:
+        raise NotImplementedError("SAIL FlashMLA requires the legacy KV layout.")
 
     return _flashmla.flash_mla_sparse_fwd(
         q,

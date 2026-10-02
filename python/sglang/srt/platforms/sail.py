@@ -44,3 +44,7 @@ class SailSRTPlatform(SailDeviceMixin, SRTPlatform):
 
     def is_zw810e(self) -> bool:
         return _ZW810E_NAME in self.get_device_name()
+
+
+if is_sail_available():
+    import sglang.srt.hardware_backend.sail.attention.ops_hooks  # noqa: F401
