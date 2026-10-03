@@ -884,6 +884,12 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             self._reset_server_log_history = False
 
             if should_track_history:
+                if (
+                    utilization_rate_gpu.device.type == "cuda"
+                    and torch.cuda.is_current_stream_capturing()
+                ):
+                    return  # skip during CUDA graph capture to avoid gpu->cpu sync crash
+                # TODO maybe refactor this part to also avoid a `.item()` gpu->cpu sync
                 self._history.append(utilization_rate_gpu.item())
 
     # TODO refactor
