@@ -45,6 +45,12 @@ class SailSRTPlatform(SailDeviceMixin, SRTPlatform):
     def is_zw810e(self) -> bool:
         return _ZW810E_NAME in self.get_device_name()
 
+    def get_device_num_tensorcores(self, device_id: int = 0) -> int:
+        if _ZW810E_NAME in self.get_device_name(device_id):
+            return 20
+        return super().get_device_num_tensorcores(device_id)
+
 
 if is_sail_available():
     import sglang.srt.hardware_backend.sail.attention.ops_hooks  # noqa: F401
+    import sglang.srt.hardware_backend.sail.moe.deepep_hooks  # noqa: F401
