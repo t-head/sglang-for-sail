@@ -9,7 +9,6 @@
 #include <iostream>
 #include <type_traits>
 
-#include "cutlass/array.h"
 #include "utils.h"
 
 template <typename T>
