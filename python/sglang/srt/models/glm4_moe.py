@@ -1308,6 +1308,11 @@ class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
 
 
 class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
+    packed_modules_mapping = {
+        "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
     # ModelConfig rewrites a GLM draft's architecture to this class's own name,
     # so the inherited DeepSeek name would never match what the gate compares.
     fused_shared_experts_architecture = "GlmMoeDsaForCausalLMNextN"
