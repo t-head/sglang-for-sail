@@ -22,6 +22,7 @@ from pathlib import Path
 
 import torch
 from setuptools import find_namespace_packages, setup
+from torch.utils import cpp_extension
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 root = Path(__file__).parent.resolve()
@@ -29,6 +30,21 @@ third_party = Path(
     os.environ.get("SGL_KERNEL_THIRD_PARTY_DIR", root / "build" / "_deps")
 )
 arch = platform.machine().lower()
+cuda_home = getattr(cpp_extension, "CUDA_HOME", None)
+
+if "SGL_KERNEL_SKIP_SAILIFY" in os.environ:
+    skip_sailify = os.environ["SGL_KERNEL_SKIP_SAILIFY"] == "1"
+else:
+    skip_sailify = os.environ.get("SGL_KERNEL_USE_SAILIFY", "1") != "1"
+
+# Disabling conversion also supports the SDK's CUDA-compatible headers. A
+# preconverted native tree keeps its own compat layer and native build flags.
+cuda_compatible_build = (
+    skip_sailify
+    and cuda_home is not None
+    and (Path(cuda_home) / "include" / "cuda_runtime.h").is_file()
+    and not (root / ".ppu_compat").is_dir()
+)
 
 # ======================= CUDA Version Detection ======================= #
 cuda_version = torch.version.cuda
@@ -146,6 +162,16 @@ sgl_kernel_cuda_flags = [
     abi_flag,
 ]
 
+if cuda_compatible_build:
+    sgl_kernel_cuda_flags.extend(
+        [
+            "-U__CUDA_NO_HALF_OPERATORS__",
+            "-U__CUDA_NO_HALF_CONVERSIONS__",
+            "-U__CUDA_NO_HALF2_OPERATORS__",
+            "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+        ]
+    )
+
 if enable_bf16:
     sgl_kernel_cuda_flags.append("-DFLASHINFER_ENABLE_BF16")
 
@@ -221,13 +247,16 @@ flashinfer_sources = [
 # `library_paths()` from SAIL torch already contributes $PPU_SDK/lib, so no
 # explicit library_dirs is needed.
 libraries = ["c10", "hggcrt1", "hggc", "acblas", "acblasLt"]
+if cuda_compatible_build:
+    # CUDAExtension supplies cudart; BLAS names must match the active SDK too.
+    libraries = ["c10", "cublas", "cublasLt"]
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib"]
 
 
 # ======================= Extension Modules ======================= #
 def _make_common_ops():
     """common_ops for SM80/SM89."""
-    nvcc_flags = sgl_kernel_cuda_flags + ["-use_fast_math"]
+    nvcc_flags = sgl_kernel_cuda_flags + ["-use_fast_math", "-DSGL_KERNEL_SAIL"]
     return CUDAExtension(
         name="sgl_kernel.common_ops",
         sources=staged_common_sources,
@@ -293,11 +322,6 @@ sailify_staging_dir = root / "build" / "sailified"
 # (root/.ppu_compat, see the skip branch).  The legacy
 # SGL_KERNEL_SKIP_SAILIFY variable is kept for backwards compatibility and
 # takes precedence when explicitly set.
-if "SGL_KERNEL_SKIP_SAILIFY" in os.environ:
-    skip_sailify = os.environ["SGL_KERNEL_SKIP_SAILIFY"] == "1"
-else:
-    skip_sailify = os.environ.get("SGL_KERNEL_USE_SAILIFY", "1") != "1"
-
 # Targeted fixes applied to the *staged* copies after the generic sailify
 # pass, for CUDA constructs the identifier-level mapping cannot express.
 # The -U__HGGC_NO_HALF* flags in sgl_kernel_cuda_flags disable
@@ -438,7 +462,10 @@ if skip_sailify:
     # cuda_free toolchain) it is prepended to shadow the CUDA headers, and
     # otherwise the upstream include layout is used unchanged.
     print("WARNING: sailify disabled, compiling upstream sources directly")
-    staged_common_sources = [str(root / s) for s in common_sources] + flashinfer_sources
+    # Setuptools rejects absolute extension source paths when writing the wheel
+    # manifest. Resolve the same inputs relative to the setup directory.
+    staged_common_sources = [os.path.relpath(root / s, root) for s in common_sources]
+    staged_common_sources += [os.path.relpath(s, root) for s in flashinfer_sources]
     ppu_compat_dir = root / ".ppu_compat"
     if ppu_compat_dir.is_dir():
         print(f"note: using existing compat layer {ppu_compat_dir}")
