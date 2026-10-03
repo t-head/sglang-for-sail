@@ -26,7 +26,7 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
+    from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -43,11 +43,6 @@ class SailFlashMLABackend(FlashMLABackend):
 
     def __init__(self, model_runner: ModelRunner, **kwargs):
         super().__init__(model_runner, **kwargs)
-        # FlashMLABackend leaves the translator to bind_and_verify_backends,
-        # which only reaches top-level backends; on SAIL this instance is wrapped
-        # by SailHybridAttnBackend, so wire it here. Runners without the unified
-        # pool (predating the translator) keep the triton path below.
-        self.kv_index_translator = getattr(model_runner, "kv_index_translator", None)
         if self.is_fp8_kvcache:
             raise NotImplementedError(
                 "FP8 KV cache is not supported by FlashMLA on SAIL."
@@ -61,7 +56,7 @@ class SailFlashMLABackend(FlashMLABackend):
 
     def _apply_decode_target_verify_metadata(
         self,
-        plan: KVLocPlan,
+        plan: IterationIds,
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
@@ -81,10 +76,9 @@ class SailFlashMLABackend(FlashMLABackend):
         else:
             max_seqlen_pad = self.cuda_graph_kv_indices.shape[1]
 
-        translator = self.kv_index_translator
-        if translator is not None and translator.reads_are_translated:
+        if self.runner_ids is not None and self.runner_ids.reads_are_translated:
             assert self.page_size == PAGE_SIZE
-            translator.copy_page_table(plan, out=self.cuda_graph_kv_indices[:bs])
+            self.runner_ids.copy_page_table(plan, out=self.cuda_graph_kv_indices[:bs])
         else:
             create_flashmla_kv_indices_triton[
                 (
@@ -150,7 +144,7 @@ class SailFlashMLABackend(FlashMLABackend):
         """Write split k and concat split q; returns (q, save_kv_cache)."""
         if k_rope is not None:
             if save_kv_cache and k is not None:
-                self.token_to_kv_pool.set_mla_kv_buffer(
+                self.kv_layers.layer(layer.layer_id).store_mla(
                     layer, KVWriteLoc.for_batch(forward_batch), k, k_rope
                 )
             save_kv_cache = False
@@ -219,7 +213,7 @@ class SailFlashMLAMultiStepDraftBackend(FlashMLAMultiStepDraftBackend):
             )
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
-        self.kv_index_translator = model_runner.kv_index_translator
+        self.runner_ids = model_runner.runner_ids
         max_bs = model_runner.req_to_token_pool.size * self.topk
         self.kv_indptr = torch.zeros(
             (
