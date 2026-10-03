@@ -2670,6 +2670,7 @@ piecewise_cuda_graph_disabled_model_archs = [
     "Ernie5_5_MoeForCausalLMDSpark",
     "Qwen3NextForCausalLM",
     "Glm5NextForConditionalGeneration",
+    "GlmMoeDsaForCausalLMNextN",
     "BailingMoeV2_5ForCausalLM",
     "LLaDAModelLM",
 ]
