@@ -2549,7 +2549,7 @@ class KVCacheConfigurator:
             max_running_requests=max_running_requests,
             kv_scale_ue8m0=is_kimi_k31(self.model_config.hf_config),
             fp8_cast_on_write=is_kimi_k31(self.model_config.hf_config),
-            use_fp4_indexer=get_exec().kernel.enable_fp4_indexer,
+            use_fp4_indexer=DSATokenToKVPool.use_fp4_indexer_for_current_platform(),
             **pool_kwargs,
         )
         return token_to_kv_pool
