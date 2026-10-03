@@ -73,7 +73,7 @@ from sglang.srt.models.deepseek_common.utils import (
     is_wint4afp8_or_wint4a16_config,
 )
 from sglang.srt.models.utils import bind_or_assign
-from sglang.srt.utils import log_info_on_rank0
+from sglang.srt.utils import is_sail, log_info_on_rank0
 
 if _use_aiter_gfx95:
     from sglang.srt.layers.quantization.quark.utils import quark_post_load_weights
@@ -680,17 +680,37 @@ class DeepseekV2WeightLoaderMixin:
 
             if hasattr(self_attn.kv_b_proj, "qweight"):
                 # awq compatible, dequantize the weight if supported
-                awq_dequantize_f = awq_dequantize_func()
-                if awq_dequantize_f is not None:
-                    w = awq_dequantize_f(
+                if is_sail() and (
+                    self.quant_config.get_name()
+                    in [
+                        "gptq",
+                        "gptq_marlin",
+                    ]
+                    or (
+                        self.quant_config.get_name() == "moe_wna16"
+                        and self.quant_config.linear_quant_method == "gptq"
+                    )
+                ):
+                    from sgl_kernel import gptq_dequantize
+
+                    w = gptq_dequantize(
                         self_attn.kv_b_proj.qweight,
                         self_attn.kv_b_proj.scales,
                         self_attn.kv_b_proj.qzeros,
                     ).T
+                    assert w is not None
                 else:
-                    raise ValueError(
-                        "AWQ dequantize function is not supported for the current device"
-                    )
+                    awq_dequantize_f = awq_dequantize_func()
+                    if awq_dequantize_f is not None:
+                        w = awq_dequantize_f(
+                            self_attn.kv_b_proj.qweight,
+                            self_attn.kv_b_proj.scales,
+                            self_attn.kv_b_proj.qzeros,
+                        ).T
+                    else:
+                        raise ValueError(
+                            "AWQ dequantize function is not supported for the current device"
+                        )
             elif isinstance(
                 self_attn.kv_b_proj.quant_method, CompressedTensorsLinearMethod
             ) and isinstance(self_attn.kv_b_proj.scheme, CompressedTensorsWNA16):

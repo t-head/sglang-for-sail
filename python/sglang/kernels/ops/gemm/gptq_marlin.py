@@ -7,6 +7,7 @@ import torch
 from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.srt.platforms import current_platform
 
 if TYPE_CHECKING:
     from sgl_kernel.scalar_type import ScalarType
@@ -73,7 +74,11 @@ def gptq_marlin_gemm(
 
     # Allocate c_tmp for fp32 reduce
     if use_fp32_reduce:
-        sms = current_arch().num_sms
+        sms = (
+            current_platform.get_device_num_tensorcores(device)
+            if current_platform.is_sail()
+            else current_arch().num_sms
+        )
         max_m_block = min(((size_m + 15) // 16) * 16, 64)
         c_tmp = torch.empty(
             sms * max_m_block * _MAX_THREAD_N,
