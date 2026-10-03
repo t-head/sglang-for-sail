@@ -1428,4 +1428,4 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
         return quant_config
 
 
-EntryClass = [Glm4MoeForCausalLM, GlmMoeDsaForCausalLM, GlmMoeDsaForCausalLMNextN]
+EntryClass = [Glm4MoeForCausalLM, GlmMoeDsaForCausalLM]
