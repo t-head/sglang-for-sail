@@ -214,7 +214,7 @@ struct ActivationKernel {
 #endif
 
   using kernel_fn_t = decltype(&act_and_mul_kernel<T, ActivationKind::kSiLU, kUsePDL, kFastMath, false>);
-  using unary_kernel_fn_t = decltype(&act_kernel<T, ActivationKind::kReLU2, kUsePDL, kFastMath>);
+  using unary_kernel_fn_t = void (*const)(UnaryActivationParams);
 
   template <
       ActivationKind kAct,
