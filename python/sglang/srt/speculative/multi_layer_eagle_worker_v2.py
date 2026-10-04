@@ -41,6 +41,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
+from sglang.srt.model_executor.runner_utils.nvtx_profile import profile_mtp_stage
 from sglang.srt.observability.profile_utils import build_step_span_name
 from sglang.srt.runtime_context import (
     get_device,
@@ -462,6 +463,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             - tic
         )
 
+    @profile_mtp_stage("mtp_draft_decode", draft_decode=True)
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
         forward_batch, can_run_decode_cuda_graph, iteration_ids = prepare_for_draft(
@@ -606,6 +608,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None
 
+    @profile_mtp_stage("mtp_draft_extend_prefill")
     def _draft_extend_for_prefill(
         self,
         batch: ScheduleBatch,
@@ -805,6 +808,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         )
         return True
 
+    @profile_mtp_stage("mtp_draft_extend_decode")
     def _draft_extend_for_decode(
         self,
         batch: ScheduleBatch,
@@ -1207,6 +1211,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             )
             return batch_output
 
+    @profile_mtp_stage("mtp_target_verify")
     def verify(self, batch: ScheduleBatch, grammar_barrier=None):
         return run_eagle_verify(
             batch,
