@@ -16,6 +16,17 @@ import flash_mla
 import torch
 from flash_mla.flash_mla_interface import FlashMLASchedMeta
 
+from sglang.srt.environ import envs
+
+SGLANG_PROFILE_NVTX = envs.SGLANG_PROFILE_NVTX.get()
+SGLANG_PROFILE_NVTX_PRINT_SEQLEN = envs.SGLANG_PROFILE_NVTX_PRINT_SEQLEN.get()
+if SGLANG_PROFILE_NVTX:
+    try:
+        from torch.cuda.nvtx import range_pop as th_nvtx_range_pop
+        from torch.cuda.nvtx import range_push as th_nvtx_range_push
+    except ImportError:
+        SGLANG_PROFILE_NVTX = False
+
 try:
     from flash_mla import fused_norm_rope_attn_rope_cast as _mega
 
@@ -145,28 +156,45 @@ def flash_mla_with_kvcache(
             and k_cache.shape[-1] == _V32_NO_ROPE_BYTES_PER_TOKEN
         ):
             kv_format = "V32_NO_ROPE"
-    return flash_mla.flash_mla_with_kvcache(
-        q=q,
-        k_cache=k_cache,
-        block_table=block_table,
-        cache_seqlens=cache_seqlens,
-        head_dim_v=head_dim_v,
-        tile_scheduler_metadata=sched_meta,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        is_fp8_kvcache=is_fp8_kvcache,
-        indices=indices,
-        attn_sink=attn_sink,
-        extra_k_cache=extra_k_cache,
-        extra_indices_in_kvcache=extra_indices_in_kvcache,
-        topk_length=topk_length,
-        extra_topk_length=extra_topk_length,
-        use_legacy=use_legacy,
-        kv_format=kv_format,
-        descale_q=descale_q,
-        descale_k=descale_k,
-        **extra,
-    )
+    if SGLANG_PROFILE_NVTX:
+        mode = "D" if torch.cuda.is_current_stream_capturing() else "P"
+        message = (
+            f"[FW_FMHA] --format=MLA,Forward,type:{mode},"
+            f"seqlen_q:{q.shape[-3] if q.dim() == 4 else 1},"
+            f"head_dim:{q.shape[-1]},head_dim_v:{head_dim_v},"
+            f"num_heads_kv:{k_cache.shape[-2]},num_heads:{q.shape[-2]},"
+            f"batch_size:{q.shape[0]},data_type:{q.dtype},causal:{causal}"
+        )
+        if mode == "P" and SGLANG_PROFILE_NVTX_PRINT_SEQLEN:
+            lengths = cache_seqlens.tolist() if cache_seqlens is not None else None
+            message += f",cu_seqlens_k:{lengths}"
+        th_nvtx_range_push(message)
+    try:
+        return flash_mla.flash_mla_with_kvcache(
+            q=q,
+            k_cache=k_cache,
+            block_table=block_table,
+            cache_seqlens=cache_seqlens,
+            head_dim_v=head_dim_v,
+            tile_scheduler_metadata=sched_meta,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            is_fp8_kvcache=is_fp8_kvcache,
+            indices=indices,
+            attn_sink=attn_sink,
+            extra_k_cache=extra_k_cache,
+            extra_indices_in_kvcache=extra_indices_in_kvcache,
+            topk_length=topk_length,
+            extra_topk_length=extra_topk_length,
+            use_legacy=use_legacy,
+            kv_format=kv_format,
+            descale_q=descale_q,
+            descale_k=descale_k,
+            **extra,
+        )
+    finally:
+        if SGLANG_PROFILE_NVTX:
+            th_nvtx_range_pop()
 
 
 def flash_mla_sparse_fwd(

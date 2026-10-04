@@ -478,6 +478,13 @@ class Envs:
     # ===================================================================
     # Profiling, tracing, and metrics
     # ===================================================================
+    SGLANG_PROFILE_NVTX = EnvBool(False)
+    SGLANG_PROFILE_NVTX_PRINT_TOPID = EnvBool(False)
+    SGLANG_PROFILE_NVTX_PRINT_SEQLEN = EnvBool(False)
+    # TileLang MHC integration knobs; preserve the vendor-facing names.
+    TL_MHC_PRE_BIG_FUSE_WITH_NORM_ENABLE_FAST_MATH = EnvBool(False)
+    TL_MHC_PRE_BIG_FUSE_WITH_NORM_PIPELINED_NUM_STAGES_1ST = EnvInt(3)
+    TL_MHC_PRE_BIG_FUSE_WITH_NORM_PIPELINED_NUM_STAGES_2ND = EnvInt(2)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
     SGLANG_PROFILE_V2 = EnvBool(False)
