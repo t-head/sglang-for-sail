@@ -94,6 +94,7 @@ class TestGPTQMarlinMoE(CustomTestCase):
     def test_fused_moe_w2_loader_honors_load_full(self):
         loader = SimpleNamespace(
             quant_config=None,
+            quant_method=None,
             use_padded_loading=False,
             use_presharded_weights=False,
             moe_tp_size=2,
