@@ -1,6 +1,28 @@
+from functools import lru_cache
+
 import torch
 import triton
 import triton.language as tl
+
+
+@lru_cache(maxsize=1)
+def _supports_fp8() -> bool:
+    """Check if current GPU supports FP8 compute (requires SM89+ for CUDA, or HIP)."""
+    if not torch.cuda.is_available():
+        return False
+
+    from sglang.srt.utils.device import get_device_sm
+
+    cc = get_device_sm()
+    return cc >= 89
+
+
+@lru_cache(maxsize=1)
+def use_sail_dsv4_int8_indexer() -> bool:
+    from sglang.srt.environ import envs
+    from sglang.srt.utils.device import is_sail
+
+    return is_sail() and (not _supports_fp8() or envs.SGLANG_SAIL_DSV4_USE_INT8.get())
 
 
 @triton.jit

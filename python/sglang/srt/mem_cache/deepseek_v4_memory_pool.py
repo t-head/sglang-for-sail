@@ -568,8 +568,8 @@ class DeepSeekV4IndexerPool(KVCache):
 
     @property
     def index_key_bytes_per_token(self) -> int:
-        # GetKAndS reads it; index_k_with_scale_buffer keeps fp8 keys.
-        return self.index_head_dim
+        # GetKAndS uses the physical key width, excluding its four scale bytes.
+        return self.index_head_dim // 2 if self.use_fp4_indexer else self.index_head_dim
 
     def __init__(
         self,
@@ -615,6 +615,11 @@ class DeepSeekV4IndexerPool(KVCache):
         return get_dsv4_indexer_bytes_per_token(
             self.index_head_dim, self.use_fp4_indexer
         )
+
+    @property
+    def packed_bytes_per_token(self) -> int:
+        """K-side bytes per token in the cache buffer (excludes scales)."""
+        return self.index_key_bytes_per_token
 
     def _create_buffer(self):
         page_bytes = self.page_size * self.get_bytes_per_token()

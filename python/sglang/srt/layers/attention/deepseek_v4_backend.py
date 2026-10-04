@@ -1466,6 +1466,8 @@ class DeepseekV4AttnBackend(
         self.builds_verify_metadata_early = False
         # Ids of the captured verify metadata built that way; the bucket keeps them alive.
         self._early_verify_metadata_ids: set = set()
+        self.index_n_heads = model_runner.model_config.hf_text_config.index_n_heads
+        self.index_head_dim = model_runner.model_config.index_head_dim
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -1592,6 +1594,7 @@ class DeepseekV4AttnBackend(
         compress_ratio: int = 4,
         use_prefill_cuda_graph: bool = False,
         rows_per_request: int = 1,
+        build_paged_mqa_logits_metadata: bool = True,
     ):
         page_table = core_attn_metadata.page_table
         index_page_size = 0
@@ -1631,7 +1634,18 @@ class DeepseekV4AttnBackend(
             compress_ratio=compress_ratio,
             rows_per_request=rows_per_request,
             # The dsv41 low-ratio indexers call deep_gemm_fp4_paged_mqa_logits.
-            deep_gemm_varlen=compress_ratio != 4 and deep_gemm_paged_varlen(),
+            deep_gemm_varlen=(
+                not is_sail() and compress_ratio != 4 and deep_gemm_paged_varlen()
+            ),
+            build_paged_mqa_logits_metadata=build_paged_mqa_logits_metadata,
+            q_fp8_shape=torch.Size(
+                (
+                    c_seq_lens.shape[0] // rows_per_request,
+                    rows_per_request,
+                    self.index_n_heads,
+                    self.index_head_dim,
+                )
+            ),
         )
 
     def init_forward_metadata_decode(
@@ -1671,6 +1685,7 @@ class DeepseekV4AttnBackend(
         cp_metadata: Optional[InterleaveContextParallelMetadata] = None,
         dspark_swa_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         real_num_tokens: Optional[int] = None,
+        build_paged_mqa_logits_metadata: bool = True,
     ) -> DSV4Metadata:
         padded_num_tokens = out_cache_loc.shape[0]
         cp_active = forward_batch is not None and is_cp_active(forward_batch)
@@ -1735,6 +1750,7 @@ class DeepseekV4AttnBackend(
             self.init_forward_metadata_indexer(
                 core_attn_metadata,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
+                build_paged_mqa_logits_metadata=build_paged_mqa_logits_metadata,
             )
             if need_compress and self.has_c4
             else None
@@ -3289,6 +3305,9 @@ class DeepseekV4AttnBackend(
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
                 forward_batch=forward_batch,
                 real_num_tokens=real_num_tokens,
+                build_paged_mqa_logits_metadata=not self._use_prefill_logits(
+                    forward_batch
+                ),
             )
             self._snapshot_low_ratio_k_slots(
                 forward_batch, metadata, publish_rows=not use_prefill_cuda_graph

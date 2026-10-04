@@ -21,6 +21,7 @@ from sglang.srt.utils.device import (
     get_device,
     is_gfx95_supported,
     is_mnnvl_fabric_device,
+    is_sail,
 )
 
 logger = logging.getLogger(__name__)
@@ -473,7 +474,10 @@ def handle_environment_variables(server_args: Any):
                 "All operations will run eagerly through the graph capture/replay path."
             )
     if cfg.enable_deepseek_v4_fp4_indexer and not (
-        get_platform().is_sm100 or get_platform().is_sm120 or is_gfx95_supported()
+        (is_sail() and get_platform().device_sm >= 89)
+        or get_platform().is_sm100
+        or get_platform().is_sm120
+        or is_gfx95_supported()
     ):
         raise ValueError(
             "--enable-deepseek-v4-fp4-indexer requires SM100, SM120, or gfx95 GPUs "
