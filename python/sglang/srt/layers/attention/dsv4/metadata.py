@@ -22,7 +22,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
-from sglang.srt.utils import is_hip, is_sm120_supported, is_xpu
+from sglang.srt.utils import is_hip, is_sail, is_sm120_supported, is_xpu
 
 logger = logging.getLogger(__name__)
 
@@ -193,7 +193,9 @@ class PagedIndexerMetadata:
     rows_per_request: int = 1
     # Schedule DeepGEMM's current paged API: varlen rows grouped by request indices.
     deep_gemm_varlen: bool = False
+    q_fp8_shape: Optional[torch.Size] = None
     # A list when the dynamic-budget forward is row-chunked: one schedule per chunk.
+    build_paged_mqa_logits_metadata: bool = True
     deep_gemm_metadata: Any = field(init=False, repr=False)
     # The request of each query row of a chunk (all rows if unchunked) when the
     # schedule is varlen, else None; a shorter last chunk takes its prefix.
@@ -213,14 +215,18 @@ class PagedIndexerMetadata:
 
     def __post_init__(self):
         if (
-            is_hip() or is_xpu() or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            or is_xpu()
+            or is_hip()
+            or not self.build_paged_mqa_logits_metadata
         ) and not self.force_deep_gemm_metadata:
             self.deep_gemm_metadata = None
         else:
             import deep_gemm
 
             use_jit_indexer = (
-                not self.force_deep_gemm_metadata
+                not is_sail()
+                and not self.force_deep_gemm_metadata
                 and self.rows_per_request == 1
                 and (
                     envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
@@ -261,8 +267,17 @@ class PagedIndexerMetadata:
                     self.rows_per_chunk,
                     self.mqa_logits_budget_bytes,
                 )
+            extra_kwargs = {}
+            if is_sail() and self.q_fp8_shape is not None:
+                extra_kwargs["metadata_extra"] = (
+                    self.rows_per_request,
+                    self.q_fp8_shape[2],
+                    self.q_fp8_shape[3],
+                    1,
+                )
             varlen = (
-                self.deep_gemm_varlen
+                not is_sail()
+                and self.deep_gemm_varlen
                 and not use_jit_indexer
                 and num_rows >= DEEP_GEMM_VARLEN_MIN_ROWS
                 and (self.rows_per_chunk or num_rows) <= DEEP_GEMM_VARLEN_MAX_ROWS
@@ -290,6 +305,7 @@ class PagedIndexerMetadata:
                     lens.view(-1, group),
                     self.compressed_page_size,
                     deep_gemm.get_num_sms(),
+                    **extra_kwargs,
                 )
 
             if self.rows_per_chunk is not None:
@@ -412,6 +428,8 @@ class PagedIndexerMetadata:
                 "use_topk_v2",
                 "rows_per_request",
                 "deep_gemm_varlen",
+                "build_paged_mqa_logits_metadata",
+                "q_fp8_shape",
             ],
             copy_fields=copy_fields,
             assign_fields=assign_fields,
