@@ -211,6 +211,7 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_executor.runner_utils.nvtx_profile import RunnerNvtxProfiler
 from sglang.srt.model_executor.weight_checker import WeightChecker
 from sglang.srt.models.unlimited_ocr_v2_support.greedy_graph import UocrGreedyGraph
 from sglang.srt.observability.profile_utils import build_step_span_name
@@ -461,6 +462,7 @@ class ModelRunner:
 
         # Auxiliary hidden capture: from the draft, or --enable-return-aux-hidden-states.
         self.init_spec_aux_hidden_state()
+        self.init_nvtx_profiler()
 
         misc_utils.maybe_disable_chunked_prefix_cache(
             use_mla_backend=self.use_mla_backend,
@@ -629,6 +631,9 @@ class ModelRunner:
             recapture_cuda_graph=self.recapture_decode_cuda_graph,
             get_model_runner=lambda: self,
         )
+
+    def init_nvtx_profiler(self):
+        self.nvtx_profiler = RunnerNvtxProfiler(is_draft_worker=self.is_draft_worker)
 
     def init_spec_aux_hidden_state(self):
         self.spec_aux_config: SpecAuxHiddenStateConfig = (
@@ -1963,6 +1968,7 @@ class ModelRunner:
         with (
             canary_ctx,
             step_span_ctx,
+            self.nvtx_profiler.forward_range(forward_batch, self.forward_pass_id),
             record_ctx,
             recorder.with_forward_pass(
                 self.forward_pass_id,
@@ -2144,11 +2150,13 @@ class ModelRunner:
                 )
 
             # Replay cuda graph if applicable
+            self.nvtx_profiler.before_forward()
             if can_run_graph:
-                ret = self.decode_cuda_graph_runner.execute(
-                    forward_batch,
-                    pp_proxy_tensors=pp_proxy_tensors,
-                )
+                with self.nvtx_profiler.range("decode_cudagraph"):
+                    ret = self.decode_cuda_graph_runner.execute(
+                        forward_batch,
+                        pp_proxy_tensors=pp_proxy_tensors,
+                    )
                 return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
             # DP / MLP-sync padding + attn-tp normalization. Only the decode
@@ -2187,16 +2195,20 @@ class ModelRunner:
                 # TODO: the timing here is too broad -- it also includes
                 # load_batch time. Move it into the prefill cuda graph runner
                 # to capture only the model.forward part.
-                with device_timer_ctx(self.device_timer, category):
+                with (
+                    device_timer_ctx(self.device_timer, category),
+                    self.nvtx_profiler.range("forward_extend"),
+                ):
                     ret = self.prefill_cuda_graph_runner.execute(
                         forward_batch, **kwargs
                     )
                 can_run_graph = True
             else:
                 # Eager: decode / extend / idle dispatched inside the runner.
-                ret = self.eager_runner.execute(
-                    forward_batch, pp_proxy_tensors=pp_proxy_tensors
-                )
+                with self.nvtx_profiler.mode_range(forward_batch.forward_mode):
+                    ret = self.eager_runner.execute(
+                        forward_batch, pp_proxy_tensors=pp_proxy_tensors
+                    )
 
             if (
                 forward_batch.global_num_tokens_cpu is not None
@@ -2248,98 +2260,99 @@ class ModelRunner:
         Returns:
             A list of next_token_ids
         """
-        # LogitsProcessorOutput is normally invocation-scoped, but CUDA graph
-        # runners may reuse backing objects. Never leak an auxiliary result from
-        # a previous replay into a request with no observer state.
-        logits_output.auxiliary_device_output = None
-        observer = self.sampling_observer
-        # Preserve two-argument overrides when observation is inactive.
-        if observer is not None and observer.is_active(forward_batch.sampling_info):
-            observer_state = self._preprocess_logits(
-                logits_output,
-                forward_batch.sampling_info,
-                observer=observer,
-            )
-        else:
-            observer_state = self._preprocess_logits(
-                logits_output, forward_batch.sampling_info
-            )
+        with self.nvtx_profiler.sample_range(logits_output.next_token_logits):
+            # LogitsProcessorOutput is normally invocation-scoped, but CUDA graph
+            # runners may reuse backing objects. Never leak an auxiliary result from
+            # a previous replay into a request with no observer state.
+            logits_output.auxiliary_device_output = None
+            observer = self.sampling_observer
+            # Preserve two-argument overrides when observation is inactive.
+            if observer is not None and observer.is_active(forward_batch.sampling_info):
+                observer_state = self._preprocess_logits(
+                    logits_output,
+                    forward_batch.sampling_info,
+                    observer=observer,
+                )
+            else:
+                observer_state = self._preprocess_logits(
+                    logits_output, forward_batch.sampling_info
+                )
 
-        watermark_state = self.watermark_state
-        if (
-            watermark_state is not None
-            and forward_batch.sampling_info.has_watermark_candidates
-        ):
-            logprob_logits = (
-                logits_output.next_token_logits.clone()
-                if forward_batch.return_logprob
-                else None
-            )
-            req_pool_indices = forward_batch.req_pool_indices[
-                : logits_output.next_token_logits.shape[0]
-            ]
-            watermark_state.init_from_prompt(
-                req_pool_indices,
-                forward_batch.watermark_prompt_tail_ids,
-                forward_batch.watermark_context_hash_history,
-            )
-            watermark_state.force(
-                logits_output.next_token_logits,
-                req_pool_indices,
-                forward_batch.sampling_info,
-            )
-        else:
-            logprob_logits = None
+            watermark_state = self.watermark_state
+            if (
+                watermark_state is not None
+                and forward_batch.sampling_info.has_watermark_candidates
+            ):
+                logprob_logits = (
+                    logits_output.next_token_logits.clone()
+                    if forward_batch.return_logprob
+                    else None
+                )
+                req_pool_indices = forward_batch.req_pool_indices[
+                    : logits_output.next_token_logits.shape[0]
+                ]
+                watermark_state.init_from_prompt(
+                    req_pool_indices,
+                    forward_batch.watermark_prompt_tail_ids,
+                    forward_batch.watermark_context_hash_history,
+                )
+                watermark_state.force(
+                    logits_output.next_token_logits,
+                    req_pool_indices,
+                    forward_batch.sampling_info,
+                )
+            else:
+                logprob_logits = None
 
-        # Sample the next tokens
-        next_token_ids = None
-        if self.uocr_greedy_graph is not None:
-            next_token_ids = self.uocr_greedy_graph.recorded_ids(
-                logits_output, forward_batch, watermark_state=watermark_state
-            )
-        if next_token_ids is None:
-            next_token_ids = self.sampler(
-                logits_output,
-                forward_batch.sampling_info,
-                forward_batch.return_logprob,
-                forward_batch.top_logprobs_nums,
-                forward_batch.token_ids_logprobs,
-                # For prefill, we only use the position of the last token.
-                (
-                    forward_batch.positions
-                    if forward_batch.forward_mode.is_decode()
-                    else forward_batch.seq_lens - 1
-                ),
-                **(
-                    {"logprob_logits": logprob_logits}
-                    if logprob_logits is not None
-                    else {}
-                ),
-            )
-        if observer_state is not None:
-            logits_output.auxiliary_device_output = observer.after_sample(
-                observer_state,
-                next_token_ids,
-            )
-        if (c := self.canary_manager) is not None:
-            c.on_sampled(
-                logits_output=logits_output,
-                forward_batch=forward_batch,
+            # Sample the next tokens
+            next_token_ids = None
+            if self.uocr_greedy_graph is not None:
+                next_token_ids = self.uocr_greedy_graph.recorded_ids(
+                    logits_output, forward_batch, watermark_state=watermark_state
+                )
+            if next_token_ids is None:
+                next_token_ids = self.sampler(
+                    logits_output,
+                    forward_batch.sampling_info,
+                    forward_batch.return_logprob,
+                    forward_batch.top_logprobs_nums,
+                    forward_batch.token_ids_logprobs,
+                    # For prefill, we only use the position of the last token.
+                    (
+                        forward_batch.positions
+                        if forward_batch.forward_mode.is_decode()
+                        else forward_batch.seq_lens - 1
+                    ),
+                    **(
+                        {"logprob_logits": logprob_logits}
+                        if logprob_logits is not None
+                        else {}
+                    ),
+                )
+            if observer_state is not None:
+                logits_output.auxiliary_device_output = observer.after_sample(
+                    observer_state,
+                    next_token_ids,
+                )
+            if (c := self.canary_manager) is not None:
+                c.on_sampled(
+                    logits_output=logits_output,
+                    forward_batch=forward_batch,
+                    next_token_ids=next_token_ids,
+                )
+            self.ngram_embedding_manager.update_after_decode(
                 next_token_ids=next_token_ids,
+                forward_batch=forward_batch,
             )
-        self.ngram_embedding_manager.update_after_decode(
-            next_token_ids=next_token_ids,
-            forward_batch=forward_batch,
-        )
-        if (
-            watermark_state is not None
-            and forward_batch.sampling_info.has_watermark_candidates
-        ):
-            watermark_state.append(
-                req_pool_indices,
-                next_token_ids,
-            )
-        return next_token_ids
+            if (
+                watermark_state is not None
+                and forward_batch.sampling_info.has_watermark_candidates
+            ):
+                watermark_state.append(
+                    req_pool_indices,
+                    next_token_ids,
+                )
+            return next_token_ids
 
     def compute_logprobs_only(
         self,

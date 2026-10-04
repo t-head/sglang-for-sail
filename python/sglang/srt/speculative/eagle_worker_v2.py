@@ -46,6 +46,7 @@ from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_executor.runner_utils.nvtx_profile import profile_mtp_stage
 from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
@@ -716,6 +717,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"avail mem={after_mem:.2f} GB.",
             )
 
+    @profile_mtp_stage("mtp_draft_decode", draft_decode=True)
     def draft(self, batch: ScheduleBatch, *, with_topology: bool = False):
         draft_input: EagleDraftInput = batch.spec_info
         forward_batch, can_run_decode_cuda_graph, iteration_ids = prepare_for_draft(
@@ -758,9 +760,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         with canary_outside_ctx:
             # Run draft
             if can_run_decode_cuda_graph:
-                parent_list, top_scores_index, draft_tokens, draft_probs = (
-                    self.cuda_graph_runner.execute(forward_batch)
-                )
+                with self.target_worker.model_runner.nvtx_profiler.range(
+                    "draft_decode_cudagraph"
+                ):
+                    parent_list, top_scores_index, draft_tokens, draft_probs = (
+                        self.cuda_graph_runner.execute(forward_batch)
+                    )
                 if draft_probs is not None:
                     # draft_probs is the one graph output read after the target
                     # forward rather than by it, and it points into the graph's
@@ -1075,6 +1080,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def draft_extend(self):
         pass
 
+    @profile_mtp_stage("mtp_draft_extend_prefill")
     def _draft_extend_for_prefill(
         self,
         batch: ScheduleBatch,
@@ -1225,6 +1231,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.dsa_extend_topk_buf = buf
         return buf[:num_tokens]
 
+    @profile_mtp_stage("mtp_draft_extend_decode")
     def _draft_extend_for_decode(
         self,
         batch: ScheduleBatch,
@@ -2146,6 +2153,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
             dw._rebuild_topk1_chain_buffers()
 
+    @profile_mtp_stage("mtp_target_verify")
     def verify(self, batch: ScheduleBatch, pp_proxy_tensors=None, grammar_barrier=None):
         # SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING: the compact top-k branch, when
         # every request allows it, in the post-verify graphs and the eager verify
