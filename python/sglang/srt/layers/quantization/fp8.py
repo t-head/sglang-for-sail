@@ -440,6 +440,12 @@ class Fp8Config(QuantizationConfig):
                 )
 
                 return NPUBlockFp8MoEMethod(self)
+            if self.is_fp4_experts and _is_sail and not self.dequant_fp4_to_fp8:
+                from sglang.srt.layers.quantization.mxfp4 import (
+                    Mxfp4MoEMethod,
+                )
+
+                return Mxfp4MoEMethod(prefix=prefix)
 
             fp8_method = Fp8MoEMethod(self)
 

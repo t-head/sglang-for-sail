@@ -931,6 +931,15 @@ class FusedMoE(torch.nn.Module):
         # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
         assert shard_id in {"w1", "w3", "w13"}
 
+        if (
+            _is_sail
+            and isinstance(self.quant_method, Mxfp4MoEMethod)
+            and not is_bias
+            and expert_data.dtype == torch.uint8
+            and loaded_weight.element_size() == 1
+        ):
+            loaded_weight = loaded_weight.view(torch.uint8)
+
         if is_bias:
             # if this weight is a bias, the last dimension must be the sharded dimension
             shard_dim = -1
@@ -1046,6 +1055,15 @@ class FusedMoE(torch.nn.Module):
 
         if shard_id != "w2":
             raise ValueError(f"shard_id must be 'w2', got {shard_id}")
+
+        if (
+            _is_sail
+            and isinstance(self.quant_method, Mxfp4MoEMethod)
+            and not is_bias
+            and expert_data.dtype == torch.uint8
+            and loaded_weight.element_size() == 1
+        ):
+            loaded_weight = loaded_weight.view(torch.uint8)
 
         # Index the loaded weight for tp sharding.
         # down_proj: "RowParallel" so tp sharding on input_dim
