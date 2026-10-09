@@ -22,6 +22,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.arch import current_arch
+from sglang.kernels.ops.attention.dsa.triton_kernel import use_sail_dsv4_int8_indexer
 from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
     BuildPageTablePositions,
@@ -1699,6 +1700,11 @@ class DeepseekV4AttnBackend(
                 not is_sail() and compress_ratio != 4 and deep_gemm_paged_varlen()
             ),
             build_paged_mqa_logits_metadata=build_paged_mqa_logits_metadata,
+            q_dtype=(
+                torch.int8
+                if self.enable_deepseek_v4_fp4_indexer or use_sail_dsv4_int8_indexer()
+                else torch.float8_e4m3fn
+            ),
             q_fp8_shape=torch.Size(
                 (
                     c_seq_lens.shape[0] // rows_per_request,

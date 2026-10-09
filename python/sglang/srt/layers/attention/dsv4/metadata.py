@@ -194,6 +194,7 @@ class PagedIndexerMetadata:
     # Schedule DeepGEMM's current paged API: varlen rows grouped by request indices.
     deep_gemm_varlen: bool = False
     q_fp8_shape: Optional[torch.Size] = None
+    q_dtype: Optional[torch.dtype] = None
     # A list when the dynamic-budget forward is row-chunked: one schedule per chunk.
     build_paged_mqa_logits_metadata: bool = True
     deep_gemm_metadata: Any = field(init=False, repr=False)
@@ -273,7 +274,7 @@ class PagedIndexerMetadata:
                     self.rows_per_request,
                     self.q_fp8_shape[2],
                     self.q_fp8_shape[3],
-                    1,
+                    self.q_dtype,
                 )
             varlen = (
                 not is_sail()
@@ -430,6 +431,7 @@ class PagedIndexerMetadata:
                 "deep_gemm_varlen",
                 "build_paged_mqa_logits_metadata",
                 "q_fp8_shape",
+                "q_dtype",
             ],
             copy_fields=copy_fields,
             assign_fields=assign_fields,

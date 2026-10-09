@@ -841,6 +841,8 @@ class DeepseekSparseAttnBackend(
         # FlashMLA cannot tell the 528 B/token zero-RoPE cache from V4.1 by shape.
         self.flashmla_kv_format = "V32_NO_ROPE" if self.qk_rope_head_dim == 0 else "V32"
         self.indexer_head_dim = model_runner.model_config.index_head_dim
+        self.num_indexer_heads = model_runner.model_config.hf_text_config.index_n_heads
+        self.num_indexer_heads = model_runner.model_config.hf_text_config.index_n_heads
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token_pool = model_runner.req_to_token_pool
@@ -1357,27 +1359,33 @@ class DeepseekSparseAttnBackend(
             ctx_lens.dtype
         )
 
-    def _paged_mqa_schedule_metadata_extra(self) -> Tuple[int, int, int, int]:
-        return (
-            1,  # next_n
-            self.num_q_heads,  # num_heads
-            self.indexer_head_dim,  # head_dim
-            (1 if not envs.SGLANG_SAIL_BF16_INDEXER.get() else 2),  # element size
-        )
+    def _paged_mqa_schedule_metadata_extra(self) -> Tuple[int, int, int, torch.dtype]:
+        if envs.SGLANG_SAIL_BF16_INDEXER.get():
+            q_dtype = torch.bfloat16
+        elif self.device_capability < (8, 9) or self.token_to_kv_pool.use_fp4_indexer:
+            q_dtype = torch.int8
+        else:
+            q_dtype = torch.float8_e4m3fn
+        return (1, self.num_indexer_heads, self.indexer_head_dim, q_dtype)
 
     def _build_paged_mqa_schedule_metadata(
         self,
         seqlens_32_2d: torch.Tensor,
     ) -> torch.Tensor:
+        extra = {}
+        if _is_sail and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
+            # Weighted PPU logits use one query per row; next_n > 1 is AVG-only.
+            seqlens_32_2d = seqlens_32_2d.contiguous().view(-1, 1)
+            extra["metadata_extra"] = self._paged_mqa_schedule_metadata_extra()
+            if self.token_to_kv_pool.use_fp4_indexer:
+                # Distinct request labels disable reuse safely for expanded rows.
+                extra["indices"] = torch.arange(
+                    seqlens_32_2d.shape[0],
+                    device=seqlens_32_2d.device,
+                    dtype=torch.int32,
+                )
         return resolve_paged_mqa_logits_metadata_fn()(
-            seqlens_32_2d,
-            64,
-            resolve_num_sms(),
-            **(
-                dict(metadata_extra=self._paged_mqa_schedule_metadata_extra())
-                if _is_sail and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
-                else {}
-            ),
+            seqlens_32_2d, 64, resolve_num_sms(), **extra
         )
 
     def _refresh_paged_mqa_schedule_metadata(
@@ -4130,10 +4138,23 @@ class DeepseekSparseAttnBackend(
                 # SM90 needs static top-k; -1 padding masks nonlocal keys.
                 topk_length = None
             num_splits = None
+        elif _is_sail and self.dsa_index_kpool > 1:
+            assert (
+                page_table_1.shape[-1] == self.dsa_index_topk + self.dsa_index_kpool - 1
+            )
+            padding = (-page_table_1.shape[-1]) % 64
+            if padding:
+                page_table_1 = torch.cat(
+                    (
+                        page_table_1,
+                        page_table_1.new_full((page_table_1.shape[0], padding), -1),
+                    ),
+                    dim=1,
+                )
+            topk_length = cache_seqlens[: page_table_1.shape[0]]
         indices = page_table_1.unsqueeze(1)
-        assert (
-            indices.shape[-1] == self.dsa_index_topk
-        )  # requirement of FlashMLA decode kernel
+        if not (_is_sail and self.dsa_index_kpool > 1 and not dcp_partial):
+            assert indices.shape[-1] == self.dsa_index_topk
         if dcp_partial:
             tile_scheduler_metadata = self._dcp_flashmla_sched_meta(
                 q_input, indices, topk_length
@@ -5259,6 +5280,8 @@ class DeepseekSparseAttnBackend(
         if num_heads_q is None:
             num_heads_q = self.flashmla_kv_num_q_heads
 
+        topk_length = cache_seqlens if (_is_sail and self.dsa_index_kpool > 1) else None
+
         flashmla_metadata, num_splits = self._call_get_mla_metadata(
             cache_seqlens=cache_seqlens,
             # TODO doc says `num_q_tokens_per_q_seq * num_heads_q // num_heads_k`
@@ -5268,6 +5291,8 @@ class DeepseekSparseAttnBackend(
             num_heads_q=num_heads_q,
             is_fp8_kvcache=envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.get(),
             topk=self.dsa_index_topk,
+            # [迁移自 v0.5.18_rel feat/glm-5.3-flash B1 6dd5c0cc6e]
+            topk_length=topk_length,
         )
 
         return DSAFlashMLAMetadata(
