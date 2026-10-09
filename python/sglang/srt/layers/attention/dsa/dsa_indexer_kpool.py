@@ -33,6 +33,7 @@ from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.utils import ceil_align, is_cuda, is_gfx1250_supported, is_hip, is_npu
+from sglang.srt.utils.device import get_device_sm, is_sail
 
 if is_cuda():
     try:
@@ -46,6 +47,7 @@ if is_npu():
     except ImportError:
         pass
 
+from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -88,6 +90,14 @@ def _slice_rows(
     *, tensor: Optional[torch.Tensor], rows: slice
 ) -> Optional[torch.Tensor]:
     return None if tensor is None else tensor[rows]
+
+
+def _kpool_act_quant_int8(
+    x: torch.Tensor, block_size=None, scale_fmt=None
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # PPU int8: act_quant replacement on PPU 1.0/1.1 (SM80); the fp8 quantizer's
+    # block_size / scale_fmt are ignored, per-token int8 quantization is used.
+    return per_token_quant_int8(x)
 
 
 def _mqa_logits_row_chunks(
@@ -244,6 +254,15 @@ class IndexerKPool(MultiPlatformOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
+        # PPU int8: PPU 1.0/1.1 (SM80) cannot run DeepGEMM's fp8 indexer path;
+        # select the int8 variant, mirroring dsa_indexer.py's use_int8 flag.
+        self.use_fp8 = 0
+        self.use_int8 = 0
+        if is_sail() and get_device_sm() < 89:
+            self.use_int8 = 1
+        else:
+            self.use_fp8 = 1
+
     @torch.compile(dynamic=True)
     def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
         weights, _ = self.weights_proj(x.float())
@@ -305,7 +324,8 @@ class IndexerKPool(MultiPlatformOp):
                 return (
                     torch.empty(
                         (0, self.head_dim),
-                        dtype=torch.float8_e4m3fn,
+                        # PPU int8: was torch.float8_e4m3fn
+                        dtype=torch.int8 if self.use_int8 else torch.float8_e4m3fn,
                         device=slot_k.device,
                     ),
                     torch.empty((0,), dtype=torch.float32, device=slot_k.device),
@@ -898,8 +918,8 @@ class IndexerKPool(MultiPlatformOp):
             return None, attn_metadata.topk_indices_offset, None
         return None, None, None
 
-    @staticmethod
     def _fp8_mqa_logits(
+        self,
         q_fp8: torch.Tensor,
         k_fp8: torch.Tensor,
         k_scale: torch.Tensor,
@@ -910,6 +930,17 @@ class IndexerKPool(MultiPlatformOp):
         clean_logits: bool,
     ) -> torch.Tensor:
         """Ragged MQA logits: DeepGEMM on CUDA, AITER's Triton kernel on ROCm."""
+        # PPU int8: PPU 1.0/1.1 (SM80) cannot run DeepGEMM's fp8 MQA logits; use
+        # the int8 shim instead. Instance method now, to read self.use_int8.
+        if self.use_int8:
+            return deep_gemm.int8_mqa_logits(
+                q_fp8,
+                (k_fp8, k_scale),
+                weights,
+                starts,
+                ends,
+                clean_logits=clean_logits,
+            )
         if is_hip():
             from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
@@ -1062,7 +1093,14 @@ class IndexerKPool(MultiPlatformOp):
                 clean_logits=False,
             )
         else:
-            logits = deep_gemm.fp8_paged_mqa_logits(
+            # PPU int8: PPU 1.0/1.1 (SM80) cannot run DeepGEMM's fp8 paged MQA
+            # logits; the int8 variant is structurally identical on this path.
+            paged_mqa_logits = (
+                deep_gemm.int8_paged_mqa_logits
+                if self.use_int8
+                else deep_gemm.fp8_paged_mqa_logits
+            )
+            logits = paged_mqa_logits(
                 q_fp8.unsqueeze(1),
                 kv_cache_fp8,
                 weights,
@@ -1124,7 +1162,9 @@ class IndexerKPool(MultiPlatformOp):
                     weights=weights[rows].contiguous(),
                     starts=logits_starts[rows],
                     ends=logits_ends[rows],
-                    clean_logits=True,
+                    # PPU legacy MQA rejects clean_logits=True. All consumers
+                    # below bound reads by pool_lens and topk_row_starts.
+                    clean_logits=not is_sail(),
                 )
             topk_chunk = self._topk_from_kpool_logits(
                 logits=logits,
@@ -1205,7 +1245,8 @@ class IndexerKPool(MultiPlatformOp):
                 k_out=k_u8,
                 scale_out=k_scale,
             )
-            k_fp8 = k_u8.view(torch.float8_e4m3fn)
+            # PPU int8: was k_u8.view(torch.float8_e4m3fn)
+            k_fp8 = k_u8.view(torch.int8 if self.use_int8 else torch.float8_e4m3fn)
             kv_fp8 = (k_fp8.contiguous(), k_scale.contiguous())
 
         topk_method = metadata.topk_transform_method
@@ -1388,7 +1429,10 @@ class IndexerKPool(MultiPlatformOp):
                             curr_k_fp8.view(torch.uint8)
                         )
                         k_scale[curr_pool_start:pool_seq_len].copy_(curr_k_scale)
-                        k_fp8 = k_u8.view(torch.float8_e4m3fn)
+                        # PPU int8: was k_u8.view(torch.float8_e4m3fn)
+                        k_fp8 = k_u8.view(
+                            torch.int8 if self.use_int8 else torch.float8_e4m3fn
+                        )
                     else:
                         k_fp8 = curr_k_fp8
                         k_scale = curr_k_scale
@@ -1409,7 +1453,10 @@ class IndexerKPool(MultiPlatformOp):
                         pool_seq_len,
                         pool_seq_len,
                     )
-                    k_fp8 = k_fp8.view(torch.float8_e4m3fn)
+                    # PPU int8: was k_fp8.view(torch.float8_e4m3fn)
+                    k_fp8 = k_fp8.view(
+                        torch.int8 if self.use_int8 else torch.float8_e4m3fn
+                    )
                     k_scale = k_scale.view(torch.float32).squeeze(-1)
                 row_starts = torch.zeros(
                     (q_len,), dtype=torch.int32, device=q_fp8.device
@@ -1679,7 +1726,9 @@ class IndexerKPool(MultiPlatformOp):
         layer_id: int,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
-        if is_hip() and not is_gfx1250_supported():
+        if self.use_int8:
+            act_quant = _kpool_act_quant_int8
+        elif is_hip() and not is_gfx1250_supported():
             from sglang.kernels.ops.quantization.act_quant_tilelang import act_quant
         elif not is_npu():
             from sglang.kernels.ops.quantization.act_quant_triton import act_quant
