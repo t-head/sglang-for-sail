@@ -388,7 +388,12 @@ def fused_recurrent_gated_delta_rule_packed_decode(
 
     NV = triton.cdiv(V, BV)
     grid = (NV, B * HV)
-    if is_sail() and envs.SGLANG_SAIL_PLA_CUDA.get() and initial_state.is_contiguous():
+    if (
+        is_sail()
+        and envs.SGLANG_SAIL_PLA_CUDA.get()
+        and initial_state.is_contiguous()
+        and initial_state.dtype == torch.float32
+    ):
         from pla.decode import (
             fused_sigmoid_gating_delta_rule_forward_k_last_packed,
         )
@@ -397,15 +402,15 @@ def fused_recurrent_gated_delta_rule_packed_decode(
             mixed_qkv,
             a,
             b,
-            A_log,
-            dt_bias,
+            A_log.to(mixed_qkv.dtype),
+            dt_bias.to(mixed_qkv.dtype),
             1.0,
             20.0,
-            (K**-0.5),
+            scale,
             initial_state,
             ssm_state_indices,
             out,
-            True,
+            use_qk_l2norm_in_kernel,
             torch.arange(B + 1, device=a.device, dtype=torch.int32),
             False,
         )
