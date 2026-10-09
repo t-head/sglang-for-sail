@@ -84,6 +84,7 @@ from sglang.srt.layers.quantization.unquant import (
 )
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_sail, is_xpu
+from sglang.srt.utils.log_utils import print_info_once
 
 _is_cpu = is_cpu()
 _is_cuda = is_cuda()
@@ -1159,15 +1160,10 @@ class CompressedTensorsConfig(QuantizationConfig):
             if _is_npu:
                 logger.info_once("Using NPUCompressedTensorsW8A8Int8DynamicMoE")
                 return NPUCompressedTensorsW8A8Int8DynamicMoE(weight_quant, input_quant)
-            # [batch8 PPU W8A8 INT8 MoE - migrated from v0.5.18_rel dirty WIP] 旧代码：
-            # else:
-            #     raise NotImplementedError(
-            #         "The W8A8Int8 Fused MoE scheme is implemented only for NPU for now."
-            #     )
             # PPU uses the generic Triton/DeepGEMM W8A8 INT8 MoE scheme
             # (validated on GLM-5.3-Flash INT8 W8A8 workloads).
             elif _is_sail:
-                logger.info_once("Using CompressedTensorsW8A8Int8MoE (PPU)")
+                print_info_once("Using CompressedTensorsW8A8Int8MoE (PPU)")
                 return CompressedTensorsW8A8Int8MoE(weight_quant, input_quant)
             else:
                 raise NotImplementedError(

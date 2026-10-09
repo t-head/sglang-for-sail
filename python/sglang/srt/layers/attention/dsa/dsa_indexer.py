@@ -1251,8 +1251,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 weights.to(torch.bfloat16),
                 cu_seq_len_k_start,
                 cu_seq_len_k_end,
-                max_seqlen_k=k_packed.shape[0],
+                max_seqlen_k=0,
             )
+            # Zero keeps global KV column coordinates for ragged top-k.
             # The weighted MXFP4 ABI emits BF16; unfused top-k consumes FP32.
             return (
                 logits.float()
