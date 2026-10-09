@@ -645,7 +645,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         indexer_size_per_token = ceil_div(
             DSATokenToKVPool.index_bytes_per_token_for(
                 index_head_dim,
-                DSATokenToKVPool.use_fp4_indexer_for_current_platform(),
+                DSATokenToKVPool.use_fp4_indexer_for_current_platform(
+                    get_dsa_index_kpool(kvc.model_config.hf_config)
+                ),
                 DSATokenToKVPool.use_bf16_indexer,
             ),
             get_dsa_index_kpool(kvc.model_config.hf_config),
@@ -773,7 +775,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 index_elements = ceil_div(
                     DSATokenToKVPool.index_bytes_per_token_for(
                         index_head_dim,
-                        DSATokenToKVPool.use_fp4_indexer_for_current_platform(),
+                        DSATokenToKVPool.use_fp4_indexer_for_current_platform(
+                            get_dsa_index_kpool(model_config.hf_config)
+                        ),
                         DSATokenToKVPool.use_bf16_indexer,
                     ),
                     get_dsa_index_kpool(model_config.hf_config),

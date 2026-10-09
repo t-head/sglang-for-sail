@@ -5406,13 +5406,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
         return self.index_head_dim // 2 if self.use_fp4_indexer else self.index_head_dim
 
     @staticmethod
-    def use_fp4_indexer_for_current_platform() -> bool:
+    def use_fp4_indexer_for_current_platform(index_kpool: int = 1) -> bool:
         if is_sail():
             from sglang.kernels.ops.attention.dsa.triton_kernel import (
                 is_fp4_indexer_cache_enabled,
             )
 
-            return is_fp4_indexer_cache_enabled()
+            return index_kpool == 1 and is_fp4_indexer_cache_enabled()
         return get_exec().kernel.enable_fp4_indexer
 
     def __init__(
