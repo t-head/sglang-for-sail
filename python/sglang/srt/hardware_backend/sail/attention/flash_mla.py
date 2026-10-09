@@ -52,12 +52,16 @@ def get_mla_metadata(
     num_heads_q: Optional[int] = None,
     is_fp8_kvcache: bool = False,
     topk: Optional[int] = None,
+    # [迁移自 v0.5.18_rel feat/glm-5.3-flash B1 6dd5c0cc6e] kpool scheduler metadata
+    topk_length: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return MLA tile scheduler metadata for SAIL.
 
     Delegates to ``flash_mla.get_mla_metadata``.
 
-    Arguments mirror :func:`sglang.kernels.ops.attention.flash_mla_interface.get_mla_metadata`.
+    Arguments mirror the framework FlashMLA interface. The SAIL vendor build
+    returns a lazy scheduler object: actual per-query lengths reach the scheduler
+    through the first flash_mla_with_kvcache call (topk_length).
     """
     if _import_error is not None:
         raise _IMPORT_ERROR from _import_error
@@ -73,6 +77,15 @@ def get_mla_metadata(
             "FlashMLA dense FP8 get_mla_metadata is not supported on SAIL."
         )
 
+    # [迁移自 v0.5.18_rel feat/glm-5.3-flash B1 6dd5c0cc6e - propagate topk_length] 旧代码：
+    # return _flashmla.get_mla_metadata(
+    #     cache_seqlens,
+    #     num_q_tokens_per_head_k,
+    #     num_heads_k,
+    #     num_heads_q=num_heads_q,
+    #     is_fp8_kvcache=is_fp8_kvcache,
+    #     topk=topk,
+    # )
     return _flashmla.get_mla_metadata(
         cache_seqlens,
         num_q_tokens_per_head_k,
@@ -80,6 +93,7 @@ def get_mla_metadata(
         num_heads_q=num_heads_q,
         is_fp8_kvcache=is_fp8_kvcache,
         topk=topk,
+        topk_length=topk_length,
     )
 
 

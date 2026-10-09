@@ -3714,10 +3714,23 @@ class DeepseekSparseAttnBackend(
                 # SM90 needs static top-k; -1 padding masks nonlocal keys.
                 topk_length = None
             num_splits = None
+        elif _is_sail and self.dsa_index_kpool > 1:
+            assert (
+                page_table_1.shape[-1] == self.dsa_index_topk + self.dsa_index_kpool - 1
+            )
+            padding = (-page_table_1.shape[-1]) % 64
+            if padding:
+                page_table_1 = torch.cat(
+                    (
+                        page_table_1,
+                        page_table_1.new_full((page_table_1.shape[0], padding), -1),
+                    ),
+                    dim=1,
+                )
+            topk_length = cache_seqlens[: page_table_1.shape[0]]
         indices = page_table_1.unsqueeze(1)
-        assert (
-            indices.shape[-1] == self.dsa_index_topk
-        )  # requirement of FlashMLA decode kernel
+        if not (_is_sail and self.dsa_index_kpool > 1 and not dcp_partial):
+            assert indices.shape[-1] == self.dsa_index_topk
         if dcp_partial:
             tile_scheduler_metadata = self._call_get_mla_metadata()[0]
 
@@ -4699,6 +4712,8 @@ class DeepseekSparseAttnBackend(
         if num_heads_q is None:
             num_heads_q = self.flashmla_kv_num_q_heads
 
+        topk_length = cache_seqlens if (_is_sail and self.dsa_index_kpool > 1) else None
+
         flashmla_metadata, num_splits = self._call_get_mla_metadata(
             cache_seqlens=cache_seqlens,
             # TODO doc says `num_q_tokens_per_q_seq * num_heads_q // num_heads_k`
@@ -4708,6 +4723,8 @@ class DeepseekSparseAttnBackend(
             num_heads_q=num_heads_q,
             is_fp8_kvcache=envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.get(),
             topk=self.dsa_index_topk,
+            # [迁移自 v0.5.18_rel feat/glm-5.3-flash B1 6dd5c0cc6e]
+            topk_length=topk_length,
         )
 
         return DSAFlashMLAMetadata(

@@ -56,13 +56,16 @@ class DeepseekSparseAttnBackendKPoolMixin:
             # PPU int8: was or dsa_impl in ("fa3", "tilelang", "trtllm")
             # [PPU-int8] allow flashmla_sparse for kpool on SM80
             or dsa_impl in ("fa3", "tilelang", "trtllm")
-            or (is_sail() and dsa_impl == "flashmla_sparse")
+            or (is_sail() and dsa_impl in ("flashmla_sparse", "flashmla_kv"))
         ):
             return
         raise NotImplementedError(
             "index_kpool > 1 appends tail tokens to topk_indices and is "
-            f"currently only supported by the FA3/TileLang/TRTLLM DSA {phase} "
-            "backend."
+            # [迁移自 v0.5.18_rel feat/glm-5.3-flash 28925f0d48] 旧代码：
+            # f"currently only supported by the FA3/TileLang/TRTLLM DSA {phase} "
+            # "backend."
+            f"currently only supported by the FA3/TileLang/TRTLLM/FlashMLA-sparse DSA {phase} "
+            "backend (plus FlashMLA-KV on PPU)."
         )
 
     def _resolve_kpool_tail_backend(

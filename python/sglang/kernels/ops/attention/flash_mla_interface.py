@@ -79,9 +79,14 @@ def get_mla_metadata(
     num_heads_q: Optional[int] = None,
     is_fp8_kvcache: bool = False,
     topk: Optional[int] = None,
+    topk_length: Optional[torch.Tensor] = None,
 ) -> Tuple[Union[torch.Tensor, FlashMLASchedMeta], Optional[torch.Tensor]]:
     """Without ``cache_seqlens``, an empty ``FlashMLASchedMeta`` that the first
     decode call fills; with it, the legacy split-KV schedule as tensors."""
+    if topk_length is not None:
+        raise NotImplementedError(
+            "Per-item scheduler topk_length is a SAIL backend contract."
+        )
     if cache_seqlens is None:
         return flash_mla.get_mla_metadata()[0], None
     assert num_q_tokens_per_head_k is not None
