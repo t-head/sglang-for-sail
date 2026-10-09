@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
     update_pooled_paged_mqa_metadata,
 )
 from sglang.srt.layers.cp.interleave_kpool import local_query_inputs
+from sglang.srt.utils.device import is_sail
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
@@ -52,7 +53,10 @@ class DeepseekSparseAttnBackendKPoolMixin:
         if (
             topk_indices is None
             or self.dsa_index_kpool <= 1
+            # PPU int8: was or dsa_impl in ("fa3", "tilelang", "trtllm")
+            # [PPU-int8] allow flashmla_sparse for kpool on SM80
             or dsa_impl in ("fa3", "tilelang", "trtllm")
+            or (is_sail() and dsa_impl == "flashmla_sparse")
         ):
             return
         raise NotImplementedError(
