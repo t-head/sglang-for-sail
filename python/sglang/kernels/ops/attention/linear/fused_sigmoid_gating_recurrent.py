@@ -760,10 +760,16 @@ def fused_sigmoid_gating_delta_rule_update(
         initial_state_source is None or initial_state_source.dtype == torch.bfloat16
     )
 
+    # Keep the full target layout/ReplaySSM guards. Older PLA builds require
+    # FP32 state; unsupported state dtypes continue through the Triton path.
     if (
         is_sail()
         and envs.SGLANG_SAIL_PLA_CUDA.get()
-        and lower_bound is None
+        and (is_kda or lower_bound is None)
+        and all(
+            t is None or t.dtype == torch.float32
+            for t in (initial_state_source, intermediate_states_buffer)
+        )
         and not cache_ring
         and ring_indices is None
         and not match_cutedsl_decode
@@ -786,10 +792,19 @@ def fused_sigmoid_gating_delta_rule_update(
             f"USE PPU SAIL CUDA PLA kernel: fused_sigmoid_gating_delta_rule_forward_k_last"
         )
 
+        # A missing KDA bound denotes the softplus gate; never replace it by
+        # zero, which would select the bounded formula with zero decay.
+        kda_lower_bound = lower_bound if is_kda else None
+
+        def _sail_gate_cast(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if t is None:
+                return None
+            return t.to(q.dtype) if not disable_state_update else t
+
         output = fused_sigmoid_gating_delta_rule_forward_k_last(
-            A_log,
+            _sail_gate_cast(A_log),
             a,
-            dt_bias,
+            _sail_gate_cast(dt_bias),
             softplus_beta,
             softplus_threshold,
             q,
@@ -807,14 +822,14 @@ def fused_sigmoid_gating_delta_rule_update(
             intermediate_state_indices,
             cache_steps,
             retrieve_parent_token,
+            kda_lower_bound,
         )
         return output
 
     if is_sail() and envs.SGLANG_SAIL_PLA_CUDA.get():
         print_info_once(
-            "Using the Triton recurrent kernel for this call: the PLA "
-            "fused_sigmoid_gating_delta_rule_forward_k_last adapter requires "
-            "lower_bound=None and cache_ring=False."
+            "PPU PLA does not support this ReplaySSM layout or state dtype; "
+            "using the Triton recurrent kernel."
         )
 
     print_info_once(
