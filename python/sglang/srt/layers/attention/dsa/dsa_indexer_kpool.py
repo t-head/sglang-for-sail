@@ -843,7 +843,21 @@ class IndexerKPool(MultiPlatformOp):
             pool_schedule_metadata = plan.pool_schedule_metadata
             if pool_schedule_metadata is None and build_schedule_metadata:
                 pool_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    pool_context_lens.clamp(min=1), blocksize, self.sm_count
+                    pool_context_lens.clamp(min=1),
+                    blocksize,
+                    self.sm_count,
+                    **(
+                        dict(
+                            metadata_extra=(
+                                1,
+                                self.n_heads,
+                                self.head_dim,
+                                torch.int8 if self.use_int8 else torch.float8_e4m3fn,
+                            )
+                        )
+                        if is_sail()
+                        else {}
+                    ),
                 )
             return (
                 pool_seqlens,
@@ -883,7 +897,21 @@ class IndexerKPool(MultiPlatformOp):
         pool_context_lens = pool_seqlens.contiguous().view(-1, 1)
         if pool_schedule_metadata is None and build_schedule_metadata:
             pool_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                pool_context_lens.clamp(min=1), blocksize, self.sm_count
+                pool_context_lens.clamp(min=1),
+                blocksize,
+                self.sm_count,
+                **(
+                    dict(
+                        metadata_extra=(
+                            1,
+                            self.n_heads,
+                            self.head_dim,
+                            torch.int8 if self.use_int8 else torch.float8_e4m3fn,
+                        )
+                    )
+                    if is_sail()
+                    else {}
+                ),
             )
 
         return (
@@ -1644,6 +1672,7 @@ class IndexerKPool(MultiPlatformOp):
                 write_loc=plan.write_loc,
                 out_cache_loc=forward_batch.out_cache_loc[:num_write_tokens],
                 num_draft_tokens=num_draft_tokens,
+                plan_bs=plan.plan_bs,
                 round_scale=self.scale_fmt is not None,
                 effective_n_per_batch=plan.effective_n_per_batch,
             )

@@ -1245,20 +1245,19 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             k_packed, k_sf = kv
             q_packed_int8 = q_packed.contiguous().view(torch.int8)
             k_packed_int8 = k_packed.contiguous().view(torch.int8)
-            return deep_gemm.fp8_fp4_mqa_logits(
+            logits = deep_gemm.fp8_fp4_mqa_logits(
                 (q_packed_int8, q_sf),
                 (k_packed_int8, k_sf),
-                weights,
+                weights.to(torch.bfloat16),
                 cu_seq_len_k_start,
                 cu_seq_len_k_end,
-                clean_logits=clean_logits,
-                # Unfused topk (fast_topk_v2) requires fp32; the fused bf16 kernel consumes bf16 directly.
-                logits_dtype=(
-                    torch.float32
-                    if force_unfused_topk
-                    or not envs.SGLANG_DSA_USE_DSV4_BF16_TOPK.get()
-                    else torch.bfloat16
-                ),
+                max_seqlen_k=k_packed.shape[0],
+            )
+            # The weighted MXFP4 ABI emits BF16; unfused top-k consumes FP32.
+            return (
+                logits.float()
+                if force_unfused_topk or not envs.SGLANG_DSA_USE_DSV4_BF16_TOPK.get()
+                else logits
             )
 
         assert isinstance(q, torch.Tensor)
@@ -1292,20 +1291,19 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
         elif self.use_int8:
             kv_cache = (kv[0].view(torch.int8), kv[1])
+            logits_dtype = (
+                torch.float32
+                if force_unfused_topk or not envs.SGLANG_DSA_USE_DSV4_BF16_TOPK.get()
+                else torch.bfloat16
+            )
+            # Legacy INT8 selects its output dtype from the gate tensor.
             return deep_gemm.int8_mqa_logits(
                 q,
                 kv_cache,
-                weights,
+                weights.to(logits_dtype),
                 cu_seq_len_k_start,
                 cu_seq_len_k_end,
                 clean_logits=clean_logits,
-                # Unfused topk (fast_topk_v2) requires fp32; the fused bf16 kernel consumes bf16 directly.
-                logits_dtype=(
-                    torch.float32
-                    if force_unfused_topk
-                    or not envs.SGLANG_DSA_USE_DSV4_BF16_TOPK.get()
-                    else torch.bfloat16
-                ),
             )
         raise NotImplementedError
 
@@ -1328,15 +1326,20 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             assert isinstance(q, tuple) and len(q) == 2
             q_packed, q_sf = q
             q_packed_int8 = q_packed.contiguous().view(torch.int8)
-            return deep_gemm.fp8_fp4_paged_mqa_logits(
+            logits = deep_gemm.fp8_fp4_paged_mqa_logits(
                 (q_packed_int8, q_sf),
                 kv_cache,
-                weights,
+                weights.to(torch.bfloat16),
                 context_lens,
                 block_table,
                 schedule_meta,
                 max_context_len,
-                clean_logits=clean_logits,
+                indices=torch.arange(
+                    context_lens.shape[0], device=context_lens.device, dtype=torch.int32
+                ),
+            )
+            return (
+                logits if envs.SGLANG_DSA_USE_DSV4_BF16_TOPK.get() else logits.float()
             )
 
         if self.bf16_indexer:
@@ -1951,6 +1954,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         use_dg_native = (
             not use_cute_dsl
             and _is_cuda
+            and not is_sail()
             and forward_batch.forward_mode.is_target_verify()
             and next_n >= 2
             and ctx_2d is not None
@@ -1976,8 +1980,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 metadata_extra = (
                     1,  # next_n
                     q_probe.shape[1],  # num_heads
-                    q_probe.shape[2],  # head_dim (packed for FP4)
-                    1 if not self.bf16_indexer else 2,  # element size
+                    self.head_dim,  # logical head_dim, including packed MXFP4
+                    q_probe.dtype,
                 )
                 schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
                     seqlens_32_2d,
@@ -1986,6 +1990,17 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     **(
                         dict(
                             metadata_extra=metadata_extra,
+                            **(
+                                dict(
+                                    indices=torch.arange(
+                                        seqlens_32_2d.shape[0],
+                                        device=seqlens_32_2d.device,
+                                        dtype=torch.int32,
+                                    )
+                                )
+                                if self.use_fp4
+                                else {}
+                            ),
                         )
                         if is_sail()
                         and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
