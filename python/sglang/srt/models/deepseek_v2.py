@@ -107,7 +107,13 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     CombineInput,
     DispatchOutput,
 )
-from sglang.srt.layers.moe.topk import BypassedTopKOutput, TopK, TopKOutputFormat
+from sglang.srt.layers.moe.topk import (
+    BypassedTopKOutput,
+    StandardTopKOutput,
+    TopK,
+    TopKOutputFormat,
+    _post_process_topk_ids,
+)
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
@@ -1443,6 +1449,48 @@ class DeepseekV2MoE(nn.Module):
         final_hidden_states = post_experts_all_reduce(final_hidden_states)
         return final_hidden_states
 
+    def _select_deepep_topk(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
+        num_token_non_padded: Optional[torch.Tensor],
+    ):
+        dispatch_info = (
+            ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+            if not self.is_nextn
+            else None
+        )
+        if self.gate.e_score_correction_bias_vl is None:
+            topk_kwargs = {"input_ids": input_ids} if self.is_hash else {}
+            return self.topk(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=dispatch_info,
+                **topk_kwargs,
+            )
+
+        # Image tokens rank with the VL bias. Dispatch still needs physical
+        # expert IDs and the same padding boundary as the regular router.
+        topk_output = vision_topk(
+            self, router_logits, input_ids, num_token_non_padded=num_token_non_padded
+        )
+        topk_ids, topk_weights, recorder_ids = _post_process_topk_ids(
+            topk_ids=topk_output.topk_ids,
+            topk_weights=topk_output.topk_weights,
+            topk_config=self.topk.topk_config,
+            router_logits=router_logits,
+            layer_id=self.layer_id,
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=dispatch_info,
+        )
+        if recorder_ids is not None:
+            get_global_expert_distribution_recorder().on_select_experts(
+                topk_ids=recorder_ids
+            )
+        return StandardTopKOutput(topk_weights, topk_ids, router_logits)
+
     def forward_deepep(
         self,
         hidden_states: torch.Tensor,
@@ -1477,23 +1525,11 @@ class DeepseekV2MoE(nn.Module):
                         torch.cuda.current_stream().wait_event(shared_event)
                 else:
                     shared_output = self._forward_shared_experts(hidden_states)
-            topk_kwargs = (
-                {"input_ids": input_ids_global}
-                if getattr(self, "is_hash", False)
-                else {}
-            )
-            topk_output = self.topk(
+            topk_output = self._select_deepep_topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=(
-                    ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
-                    )
-                    if not self.is_nextn
-                    else None
-                ),
-                **topk_kwargs,
+                input_ids_global,
+                forward_batch.moe_num_token_non_padded(),
             )
         else:
             topk_output = self.topk.empty_topk_output(
@@ -1864,30 +1900,15 @@ class DeepseekV2MoE(nn.Module):
         router_logits = state.pop("router_logits")
         hidden_states = state.hidden_states_mlp_input
 
-        # Hash MoE layers (e.g. DeepSeek-V4) route on input_ids; forward_deepep
-        # passes them as a topk kwarg. The per-ubatch forward_batch.input_ids is
-        # already sliced+padded to match hidden_states rows (and equals the
-        # global ids under EP dp-attention). No-op for non-hash models.
-        topk_kwargs = {}
-        if getattr(self, "is_hash", False):
-            topk_kwargs["input_ids"] = state.forward_batch.input_ids
-
         if router_logits is not None:
             with get_global_expert_distribution_recorder().with_current_layer(
                 self.layer_id
             ):
-                state.topk_output = self.topk(
-                    hidden_states=hidden_states,
-                    router_logits=router_logits,
-                    num_token_non_padded=state.forward_batch.moe_num_token_non_padded(),
-                    expert_location_dispatch_info=(
-                        ExpertLocationDispatchInfo.init_new(
-                            layer_id=self.layer_id,
-                        )
-                        if not self.is_nextn
-                        else None
-                    ),
-                    **topk_kwargs,
+                state.topk_output = self._select_deepep_topk(
+                    hidden_states,
+                    router_logits,
+                    state.forward_batch.input_ids,
+                    state.forward_batch.moe_num_token_non_padded(),
                 )
         else:
             state.topk_output = self.topk.empty_topk_output(
