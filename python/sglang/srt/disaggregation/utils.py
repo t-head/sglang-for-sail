@@ -1460,6 +1460,7 @@ def setup_state_kv_args(
     from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
     kv_args.state_types = []
+    kv_args.dsa_index_k_token_bytes = None
     kv_args.state_data_ptrs = []
     kv_args.state_data_lens = []
     kv_args.state_item_lens = []
@@ -1475,6 +1476,15 @@ def setup_state_kv_args(
         if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
         else None
     )
+
+    def set_dsa_index_k_token_bytes(kv_args, pool) -> None:
+        # Per-token bytes of an index-K page: the fp8 keys of every token,
+        # then their scales. A PD DCP relayout moves the two parts separately.
+        if pool.index_kpool != 1:
+            return
+        value_bytes = pool.index_head_dim
+        scale_bytes = pool.index_head_dim // pool.quant_block_size * 4
+        kv_args.dsa_index_k_token_bytes = (value_bytes, scale_bytes)
 
     def append_dsa_tail(pool) -> None:
         if not pool.kpool_use_compress:
@@ -1612,6 +1622,7 @@ def setup_state_kv_args(
                     dsa_lens,
                     dsa_item_lens,
                 )
+                set_dsa_index_k_token_bytes(kv_args, dsa_pool)
                 append_dsa_tail(dsa_pool)
             if isinstance(token_to_kv_pool, QSATokenToKVPool):
                 qsa_ptrs, qsa_lens, qsa_item_lens = (

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import replace
+from functools import partial
 from typing import Any
 
 import torch
 
+from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -30,6 +32,9 @@ class DevicePoolEntry:
         page_size: int,
         rows_are_pages: bool,
         packed: bool = True,
+        pcp_replicated: bool = False,
+        tp_replicated: bool = False,
+        dcp_sharded: bool = False,
         index_mapper: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ):
         self.name = name
@@ -39,6 +44,14 @@ class DevicePoolEntry:
         self.layer_mapping = layer_mapping
         self.page_size = page_size
         self.packed = packed
+        # PCP can replicate DSA pages while the same group holds sharded KDA
+        # states. Replication is a property of a physical pool, not the group.
+        self.pcp_replicated = pcp_replicated
+        # Same per-pool granularity along the attention-TP axis: an MLA-family
+        # pool has no head dimension to shard, so every attention-TP rank holds
+        # byte-identical pages, while KDA state in the same group is sharded.
+        self.tp_replicated = tp_replicated
+        self.dcp_sharded = dcp_sharded
         self._index_mapper = index_mapper
         self._page_offsets = torch.arange(page_size)
         self._row_span = 1 if rows_are_pages else page_size

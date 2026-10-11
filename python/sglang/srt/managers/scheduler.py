@@ -99,6 +99,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_dsa_seed_metadata_dim,
+    is_unadmitted_reject,
     prepare_abort,
     unified_memory_disagg_move_gate,
 )
@@ -218,6 +219,7 @@ from sglang.srt.managers.schedule_batch import (
     retract_all,
 )
 from sglang.srt.managers.schedule_policy import (
+    WAITING_QUEUE_PREFIX_MATCH_MAX,
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
@@ -296,6 +298,7 @@ from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
     discard_kv_cache_backup,
+    peek_uncached_tokens,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.events import LoRANameTable
@@ -439,6 +442,11 @@ _is_npu = is_npu()
 _is_hip = is_hip()
 
 
+# Load-sized PP chunks shrink only after this many sizing steps per stage of
+# lower load (see Scheduler._pp_hold_chunk).
+_PP_DIP_STEPS_PER_STAGE = 4
+
+
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -512,6 +520,8 @@ class Scheduler(
         self.enable_unified_cache_external_linker = (
             get_memory().enable_unified_cache_external_linker
         )
+        # Waiting requests whose PP Linker lookups admission starts ahead.
+        self.linker_lookup_window = 0
         self.enable_decode_hicache = (
             get_disagg().disaggregation_decode_enable_radix_cache
             and self.enable_hierarchical_cache
@@ -1338,6 +1348,25 @@ class Scheduler(
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
+        self.pp_min_chunked_prefill_size = None
+        if (
+            get_schedule().pp_min_chunked_prefill_size is not None
+            and get_parallel().pp_size > 1
+            and self.chunked_prefill_size is not None
+        ):
+            self.pp_min_chunked_prefill_size = min(
+                get_schedule().pp_min_chunked_prefill_size, self.chunked_prefill_size
+            )
+        self.pp_chunk_overhead_tokens = (
+            get_schedule().pp_chunk_overhead_tokens
+            if self.pp_min_chunked_prefill_size is not None
+            else None
+        )
+        # Uncached tokens pending when this step's chunk was sized (load rule).
+        self._pp_pending_tokens = 0
+        # Load rule: the size held through a dip, and the steps the dip has lasted.
+        self._pp_held_chunk = 0
+        self._pp_dip_steps = 0
 
     def maybe_init_dynamic_chunk_sizer(self) -> None:
         """Profile a PP prefill latency model that sizes chunks per stage."""
@@ -1358,6 +1387,136 @@ class Scheduler(
         )
         if sizer.profile_and_fit():
             self.dynamic_chunk_sizer = sizer
+
+    def _pp_chunk_size_for_pending(self, chunk: int) -> int:
+        """Use the small prefill chunk unless a pending request has at least a
+        full chunk of uncached tokens. Small chunks keep a batch with few new
+        tokens spread over every pipeline stage, while a long prefill keeps the
+        full chunk: every chunk rereads its whole prefix in the indexer.
+
+        Waiting requests are read from their pp_uncached_hint, so a request is
+        probed about once while it waits instead of on every step. Only a
+        request without a hint, or a hint of a full chunk (its prefix may have
+        been cached since), is probed again. The probe is read-only: it never
+        splits a node or refreshes LRU. The admission loop refreshes the hints
+        and restores the full chunk if a stale hint hid a long request (see
+        _pp_restore_full_chunk). Every PP rank sees the same queue and tree, so
+        all ranks pick the same size.
+
+        With --pp-chunk-overhead-tokens the size follows the total pending
+        uncached tokens instead (see _pp_chunk_size_for_load)."""
+        if self.pp_chunk_overhead_tokens is not None:
+            return self._pp_chunk_size_for_load(chunk)
+        req = self.chunked_req
+        if req is not None and req.seqlen - req.prefix_len >= chunk:
+            return chunk
+        # The policy matched every waiting request this step: read those results.
+        matched = self.policy.waiting_queue_prefix_matched(self.waiting_queue)
+        for req in self.waiting_queue[:WAITING_QUEUE_PREFIX_MATCH_MAX]:
+            uncached = req.pp_uncached_hint
+            if matched:
+                uncached = self._pp_record_uncached(req)
+            elif uncached is None or uncached >= chunk:
+                # Sizing a chunk must not change cache state.
+                uncached = peek_uncached_tokens(req, self.tree_cache)
+                if uncached is None:
+                    return chunk
+                req.pp_uncached_hint = uncached
+            if uncached >= chunk:
+                return chunk
+        return self.pp_min_chunked_prefill_size
+
+    def _pp_chunk_size_for_load(self, full_chunk: int) -> int:
+        """Size the chunk from U, the uncached tokens of the chunked request and
+        the waiting requests. Chunk C costs about overhead + C, so U takes
+        (U / C + pp - 1) * (overhead + C) through the pipeline: a light load
+        wants small chunks to fill every stage, a heavy one larger chunks to
+        pay the per-chunk overhead (MoE weights reread, launches) less often.
+        The pipeline fills and drains at the pace of its largest chunk, so a
+        request keeps the size its whole prefill was given: the chunked
+        request counts the uncached tokens it was admitted with, not just its
+        rest. Hints are read as in the binary rule; the sum stops once it
+        reaches the full chunk."""
+        cap = self._pp_min_pending_for(full_chunk)
+        pending = 0
+        req = self.chunked_req
+        if req is not None:
+            pending = max(req.seqlen - req.prefix_len, req.pp_uncached_hint or 0)
+        matched = self.policy.waiting_queue_prefix_matched(self.waiting_queue)
+        for req in self.waiting_queue[:WAITING_QUEUE_PREFIX_MATCH_MAX]:
+            if pending >= cap:
+                break
+            uncached = req.pp_uncached_hint
+            if matched:
+                uncached = self._pp_record_uncached(req)
+            elif uncached is None or uncached >= self.pp_min_chunked_prefill_size:
+                # Sizing a chunk must not change cache state.
+                uncached = peek_uncached_tokens(req, self.tree_cache)
+                if uncached is None:
+                    return full_chunk
+                req.pp_uncached_hint = uncached
+            pending += uncached
+        self._pp_pending_tokens = pending
+        return self._pp_hold_chunk(self._pp_load_chunk(pending, full_chunk), full_chunk)
+
+    def _pp_hold_chunk(self, chunk: int, full_chunk: int) -> int:
+        """Grow at once, shrink only after the load stayed lower for
+        _PP_DIP_STEPS_PER_STAGE * pp_size sizing steps. A steady concurrent
+        load dips whenever one prefill ends before the client's next request
+        arrives; switching sizes there mixes chunks, and a pipeline runs at
+        the pace of its largest chunk while paying the overhead of every
+        small one. Steps, unlike time, advance alike on every PP rank."""
+        if chunk >= self._pp_held_chunk:
+            self._pp_held_chunk, self._pp_dip_steps = chunk, 0
+        else:
+            self._pp_dip_steps += 1
+            if self._pp_dip_steps > _PP_DIP_STEPS_PER_STAGE * get_parallel().pp_size:
+                self._pp_held_chunk, self._pp_dip_steps = chunk, 0
+        return min(self._pp_held_chunk, full_chunk)
+
+    def _pp_load_chunk(self, pending: int, full_chunk: int) -> int:
+        """Double the small chunk while the doubled one gets pending through
+        the pipeline faster, i.e. pending * overhead >= 2 * (pp - 1) * C^2."""
+        chunk = self.pp_min_chunked_prefill_size
+        while chunk * 2 <= full_chunk and pending >= self._pp_min_pending_for(
+            chunk * 2
+        ):
+            chunk *= 2
+        return chunk
+
+    def _pp_min_pending_for(self, chunk: int) -> int:
+        """Pending uncached tokens from which chunk beats chunk / 2."""
+        half = chunk // 2
+        stages = get_parallel().pp_size - 1
+        return -(-2 * stages * half * half // self.pp_chunk_overhead_tokens)
+
+    @staticmethod
+    def _pp_record_uncached(req: Req) -> int:
+        """Store the uncached tokens of req's latest prefix match as its hint."""
+        req.pp_uncached_hint = max(1, req.seqlen - req.num_matched_prefix_tokens)
+        return req.pp_uncached_hint
+
+    def _pp_restore_full_chunk(
+        self, req: Req, adder: PrefillAdder, chunk: int, full_chunk: int
+    ) -> int:
+        """Called after the admission loop matched req. Refresh its hint and,
+        if it needs a full chunk that a stale hint shrank away, give the rest
+        of this batch the full chunk, as a fresh match would have. Return the
+        batch's chunk size. Under the load rule, a hint that undercounted adds
+        the difference to the pending load and the chunk is resized from it."""
+        hint = req.pp_uncached_hint
+        uncached = self._pp_record_uncached(req)
+        if self.pp_chunk_overhead_tokens is None:
+            target = full_chunk if uncached >= full_chunk else chunk
+        else:
+            self._pp_pending_tokens += max(0, uncached - (hint or 0))
+            target = self._pp_load_chunk(self._pp_pending_tokens, full_chunk)
+            if target > chunk:
+                self._pp_held_chunk, self._pp_dip_steps = target, 0
+        if target > chunk and adder.rem_chunk_tokens is not None:
+            adder.rem_chunk_tokens += target - chunk
+            return target
+        return chunk
 
     def _should_defer_prefill(self) -> bool:
         if self._prefill_decode_interval_remaining == 0:
@@ -3197,6 +3356,14 @@ class Scheduler(
             recv_req.pp_prefetch_ticketed = bool(self._prefetch_kvcache(req))
             self.tree_cache.bind_prefetch_ticket(req.rid, recv_req.pp_prefetch_ticketed)
 
+        linker = getattr(self.tree_cache, "linker", None)
+        if (
+            linker is not None
+            and linker.pp_coordinator is not None
+            and get_parallel().pp_rank == 0
+        ):
+            linker.submit_pp_request(req)
+
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
             self._add_request_to_queue(req)
@@ -3326,7 +3493,7 @@ class Scheduler(
         return True
 
     def retire_unadmitted_request(self, req: Req) -> None:
-        """Finish a request the disaggregation queues rejected at their door."""
+        """Finish an intake rejection before it enters an admission queue."""
         # `create_req` marks a streaming session in-flight, and the pre-abort
         # detach lives in `StreamingSession.find_active_slot`, which only runs
         # while scheduling; a session left in-flight rejects every later request.
@@ -3359,6 +3526,17 @@ class Scheduler(
             req.storage_prefetch_last_match_len = None
             req.staged_prefetch_plan = None
         if self.disaggregation_mode == DisaggregationMode.NULL:
+            linker = getattr(self.tree_cache, "linker", None)
+            if (
+                linker is not None
+                and linker.pp_coordinator is not None
+                and not is_retracted
+                and is_unadmitted_reject(req)
+            ):
+                # Intake rejects return before PP lookup ticket submission.
+                # Retire them here instead of waiting for an impossible ticket.
+                self.retire_unadmitted_request(req)
+                return
             if self._abort_on_queued_limit(req):
                 self._release_aborted_request(req)
                 return
@@ -4022,6 +4200,10 @@ class Scheduler(
             dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
+        pp_full_chunk = None
+        if self.pp_min_chunked_prefill_size is not None:
+            pp_full_chunk = chunked_prefill_size
+            chunked_prefill_size = self._pp_chunk_size_for_pending(chunked_prefill_size)
 
         # Prefill policy
         # Get BLOCK_M from the backend for tile-budget admission logic
@@ -4077,6 +4259,31 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
+        linker = getattr(self.tree_cache, "linker", None)
+        lookup_window = 0
+        if linker is not None and linker.pp_coordinator is not None:
+            # Query L3 for the requests the pipeline can hold next, so their
+            # hits are known by the time admission reaches them. Query no
+            # further: hits expire while a long backlog drains.
+            parallel = get_parallel()
+            lookup_window = parallel.pp_max_micro_batch_size * (
+                parallel.pp_size + parallel.pp_async_batch_depth
+            )
+            if lookup_window != self.linker_lookup_window:
+                # set_internal_state can change the micro-batch size at runtime.
+                logger.info(
+                    "PP linker lookup window: %d requests "
+                    "(pp_max_micro_batch_size=%d, pp_size=%d, "
+                    "pp_async_batch_depth=%d)",
+                    lookup_window,
+                    parallel.pp_max_micro_batch_size,
+                    parallel.pp_size,
+                    parallel.pp_async_batch_depth,
+                )
+                self.linker_lookup_window = lookup_window
+            linker.start_pp_lookups(
+                req.rid for req in self.waiting_queue[:lookup_window]
+            )
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
@@ -4133,7 +4340,16 @@ class Scheduler(
                     # marks the staged span below once it is surfaced.
                     req.host_hit_is_storage = False
 
+            if linker is not None and not linker.check_pp_ready(req.rid):
+                if index < lookup_window:
+                    # Its lookup is in flight; a later candidate may be ready.
+                    continue
+                break
             req.init_next_round_input(self.tree_cache)
+            if pp_full_chunk is not None:
+                chunked_prefill_size = self._pp_restore_full_chunk(
+                    req, adder, chunked_prefill_size, pp_full_chunk
+                )
             if self.enable_hicache_storage and (
                 self._prefetch_after_device_hit_loss(req)
             ):
@@ -4164,6 +4380,8 @@ class Scheduler(
                 # lifecycle and freeing them here causes double-free.
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
+                    if linker is not None:
+                        linker.defer_pp_request(req.rid)
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.
                     req.kv.mamba_cow_src_index = None
@@ -4796,7 +5014,8 @@ class Scheduler(
 
         if self.enable_unified_cache_external_linker:
             failed = self.tree_cache.finish_external_linker_loads(batch.reqs)
-            if self.chunked_req in failed:
+            ret.external_linker_failed_rids = [req.rid for req in failed]
+            if get_parallel().pp_size == 1 and self.chunked_req in failed:
                 # Result processing finishes the others; a chunked one is
                 # released like a client abort so its next chunk never runs.
                 self._pending_chunked_abort_req = self.chunked_req

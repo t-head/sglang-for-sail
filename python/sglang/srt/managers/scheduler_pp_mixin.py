@@ -29,6 +29,16 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.observability.req_time_stats import set_time_batch
+from sglang.srt.observability.scheduler_stage_metrics import (
+    SCHEDULER_STAGE_BUILD_BATCH,
+    SCHEDULER_STAGE_DISAGG_BOOKKEEPING,
+    SCHEDULER_STAGE_LAUNCH_BATCH,
+    SCHEDULER_STAGE_PD_CONSENSUS,
+    SCHEDULER_STAGE_PP_COMM_WAIT,
+    SCHEDULER_STAGE_PP_OUTPUT_WAIT,
+    SCHEDULER_STAGE_PP_RECV_PROXY,
+    scheduler_stage_method,
+)
 from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
 from sglang.srt.sampling.sampling_observer_pp import (
     add_auxiliary_output_to_pp_tensors,
@@ -53,6 +63,7 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
         and len(batch.reqs) == 1
         and not batch.contains_last_prefill_chunk
         and not batch.return_logprob
+        and getattr(getattr(batch, "tree_cache", None), "linker", None) is None
     )
 
 
@@ -286,14 +297,17 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
 
-                self.process_prefill_chunk(
-                    last_batch=self.last_batch, running_batch=self.running_batch
-                )
-                self._process_hicache_events()
-                prefill_plan = self.get_new_batch_prefill(self.running_batch)
-                batch = prefill_plan.batch_to_run
-                self.running_batch = prefill_plan.running_batch
-                batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
+                # The pipeline loop builds its own batch instead of calling
+                # get_next_batch_to_run, so label the same work here.
+                with self.scheduler_stage_metrics.record(SCHEDULER_STAGE_BUILD_BATCH):
+                    self.process_prefill_chunk(
+                        last_batch=self.last_batch, running_batch=self.running_batch
+                    )
+                    self._process_hicache_events()
+                    prefill_plan = self.get_new_batch_prefill(self.running_batch)
+                    batch = prefill_plan.batch_to_run
+                    self.running_batch = prefill_plan.running_batch
+                    batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
@@ -339,7 +353,10 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
-                    d2h_event.synchronize()
+                    with self.scheduler_stage_metrics.record(
+                        SCHEDULER_STAGE_PP_OUTPUT_WAIT
+                    ):
+                        d2h_event.synchronize()
                     self._pp_process_batch_result(
                         self.mbs[next_mb_id],
                         next_batch_result,
@@ -620,6 +637,7 @@ class SchedulerPPMixin:
         reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
         self.waiting_queue.extend(reqs)
 
+    @scheduler_stage_method(SCHEDULER_STAGE_PD_CONSENSUS)
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
         # get the current stage transfer success
         if self.pp_group.is_first_rank:
@@ -668,6 +686,7 @@ class SchedulerPPMixin:
                 )
         return send_consensus_bootstrapped_work, consensus_bootstrapped_rids
 
+    @scheduler_stage_method(SCHEDULER_STAGE_PD_CONSENSUS)
     def _pp_pd_send_consensus_release_ids(
         self: Scheduler,
         tmbs: List[List[str]],
@@ -698,6 +717,7 @@ class SchedulerPPMixin:
         event.record(self.pp_comm_stream)
         return event
 
+    @scheduler_stage_method(SCHEDULER_STAGE_PP_COMM_WAIT)
     def _pp_commit_comm_work(
         self: Scheduler,
         work: List[P2PWork],
@@ -713,6 +733,7 @@ class SchedulerPPMixin:
             self.pp_send_done_event = self._pp_record_comm_event()
         work.clear()
 
+    @scheduler_stage_method(SCHEDULER_STAGE_PP_COMM_WAIT)
     def _pp_commit_proxy_send_work(self: Scheduler) -> None:
         self._pp_commit_comm_work(
             self.send_proxy_work,
@@ -729,6 +750,7 @@ class SchedulerPPMixin:
             self.forward_stream.wait_event(self.pp_proxy_recv_event)
             self.pp_proxy_recv_event = None
 
+    @scheduler_stage_method(SCHEDULER_STAGE_PP_OUTPUT_WAIT)
     def _pp_commit_send_output_work_and_preprocess_output_tensors(
         self: Scheduler,
         next_first_rank_mb_id: int,
@@ -754,6 +776,7 @@ class SchedulerPPMixin:
         )
         return next_pp_outputs, next_batch_result, d2h_event
 
+    @scheduler_stage_method(SCHEDULER_STAGE_PP_COMM_WAIT)
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
         p2p_work = []
         if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
@@ -774,6 +797,7 @@ class SchedulerPPMixin:
             )
         return p2p_work
 
+    @scheduler_stage_method(SCHEDULER_STAGE_PP_COMM_WAIT)
     def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
         if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
             dp_offset = (
@@ -802,6 +826,8 @@ class SchedulerPPMixin:
         tensor_dict = {
             "next_token_ids": result.next_token_ids,
         }
+        if result.external_linker_failed_rids is not None:
+            tensor_dict["__linker_failed_rids__"] = result.external_linker_failed_rids
 
         if self._pp_spec_relay and result.accept_lens is not None:
             # PP+spec verify round: earlier stages need the accept results to
@@ -827,7 +853,7 @@ class SchedulerPPMixin:
         draft_input = result.next_draft_input
         if (
             draft_input is not None
-            and not batch.spec_algorithm.is_dspark()
+            and not batch.spec_algorithm.is_dflash_family()
             and draft_input.topk_p is not None
         ):
             tensor_dict["draft_topk_p"] = draft_input.topk_p.contiguous()
@@ -884,6 +910,7 @@ class SchedulerPPMixin:
             )
         return p2p_work
 
+    @scheduler_stage_method(SCHEDULER_STAGE_PP_COMM_WAIT)
     def _pp_send_proxy_to_next_stage(
         self: Scheduler, result: GenerationBatchResult
     ) -> None:
@@ -934,6 +961,7 @@ class SchedulerPPMixin:
                     (tensor_dict, recv_event)
                 )
 
+    @scheduler_stage_method(SCHEDULER_STAGE_PP_RECV_PROXY)
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
@@ -958,7 +986,13 @@ class SchedulerPPMixin:
         mb_metadata: Optional[PPBatchMetadata],
     ):
         bs = len(batch.reqs)
-        placeholder = torch.zeros(bs, dtype=torch.int64, device=self.device)
+        placeholder = torch.zeros(
+            bs,
+            dtype=torch.int64,
+            device=(
+                "cpu" if get_disagg().disaggregation_mode == "prefill" else self.device
+            ),
+        )
         # next_pp_outputs = None so non-last ranks skip forwarding
         # (pp_outputs is None gate). Placeholder carried in
         # batch_result.next_token_ids for process_batch_result_prefill.
@@ -1091,6 +1125,17 @@ class SchedulerPPMixin:
                 new_seq_lens=batch.seq_lens,
             )
             batch.spec_info = next_draft_input
+        elif batch.spec_algorithm.is_dflash():
+            from sglang.srt.speculative.draft_worker_common import (
+                make_draft_input_v2,
+            )
+
+            # Same as the PD decode's first draft input: the bonus token only.
+            next_draft_input = make_draft_input_v2(
+                bonus_tokens=next_token_ids,
+                new_seq_lens=batch.seq_lens,
+            )
+            batch.spec_info = next_draft_input
 
         if self._pp_spec_relay:
             # Gated single-instance PP+spec: the sampled first token roots
@@ -1150,6 +1195,13 @@ class SchedulerPPMixin:
         )
         output_result.copy_auxiliary_output_to_cpu()
         return output_result
+
+    def _pp_apply_linker_failures(self: Scheduler, batch: ScheduleBatch, rids) -> None:
+        if not rids:
+            return
+        failed = self.tree_cache.abort_external_linker_loads(batch.reqs, rids)
+        if self.chunked_req in failed:
+            self._pending_chunked_abort_req = self.chunked_req
 
     def _pp_process_batch_result(
         self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
@@ -1516,6 +1568,12 @@ class SchedulerPPMixin:
                 batch_result = self._pp_prep_batch_result(
                     target, mb_metadata[next_mb_id], next_pp_outputs
                 )
+                if get_disagg().disaggregation_mode == "prefill":
+                    # Keep the output ring on device, but make the result's
+                    # tokens host-readable under the existing d2h_event. A
+                    # GPU .tolist() in PD result processing adds a stream sync
+                    # even after the output receive has already completed.
+                    batch_result.next_token_ids = async_d2h(batch_result.next_token_ids)
                 d2h_event = self.device_module.Event()
                 if (
                     batch_result.logits_output is not None
@@ -1648,6 +1706,7 @@ class SchedulerPPMixin:
 
         return next_pp_outputs, batch_result, d2h_event, send_output_work
 
+    @scheduler_stage_method(SCHEDULER_STAGE_LAUNCH_BATCH)
     def _pp_launch_batch(
         self: Scheduler,
         mb_id: int,
@@ -1664,7 +1723,25 @@ class SchedulerPPMixin:
                     "set_run_batch_cpu_start_time",
                     trace_only=True,
                 )
+                incoming_failures = (
+                    pp_proxy_tensors.tensors.pop("__linker_failed_rids__", [])
+                    if pp_proxy_tensors is not None
+                    else []
+                )
                 result = self.run_batch(cur_batch, pp_proxy_tensors)
+                if result.external_linker_failed_rids is not None or incoming_failures:
+                    result.external_linker_failed_rids = list(
+                        dict.fromkeys(
+                            incoming_failures
+                            + (result.external_linker_failed_rids or [])
+                        )
+                    )
+                    # Foreground PP only relays metadata. The final stage sends
+                    # the union back before any rank publishes cache/PD results.
+                    if not self.pp_group.is_last_rank:
+                        result.pp_hidden_states_proxy_tensors.tensors[
+                            "__linker_failed_rids__"
+                        ] = result.external_linker_failed_rids
                 set_time_batch(
                     cur_batch.reqs,
                     "set_run_batch_cpu_end_time",

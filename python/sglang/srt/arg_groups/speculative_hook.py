@@ -158,6 +158,20 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         ),
     )
 
+    # Check the final algorithm: NEXTN aliases EAGLE, while Gemma4 drafts promote
+    # EAGLE/NEXTN to FROZEN_KV_MTP.
+    if (
+        cfg.disaggregation_mode == "decode"
+        and cfg.disaggregation_decode_enable_radix_cache
+        and cfg.speculative_algorithm
+        not in (None, "DFLASH", "DSPARK", "EAGLE", "EAGLE3")
+    ):
+        raise ValueError(
+            "--disaggregation-decode-enable-radix-cache is incompatible "
+            "with speculative decoding "
+            f"(--speculative-algorithm {cfg.speculative_algorithm})"
+        )
+
     if cfg.speculative_use_block_verification:
         if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "DFLASH", "DSPARK"):
             raise ValueError(
@@ -292,16 +306,30 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             f"{type(current_platform).__name__} on device {cfg.device!r}."
         )
 
-    # DFLASH + dp attention is validated on NPU only.
-    if attn_dp_enabled_of(cfg) and not cfg.device == "npu":
+    # DFLASH + dp attention is validated on NPU and CUDA only.
+    if attn_dp_enabled_of(cfg) and not (
+        cfg.device == "npu" or cfg.device.startswith("cuda")
+    ):
         raise ValueError(
-            "Currently DFLASH speculative decoding does not support dp "
-            "attention on non-NPU devices."
+            "Currently DFLASH speculative decoding supports dp attention on NPU "
+            "and CUDA only."
         )
+    if (
+        attn_dp_enabled_of(cfg)
+        and cfg.device.startswith("cuda")
+        and not cfg.enable_dp_lm_head
+    ):
+        # The draft's candidate top-k reads the target head on this DP rank's
+        # tokens only, so the head must be vocab-sharded within attention TP.
+        logger.info("DFLASH with dp attention: enabling --enable-dp-lm-head.")
+        declare_resolution(server_args, "_handle_dflash", enable_dp_lm_head=True)
 
-    if cfg.pp_size != 1:
+    if cfg.pp_size != 1 and cfg.disaggregation_mode != "prefill":
+        # A pipelined PD prefill keeps the draft on its last stage, which
+        # materializes the prompt's draft KV for the decode.
         raise ValueError(
-            "Currently DFLASH speculative decoding only supports pp_size == 1."
+            "DFLASH pipeline parallelism requires PD prefill; decode and "
+            "non-disaggregated serving require pp_size == 1."
         )
 
     if cfg.speculative_draft_model_path is None:
@@ -691,6 +719,8 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 "--speculative-draft-model-path."
             )
 
+    _keep_mla_dspark_draft_off_trtllm_mha(server_args)
+
     if cfg.speculative_num_steps is None:
         declare_resolution(
             server_args,
@@ -825,12 +855,49 @@ def _handle_dspark(server_args: ServerArgs) -> None:
         )
 
 
+def _load_draft_hf_config(cfg):
+    from sglang.srt.utils.hf_transformers_utils import get_config
+
+    return get_config(
+        cfg.speculative_draft_model_path,
+        trust_remote_code=cfg.trust_remote_code,
+        revision=cfg.speculative_draft_model_revision,
+        model_override_args=json.loads(cfg.json_model_override_args),
+    )
+
+
+def _keep_mla_dspark_draft_off_trtllm_mha(server_args: ServerArgs) -> None:
+    """trtllm_mha serves only MHA/GQA layers, so an MLA DSpark draft falls back."""
+    cfg = resolving_view(server_args)
+    draft_backend = cfg.speculative_draft_attention_backend
+    if draft_backend is None:
+        draft_backend, _ = attention_backends_of(resolved_view(server_args))
+    if draft_backend != "trtllm_mha":
+        return
+    from sglang.srt.speculative.dflash_utils import is_dflash_mla_draft_config
+
+    if not is_dflash_mla_draft_config(_load_draft_hf_config(cfg)):
+        return
+    # trtllm_mha implies CUDA, where flashinfer serves MLA drafts.
+    logger.warning("DSpark MLA drafts cannot use 'trtllm_mha'; using 'flashinfer'.")
+    declare_resolution(
+        server_args,
+        "_handle_dspark",
+        speculative_draft_attention_backend="flashinfer",
+    )
+
+
 def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     """Resolve `speculative_draft_attention_backend` to a final, supported value.
 
     Consumed by ModelRunner's `is_draft_worker` override (one backend for all
     draft modes).
     """
+    from sglang.srt.speculative.dflash_utils import is_dflash_mla_draft_config
+    from sglang.srt.speculative.draft_worker_common import (
+        DFLASH_MLA_ONLY_DRAFT_BACKENDS,
+    )
+
     cfg = resolving_view(server_args)
 
     supported_draft_backends = DRAFT_ATTENTION_BACKEND_CHOICES
@@ -840,6 +907,10 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
             return current_platform.supports_speculative_draft_attention_backend(
                 "DFLASH", backend
             )
+        if backend in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
+            # These serve only MLA layers: a draft verify window through the
+            # target's MLA decode kernels (DCP owner rows under DCP).
+            return is_dflash_mla_draft_config(_load_draft_hf_config(cfg))
         return backend in supported_draft_backends
 
     def get_fallback_backend() -> str:
@@ -886,14 +957,8 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
         draft_backend = fallback_backend
     elif draft_backend == "trtllm_mha":
         from sglang.srt.speculative.dflash_utils import get_dflash_layer_types
-        from sglang.srt.utils.hf_transformers_utils import get_config
 
-        draft_hf_config = get_config(
-            cfg.speculative_draft_model_path,
-            trust_remote_code=cfg.trust_remote_code,
-            revision=cfg.speculative_draft_model_revision,
-            model_override_args=json.loads(cfg.json_model_override_args),
-        )
+        draft_hf_config = _load_draft_hf_config(cfg)
         draft_text_config = (
             getattr(draft_hf_config, "text_config", None) or draft_hf_config
         )
@@ -905,11 +970,14 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
             and set(layer_types) == {"sliding_attention"}
         )
         all_causal = getattr(draft_text_config, "is_causal", False) is True
-        if not (all_sliding or all_causal):
+        # trtllm_mha serves only MHA/GQA layers.
+        if is_dflash_mla_draft_config(draft_hf_config) or not (
+            all_sliding or all_causal
+        ):
             fallback_backend = get_fallback_backend()
             logger.warning(
-                "DFLASH only enables 'trtllm_mha' when all layers use sliding "
-                "attention or the draft is explicitly causal; got "
+                "DFLASH only enables 'trtllm_mha' for non-MLA drafts whose "
+                "layers all use sliding attention or are explicitly causal; got "
                 "layer_types=%r, is_causal=%r. "
                 "Falling back to '%s'.",
                 layer_types,
@@ -917,6 +985,16 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
                 fallback_backend,
             )
             draft_backend = fallback_backend
+    elif draft_backend == "tokenspeed_mla" and not is_dflash_mla_draft_config(
+        _load_draft_hf_config(cfg)
+    ):
+        fallback_backend = get_fallback_backend()
+        logger.warning(
+            "DFLASH only enables 'tokenspeed_mla' for MLA drafts. "
+            "Falling back to '%s'.",
+            fallback_backend,
+        )
+        draft_backend = fallback_backend
     # FIXME: avoid overriding server args directly; pass the resolved draft
     # backend to the draft worker explicitly instead.
     declare_resolution(

@@ -667,6 +667,7 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         self._tools_passthrough = False
         self._stream_text = ""
         self._streamed_reasoning: list[str] = []
+        self.replayed_reasoning_chars = 0
         self._discard_delayed_think_close = False
 
     def _clean_content(self, text: str) -> str:
@@ -746,6 +747,7 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         )
 
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        self.replayed_reasoning_chars = 0
         self._buffer += new_text
         if self._force_nonempty_content:
             self._stream_text += new_text
@@ -779,6 +781,7 @@ class KimiK3Detector(BaseReasoningFormatDetector):
                 next_channel_idx=channel_idx,
             ):
                 replay = "".join(self._streamed_reasoning)
+                self.replayed_reasoning_chars = len(replay)
                 self._streamed_reasoning.clear()
                 self._in_reasoning = False
                 self._reasoning_done = True
@@ -833,6 +836,7 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         return StreamingParseResult(normal_text=self._drain_content())
 
     def finish(self) -> StreamingParseResult:
+        streamed_chars = sum(map(len, self._streamed_reasoning))
         self._streamed_reasoning.clear()
         if not self._force_nonempty_content:
             return super().finish()
@@ -842,6 +846,7 @@ class KimiK3Detector(BaseReasoningFormatDetector):
             # answer went out as reasoning; without this gate the re-emit duplicates
             # answers already streamed as content (RESPONSE_OPEN / force_reasoning=False).
             self._buffer = ""
+            self.replayed_reasoning_chars = streamed_chars
             return StreamingParseResult(normal_text=self._clean_content(text))
         if self._in_reasoning and not self.stream_reasoning and self._buffer:
             # super().finish() would emit this buffer as content under

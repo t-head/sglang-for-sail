@@ -23,8 +23,9 @@ reaches nothing but its own requests, which the scheduler aborts.
 from __future__ import annotations
 
 import logging
+import time
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
@@ -118,7 +119,9 @@ class LayerWiseLoadCounter:
             return True
         # Wait before dropping the entry: the load thread still completes the
         # layers the forward never waited on through it.
-        landed = all(future.exception() is None for future in futures)
+        # Do not short-circuit after an error: later layers may still be writing.
+        errors = [future.exception() for future in futures]
+        landed = all(error is None for error in errors)
         del self.futures[index]
         return landed
 
@@ -248,6 +251,90 @@ class UnifiedCacheLinkerWrapper:
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
+        self.pp_coordinator = None
+        self.pp_hits = {}
+        if getattr(cache, "pp_size", 1) > 1:
+            from sglang.srt.distributed.parallel_state import (
+                create_custom_parallel_group,
+            )
+            from sglang.srt.mem_cache.unified_cache.linker_pp import PPLinkerCoordinator
+
+            rank = torch.distributed.get_rank()
+            tp_ranks = torch.distributed.get_process_group_ranks(cache.tp_group)
+            pp_ranks = torch.distributed.get_process_group_ranks(cache.pp_group)
+            ranks = sorted({p + t - rank for p in pp_ranks for t in tp_ranks})
+            group = create_custom_parallel_group(ranks, backend="gloo")
+            self.pp_coordinator = PPLinkerCoordinator(
+                group, self._lookup_hashes, self._wait_local_offload
+            )
+            cache_linker.log_load_timing = self.pp_coordinator.is_source
+
+    def submit_pp_request(self, req: Req) -> None:
+        from sglang.srt.mem_cache.common import _req_radix_key
+
+        req.refresh_fill_ids()
+        key = _req_radix_key(
+            self.cache,
+            req,
+            req.full_untruncated_fill_ids,
+            req._compute_max_prefix_len(len(req.full_untruncated_fill_ids)),
+        )
+        key, _ = key.maybe_to_bigram_view(self.cache.tree_core.is_eagle)
+        if req.positional_embed_overrides is not None:
+            key = key[:0]
+        hashes = get_storage_hash_str(
+            key.page_aligned(self.cache.page_size), page_size=self.cache.page_size
+        )
+        self.pp_coordinator.submit(req.rid, hashes)
+
+    def start_pp_lookups(self, rids: Iterable[str]) -> None:
+        if self.pp_coordinator is not None:
+            for rid in rids:
+                self.pp_coordinator.start_lookup(rid)
+
+    def check_pp_ready(self, rid: str) -> bool:
+        if self.pp_coordinator is None:
+            return True
+        sequence = (
+            self.pp_coordinator.ready_sequence(rid) if self.cache.pp_rank == 0 else 0
+        )
+        ready = torch.tensor(sequence, dtype=torch.int64)
+        self.cache._all_reduce(ready, torch.distributed.ReduceOp.MIN)
+        if not ready.item():
+            return False
+        self.pp_hits[rid] = self.pp_coordinator.result(rid, int(ready.item()))
+        return True
+
+    def defer_pp_request(self, rid: str) -> None:
+        if self.pp_coordinator is not None:
+            hit = self.pp_hits.pop(rid, None)
+            if hit is not None:
+                self.pp_coordinator.defer(rid, hit.sequence)
+            self.hit_markers.pop(rid, None)
+
+    def _lookup_transfers(self, hashes: list[str]) -> list[PoolTransfer]:
+        transfers = []
+        for component in self._components:
+            transfer = component.build_external_linker_transfer(
+                LinkerTransferPhase.LOOKUP, None, hashes
+            )
+            if transfer is None:
+                return []
+            transfers.append(transfer)
+        return transfers
+
+    def _lookup_hashes(self, rid: str, hashes: list[str]) -> list[int]:
+        transfers = self._lookup_transfers(hashes)
+        return self.cache_linker.lookup(rid, transfers) if transfers else []
+
+    def _wait_local_offload(self) -> bool:
+        deadline = time.monotonic() + 600
+        while not self.cache_linker.num_completed_offloads():
+            if time.monotonic() >= deadline:
+                # Fail the coordinator, never acknowledge a still-active DMA.
+                raise TimeoutError("PP linker offload failed to complete within 600s")
+            time.sleep(0.01)
+        return self.cache_linker.pop_completed_offload()
 
     @property
     def layer_done_counter(self) -> object:
@@ -266,28 +353,32 @@ class UnifiedCacheLinkerWrapper:
         if device_hit_len >= len(key):
             return result
 
-        tail_hashes = self._tail_hashes(key, result, device_hit_len)
-        if not tail_hashes:
-            return result
-
-        lookup_transfers = []
-        for component in self._components:
-            transfer = component.build_external_linker_transfer(
-                LinkerTransferPhase.LOOKUP, None, tail_hashes
-            )
-            if transfer is None:
+        if self.pp_coordinator is not None:
+            hit = self.pp_hits.get(req.rid)
+            if hit is None:
+                return result  # Scheduling policy may probe before admission.
+            candidates = [p for p in hit.pages if device_hit_len < p * page <= len(key)]
+            if not candidates:
                 return result
-            lookup_transfers.append(transfer)
-        by_pool = {transfer.name: transfer for transfer in lookup_transfers}
-
-        # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
-        hit_pages = self._sync_restorable_prefix(
-            self.cache_linker.lookup(req.rid, lookup_transfers),
-            num_pages=len(tail_hashes),
-            device_hit_pages=0,
-        )
+            end_page = candidates[-1]
+            tail_hashes = hit.hashes[device_hit_len // page : end_page]
+            hit_pages = len(tail_hashes)
+            lookup_transfers = self._lookup_transfers(tail_hashes)
+        else:
+            tail_hashes = self._tail_hashes(key, result, device_hit_len)
+            if not tail_hashes:
+                return result
+            lookup_transfers = self._lookup_transfers(tail_hashes)
+            if not lookup_transfers:
+                return result
+            hit_pages = self._sync_restorable_prefix(
+                self.cache_linker.lookup(req.rid, lookup_transfers),
+                num_pages=len(tail_hashes),
+                device_hit_pages=0,
+            )
         if hit_pages == 0:
             return result
+        by_pool = {transfer.name: transfer for transfer in lookup_transfers}
         hit_tokens = hit_pages * page
 
         swa_transfer = by_pool.get(PoolName.SWA)
@@ -385,6 +476,8 @@ class UnifiedCacheLinkerWrapper:
                     component_transfers,
                     prefix_len,
                 )
+                if self.pp_coordinator is not None:
+                    raise RuntimeError("PP linker could not allocate an agreed load")
                 return 0, req.last_node
             component_transfers.append((component, transfer))
 
@@ -406,6 +499,8 @@ class UnifiedCacheLinkerWrapper:
             self._update_load(
                 ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
             )
+            if self.pp_coordinator is not None:
+                raise RuntimeError("PP linker backend refused an agreed load")
             return 0, req.last_node
         self._update_load(
             ExternalLinkerLoadPhase.PREPARE,
@@ -489,6 +584,8 @@ class UnifiedCacheLinkerWrapper:
 
         cache.tree_core.mark_external_linker_offload_pending(node_id)
         self.pending_offloads.append(_PendingOffload(node_id, lock_params, [node_id]))
+        if self.pp_coordinator is not None:
+            self.pp_coordinator.offload_submitted()
 
     def replace_pending_offload_node(
         self, ack_id: NodeId, old_node_id: NodeId, new_node_ids: list[NodeId]
@@ -508,12 +605,13 @@ class UnifiedCacheLinkerWrapper:
             return
 
     def num_completed_offloads(self) -> int:
-        return min(
-            self.cache_linker.num_completed_offloads(), len(self.pending_offloads)
-        )
+        backend = self.pp_coordinator or self.cache_linker
+        return min(backend.num_completed_offloads(), len(self.pending_offloads))
 
     def take_completed_offloads(self, finish_count: int) -> list[bool]:
         assert finish_count <= len(self.pending_offloads)
+        if self.pp_coordinator is not None:
+            return self.pp_coordinator.take_completed_offloads(finish_count)
         return [self.cache_linker.pop_completed_offload() for _ in range(finish_count)]
 
     def commit_completed_offloads(self, successes: Sequence[bool]) -> None:
@@ -551,6 +649,11 @@ class UnifiedCacheLinkerWrapper:
         for rid in rids:
             self.private_load_indices.pop(rid, None)
         if landed.item():
+            logger.info(
+                "External linker stage load completed: requests=%d rids=%s",
+                len(rids),
+                rids,
+            )
             return []
         logger.error(
             "External linker load failed; aborting %d request(s): %s", len(rids), rids
@@ -560,6 +663,9 @@ class UnifiedCacheLinkerWrapper:
     # ---- lifecycle ----
 
     def reset(self) -> None:
+        if self.pp_coordinator is not None:
+            self.pp_coordinator.reset()
+        self.pp_hits.clear()
         self.cache_linker.reset()
         self.hit_markers.clear()
         self.inflight_load_rids.clear()
@@ -576,6 +682,9 @@ class UnifiedCacheLinkerWrapper:
         self.pending_offloads.clear()
 
     def release_request(self, rid: str) -> None:
+        if self.pp_coordinator is not None:
+            self.pp_coordinator.release(rid)
+        self.pp_hits.pop(rid, None)
         self.hit_markers.pop(rid, None)
         # A queued load targets slots the request owns and is about to free.
         # A started one is finished by finish_loads before anything is freed.
@@ -584,6 +693,9 @@ class UnifiedCacheLinkerWrapper:
             self.private_load_indices.pop(rid, None)
 
     def close(self) -> None:
+        if self.pp_coordinator is not None:
+            self.pp_coordinator.close()
+        self.pp_hits.clear()
         self.cache_linker.close()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()

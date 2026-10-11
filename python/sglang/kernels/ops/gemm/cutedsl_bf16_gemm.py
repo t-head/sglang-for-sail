@@ -1353,6 +1353,15 @@ _K3_TGV_WIN_SHAPES = frozenset(
     }
 )
 
+# (n, k) -> the largest m that takes TGV, registered by a model for shapes it
+# measured (register_tgv_win_shapes).
+_MODEL_TGV_WIN_SHAPES: dict[tuple[int, int], int] = {}
+
+
+def register_tgv_win_shapes(shapes: dict[tuple[int, int], int]) -> None:
+    """Route a model's dense-GEMM shapes ``(n, k)`` to TGV up to the given m."""
+    _MODEL_TGV_WIN_SHAPES.update(shapes)
+
 
 def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
     """TGV-vs-cuBLAS (``F.linear``) decision, CUPTI-measured on B300 under CUDA
@@ -1366,6 +1375,8 @@ def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
     if k % 8 != 0:  # TMA requires 16B-aligned rows
         return False
     if m <= 8 and (n, k) in _K3_TGV_WIN_SHAPES:
+        return True
+    if m <= _MODEL_TGV_WIN_SHAPES.get((n, k), 0):
         return True
     if n < 1024 or k < 2048 or k > 6144:
         return False
