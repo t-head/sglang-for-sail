@@ -120,11 +120,13 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
             "backup and the storage keys must become dcp_rank-aware "
             "first. Run HiCache+DCP with L1/L2 only."
         )
-    if cfg.speculative_algorithm not in (None, "DSPARK"):
+    # A DFLASH MLA draft holds this rank's rows; its sidecar host pool
+    # translates with dcp_size like the target's.
+    if cfg.speculative_algorithm not in (None, "DSPARK", "EAGLE3", "DFLASH"):
         raise NotImplementedError(
-            "HiCache with --dcp-size > 1 only supports DSPARK speculative "
-            "decoding; other draft-model host pools have no DCP index "
-            "translation."
+            "HiCache with --dcp-size > 1 only supports DSPARK, EAGLE3 and "
+            "DFLASH speculative decoding; other speculative algorithms are not "
+            "supported."
         )
     if cfg.enable_lmcache:
         raise NotImplementedError(

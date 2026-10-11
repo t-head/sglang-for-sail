@@ -68,6 +68,9 @@ class GenerationBatchResult:
     # to validate that skipped output is never consumed.
     skipped_output_comm: bool = False
 
+    # Failed direct-L3 reads travel through PP before insertion or PD send.
+    external_linker_failed_rids: Optional[List[str]] = None
+
     # For output processing
     extend_input_len_per_req: Optional[List[int]] = None
     extend_logprob_start_len_per_req: Optional[List[int]] = None

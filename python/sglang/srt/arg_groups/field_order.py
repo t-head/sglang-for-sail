@@ -523,5 +523,10 @@ POSITIONAL_FIELD_ORDER = (
     "enable_decoder_swa_bounded_replay",
     "enable_response_store",
     "disaggregation_decode_host_receive_threshold",
+    # Kimi-K3.1 additions, appended to keep existing positional slots
+    "enable_cp_tp_group_sharing",
+    "pp_min_chunked_prefill_size",
+    "pp_chunk_overhead_tokens",
+    "enable_flashmla_prefill_token_packing",
 )
 # fmt: on

@@ -200,12 +200,25 @@ def touch_waiting_prefix(req: Req, tree_cache: BasePrefixCache) -> None:
     )
 
 
+def peek_uncached_tokens(req: Req, tree_cache: BasePrefixCache) -> Optional[int]:
+    """Uncached tokens req would prefill now, read without changing cache state;
+    None when the cache cannot answer read-only."""
+    token_ids = req.origin_input_ids + req.output_ids
+    cached = tree_cache.peek_prefix_len(_req_radix_key(tree_cache, req, token_ids))
+    if cached is None:
+        return None
+    return max(
+        1, len(token_ids) - min(cached, req._compute_max_prefix_len(len(token_ids)))
+    )
+
+
 def match_kv_cache(
     req: Req,
     tree_cache: BasePrefixCache,
     token_ids: Optional[array] = None,
     *,
     cow_mamba: bool = False,
+    full_kv_only: bool = False,
     max_prefix_len: Optional[int] = None,
 ) -> MatchResult:
     """Match token_ids against tree_cache and adopt the hit as req's prefix."""
@@ -217,6 +230,7 @@ def match_kv_cache(
             key=_req_radix_key(tree_cache, req, token_ids, max_prefix_len),
             cow_mamba=cow_mamba,
             req=req,
+            full_kv_only=full_kv_only,
         )
     )
     if envs.SGLANG_RADIX_FORCE_MISS.get():

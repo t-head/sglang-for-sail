@@ -41,6 +41,8 @@ from sglang.srt.model_executor.runner_utils.pool import (
     disable_graph_pool_borrow,
     graph_pool_borrow_enabled,
 )
+from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
+from sglang.srt.models.dflash import DFlashMLAAttention
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
@@ -375,7 +377,7 @@ class DFlashWorkerV2(BaseSpecWorker):
     """
 
     def weight_update_runners(self) -> List[Tuple[str, "ModelRunner"]]:
-        return [("draft", self.draft_model_runner)]
+        return [("draft", self.draft_model_runner)] if self._hosts_draft else []
 
     def __init__(
         self,
@@ -414,6 +416,19 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.draft_owns_attention = get_parallel().attn_dp_enabled
         # Inside the draft scope the context answers the draft's narrowed rank.
         self._target_tp_rank = get_parallel().tp_rank
+        # On a pipelined PD prefill only the last stage holds the draft: the
+        # aux hidden states reach it on the PP proxy, and it materializes and
+        # sends the prompt's draft KV. Earlier stages run the target only.
+        self._hosts_draft = get_parallel().pp_group.is_last_rank
+        if not self._hosts_draft:
+            self._draft_worker = None
+            self.draft_model_runner = None
+            self.draft_model = None
+            return
+        # The draft worker exists on the last stage only: it reuses the
+        # target's seed and loads within the stage, so no all-rank collective
+        # waits on the earlier stages (as DSPARK does).
+        load_group = get_pp_stage_load_group()
         with draft_pp_context(), draft_tp_context(self.draft_owns_attention):
             bundle = build_draft_tp_worker(
                 server_args=server_args,
@@ -421,6 +436,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 nccl_port=nccl_port,
                 target_model_config=target_worker.model_runner.model_config,
                 algo_label="DFLASH",
+                random_seed=target_worker.random_seed,
+                load_group=load_group,
             )
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
@@ -606,6 +623,8 @@ class DFlashWorkerV2(BaseSpecWorker):
     def spec_v2_attn_backends(self) -> tuple:
         # Every attn backend a spec_v2 forward touches; consumed by
         # decide_needs_cpu_seq_lens to gate the seq_lens_cpu D2H.
+        if not self._hosts_draft:
+            return (self._target_worker.model_runner.attn_backend,)
         return (
             self._target_worker.model_runner.attn_backend,
             self.draft_model_runner.attn_backend,
@@ -617,6 +636,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
     ):
+        if not self._hosts_draft:
+            return
         # Without draft windowing, the draft worker aliases the target
         # request->token mapping and allocation state. With draft windowing
         # enabled, the draft worker keeps a private compact req->token table
@@ -631,6 +652,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def init_attention_backends(self):
+        if not self._hosts_draft:
+            return
         with (
             draft_pp_context(),
             draft_tp_context(self.draft_owns_attention),
@@ -644,6 +667,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
+        if not self._hosts_draft:
+            return
         with (
             draft_pp_context(),
             draft_tp_context(self.draft_owns_attention),
@@ -662,10 +687,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "device graph capture.",
                     type(current_platform).__name__,
                 )
-            if get_parallel().attn_dp_enabled and capture_decode_cuda_graph:
+            if _is_npu and get_parallel().attn_dp_enabled and capture_decode_cuda_graph:
                 # Idle DP ranks skip the draft step, so they cannot join a
                 # shared graph capture/replay; keep the draft eager under dp
-                # attention.
+                # attention. On CUDA the draft runs attn-TP-local
+                # (draft_tp_context, no cross-DP collective) and keys its
+                # graphs by the local batch size, so only busy DP groups
+                # replay (see DecodeCudaGraphRunner._forward_is_dp_local).
                 capture_decode_cuda_graph = False
                 if self._target_tp_rank == 0:
                     logger.warning(
@@ -728,7 +756,11 @@ class DFlashWorkerV2(BaseSpecWorker):
     def prewarm_sampling(self) -> SamplingPrewarmResult:
         """Rehearse the non-greedy verify path so an undersized graph-pool
         borrow surfaces at startup rather than under traffic."""
-        if not is_cuda() or not is_dflash_sampling_verify_available():
+        if (
+            not self._hosts_draft
+            or not is_cuda()
+            or not is_dflash_sampling_verify_available()
+        ):
             return self.model_runner.prewarm_sampling()
 
         block_size = int(self.block_size)
@@ -1918,6 +1950,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                     layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
                         layer, ctx_hidden
                     )
+                    if isinstance(attn, DFlashMLAAttention):
+                        attn.write_context_kv(
+                            pool=self.draft_model_runner.token_to_kv_pool,
+                            positions=positions,
+                            hidden_states=layer_ctx_hidden,
+                            cache_loc=cache_loc,
+                            cache_loc_2d=cache_loc_2d,
+                            commit_lens=commit_lens,
+                        )
+                        continue
                     k, v = attn.kv_proj_only(layer_ctx_hidden)
                     k = attn.apply_k_norm(k)
                     k = attn.apply_k_rope(positions, k)
@@ -1968,6 +2010,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
                 layer, ctx_hidden
             )
+            if isinstance(attn, DFlashMLAAttention):
+                attn.write_context_kv(
+                    pool=self.draft_model_runner.token_to_kv_pool,
+                    positions=ctx_positions,
+                    hidden_states=layer_ctx_hidden,
+                    cache_loc=ctx_cache_loc,
+                )
+                continue
             if _is_npu:
                 _, k, v = attn.forward_prepare_npu(ctx_positions, layer_ctx_hidden)
                 # Keep V scaling consistent with forward().
@@ -2291,6 +2341,18 @@ class DFlashWorkerV2(BaseSpecWorker):
         grammar_barrier=None,
         pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
+        if not self._hosts_draft:
+            # An earlier pipeline stage of a PD prefill: the target forward,
+            # whose captured aux hidden states ride the PP proxy onward.
+            batch_output = self.target_worker.forward_batch_generation(
+                batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
+            batch_output.new_seq_lens = batch.seq_lens
+            if on_publish is not None:
+                on_publish(batch_output.new_seq_lens)
+            return batch_output
         self._validate_phase1_sampling_support(batch)
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
@@ -2384,6 +2446,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             # verify forward (IDLE mode) so its cross-DP collectives stay in
             # lockstep with the active DP group; the draft block's
             # collectives are within-rank and skipped.
+            idle_can_run_cuda_graph = False
             if get_parallel().attn_dp_enabled:
                 idle_verify_input = DFlashVerifyInput(
                     draft_token=torch.empty((0,), dtype=torch.long, device=self.device),
@@ -2392,14 +2455,21 @@ class DFlashWorkerV2(BaseSpecWorker):
                     custom_mask=None,
                     capture_hidden_mode=CaptureHiddenMode.FULL,
                 )
-                idle_verify_forward_batch, _ = idle_verify_input.prepare_for_verify(
-                    batch, self._target_worker
+                idle_verify_forward_batch, idle_can_run_cuda_graph = (
+                    idle_verify_input.prepare_for_verify(batch, self._target_worker)
                 )
-                # Force eager: the active ranks run eager verify when any DP
-                # rank is idle (see the idle-guard below); a graph-replaying
-                # idle rank would disagree with them on DP-gather segment
-                # offsets (padded bucket vs raw counts).
-                idle_verify_forward_batch.can_run_decode_cuda_graph = False
+                if _is_npu:
+                    # Force eager: NPU active ranks run eager verify when any
+                    # DP rank is idle (see the idle-guard below); a
+                    # graph-replaying idle rank would disagree with them on
+                    # DP-gather segment offsets (padded bucket vs raw counts).
+                    idle_verify_forward_batch.can_run_decode_cuda_graph = False
+                    idle_can_run_cuda_graph = False
+                # On CUDA the idle rank keeps prepare_for_verify's graph
+                # decision: the bucket is max(original_global_num_tokens_cpu)
+                # on every rank, so it replays the active ranks' graph with
+                # zero real rows (raw_bs=0) and the same [bucket*w]*ndp
+                # DP-gather layout, like plain decode and EAGLE idle ranks.
                 self._target_worker.forward_batch_generation(
                     batch=None,
                     forward_batch=idle_verify_forward_batch,
@@ -2419,7 +2489,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 next_token_ids=empty_ids,
                 accept_lens=empty_lens,
                 next_draft_input=next_draft_input,
-                can_run_cuda_graph=False,
+                can_run_cuda_graph=idle_can_run_cuda_graph,
                 speculative_num_draft_tokens=int(self.block_size),
                 new_seq_lens=next_draft_input.new_seq_lens,
             )
@@ -2605,6 +2675,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
             global_num_token_non_padded_cpu=bs * block_size,
         )
+        # Graph eligibility follows the target batch (the scheduler's DP vote),
+        # as for the DSpark draft; the draft keys its graph by local batch size.
+        forward_batch.can_run_decode_cuda_graph = batch.can_run_decode_cuda_graph
         # The draft block writes the whole window. A compact draft reads its
         # own `req_to_token` rows over its own lengths.
         draft_translator = self.draft_model_runner.kv_index_translator
@@ -2800,12 +2873,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
 
-        # Idle-DP guard: an idle rank's eager verify contributes raw scheduler
-        # counts while a graph-replaying rank assumes the padded bucket, so
-        # their DP-gather segment offsets disagree. Fall back to eager verify
-        # whenever any DP rank is idle this round.
+        # Idle-DP guard (NPU): an idle rank's eager verify contributes raw
+        # scheduler counts while a graph-replaying rank assumes the padded
+        # bucket, so their DP-gather segment offsets disagree. Fall back to
+        # eager verify whenever any DP rank is idle this round. CUDA idle
+        # ranks replay the same bucket instead (see the idle branch above).
         if (
-            get_parallel().attn_dp_enabled
+            _is_npu
+            and get_parallel().attn_dp_enabled
             and verify_forward_batch.original_global_num_tokens_cpu is not None
             and min(verify_forward_batch.original_global_num_tokens_cpu) == 0
         ):

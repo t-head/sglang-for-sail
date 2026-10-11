@@ -292,6 +292,44 @@ class PrefetchOperation(StorageOperation):
             return self._terminated_flag
 
 
+def check_dcp_l3_extra_pool(entry: Any, anchor: Any) -> None:
+    """Reject a host pool that HiCache L3 cannot store under DCP.
+
+    The DCP L3 path stores one physical page per logical page on each rank, so
+    every pool besides the MLA anchor must be either per-slot state or sharded
+    by the same DCP rows as the anchor.
+    """
+    from sglang.srt.layers.dcp.layout import dsa_shards_index_k
+    from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
+    from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
+    from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+
+    pool = entry.host_pool
+    if pool is anchor:
+        return
+    if entry.name == PoolName.MAMBA and isinstance(pool, MambaPoolHost):
+        return  # KDA state: one slot per key
+    if (
+        entry.name == PoolName.INDEXER
+        and isinstance(pool, DSAIndexerPoolHost)
+        and dsa_shards_index_k()
+        and pool.dcp_size == anchor.dcp_size
+        and pool.size == anchor.size
+    ):
+        return  # index-K row-sharded like the MLA KV (Kimi-K3.1)
+    if (
+        entry.name == PoolName.DRAFT
+        and isinstance(pool, MLATokenToKVPoolHost)
+        and pool.kv_buffer is not None
+        and pool.dcp_size == anchor.dcp_size
+    ):
+        return  # DFLASH MLA draft holds this rank's rows, like the target
+    raise NotImplementedError(
+        f"HiCache L3 with DCP does not support the {entry.name} host pool "
+        f"({type(pool).__name__})."
+    )
+
+
 class HiCacheController:
     def __init__(
         self,

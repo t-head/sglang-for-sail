@@ -44,6 +44,9 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     dflash_target_layer_ids: Any = None
     # DFLASH draft KV bytes/token; None when unresolved.
     dflash_draft_cell_size_per_token: int | None = None
+    # The DFLASH draft pool keeps DCP-collapsed MLA rows (one per target row),
+    # so the target's budget charges it per row, not per widened location.
+    dflash_draft_rows_dcp_collapsed: bool = False
     # The draft checkpoint read in draft mode, and its KV layer count, for
     # every drafting algorithm: the fused-draft placement's input. A private
     # EAGLE draft pool is sized by `eagle_draft_num_layers` instead.
@@ -225,7 +228,10 @@ def _resolve_dflash_aux_hidden_state(
         config.draft_model_config = draft_model_config
         config.draft_kv_num_layers = int(draft_num_layers)
         config.dflash_target_layer_ids = target_layer_ids
-        config.dflash_draft_cell_size_per_token = _resolve_dflash_draft_cell_size(
+        (
+            config.dflash_draft_cell_size_per_token,
+            config.dflash_draft_rows_dcp_collapsed,
+        ) = _resolve_dflash_draft_cell_size(
             draft_model_config=draft_model_config,
             draft_num_layers=int(draft_num_layers),
         )
@@ -235,13 +241,19 @@ def _resolve_dflash_draft_cell_size(
     *,
     draft_model_config: ModelConfig,
     draft_num_layers: int,
-) -> int | None:
-    """Bytes/token the DFLASH draft KV pool will cost the target's pool budget.
+) -> tuple[int | None, bool]:
+    """Bytes/token the DFLASH draft KV pool will cost the target's pool budget,
+    and whether its MLA rows are DCP-collapsed.
 
     Resolved from the draft's own attention geometry and the KV dtype the draft
-    worker will actually resolve. Returns None if anything is unresolvable,
-    leaving callers on layer-count scaling.
+    worker will actually resolve. Returns (None, False) if anything is
+    unresolvable, leaving callers on layer-count scaling.
     """
+    from sglang.srt.configs.hybrid_arch import mambaish_config
+    from sglang.srt.configs.model_config import AttentionArch
+    from sglang.srt.mem_cache.kv_cache_configurator import (
+        mla_draft_rows_are_dcp_collapsed,
+    )
     from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
     from sglang.srt.speculative.dflash_utils import dflash_draft_cell_size_per_token
 
@@ -259,7 +271,7 @@ def _resolve_dflash_draft_cell_size(
                 get_spec().speculative_draft_attention_backend
             ),
         )
-        return dflash_draft_cell_size_per_token(
+        cell_size = dflash_draft_cell_size_per_token(
             draft_model_config=draft_model_config,
             draft_num_layers=draft_num_layers,
             draft_kv_cache_dtype=draft_kv_cache_dtype,
@@ -272,4 +284,23 @@ def _resolve_dflash_draft_cell_size(
             "layer-count scaling for the KV pool budget.",
             e,
         )
-        return None
+        return None, False
+    if get_parallel().attn_dcp_size <= 1:
+        return cell_size, False
+    try:
+        collapsed = mla_draft_rows_are_dcp_collapsed(
+            model_config=draft_model_config,
+            use_mla_backend=draft_model_config.attention_arch == AttentionArch.MLA,
+            has_mambaish_state=mambaish_config(draft_model_config) is not None,
+            is_hybrid_swa=draft_model_config.is_hybrid_swa,
+            kv_cache_dtype=draft_kv_cache_dtype,
+        )
+    except Exception as e:  # noqa: BLE001
+        # Charging per widened location only over-reserves; keep it on doubt.
+        logger.warning(
+            "Could not resolve the DFLASH draft's DCP row layout (%s); charging it "
+            "per widened location.",
+            e,
+        )
+        collapsed = False
+    return cell_size, collapsed

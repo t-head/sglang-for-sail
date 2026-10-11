@@ -186,6 +186,13 @@ class StageBoundary:
             )
         return self.exit(forward_batch).finish(hidden_states)
 
+    def outputs_on_cp_shards(self, forward_batch) -> bool:
+        """Whether this batch's compute must return only this rank's CP rows,
+        its sum complete (``StageDeclaration.output_on_cp_shards``)."""
+        return self.declaration.output_on_cp_shards and self.plan.outputs_on_cp_shards(
+            self.plan.variant_for(forward_batch)
+        )
+
     def exit(self, forward_batch):
         """Select and scope one FFN or single-stage mixer's output decision,
         for an FFN whose MoE may hand off its finalize (see finish()).
