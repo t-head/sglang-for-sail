@@ -13,8 +13,9 @@ from sglang.srt.layers.moe.topk import (
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
     has_per_rank_fused_shared_slots,
+    is_deepep_class_backend,
 )
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_hip
 
 
 def _scale_fused_shared_weights(weights, num_fused_shared_experts, scaling_factor):
@@ -35,7 +36,8 @@ def vision_topk(
     config = moe.topk.topk_config
     num_fused_shared_experts = config.num_fused_shared_experts
     use_mega_moe = get_moe_a2a_backend().is_megamoe()
-    if num_fused_shared_experts and not use_mega_moe:
+    use_deepep = is_deepep_class_backend()
+    if num_fused_shared_experts and not (use_mega_moe or use_deepep):
         # This path bypasses _post_process_topk_ids, which appends the per-rank slots.
         assert not has_per_rank_fused_shared_slots(num_fused_shared_experts), (
             "VL routing does not support per-rank fused shared slots"
@@ -50,6 +52,7 @@ def vision_topk(
         if (
             num_fused_shared_experts == 0
             and not use_mega_moe
+            and not use_deepep
             and get_moe_runner_backend().is_flashinfer_mxfp4()
         ):
             packed_topk = torch.empty(
@@ -136,9 +139,10 @@ def _finish_vision_topk(
 ):
     config = moe.topk.topk_config
     use_mega_moe = get_moe_a2a_backend().is_megamoe()
-    if use_mega_moe:
-        # Use the same EPLB mapping, recording and home-rank shared slots as
-        # ordinary top-k before handing physical expert IDs to MegaMoE.
+    use_dispatch_postprocessing = use_mega_moe or is_deepep_class_backend()
+    if use_dispatch_postprocessing:
+        # DeepEP and MegaMoE need the ordinary top-k EPLB mapping, recording
+        # and home-rank shared slots before dispatch.
         indices, weights, recorder_ids = _post_process_topk_ids(
             indices,
             weights,
@@ -153,7 +157,7 @@ def _finish_vision_topk(
             config.num_fused_shared_experts
             and config.apply_routed_scaling_factor_on_output
         ):
-            # MegaMoE applies no post-expert scale when it is already in top-k.
+            # No post-expert scale is applied when it is already in top-k.
             weights[:, -config.num_fused_shared_experts :] = 1.0
         if recorder_ids is not None:
             get_global_expert_distribution_recorder().on_select_experts(
@@ -168,8 +172,11 @@ def _finish_vision_topk(
     # Shared-slot remapping can overwrite padded weights; mask last so idle
     # and partially padded DP ranks never dispatch a phantom shared expert.
     if num_token_non_padded is not None and (
-        not padded_rows_masked or (use_mega_moe and config.num_fused_shared_experts)
+        not padded_rows_masked
+        or (use_dispatch_postprocessing and config.num_fused_shared_experts)
     ):
-        _mask_topk_ids_padded_region(indices, num_token_non_padded)
+        _mask_topk_ids_padded_region(
+            indices, num_token_non_padded, fill_value=0 if is_hip() else -1
+        )
         _zero_topk_weights_padded_region(weights, num_token_non_padded)
     return weights, indices
