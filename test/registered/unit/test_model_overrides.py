@@ -1920,7 +1920,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
     def test_layer_types_hybrid_swa_memory_off_on_default_aiter(self):
         # The gate has to see the default backend, which resolves after the
         # model overrides run.
-        with override_platform(is_cuda=False, is_hip=True):
+        with override_platform(is_cuda=False, is_hip=True, is_sail=False):
             sa = self._construct(
                 "Gemma3ForCausalLM", "llama", config_extra=self._SWA_MIX
             )
@@ -3542,6 +3542,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         def _view(hf, **kw):
             defaults = dict(
                 disable_radix_cache=False,
+                attention_backend=None,
+                decode_attention_backend=None,
                 mamba_radix_cache_strategy="auto",
                 disable_overlap_schedule=False,
                 page_size=None,
