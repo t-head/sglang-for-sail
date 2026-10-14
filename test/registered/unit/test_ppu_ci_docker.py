@@ -9,9 +9,12 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 from pathlib import Path
+
+import yaml
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -21,7 +24,11 @@ if sys.platform == "linux":
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
-SCRIPT = Path(__file__).resolve().parents[3] / "scripts/ci/ppu/run_test.sh"
+REPO = Path(__file__).resolve().parents[3]
+SCRIPT = REPO / "scripts/ci/ppu/run_test.sh"
+WORKFLOW = REPO / ".github/workflows/pr-test-ppu.yml"
+# Finish before GitHub's ~7.5s SIGINT + 2.5s SIGTERM force-kill window.
+CANCELLATION_BUDGET = 7.5
 SHA = "a" * 40
 IMAGE_ID = "sha256:" + "b" * 64
 
@@ -33,7 +40,7 @@ from pathlib import Path
 
 args = sys.argv[1:]
 root = Path(os.environ["FIXTURE_SOURCE"])
-assert args[:2] == ["-C", str(root)] or args[:2] == ["-C", str(root / "scripts/ci/ppu")], args
+assert args[0] == "-C" and Path(args[1]).resolve() in (root, root / "scripts/ci/ppu"), args
 args = args[2:]
 if args == ["rev-parse", "--show-toplevel"]:
     print(root)
@@ -57,6 +64,7 @@ import json
 import os
 import signal
 import sys
+import time
 from pathlib import Path
 
 args = sys.argv[1:]
@@ -89,7 +97,11 @@ elif args[0] == "start":
     data["pid"] = os.getpid()
     state.write_text(json.dumps(data))
     if os.environ.get("BLOCK_TEST"):
-        signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+        # Model PID 1 deferring TERM while its foreground inference is running.
+        if os.environ.get("DELAY_CONTAINER_TERM"):
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        else:
+            signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
         with (root / "ready.fifo").open("w") as ready:
             ready.write("started\n")
         signal.pause()
@@ -100,6 +112,20 @@ elif args[0] == "stop":
     if "pid" in data:
         try:
             os.kill(data["pid"], signal.SIGTERM)
+            if os.environ.get("DELAY_CONTAINER_TERM"):
+                # Simulate Docker's daemon waiting the requested grace, then KILL.
+                grace = 10.0
+                for index, arg in enumerate(args):
+                    if arg.startswith(("--time=", "--timeout=")):
+                        grace = float(arg.split("=", 1)[1])
+                    elif arg in ("--time", "--timeout", "-t"):
+                        grace = float(args[index + 1])
+                started = time.monotonic()
+                time.sleep(grace)
+                os.kill(data["pid"], signal.SIGKILL)
+                (root / "stop-delay.json").write_text(json.dumps({
+                    "grace": grace, "elapsed": time.monotonic() - started,
+                }))
         except ProcessLookupError:
             pass
 elif args[0] == "rm":
@@ -168,7 +194,8 @@ class TestPPUCIDocker(CustomTestCase):
         self.env = {
             key: value
             for key, value in os.environ.items()
-            if not key.startswith("PPU_CI_") and key != "NVIDIA_VISIBLE_DEVICES"
+            if not key.startswith(("PPU_CI_", "CONFIG_PPU_CI_"))
+            and key != "NVIDIA_VISIBLE_DEVICES"
         }
         self.env.update(
             PATH=f"{self.bin}:{os.environ['PATH']}",
@@ -400,27 +427,57 @@ class TestPPUCIDocker(CustomTestCase):
         self.assertIn(f"--device=/dev/alixpu_ppu{self.device}", create)
         self.assertFalse(any(event["args"][0] == "pull" for event in self.events()))
 
-    def start_blocked(self):
+    def start_blocked(self, **updates):
+        workflow = yaml.safe_load(WORKFLOW.read_text())
+        step = next(
+            step
+            for step in workflow["jobs"]["ppu-sanity"]["steps"]
+            if step.get("name")
+            == "Run both speculative sanity files in isolated Docker"
+        )
+        env = {
+            **self.env,
+            "BLOCK_TEST": "1",
+            "RUNNER_TEMP": str(self.root / "runner-a"),
+            **updates,
+        }
+        for key in step["env"]:
+            env[key] = env.pop(key.removeprefix("CONFIG_"), "")
+        # Sourcing prevents bash -c's implicit exec from masking the wrapper bug.
+        step_script = self.root / "workflow-step.sh"
+        step_script.write_text(step["run"])
         process = subprocess.Popen(
-            ["bash", str(self.launcher)],
-            cwd=self.root,
-            env={
-                **self.env,
-                "BLOCK_TEST": "1",
-                "RUNNER_TEMP": str(self.root / "runner-a"),
-            },
+            [
+                "bash",
+                "-e",
+                "-o",
+                "pipefail",
+                "-c",
+                'source "$1"',
+                "workflow-step",
+                str(step_script),
+            ],
+            cwd=self.source,
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            start_new_session=True,
         )
 
         def cleanup():
-            if process.poll() is None:
-                process.terminate()
-                process.communicate(timeout=10)
+            # A broken wrapper may exit before its children release pipes and locks.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate(timeout=5)
 
         self.addCleanup(cleanup)
         readable, _, _ = select.select([self.ready], [], [], 10)
+        if not readable and process.poll() is not None:
+            output, errors = process.communicate(timeout=1)
+            self.fail(f"workflow exited before container start: {output}{errors}")
         self.assertTrue(readable, "launcher did not reach attached container start")
         self.assertEqual(os.read(self.ready, 100), b"started\n")
         return process
@@ -439,18 +496,41 @@ class TestPPUCIDocker(CustomTestCase):
         self.assertEqual(first.returncode, 143)
         self.assert_lifecycle()
 
-    def test_cancellation_cleans_up_before_unlocking(self):
-        """The host must handle signals while Docker is attached, not after inference."""
-        for sig, code in ((signal.SIGTERM, 143), (signal.SIGINT, 130)):
-            with self.subTest(signal=sig):
-                process = self.start_blocked()
-                process.send_signal(sig)
-                output, errors = process.communicate(timeout=10)
-                self.assertEqual(process.returncode, code, output + errors)
-                self.assert_lifecycle()
-                (self.root / "docker.jsonl").unlink()
-                for private in self.artifacts.iterdir():
-                    shutil.rmtree(private)
+    def assert_workflow_cancellation(self, sig, code, **updates):
+        process = self.start_blocked(**updates)
+        started = time.monotonic()
+        process.send_signal(sig)
+        try:
+            output, errors = process.communicate(timeout=CANCELLATION_BUDGET)
+        except subprocess.TimeoutExpired:
+            self.fail(
+                "workflow cancellation did not finish cleanup before the "
+                f"{CANCELLATION_BUDGET}s budget; status={process.poll()}, "
+                f"Docker events={self.events()}"
+            )
+        elapsed = time.monotonic() - started
+        self.assertEqual(process.returncode, code, output + errors)
+        self.assertLess(elapsed, CANCELLATION_BUDGET)
+        self.assert_lifecycle()
+        return elapsed
+
+    def test_workflow_sigterm_cleans_up_before_unlocking(self):
+        """Signalling the step PID must not orphan its attached child launcher."""
+        self.assert_workflow_cancellation(signal.SIGTERM, 143)
+
+    def test_workflow_sigint_cleans_up_before_unlocking(self):
+        """GitHub's initial INT must reach cleanup without waiting for inference."""
+        self.assert_workflow_cancellation(signal.SIGINT, 130)
+
+    def test_workflow_cancellation_with_delayed_container_term(self):
+        """A PID 1 deferring TERM must not consume the runner's force-kill budget."""
+        elapsed = self.assert_workflow_cancellation(
+            signal.SIGINT, 130, DELAY_CONTAINER_TERM="1"
+        )
+        delay = json.loads((self.root / "stop-delay.json").read_text())
+        self.assertGreater(delay["grace"], 0)
+        self.assertGreaterEqual(delay["elapsed"], delay["grace"])
+        self.assertGreaterEqual(elapsed, delay["elapsed"])
 
 
 if __name__ == "__main__":

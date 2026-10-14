@@ -140,7 +140,8 @@ cleanup() {
     set +e
     cleanup_code=0
     if [[ -n "$container" ]]; then
-        docker stop --time=30 "$container" 9>&- >/dev/null 2>&1
+        # Leave time for removal and ownership recovery before runner SIGKILL.
+        docker stop --time=2 "$container" 9>&- >/dev/null 2>&1
         docker rm --force "$container" 9>&- >/dev/null 2>&1 || cleanup_code=1
     fi
     if [[ -n "$docker_pid" ]]; then

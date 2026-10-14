@@ -239,7 +239,7 @@ jobs:
               export "$key=${!override}"
             fi
           done
-          bash scripts/ci/ppu/run_test.sh
+          exec bash scripts/ci/ppu/run_test.sh
 
       - name: Upload runtime diagnostics
         if: always()
