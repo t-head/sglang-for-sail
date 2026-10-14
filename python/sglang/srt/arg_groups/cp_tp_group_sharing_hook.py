@@ -9,6 +9,7 @@ from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+from sglang.srt.utils.device import is_sail
 
 # Architectures whose model code implements CP-TP group sharing: the CP group
 # is the TP group, the residual stream / attention / indexer are CP-sharded,
@@ -98,8 +99,14 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
                 "disaggregation-transfer-backend != mooncake": (
                     cfg.disaggregation_transfer_backend != "mooncake"
                 ),
-                "speculative-algorithm != DFLASH": cfg.speculative_algorithm
-                != "DFLASH",
+                "speculative-algorithm != DFLASH": cfg.speculative_algorithm != "DFLASH"
+                and not (
+                    is_sail()
+                    and (
+                        cfg.speculative_algorithm is None
+                        or cfg.speculative_algorithm.upper() in ("EAGLE", "NEXTN")
+                    )
+                ),
                 "pp-size > 1": cfg.pp_size > 1,
                 "dp-size > 1": cfg.dp_size > 1,
                 "ep-size > 1": view.ep_size > 1,

@@ -796,6 +796,13 @@ class KVStorage:
             return None
         return page_envelope_pair(self._plan)
 
+    @property
+    def mamba_state_shard_on_attn_cp(self) -> bool:
+        state = self._allocator.state
+        return bool(
+            state is not None and getattr(state.pool, "state_shard_on_attn_cp", False)
+        )
+
     def wire_entries(self) -> Tuple[WireEntry, ...]:
         return self._plan.wire_entries()
 

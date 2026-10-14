@@ -543,7 +543,9 @@ class CommonKVManager(BaseKVManager):
     ) -> Optional[List]:
         return state_indices
 
-    def _should_skip_cp_replicated_state_transfer(self) -> bool:
+    def _should_skip_cp_replicated_state_transfer(
+        self, *, include_cp_tp_shared_state: bool = False
+    ) -> bool:
         """Whether this prefill rank should omit CP-replicated state.
 
         Prefill CP materializes global token order before writing state pools, so
@@ -552,12 +554,17 @@ class CommonKVManager(BaseKVManager):
         exception because each CP rank owns different state layers. Page-sharded
         DSA indexer state likewise needs every owner; Mooncake filters its page
         lists before transfer instead of suppressing whole ranks.
+        ``include_cp_tp_shared_state`` checks replicated non-Mamba entries even
+        when CP-TP sharing makes the recurrent state itself rank-local.
         """
         return (
             self.attn_cp_size > 1
             and self.attn_cp_rank != 0
             and not get_parallel().enable_dsa_cache_layer_split
-            and not get_parallel().enable_cp_tp_group_sharing
+            and (
+                include_cp_tp_shared_state
+                or not get_parallel().enable_cp_tp_group_sharing
+            )
             and getattr(self, "kv_shard_size", 1) <= 1
         )
 

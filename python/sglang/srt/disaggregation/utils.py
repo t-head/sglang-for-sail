@@ -1825,6 +1825,7 @@ def setup_state_kv_args(
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
     kv_args.state_types = []
+    kv_args.mamba_state_shard_on_attn_cp = storage.mamba_state_shard_on_attn_cp
     kv_args.dsa_index_k_token_bytes = None
     kv_args.state_sub_pools = []
     kv_args.state_wire_keys = []
