@@ -40,6 +40,7 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import build_eager_reg
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
     forward_context,
+    get_attn_backend,
     get_forward_context,
     get_req_to_token_pool,
     get_token_to_kv_pool,
@@ -59,11 +60,13 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import is_hip, is_npu
 from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.device import is_sail
 from sglang.srt.utils.device_timer import device_timer_ctx
 
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
+_is_sail = is_sail()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -224,12 +227,19 @@ class EagerRunner(BaseRunner):
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         model_runner = self.model_runner
         forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
+        attn_backend = model_runner.attn_backend
+        if (
+            _is_sail
+            and model_runner.is_draft_worker
+            and forward_batch.forward_metadata_replan_equivalent
+        ):
+            attn_backend = get_attn_backend()
         if forward_batch.needs_forward_metadata_init():
             if hasattr(model_runner.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 model_runner.model.prepare_forward_batch(forward_batch)
-            model_runner.attn_backend.init_forward_metadata(forward_batch)
+            attn_backend.init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
 
