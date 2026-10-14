@@ -760,6 +760,7 @@ def popen_launch_server(
         merged = os.environ.copy()
         merged.update(env)
         env = merged
+    offline_required = env.get("HF_HUB_OFFLINE") == "1"
 
     # A dying predecessor can hold the derived port plan past
     # kill_process_tree() while GPU teardown completes; give CI launches
@@ -821,8 +822,8 @@ def popen_launch_server(
     process = _launch_server_process(command, env, return_stdout_stderr, model)
     success, error_msg = _wait_for_server_health(process, base_url, api_key, timeout)
 
-    # If offline launch failed and offline was enabled, retry with online mode
-    if not success and offline_enabled:
+    # Auto-detected offline mode may retry; explicit offline requests must not.
+    if not success and offline_enabled and not offline_required:
         print(
             f"CI_OFFLINE: Offline launch failed ({error_msg}), retrying with online mode..."
         )
