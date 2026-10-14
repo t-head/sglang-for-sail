@@ -54,6 +54,7 @@ defaults:
 
 env:
   GIT_CONFIG_NOSYSTEM: "1"
+  PPU_CI_RUNTIME_IMAGE: "reg.docker.alibaba-inc.com/ai-tmp/llm@sha256:83f3624dcdeb22f85a8608c5cb0fc1897dbd81ea442eec05f3da6095d71617a5"
 
 jobs:
   check-changes:
