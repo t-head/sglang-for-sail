@@ -421,9 +421,6 @@ def run_a_suite(args):
             ci_tests, auto_partition_id, auto_partition_size, live_est=live_est
         )
 
-    if hw == HWBackend.PPU and not ci_tests:
-        raise ValueError("PPU suite requires at least one enabled test")
-
     pretty_print_tests(args, ci_tests, skipped_tests)
 
     # None hands the per-file budget over to est_time (see run_unittest_files).

@@ -5,7 +5,6 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -60,35 +59,53 @@ class TestPPUCISuite(CustomTestCase):
             ["core/test_basic_sanity_eagle3.py", "core/test_basic_sanity_dflash.py"],
         )
 
-    def test_empty_ppu_suite_fails(self):
-        for disabled in (False, True):
-            with self.subTest(disabled=disabled), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                runner = root / "run_suite.py"
-                runner.write_text(RUNNER.read_text())
-                if disabled:
-                    registered = root / "registered"
-                    registered.mkdir()
-                    (registered / "test_disabled.py").write_text(
-                        'register_ppu_ci(est_time=1, suite="stage-a-test-1-gpu-ppu", '
-                        'disabled="test fixture")\n'
+    def test_runtime_requires_both_sanity_files_to_pass(self):
+        source = Path(__file__).with_name("build_and_test.sh").read_text()
+        marker = 'cd "$artifacts"\n'
+        self.assertIn(marker, source)
+        script = (
+            "\n".join(source.splitlines()[:2])
+            + "\n"
+            + marker
+            + source.split(marker, 1)[1]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo with spaces"
+            (root / "test").mkdir(parents=True)
+            artifacts = root / "artifacts"
+            artifacts.mkdir()
+            (root / "test/run_suite.py").write_text(
+                "import os, sys\n"
+                "print(os.environ['FIXTURE_SUMMARY'], file=sys.stderr)\n"
+                "sys.exit(int(os.environ['FIXTURE_EXIT']))\n"
+            )
+            for summary, exit_code, expected in (
+                ("Test Summary: 2/2 passed", 0, 0),
+                ("Test Summary: 0/0 passed", 0, 1),
+                ("Test Summary: 1/1 passed", 0, 1),
+                ("Test Summary: 1/2 passed", 0, 1),
+                ("Test Summary: 3/3 passed", 0, 1),
+                ("Test Summary: 2/2 passed", 7, 7),
+                ("Test Summary: 2/2 passed (incomplete)", 0, 1),
+                ("", 0, 1),
+            ):
+                with self.subTest(summary=summary, exit_code=exit_code):
+                    result = subprocess.run(
+                        ["bash", "-c", script],
+                        env=dict(
+                            os.environ,
+                            repo=str(root),
+                            artifacts=str(artifacts),
+                            FIXTURE_SUMMARY=summary,
+                            FIXTURE_EXIT=str(exit_code),
+                        ),
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
                     )
-                result = subprocess.run(
-                    [
-                        sys.executable,
-                        str(runner),
-                        "--hw",
-                        "ppu",
-                        "--suite",
-                        "stage-a-test-1-gpu-ppu",
-                    ],
-                    capture_output=True,
-                    text=True,
-                )
-                self.assertNotEqual(result.returncode, 0, result.stdout)
-                self.assertIn(
-                    "PPU suite requires at least one enabled test", result.stderr
-                )
+                    self.assertEqual(
+                        result.returncode, expected, result.stdout + result.stderr
+                    )
 
 
 class TestPPUCIWorkflow(CustomTestCase):
@@ -96,6 +113,13 @@ class TestPPUCIWorkflow(CustomTestCase):
     def setUpClass(cls):
         path = RUNNER.parent.parent / ".github/workflows/pr-test-ppu.yml"
         cls.jobs = yaml.safe_load(path.read_text())["jobs"]
+
+    def test_runtime_image_is_only_configured_by_runner_environment(self):
+        path = RUNNER.parent.parent / ".github/workflows/pr-test-ppu.yml"
+        workflow = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+        for event in ("workflow_dispatch", "workflow_call"):
+            self.assertNotIn("runtime_image", workflow["on"][event]["inputs"])
+        self.assertNotIn("PPU_CI_RUNTIME_IMAGE", path.read_text())
 
     def test_shared_ci_changes_do_not_require_ppu_labels(self):
         """Shared CI edits must not opt unrelated PRs into the PPU label gate."""

@@ -78,10 +78,18 @@ with (root / "docker.jsonl").open("a") as log:
     log.write(json.dumps({"args": args, "lock_held": held}) + "\n")
 state = root / "container.json"
 if args[:2] == ["image", "inspect"]:
+    print("Inspecting " + args[2], file=sys.stderr)
     if os.environ.get("MISSING_IMAGE") and not (root / "pulled").exists():
         sys.exit(1)
+    if os.environ.get("INSPECT_EXIT"):
+        sys.exit(int(os.environ["INSPECT_EXIT"]))
     print("sha256:" + "b" * 64)
 elif args[0] == "pull":
+    print("Pulling " + args[1])
+    print("Registry: " + args[1].split("/")[0], file=sys.stderr)
+    print("Repository: " + args[1], file=sys.stderr)
+    if os.environ.get("PULL_EXIT"):
+        sys.exit(int(os.environ["PULL_EXIT"]))
     (root / "pulled").touch()
 elif args[0] == "create":
     name = args[args.index("--name") + 1]
@@ -249,6 +257,30 @@ class TestPPUCIDocker(CustomTestCase):
         self.assertIn(message, result.stderr)
         self.assertEqual(self.events(), [], "validation must precede Docker")
 
+    def test_runtime_image_requires_runner_configuration(self):
+        self.env.pop("PPU_CI_RUNTIME_IMAGE")
+        self.rejected("Set PPU_CI_RUNTIME_IMAGE explicitly")
+
+    def test_image_acquisition_errors_are_private_and_preserve_status(self):
+        for variable, code in (("PULL_EXIT", 23), ("INSPECT_EXIT", 24)):
+            with self.subTest(failure=variable):
+                result = self.run_launcher(MISSING_IMAGE="1", **{variable: str(code)})
+                self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                self.assertIn("PPU CI:", result.stderr)
+                self.assert_image_reference_is_private(result)
+                self.assertFalse(
+                    any(event["args"][0] == "create" for event in self.events())
+                )
+                with self.lock.open("a") as handle:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def assert_image_reference_is_private(self, result):
+        registry = self.env["PPU_CI_RUNTIME_IMAGE"].split("/")[0]
+        self.assertNotIn(registry, result.stdout + result.stderr)
+        for path in self.artifacts.rglob("*"):
+            if path.is_file():
+                self.assertNotIn(registry, path.read_text(), str(path))
+
     def test_device_is_explicit_and_single_numeric(self):
         """Never turn absent, invalid or multi-card runner assignments into card 0."""
         for device in ("", "all", "void", "1,2", "-1", "1x"):
@@ -368,6 +400,7 @@ class TestPPUCIDocker(CustomTestCase):
         """A tag may move after inspect; an NVIDIA default runtime must not add GPUs."""
         result = self.run_launcher(MISSING_IMAGE="1")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_image_reference_is_private(result)
         create = self.assert_lifecycle()
         self.assertIn("--runtime=runc", create)
         self.assertIn("NVIDIA_VISIBLE_DEVICES=void", create)

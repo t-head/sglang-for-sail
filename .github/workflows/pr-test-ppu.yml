@@ -13,10 +13,6 @@ on:
         required: false
         type: boolean
         default: true
-      runtime_image:
-        description: "CUDA-compatible PPU runtime image, overriding runner configuration"
-        required: false
-        type: string
   workflow_call:
     inputs:
       ref:
@@ -29,11 +25,6 @@ on:
         required: false
         type: boolean
         default: false
-      runtime_image:
-        description: "CUDA-compatible PPU runtime image, overriding runner configuration"
-        required: false
-        type: string
-        default: ''
 
 concurrency:
   # Unrelated label events must not cancel or replace the active PPU checks.
@@ -54,7 +45,6 @@ defaults:
 
 env:
   GIT_CONFIG_NOSYSTEM: "1"
-  PPU_CI_RUNTIME_IMAGE: "reg.docker.alibaba-inc.com/ai-tmp/llm@sha256:83f3624dcdeb22f85a8608c5cb0fc1897dbd81ea442eec05f3da6095d71617a5"
 
 jobs:
   check-changes:
@@ -226,14 +216,13 @@ jobs:
 
       - name: Run both speculative sanity files in isolated Docker
         env:
-          CONFIG_PPU_CI_RUNTIME_IMAGE: ${{ inputs.runtime_image || vars.PPU_CI_RUNTIME_IMAGE }}
           CONFIG_PPU_CI_DEVICE: ${{ vars.PPU_CI_DEVICE }}
           CONFIG_PPU_CI_TARGET_MODEL_PATH: ${{ vars.PPU_CI_TARGET_MODEL_PATH }}
           CONFIG_PPU_CI_EAGLE3_MODEL_PATH: ${{ vars.PPU_CI_EAGLE3_MODEL_PATH }}
           CONFIG_PPU_CI_DFLASH_MODEL_PATH: ${{ vars.PPU_CI_DFLASH_MODEL_PATH }}
           CONFIG_PPU_CI_EVAL_CACHE: ${{ vars.PPU_CI_EVAL_CACHE }}
         run: |
-          for key in PPU_CI_RUNTIME_IMAGE PPU_CI_DEVICE PPU_CI_TARGET_MODEL_PATH PPU_CI_EAGLE3_MODEL_PATH PPU_CI_DFLASH_MODEL_PATH PPU_CI_EVAL_CACHE; do
+          for key in PPU_CI_DEVICE PPU_CI_TARGET_MODEL_PATH PPU_CI_EAGLE3_MODEL_PATH PPU_CI_DFLASH_MODEL_PATH PPU_CI_EVAL_CACHE; do
             override="CONFIG_$key"
             if [[ -n "${!override}" ]]; then
               export "$key=${!override}"

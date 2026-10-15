@@ -168,11 +168,20 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 if ! image_id=$(docker image inspect "$PPU_CI_RUNTIME_IMAGE" --format '{{.Id}}' 9>&- 2>/dev/null); then
-    docker pull "$PPU_CI_RUNTIME_IMAGE" 9>&- &
+    # Docker output can expose the runner-private registry and repository.
+    docker pull "$PPU_CI_RUNTIME_IMAGE" 9>&- >/dev/null 2>&1 &
     docker_pid=$!
-    wait "$docker_pid"
+    wait "$docker_pid" || {
+        code=$?
+        printf '%s\n' 'PPU CI: Failed to pull runtime image' >&2
+        exit "$code"
+    }
     docker_pid=""
-    image_id=$(docker image inspect "$PPU_CI_RUNTIME_IMAGE" --format '{{.Id}}' 9>&-)
+    image_id=$(docker image inspect "$PPU_CI_RUNTIME_IMAGE" --format '{{.Id}}' 9>&- 2>/dev/null) || {
+        code=$?
+        printf '%s\n' 'PPU CI: Failed to inspect runtime image after pull' >&2
+        exit "$code"
+    }
 fi
 [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || fail 'Docker did not resolve an immutable image ID'
 printf '%s\n' "$image_id" > "$private/runtime-image-id.txt"
