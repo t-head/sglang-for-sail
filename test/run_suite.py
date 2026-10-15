@@ -35,7 +35,6 @@ HW_MAPPING = {
 PER_COMMIT_SUITES = {
     HWBackend.CPU: [
         "base-a-test-cpu",
-        "stage-a-test-cpu-ppu",
         "stage-a-test-cpu-intel",
         "stage-a-tp-test-cpu-intel",
         "stage-b-test-cpu-intel",

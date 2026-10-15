@@ -13,35 +13,28 @@ from unittest.mock import patch
 
 import yaml
 
-from sglang.test.ci.ci_register import HWBackend, collect_tests, register_cpu_ci
+from sglang.test.ci.ci_register import HWBackend, collect_tests, ut_parse_one_file
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=20, suite="stage-a-test-cpu-ppu")
-
-RUNNER = Path(__file__).resolve().parents[2] / "run_suite.py"
+RUNNER = Path(__file__).resolve().parents[3] / "test/run_suite.py"
 
 
 class TestPPUCISuite(CustomTestCase):
-    def test_cpu_checks_are_excluded_from_the_general_cpu_suite(self):
+    def test_manual_checks_are_not_ci_registered(self):
         files = list(Path(__file__).parent.glob("test_ppu_ci_*.py"))
-        tests = collect_tests([str(path) for path in files])
-        spec = importlib.util.spec_from_file_location("ppu_run_suite", RUNNER)
-        runner = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(runner)
-        runner.validate_all_suites(tests)
-        general, _ = runner.filter_tests(tests, HWBackend.CPU, ["base-a-test-cpu"])
-        dedicated, skipped = runner.filter_tests(
-            tests, HWBackend.CPU, ["stage-a-test-cpu-ppu"]
-        )
-        self.assertEqual(general, [])
-        self.assertEqual(skipped, [])
         self.assertCountEqual(
-            [Path(test.filename).name for test in dedicated],
+            [path.name for path in files],
             [
                 "test_ppu_ci_dependencies.py",
                 "test_ppu_ci_docker.py",
                 "test_ppu_ci_suite.py",
             ],
+        )
+        for path in files:
+            with self.subTest(path=path.name):
+                self.assertEqual(ut_parse_one_file(str(path)), ([], True))
+        self.assertEqual(
+            list((RUNNER.parent / "registered").rglob("test_ppu_ci_*.py")), []
         )
 
     def test_ppu_suite_contains_both_speculative_sanity_files(self):
@@ -119,7 +112,7 @@ class TestPPUCIWorkflow(CustomTestCase):
             (".github/workflows/pr-test-ppu.yml", True),
             ("scripts/ci/ppu/run_test.sh", True),
             ("python/sglang/srt/platforms/sail.py", True),
-            ("test/registered/unit/test_ppu_ci_suite.py", True),
+            ("scripts/ci/ppu/test_ppu_ci_suite.py", True),
         ):
             with self.subTest(path=path):
                 self.assertEqual(
@@ -127,17 +120,18 @@ class TestPPUCIWorkflow(CustomTestCase):
                     expected,
                 )
 
-    def test_selftest_gates_device_jobs_without_waiting_for_wheels(self):
-        """CPU checks must complete before allocating a device, not after a build."""
-        selftest = self.jobs["ppu-ci-selftest"]
-        self.assertEqual(selftest["runs-on"], "ubuntu-latest")
-        self.assertCountEqual(selftest["needs"], ["check-changes", "pr-gate"])
+    def test_device_jobs_require_build_but_not_manual_checks(self):
+        self.assertNotIn("ppu-ci-selftest", self.jobs)
         self.assertCountEqual(
             self.jobs["ppu-build"]["needs"], ["check-changes", "pr-gate"]
         )
-        self.assertEqual(selftest["if"], "needs.check-changes.outputs.ppu == 'true'")
-        for job in ("ppu-sanity", "pr-test-ppu-finish"):
-            self.assertIn("ppu-ci-selftest", self.jobs[job]["needs"])
+        self.assertCountEqual(
+            self.jobs["ppu-sanity"]["needs"], ["check-changes", "pr-gate", "ppu-build"]
+        )
+        self.assertCountEqual(
+            self.jobs["pr-test-ppu-finish"]["needs"],
+            ["pr-gate", "check-changes", "ppu-build", "ppu-sanity"],
+        )
         self.assertEqual(
             self.jobs["ppu-sanity"]["if"], "needs.check-changes.outputs.ppu == 'true'"
         )
@@ -145,141 +139,161 @@ class TestPPUCIWorkflow(CustomTestCase):
             self.jobs["pr-test-ppu-finish"]["if"],
             "always() && needs.check-changes.result != 'skipped'",
         )
-        checkout = next(
-            step
-            for step in selftest["steps"]
-            if step.get("uses", "").startswith("actions/checkout@")
-        )
-        self.assertEqual(
-            checkout["with"]["ref"], "${{ needs.check-changes.outputs.source-sha }}"
-        )
-        self.assertIn("ignored-label-ppu-ci-selftest", selftest["name"])
         runtime = RUNNER.parent.parent / "scripts/ci/ppu/build_and_test.sh"
         self.assertNotIn("--hw cpu", runtime.read_text())
 
-    def test_selftest_cache_preserves_wheels_and_tracks_dependencies(self):
-        """Default uv cache pruning discards the downloaded CPU wheels."""
-        steps = self.jobs["ppu-ci-selftest"]["steps"]
-        caches = [
-            step
-            for step in steps
-            if step.get("uses", "").startswith("astral-sh/setup-uv@")
-        ]
-        self.assertEqual(len(caches), 1)
-        cache = caches[0]["with"]
-        self.assertIs(cache["enable-cache"], True)
-        self.assertIs(cache["prune-cache"], False)
-        python = next(
-            step
-            for step in steps
-            if step.get("uses", "").startswith("actions/setup-python@")
-        )
-        self.assertEqual(cache["python-version"], python["with"]["python-version"])
-        self.assertTrue(
-            any(
-                fnmatch.fnmatchcase(
-                    ".github/workflows/pr-test-ppu.yml", pattern.strip()
-                )
-                for pattern in cache["cache-dependency-glob"].splitlines()
-            )
-        )
-
-    def test_finish_rejects_unsuccessful_selftest_including_skips(self):
-        """A skipped prerequisite must not produce a successful PPU finish check."""
+    def test_finish_requires_successful_build_and_sanity_when_in_scope(self):
         finish = self.jobs["pr-test-ppu-finish"]["steps"][0]
-        for status in ("success", "failure", "cancelled", "skipped"):
-            for in_scope in (True, False):
-                with self.subTest(status=status, in_scope=in_scope):
-                    needs = {
-                        name: {"result": "success"}
-                        for name in self.jobs["pr-test-ppu-finish"]["needs"]
-                    }
-                    needs["ppu-ci-selftest"] = {"result": status}
-                    result = subprocess.run(
-                        ["bash", "-e", "-o", "pipefail", "-c", finish["run"]],
-                        env=dict(
-                            os.environ,
-                            NEEDS_JSON=json.dumps(needs),
-                            PPU_IN_SCOPE=str(in_scope).lower(),
-                            SELFTEST_RESULT=status,
-                            BUILD_RESULT="success",
-                            SANITY_RESULT="success",
-                        ),
-                        capture_output=True,
-                        text=True,
-                        timeout=10,
-                    )
-                    expected = status == "success" or (
-                        not in_scope and status == "skipped"
-                    )
-                    self.assertEqual(
-                        result.returncode == 0, expected, result.stdout + result.stderr
-                    )
+        statuses = ("success", "failure", "cancelled", "skipped")
+        for build in statuses:
+            for sanity in statuses:
+                for in_scope in (True, False):
+                    with self.subTest(build=build, sanity=sanity, in_scope=in_scope):
+                        needs = {
+                            name: {"result": "success"}
+                            for name in self.jobs["pr-test-ppu-finish"]["needs"]
+                        }
+                        needs["ppu-build"] = {"result": build}
+                        needs["ppu-sanity"] = {"result": sanity}
+                        result = subprocess.run(
+                            ["bash", "-e", "-o", "pipefail", "-c", finish["run"]],
+                            env=dict(
+                                os.environ,
+                                NEEDS_JSON=json.dumps(needs),
+                                PPU_IN_SCOPE=str(in_scope).lower(),
+                                BUILD_RESULT=build,
+                                SANITY_RESULT=sanity,
+                            ),
+                            capture_output=True,
+                            text=True,
+                            timeout=10,
+                        )
+                        allowed = {"success"} if in_scope else {"success", "skipped"}
+                        self.assertEqual(
+                            result.returncode == 0,
+                            build in allowed and sanity in allowed,
+                            result.stdout + result.stderr,
+                        )
+        for variable, job in (
+            ("BUILD_RESULT", "ppu-build"),
+            ("SANITY_RESULT", "ppu-sanity"),
+        ):
+            self.assertEqual(finish["env"][variable], "${{ needs." + job + ".result }}")
+
+
+class TestPPUManualSelftests(CustomTestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.repo = self.root / "repo with spaces"
+        directory = self.repo / "scripts/ci/ppu"
+        directory.mkdir(parents=True)
+        self.script = directory / "run_selftests.sh"
+        source = Path(__file__).with_name("run_selftests.sh")
+        self.assertTrue(source.is_file(), "Manual selftest entry point is missing")
+        self.script.write_bytes(source.read_bytes())
+        self.files = [
+            "test_ppu_ci_dependencies.py",
+            "test_ppu_ci_docker.py",
+            "test_ppu_ci_suite.py",
+        ]
+        self.result_path = self.root / "executed.jsonl"
+        self.env = dict(
+            os.environ,
+            FIXTURE_RESULTS=str(self.result_path),
+            FIXTURE_FAILURE="",
+            SGLANG_IS_IN_CI="1",
+            SGLANG_TEST_MAX_RETRY="9",
+            PYTHONDONTWRITEBYTECODE="0",
+            HF_HUB_OFFLINE="0",
+            PYTHONPATH=str(self.root / "installed"),
+        )
+        for folder, value in (
+            (self.repo / "python", "source"),
+            (self.root / "installed", "installed"),
+        ):
+            folder.mkdir()
+            (folder / "selftest_fixture.py").write_text(f"ORIGIN = {value!r}\n")
+        for name in self.files:
+            (directory / name).write_text(
+                "import json, os, unittest\n"
+                "from pathlib import Path\n"
+                "from selftest_fixture import ORIGIN\n"
+                "class Check(unittest.TestCase):\n"
+                "    def test_environment(self):\n"
+                "        with open(os.environ['FIXTURE_RESULTS'], 'a') as output:\n"
+                "            output.write(json.dumps(Path(__file__).name) + '\\n')\n"
+                "        self.assertEqual(ORIGIN, 'source')\n"
+                "        for key, value in {'SGLANG_IS_IN_CI': '0', 'SGLANG_TEST_MAX_RETRY': '0',\n"
+                "                           'HF_HUB_OFFLINE': '1',\n"
+                "                           'PYTHONDONTWRITEBYTECODE': '1'}.items():\n"
+                "            self.assertEqual(os.environ[key], value)\n"
+                "        self.assertNotEqual(Path(__file__).name, os.environ['FIXTURE_FAILURE'])\n"
+                "unittest.main()\n"
+            )
+
+    def run_entry(self, env=None):
+        return subprocess.run(
+            [shutil.which("bash"), str(self.script)],
+            cwd=self.root,
+            env=self.env if env is None else env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+
+    def test_runs_all_files_from_unrelated_working_directory(self):
+        result = self.run_entry()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(
-            finish["env"]["SELFTEST_RESULT"], "${{ needs.ppu-ci-selftest.result }}"
+            [json.loads(line) for line in self.result_path.read_text().splitlines()],
+            self.files,
         )
+        self.assertEqual(result.stderr.count("Ran 1 test"), 3)
+        self.assertEqual(list(self.repo.rglob("__pycache__")), [])
 
-    def test_selftest_rejects_empty_suite_and_preserves_runner_failure(self):
-        """An empty selection must not pass before its own collection checks run."""
-        script = self.jobs["ppu-ci-selftest"]["steps"][-1]["run"]
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            python = root / "python3"
-            python.write_text(
-                '#!/bin/sh\nif [ "$1" != "-c" ]; then\n'
-                '  printf "Test Summary: %s passed\\n" "$FIXTURE_SUMMARY"\n'
-                '  exit "$FIXTURE_EXIT"\nfi\n'
-            )
-            python.chmod(0o755)
-            for summary, exit_code, expected in (
-                ("0/0", 0, False),
-                ("2/3", 0, False),
-                ("3/3", 0, True),
-                ("3/3", 7, False),
-            ):
-                with self.subTest(summary=summary, exit_code=exit_code):
-                    result = subprocess.run(
-                        ["bash", "-e", "-o", "pipefail", "-c", script],
-                        env=dict(
-                            os.environ,
-                            PATH=f"{root}{os.pathsep}{os.environ['PATH']}",
-                            RUNNER_TEMP=str(root),
-                            FIXTURE_SUMMARY=summary,
-                            FIXTURE_EXIT=str(exit_code),
-                        ),
-                        capture_output=True,
-                        text=True,
-                        timeout=10,
-                    )
-                    self.assertEqual(result.returncode == 0, expected, result.stdout)
+    def test_stops_and_propagates_test_failure_or_missing_file(self):
+        target = self.script.parent / self.files[1]
+        original = target.read_bytes()
+        for failure, code in (("assertion", 1), ("exit", 7), ("missing", 2)):
+            with self.subTest(failure=failure):
+                target.write_bytes(original)
+                self.result_path.write_text("")
+                self.env["FIXTURE_FAILURE"] = target.name
+                if failure == "exit":
+                    target.write_text("import sys\nsys.exit(7)\n")
+                elif failure == "missing":
+                    target.unlink()
+                result = self.run_entry()
+                self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                executed = self.result_path.read_text()
+                self.assertIn(self.files[0], executed)
+                self.assertNotIn(self.files[2], executed)
 
-    def test_missing_flock_fails_before_selftests_can_skip(self):
-        """Missing launcher prerequisites must fail the job rather than skip its tests."""
-        prerequisite = next(
-            step
-            for step in self.jobs["ppu-ci-selftest"]["steps"]
-            if step.get("id") == "prerequisites"
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            uname = root / "uname"
-            uname.write_text("#!/bin/sh\nprintf 'Linux\\n'\n")
-            uname.chmod(0o755)
-            result = subprocess.run(
-                [
-                    shutil.which("bash"),
-                    "-e",
-                    "-o",
-                    "pipefail",
-                    "-c",
-                    prerequisite["run"],
-                ],
-                env=dict(os.environ, PATH=str(root)),
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            self.assertNotEqual(result.returncode, 0, result.stdout)
+    def test_missing_prerequisites_fail_before_running_tests(self):
+        tools = self.root / "tools"
+        tools.mkdir()
+        uname = tools / "uname"
+        uname.write_text("#!/bin/sh\nprintf '%s\\n' Linux\n")
+        uname.chmod(0o755)
+        commands = ("flock", "git", "jq", "python3")
+        for name in commands:
+            (tools / name).symlink_to(shutil.which(name))
+        for missing in ("Linux", *commands):
+            with self.subTest(missing=missing):
+                if missing == "Linux":
+                    uname.write_text("#!/bin/sh\nprintf '%s\\n' Darwin\n")
+                else:
+                    (tools / missing).unlink()
+                result = self.run_entry(dict(self.env, PATH=str(tools)))
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(missing, result.stderr)
+                self.assertFalse(self.result_path.exists())
+                if missing == "Linux":
+                    uname.write_text("#!/bin/sh\nprintf '%s\\n' Linux\n")
+                else:
+                    (tools / missing).symlink_to(shutil.which(missing))
 
 
 class TestPPURuntimeCache(CustomTestCase):

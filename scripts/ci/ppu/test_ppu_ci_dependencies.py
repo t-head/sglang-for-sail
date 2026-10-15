@@ -7,10 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-
-register_cpu_ci(est_time=25, suite="stage-a-test-cpu-ppu")
 
 SCRIPT = Path(__file__).resolve().parents[3] / "scripts/ci/ppu/check_dependencies.py"
 ADDITIONS = {
