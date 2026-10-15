@@ -10,7 +10,7 @@ from pathlib import Path
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=25, suite="base-a-test-cpu")
+register_cpu_ci(est_time=25, suite="ppu-ci-test-cpu")
 
 SCRIPT = Path(__file__).resolve().parents[3] / "scripts/ci/ppu/check_dependencies.py"
 ADDITIONS = {
@@ -43,23 +43,17 @@ class TestPPUCIDependencies(CustomTestCase):
                 text=True,
             )
 
-    def test_only_built_packages_can_change(self):
+    def test_built_replacements_and_pinned_runtime_additions_are_allowed(self):
         before = {
             "torch": {"version": "2.13.0", "record": "compatible"},
             "triton": {"version": "3.7.0", "record": "vendor"},
+            "sglang": {"version": "0.5.17", "record": "preinstalled"},
+            "sglang-kernel": {"version": "0.4.8", "record": "preinstalled"},
         }
         after = {
             **before,
             "sglang": {"version": "0.5.18", "record": "built"},
             "sglang-kernel": {"version": "0.4.9", "record": "built"},
-        }
-        result = self.check_snapshots(before, after)
-        self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_pinned_runtime_additions_are_allowed(self):
-        before = {"torch": {"version": "2.13.0", "record": "compatible"}}
-        after = {
-            **before,
             **{
                 name: {"version": version, "record": "added"}
                 for name, version in ADDITIONS.items()
@@ -77,41 +71,38 @@ class TestPPUCIDependencies(CustomTestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(name, result.stderr)
 
-    def test_runtime_torch_cannot_be_replaced_by_build_torch(self):
-        before = {"torch": {"version": "2.13.0", "record": "compatible"}}
-        after = {"torch": {"version": "2.13.0", "record": "cuda-free"}}
-        result = self.check_snapshots(before, after)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("torch", result.stderr)
-
-    def test_dependency_changes_are_rejected(self):
-        before = {"triton": {"version": "3.7.0", "record": "vendor"}}
-        for after in (
-            {},
-            {"triton": {"version": "3.8.0", "record": "vendor"}},
-            {"triton": {"version": "3.7.0", "record": "upstream"}},
-            {**before, "nvidia-cublas-cu13": {"version": "13", "record": "new"}},
+    def test_existing_dependencies_are_preserved(self):
+        before = {
+            "torch": {"version": "2.13.0", "record": "compatible"},
+            "triton": {"version": "3.7.0", "record": "vendor"},
+            "sailify": {"version": "vendor-version", "record": "vendor"},
+            "sgl-eval": {"version": ADDITIONS["sgl-eval"], "record": "vendor"},
+        }
+        result = self.check_snapshots(before, before)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name, replacement in (
+            ("torch", {"version": "2.13.0", "record": "cuda-free"}),
+            ("triton", {"version": "3.8.0", "record": "vendor"}),
+            ("triton", {"version": "3.7.0", "record": "upstream"}),
+            ("triton", None),
+            ("sailify", {"version": ADDITIONS["sailify"], "record": "vendor"}),
+            ("sailify", {"version": "vendor-version", "record": "different"}),
+            ("sailify", None),
+            ("sgl-eval", {"version": "0.1.3", "record": "vendor"}),
+            ("sgl-eval", {"version": ADDITIONS["sgl-eval"], "record": "different"}),
+            ("sgl-eval", None),
+            ("nvidia-cublas-cu13", {"version": "13", "record": "new"}),
         ):
-            with self.subTest(after=after):
+            with self.subTest(name=name, replacement=replacement):
+                after = before.copy()
+                if replacement is None:
+                    del after[name]
+                else:
+                    after[name] = replacement
                 result = self.check_snapshots(before, after)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("Unexpected dependency changes", result.stderr)
-
-    def test_existing_runtime_additions_cannot_be_replaced_or_removed(self):
-        for name, version in {**ADDITIONS, "sailify": "vendor-version"}.items():
-            before = {name: {"version": version, "record": "vendor"}}
-            with self.subTest(name=name, unchanged=True):
-                result = self.check_snapshots(before, before)
-                self.assertEqual(result.returncode, 0, result.stderr)
-            for after in (
-                {},
-                {name: {"version": version + ".1", "record": "vendor"}},
-                {name: {"version": version, "record": "different"}},
-            ):
-                with self.subTest(name=name, after=after):
-                    result = self.check_snapshots(before, after)
-                    self.assertNotEqual(result.returncode, 0)
-                    self.assertIn(name, result.stderr)
+                self.assertIn(name, result.stderr)
 
     def run_isolated_cli(self, command, installed=None, wheel_names=()):
         with tempfile.TemporaryDirectory() as directory:
@@ -199,30 +190,21 @@ class TestPPUCIDependencies(CustomTestCase):
                 self.assertIn(version + ".1", result.stderr)
                 self.assertIn(version, result.stderr)
 
-    def test_missing_wheels_cli_rejects_missing_or_wrong_pin(self):
+    def test_missing_wheels_cli_rejects_invalid_candidates(self):
         for name, wheel in WHEELS.items():
-            for replacement in (None, wheel.replace(ADDITIONS[name], "99.0.0")):
-                with self.subTest(name=name, replacement=replacement):
+            for case, candidates in (
+                ("missing", []),
+                ("wrong-version", [wheel.replace(ADDITIONS[name], "99.0.0")]),
+                ("duplicate", [wheel, wheel.replace(".whl", "2.whl")]),
+            ):
+                with self.subTest(name=name, case=case):
                     wheels = [value for value in WHEELS.values() if value != wheel]
-                    if replacement:
-                        wheels.append(replacement)
                     result, _ = self.run_isolated_cli(
-                        "missing-wheels", wheel_names=wheels
+                        "missing-wheels", wheel_names=wheels + candidates
                     )
                     self.assertNotEqual(result.returncode, 0)
                     self.assertEqual(result.stdout, "")
                     self.assertIn(f"{name}=={ADDITIONS[name]}", result.stderr)
-
-    def test_missing_wheels_cli_rejects_duplicate_candidates(self):
-        for name, wheel in WHEELS.items():
-            with self.subTest(name=name):
-                result, _ = self.run_isolated_cli(
-                    "missing-wheels",
-                    wheel_names=[*WHEELS.values(), wheel.replace(".whl", "2.whl")],
-                )
-                self.assertNotEqual(result.returncode, 0)
-                self.assertEqual(result.stdout, "")
-                self.assertIn(f"{name}=={ADDITIONS[name]}", result.stderr)
 
     def test_snapshot_uses_first_distribution_on_python_path(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -22,7 +22,7 @@ from sglang.test.test_utils import CustomTestCase
 if sys.platform == "linux":
     import fcntl
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=15, suite="ppu-ci-test-cpu")
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "scripts/ci/ppu/run_test.sh"

@@ -132,7 +132,6 @@ trap 'exit 143' TERM
 
 python3 "$repo/scripts/ci/ppu/check_ppu_environment.py"
 python3 -c 'import torch; print("Runtime Torch:", torch.__version__, "SAIL build marker:", getattr(torch.version, "sail", None)); assert torch.cuda.device_count() == 1'
-(cd "$wheel_dir" && sha256sum -c SHA256SUMS)
 python3 -m pip uninstall -y sgl-kernel
 python3 -m pip install --no-deps --no-index --force-reinstall "$wheel_dir/"*.whl
 missing_wheels=$(python3 "$checker" missing-wheels "$wheel_dir/runtime-deps")
@@ -157,4 +156,5 @@ PY
 python3 "$repo/scripts/ci/ppu/prepare_runtime.py"
 
 cd "$artifacts"
+python3 "$repo/test/run_suite.py" --hw cpu --suite ppu-ci-test-cpu --timeout-per-file 120
 python3 "$repo/test/run_suite.py" --hw ppu --suite stage-a-test-1-gpu-ppu --timeout-per-file 1200

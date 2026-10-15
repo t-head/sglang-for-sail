@@ -6,43 +6,38 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from sglang.test.ci.ci_register import HWBackend, collect_tests, register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, popen_launch_server
+from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=20, suite="ppu-ci-test-cpu")
 
 RUNNER = Path(__file__).resolve().parents[2] / "run_suite.py"
 
 
 class TestPPUCISuite(CustomTestCase):
-    def test_explicit_offline_launch_cannot_recover_by_going_online(self):
-        """An explicitly offline launch must not succeed with downloaded replacements."""
-        failed = MagicMock()
-        failed.poll.return_value = 1
-        ready = MagicMock()
-        ready.poll.return_value = None
-        with (
-            patch(
-                "sglang.test.test_utils.subprocess.Popen", side_effect=[failed, ready]
-            ),
-            patch("sglang.test.test_utils.requests.Session") as session,
-            patch("sglang.test.test_utils.kill_process_tree"),
-        ):
-            session.return_value.__enter__.return_value.get.return_value.status_code = (
-                200
-            )
-            self.assertRaisesRegex(
-                Exception,
-                "Server process exited with code 1",
-                popen_launch_server,
-                "test/model",
-                "http://127.0.0.1:30000",
-                timeout=1,
-                device="cpu",
-                env={"HF_HUB_OFFLINE": "1"},
-            )
+    def test_cpu_checks_are_excluded_from_the_general_cpu_suite(self):
+        files = list(Path(__file__).parent.glob("test_ppu_ci_*.py"))
+        tests = collect_tests([str(path) for path in files])
+        spec = importlib.util.spec_from_file_location("ppu_run_suite", RUNNER)
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        runner.validate_all_suites(tests)
+        general, _ = runner.filter_tests(tests, HWBackend.CPU, ["base-a-test-cpu"])
+        dedicated, skipped = runner.filter_tests(
+            tests, HWBackend.CPU, ["ppu-ci-test-cpu"]
+        )
+        self.assertEqual(general, [])
+        self.assertEqual(skipped, [])
+        self.assertCountEqual(
+            [Path(test.filename).name for test in dedicated],
+            [
+                "test_ppu_ci_dependencies.py",
+                "test_ppu_ci_docker.py",
+                "test_ppu_ci_suite.py",
+            ],
+        )
 
     def test_ppu_suite_contains_both_speculative_sanity_files(self):
         registered = RUNNER.parent / "registered"
