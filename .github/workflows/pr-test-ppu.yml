@@ -178,10 +178,18 @@ jobs:
     name: >-
       ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
            github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
-          'ignored-label-ppu-sanity' || 'ppu-sanity' }}
+          format('ignored-label-ppu-sanity ({0})', matrix.runner) ||
+          format('ppu-sanity ({0})', matrix.runner) }}
     needs: [check-changes, pr-gate, ppu-build]
     if: needs.check-changes.outputs.ppu == 'true'
-    runs-on: 1-ppu-m890p
+    # Both PPU generations reuse the same wheels; each host supplies its own
+    # runtime image and device, while checkpoints come from the shared NAS.
+    strategy:
+      # A failure on one generation must not hide the other generation's result.
+      fail-fast: false
+      matrix:
+        runner: [8-ppu-m890p, 16-ppu-zw810e]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     permissions:
       contents: read
@@ -234,7 +242,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ppu-runtime-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ppu-runtime-logs-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.PPU_CI_ARTIFACT_DIR }}
           if-no-files-found: warn
 

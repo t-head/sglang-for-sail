@@ -166,6 +166,21 @@ class TestPPUCIWorkflow(CustomTestCase):
         runtime = RUNNER.parent.parent / "scripts/ci/ppu/build_and_test.sh"
         self.assertNotIn("--hw cpu", runtime.read_text())
 
+    def test_sanity_runs_on_every_ppu_generation_with_distinct_artifacts(self):
+        sanity = self.jobs["ppu-sanity"]
+        self.assertEqual(sanity["runs-on"], "${{ matrix.runner }}")
+        self.assertIs(sanity["strategy"]["fail-fast"], False)
+        self.assertEqual(
+            sanity["strategy"]["matrix"]["runner"], ["8-ppu-m890p", "16-ppu-zw810e"]
+        )
+        self.assertIn("matrix.runner", sanity["name"])
+        upload = next(
+            step
+            for step in sanity["steps"]
+            if step.get("name") == "Upload runtime diagnostics"
+        )
+        self.assertIn("${{ matrix.runner }}", upload["with"]["name"])
+
     def test_finish_requires_successful_build_and_sanity_when_in_scope(self):
         finish = self.jobs["pr-test-ppu-finish"]["steps"][0]
         statuses = ("success", "failure", "cancelled", "skipped")
