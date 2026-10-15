@@ -156,5 +156,4 @@ PY
 python3 "$repo/scripts/ci/ppu/prepare_runtime.py"
 
 cd "$artifacts"
-python3 "$repo/test/run_suite.py" --hw cpu --suite ppu-ci-test-cpu --timeout-per-file 120
 python3 "$repo/test/run_suite.py" --hw ppu --suite stage-a-test-1-gpu-ppu --timeout-per-file 1200

@@ -110,9 +110,6 @@ jobs:
               - "python/sglang/kernels/aot/pyproject_sail.toml"
               - "python/sglang/kernels/aot/csrc/common_extension_sail.cc"
               - "python/sglang/kernels/jit/utils/compile/sailify.py"
-              - "python/sglang/test/ci/ci_register.py"
-              - "python/sglang/test/ci/ci_utils.py"
-              - "test/run_suite.py"
               - "test/registered/core/test_basic_sanity_eagle3.py"
               - "test/registered/core/test_basic_sanity_dflash.py"
               - "test/registered/unit/test_ppu_ci_*.py"
@@ -129,6 +126,68 @@ jobs:
       require-run-ci: true
       require-label: run-ci-ppu
     secrets: inherit
+
+  ppu-ci-selftest:
+    name: >-
+      ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
+           github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
+          'ignored-label-ppu-ci-selftest' || 'ppu-ci-selftest' }}
+    needs: [check-changes, pr-gate]
+    if: needs.check-changes.outputs.ppu == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      PYTHONPATH: ${{ github.workspace }}/python
+      PYTHONDONTWRITEBYTECODE: "1"
+      SGLANG_IS_IN_CI: "1"
+      SGLANG_TEST_MAX_RETRY: "0"
+      HF_HUB_OFFLINE: "1"
+    steps:
+      - name: Checkout the pinned source revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check-changes.outputs.source-sha }}
+          persist-credentials: false
+
+      - name: Require Linux and flock instead of skipping launcher tests
+        id: prerequisites
+        run: |
+          [[ "$(uname -s)" == "Linux" ]]
+          command -v flock
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up uv and cache CPU selftest dependencies
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.12'
+          enable-cache: true
+          cache-dependency-glob: '.github/workflows/pr-test-ppu.yml'
+          cache-suffix: 'ppu-ci-selftest'
+          # CI pruning removes downloaded wheels, including CPU Torch.
+          prune-cache: false
+
+      - name: Install CPU selftest dependencies without building SGLang
+        run: |
+          uv pip install --only-binary=:all: --index-url https://download.pytorch.org/whl/cpu \
+            torch==2.14.1 torchvision==0.29.1
+          uv pip install --only-binary=:all: \
+            torch==2.14.1+cpu torchvision==0.29.1+cpu triton==3.8.0 \
+            transformers==5.19.0 tokenizers==0.23.2 compressed-tensors==0.18.0 \
+            sentencepiece==0.2.1 PyYAML==6.0.1 'pyzmq>=25.1.2' \
+            aiohttp datasets gguf IPython msgspec numpy orjson packaging pillow \
+            psutil pybase64 pydantic regex requests starlette tabulate tqdm
+
+      - name: Run PPU infrastructure tests without a device or candidate wheels
+        run: |
+          python3 -c 'import torch; assert torch.version.cuda is None, torch.__version__'
+          python3 test/run_suite.py --hw cpu --suite stage-a-test-cpu-ppu --timeout-per-file 120 2>&1 | tee "$RUNNER_TEMP/ppu-ci-selftest.log"
+          grep -Fx 'Test Summary: 3/3 passed' "$RUNNER_TEMP/ppu-ci-selftest.log"
 
   ppu-build:
     name: >-
@@ -193,7 +252,7 @@ jobs:
       ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
            github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
           'ignored-label-ppu-sanity' || 'ppu-sanity' }}
-    needs: [check-changes, pr-gate, ppu-build]
+    needs: [check-changes, pr-gate, ppu-ci-selftest, ppu-build]
     if: needs.check-changes.outputs.ppu == 'true'
     runs-on: 1-ppu-m890p
     timeout-minutes: 60
@@ -258,15 +317,16 @@ jobs:
       ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
            github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
           'ignored-label-pr-test-ppu-finish' || 'pr-test-ppu-finish' }}
-    needs: [pr-gate, check-changes, ppu-build, ppu-sanity]
+    needs: [pr-gate, check-changes, ppu-ci-selftest, ppu-build, ppu-sanity]
     if: always() && needs.check-changes.result != 'skipped'
     runs-on: ubuntu-latest
     permissions: {}
     steps:
-      - name: Require successful build and both sanity files when requested
+      - name: Require successful selftests, build and both sanity files when requested
         env:
           NEEDS_JSON: ${{ toJson(needs) }}
           PPU_IN_SCOPE: ${{ needs.check-changes.outputs.ppu }}
+          SELFTEST_RESULT: ${{ needs.ppu-ci-selftest.result }}
           BUILD_RESULT: ${{ needs.ppu-build.result }}
           SANITY_RESULT: ${{ needs.ppu-sanity.result }}
         run: |
@@ -275,11 +335,11 @@ jobs:
             exit 1
           fi
           if [[ "$PPU_IN_SCOPE" == "true" ]]; then
-            if [[ "$BUILD_RESULT" != "success" || "$SANITY_RESULT" != "success" ]]; then
-              printf '%s\n' '::error::PPU scope requires a successful native build and both sanity files.'
+            if [[ "$SELFTEST_RESULT" != "success" || "$BUILD_RESULT" != "success" || "$SANITY_RESULT" != "success" ]]; then
+              printf '%s\n' '::error::PPU scope requires successful CPU selftests, a native build and both sanity files.'
               exit 1
             fi
-            printf '%s\n' 'Native build and both PPU sanity files passed.'
+            printf '%s\n' 'CPU selftests, native build and both PPU sanity files passed.'
           else
             printf '%s\n' 'PPU is outside this run scope; no PPU tests were requested.'
           fi
