@@ -90,6 +90,12 @@ elif args[0] == "pull":
     print("Repository: " + args[1], file=sys.stderr)
     if os.environ.get("PULL_EXIT"):
         sys.exit(int(os.environ["PULL_EXIT"]))
+    if os.environ.get("BLOCK_PULL"):
+        (root / "pull.pid").write_text(str(os.getpid()))
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+        with (root / "ready.fifo").open("w") as ready:
+            ready.write("started\n")
+        signal.pause()
     (root / "pulled").touch()
 elif args[0] == "create":
     name = args[args.index("--name") + 1]
@@ -181,6 +187,10 @@ class TestPPUCIDocker(CustomTestCase):
         self.manifest()
         self.artifacts = self.root / "artifacts"
         self.artifacts.mkdir()
+        self.home = self.root / "runner home"
+        self.home.mkdir()
+        self.runner_temp = self.root / "runner temp"
+        self.runner_temp.mkdir()
         self.models = [self.root / name for name in ("target", "eagle3", "dflash")]
         for model in self.models:
             model.mkdir()
@@ -204,6 +214,9 @@ class TestPPUCIDocker(CustomTestCase):
         }
         self.env.update(
             PATH=f"{self.bin}:{os.environ['PATH']}",
+            HOME=str(self.home),
+            RUNNER_TEMP=str(self.runner_temp),
+            GITHUB_WORKSPACE=str(self.source),
             FIXTURE_ROOT=str(self.root),
             FIXTURE_SOURCE=str(self.source),
             FIXTURE_LOCK=str(self.lock),
@@ -262,17 +275,66 @@ class TestPPUCIDocker(CustomTestCase):
         self.rejected("Set PPU_CI_RUNTIME_IMAGE explicitly")
 
     def test_image_acquisition_errors_are_private_and_preserve_status(self):
+        logs = set()
         for variable, code in (("PULL_EXIT", 23), ("INSPECT_EXIT", 24)):
             with self.subTest(failure=variable):
                 result = self.run_launcher(MISSING_IMAGE="1", **{variable: str(code)})
                 self.assertEqual(result.returncode, code, result.stdout + result.stderr)
                 self.assertIn("PPU CI:", result.stderr)
                 self.assert_image_reference_is_private(result)
+                log = self.assert_private_pull_log(result.stdout)
+                logs.add(log)
+                if variable == "INSPECT_EXIT":
+                    self.assertIn("Inspecting ", log.read_text())
                 self.assertFalse(
                     any(event["args"][0] == "create" for event in self.events())
                 )
                 with self.lock.open("a") as handle:
                     fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.assertEqual(len(logs), 2)
+
+    def test_private_log_rejects_temporary_or_exposed_home(self):
+        alias = self.root / "home alias"
+        for home in (
+            self.runner_temp,
+            self.artifacts,
+            self.source,
+            self.wheels,
+            *self.models,
+            self.cache,
+        ):
+            with self.subTest(home=home.name):
+                alias.symlink_to(home, target_is_directory=True)
+                try:
+                    result = self.run_launcher(HOME=str(alias), MISSING_IMAGE="1")
+                finally:
+                    alias.unlink()
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("Private image logs", result.stderr)
+                self.assertFalse(
+                    any(event["args"][0] == "pull" for event in self.events())
+                )
+                self.assertEqual(list(home.glob(".sglang-ppu-ci-pull.*")), [])
+                self.assert_image_reference_is_private(result)
+
+    def assert_private_pull_log(self, output):
+        prefix = "PPU CI: Private image pull log: "
+        paths = [
+            line[len(prefix) :]
+            for line in output.splitlines()
+            if line.startswith(prefix)
+        ]
+        self.assertEqual(len(paths), 1, output)
+        path = Path(paths[0])
+        self.assertTrue(path.is_relative_to(self.home))
+        self.assertFalse(path.is_relative_to(self.runner_temp))
+        self.assertFalse(path.is_relative_to(self.artifacts))
+        self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        content = path.read_text()
+        self.assertIn("Pulling " + self.env["PPU_CI_RUNTIME_IMAGE"], content)
+        self.assertIn("Repository: " + self.env["PPU_CI_RUNTIME_IMAGE"], content)
+        return path
 
     def assert_image_reference_is_private(self, result):
         registry = self.env["PPU_CI_RUNTIME_IMAGE"].split("/")[0]
@@ -401,6 +463,7 @@ class TestPPUCIDocker(CustomTestCase):
         result = self.run_launcher(MISSING_IMAGE="1")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assert_image_reference_is_private(result)
+        self.assert_private_pull_log(result.stdout)
         create = self.assert_lifecycle()
         self.assertIn("--runtime=runc", create)
         self.assertIn("NVIDIA_VISIBLE_DEVICES=void", create)
@@ -456,6 +519,7 @@ class TestPPUCIDocker(CustomTestCase):
         create = self.assert_lifecycle()
         self.assertIn(f"--device=/dev/alixpu_ppu{self.device}", create)
         self.assertFalse(any(event["args"][0] == "pull" for event in self.events()))
+        self.assertEqual(list(self.home.iterdir()), [])
 
     def start_blocked(self, **updates):
         workflow = yaml.safe_load(WORKFLOW.read_text())
@@ -543,6 +607,25 @@ class TestPPUCIDocker(CustomTestCase):
         self.assertLess(elapsed, CANCELLATION_BUDGET)
         self.assert_lifecycle()
         return elapsed
+
+    def test_pull_cancellation_preserves_private_diagnostics(self):
+        for sig, code in ((signal.SIGINT, 130), (signal.SIGTERM, 143)):
+            with self.subTest(signal=sig):
+                process = self.start_blocked(MISSING_IMAGE="1", BLOCK_PULL="1")
+                process.send_signal(sig)
+                output, errors = process.communicate(timeout=CANCELLATION_BUDGET)
+                self.assertEqual(process.returncode, code, output + errors)
+                self.assert_private_pull_log(output)
+                self.assert_image_reference_is_private(
+                    subprocess.CompletedProcess([], code, output, errors)
+                )
+                self.assertFalse(
+                    any(event["args"][0] == "create" for event in self.events())
+                )
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(int((self.root / "pull.pid").read_text()), 0)
+                with self.lock.open("a") as handle:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_workflow_sigterm_cleans_up_before_unlocking(self):
         """Signalling the step PID must not orphan its attached child launcher."""

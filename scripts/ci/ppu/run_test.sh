@@ -168,8 +168,38 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 if ! image_id=$(docker image inspect "$PPU_CI_RUNTIME_IMAGE" --format '{{.Id}}' 9>&- 2>/dev/null); then
-    # Docker output can expose the runner-private registry and repository.
-    docker pull "$PPU_CI_RUNTIME_IMAGE" 9>&- >/dev/null 2>&1 &
+    # Raw Docker diagnostics must stay outside all uploaded or mounted paths.
+    pull_log=$(python3 - "$repo" "${inputs[@]}" <<'PY'
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+try:
+    home = Path(os.environ.get("HOME", ""))
+    if not home.is_absolute():
+        sys.exit("PPU CI: Private image logs require an absolute HOME directory")
+    home = home.resolve(strict=True)
+    if not home.is_dir() or "\n" in str(home) or "\r" in str(home):
+        sys.exit("PPU CI: Private image logs require a valid HOME directory")
+    excluded = sys.argv[1:] + [
+        os.environ[name] for name in ("RUNNER_TEMP", "GITHUB_WORKSPACE")
+        if os.environ.get(name)
+    ]
+    for raw in excluded:
+        path = Path(raw).resolve()
+        if os.path.commonpath([str(home), str(path)]) == str(path):
+            sys.exit("PPU CI: Private image logs require HOME outside temporary, source, artifact and input directories")
+    directory = tempfile.mkdtemp(prefix=".sglang-ppu-ci-pull.", dir=str(home))
+    fd, log = tempfile.mkstemp(prefix="pull-", suffix=".log", dir=directory)
+    os.close(fd)
+    print(log)
+except (OSError, ValueError, RuntimeError):
+    sys.exit("PPU CI: Private image logs could not be created under HOME")
+PY
+    ) || exit 2
+    printf 'PPU CI: Private image pull log: %s\n' "$pull_log"
+    docker pull "$PPU_CI_RUNTIME_IMAGE" 9>&- >"$pull_log" 2>&1 &
     docker_pid=$!
     wait "$docker_pid" || {
         code=$?
@@ -177,7 +207,7 @@ if ! image_id=$(docker image inspect "$PPU_CI_RUNTIME_IMAGE" --format '{{.Id}}' 
         exit "$code"
     }
     docker_pid=""
-    image_id=$(docker image inspect "$PPU_CI_RUNTIME_IMAGE" --format '{{.Id}}' 9>&- 2>/dev/null) || {
+    image_id=$(docker image inspect "$PPU_CI_RUNTIME_IMAGE" --format '{{.Id}}' 9>&- 2>>"$pull_log") || {
         code=$?
         printf '%s\n' 'PPU CI: Failed to inspect runtime image after pull' >&2
         exit "$code"
