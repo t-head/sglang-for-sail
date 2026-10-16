@@ -163,7 +163,7 @@ def storage_prefetch_end(
     """Raw-token end of the L3 prefetch span for ``req`` (before page alignment).
 
     The span must stop where the match key stops. :func:`_req_radix_key` caps
-    the key at ``len - swa_reprefill_tail_tokens()``: a prefetch commits its
+    the key at ``len - window_reprefill_tail_tokens(req)``: a prefetch commits its
     only SWA host window to the span's last page, so a span reaching past that
     cap puts the window beyond the boundary the matcher may consume. The
     boundary node then carries no SWA host value and admission drops the whole
@@ -179,6 +179,33 @@ def touch_waiting_prefix(req: Req, tree_cache: BasePrefixCache) -> None:
     tree_cache.touch_prefix(
         _req_radix_key(tree_cache, req, req.origin_input_ids + req.output_ids)
     )
+
+
+def snapshot_prefix_swa_metrics(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    match_result: MatchResult,
+    max_len: int,
+    reprefill_tail: int,
+) -> None:
+    """Refresh the match snapshot until the first prefill is admitted."""
+    if getattr(req, "_cache_breakdown_computed", False) or getattr(
+        req, "retracted_stain", False
+    ):
+        return
+    req.full_kv_hit_length = min(match_result.full_kv_hit_length, max_len)
+    matched = min(
+        match_result.device_prefix_len + match_result.host_hit_length, max_len
+    )
+    req.prefix_swa_truncated_tokens = 0
+    if (
+        req.full_kv_hit_length > matched
+        and not reprefill_tail
+        and not envs.SGLANG_RADIX_FORCE_MISS.get()
+        and tree_cache.supports_swa()
+        and not tree_cache.supports_mamba()
+    ):
+        req.prefix_swa_truncated_tokens = req.full_kv_hit_length - matched
 
 
 def match_kv_cache(
@@ -223,6 +250,13 @@ def match_kv_cache(
     req.matched_window_host_hit_lengths = dict(match_result.window_host_hit_lengths)
     max_len = req._compute_max_prefix_len(len(token_ids))
     req.num_matched_prefix_tokens = min(req.prefix_len + req.host_hit_length, max_len)
+    snapshot_prefix_swa_metrics(
+        req,
+        tree_cache,
+        match_result,
+        max_len,
+        tree_cache.window_reprefill_tail_tokens(req),
+    )
     req.swa_branching_seqlen = match_result.swa_branching_seqlen
     # A probe match keeps what it did not report; a new round resets both.
     if match_result.mamba_branching_seqlen is not None:

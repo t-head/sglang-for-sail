@@ -225,6 +225,7 @@ def _build_server_args(
             (get_mm().limit_mm_data_per_request or {}).items()
         ),
         allow_auto_truncate=get_serving().allow_auto_truncate,
+        min_output_token_reserve=get_serving().min_output_token_reserve,
         enable_return_hidden_states=sa.enable_return_hidden_states,
         return_hidden_states_mode=sa.return_hidden_states_mode,
         # Not a `server_args` field: `TokenizerManager` derives it, and the

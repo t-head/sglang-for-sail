@@ -219,6 +219,10 @@ def flash_attn_varlen_func(
     return_softmax_lse: bool = False,
     mask_mod: Optional[Callable] = None,
     out: Optional[torch.Tensor] = None,
+    head_gate: Optional[torch.Tensor] = None,
+    use_pdl: bool = False,
+    tile_mn: Optional[Tuple[int, int]] = None,
+    leftpad_k: Optional[torch.Tensor] = None,
     **_: object,
 ):
     if _flash_attn_varlen_func is None:  # pragma: no cover
@@ -228,6 +232,7 @@ def flash_attn_varlen_func(
         ) from _flash_attn_import_error
 
     q, k, v, qv = [_maybe_contiguous(t) for t in (q, k, v, qv)]
+    head_gate = _maybe_contiguous(head_gate)
     if qv is None and q.shape[-1] == 256 and k.shape[-1] == 256 and v.shape[-1] == 256:
         # The vendored hd256 kernel assumes dense Q/K/V strides.
         # TODO: Remove this workaround after the FA4 in current environment includes
@@ -275,6 +280,12 @@ def flash_attn_varlen_func(
         rel_bias_kwargs["rel_bias"] = rel_bias
     if rel_bias_prep_cache is not None:
         rel_bias_kwargs["rel_bias_prep_cache"] = rel_bias_prep_cache
+    extension_kwargs = {
+        "head_gate": head_gate,
+        "use_pdl": use_pdl,
+        "tile_mn": tile_mn,
+        "leftpad_k": leftpad_k,
+    }
     # The kernel writes into out, except where it pads MLA heads: its output
     # then has more heads than out, and the result is a new tensor.
     out_kwargs = {"out": out} if out is not None and mla_head_padding is None else {}
@@ -304,6 +315,7 @@ def flash_attn_varlen_func(
         **sf_kwargs,
         **descale_kwargs,
         **rel_bias_kwargs,
+        **extension_kwargs,
         **out_kwargs,
     )
     result = _unpad_mla_result(result, mla_head_padding)
@@ -357,16 +369,21 @@ def flash_attn_with_kvcache(
     return_softmax_lse: bool = False,
     mask_mod: Optional[Callable] = None,
     out: Optional[torch.Tensor] = None,
+    head_gate: Optional[torch.Tensor] = None,
+    use_pdl: bool = False,
+    tile_mn: Optional[Tuple[int, int]] = None,
     **_: object,
 ):
     if k is not None or v is not None:
         raise NotImplementedError("FA4 does not support updating KV cache in-place.")
     if rotary_cos is not None or rotary_sin is not None or rotary_seqlens is not None:
         raise NotImplementedError("FA4 path does not support rotary embedding.")
-    if cache_batch_idx is not None or cache_leftpad is not None:
+    if cache_batch_idx is not None:
         raise NotImplementedError(
-            "FA4 path does not support non-consecutive batch indices or left padding."
+            "FA4 path does not support non-consecutive batch indices."
         )
+    if cache_leftpad is not None and page_table is None:
+        raise NotImplementedError("FA4 cache_leftpad requires a paged KV page_table.")
     if isinstance(cache_seqlens, int):
         cache_seqlens = torch.full(
             (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
@@ -388,6 +405,8 @@ def flash_attn_with_kvcache(
         num_splits=num_splits,
         pack_gqa=pack_gqa,
         learnable_sink=sinks,
+        head_gate=head_gate,
+        use_pdl=use_pdl,
         mask_mod=mask_mod,
         score_mod=score_mod,
         aux_tensors=aux_tensors,
@@ -399,7 +418,9 @@ def flash_attn_with_kvcache(
         sfv=sfv,
         rel_bias=rel_bias,
         rel_bias_prep_cache=rel_bias_prep_cache,
+        tile_mn=tile_mn,
         return_softmax_lse=True,
+        leftpad_k=cache_leftpad,
         out=out,
     )
 

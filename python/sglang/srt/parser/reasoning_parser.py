@@ -102,6 +102,10 @@ class BaseReasoningFormatDetector:
         self._force_nonempty_content = force_nonempty_content
         self._accumulated_reasoning = ""
 
+        # Subclasses can opt into stricter boundary handling without changing
+        # the established behavior of detectors that share this base class.
+        self._prefer_tool_start_boundary = False
+
         self.continue_final_message = continue_final_message
         if self.continue_final_message:
             self.previous_content = previous_content
@@ -442,6 +446,34 @@ class IQuestQ1ReasoningDetector(BaseReasoningFormatDetector):
             thinks_internally=True,
             reasoning_default="enable_thinking",
         )
+
+
+class Step5Detector(DeepSeekR1Detector):
+    """Reasoning detector for Step5 models.
+
+    Step models follow DeepSeek-R1's always-on reasoning behavior, but may
+    begin ``<tool_call>`` without first emitting ``</think>``. Treat the tool
+    marker as an implicit reasoning boundary so the downstream tool parser
+    receives the complete tool-call payload.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = True,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = False,
+    ):
+        super().__init__(
+            stream_reasoning=stream_reasoning,
+            force_reasoning=force_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            force_nonempty_content=force_nonempty_content,
+        )
+        self.tool_start_token = "<tool_call>"
+        self._prefer_tool_start_boundary = True
 
 
 class Qwen3Detector(BaseReasoningFormatDetector):
@@ -2384,6 +2416,7 @@ class ReasoningParser:
         "nanbeige": Qwen3Detector,
         "step3": DeepSeekR1Detector,
         "step3p5": DeepSeekR1Detector,
+        "step5": Step5Detector,
         "mistral": MistralDetector,
         "nemotron_3": Nemotron3Detector,
         "granite_thinking_parser": GraniteThinkingDetector,

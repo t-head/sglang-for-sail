@@ -31,6 +31,8 @@ pub struct Limits {
     pub allow_auto_truncate: bool,
     /// The most a request's `return_hidden_states` may ask for.
     pub return_hidden_states_mode: HiddenStatesMode,
+    /// Minimum context space left after the prompt (admission only).
+    pub min_output_token_reserve: u64,
 }
 
 impl From<&ServerArgs> for Limits {
@@ -42,6 +44,7 @@ impl From<&ServerArgs> for Limits {
             num_reserved_tokens: sa.num_reserved_tokens,
             allow_auto_truncate: sa.allow_auto_truncate,
             return_hidden_states_mode: sa.hidden_states_mode(),
+            min_output_token_reserve: sa.min_output_token_reserve,
         }
     }
 }

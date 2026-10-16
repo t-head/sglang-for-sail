@@ -7,6 +7,8 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -30,6 +32,7 @@ class TestEagleDraftSamplingPosition(CustomTestCase):
         )
         worker.draft_runner = SimpleNamespace(
             canary_manager=None,
+            attn_backend=SimpleNamespace(init_forward_metadata=lambda _: None),
             forward=lambda _: SimpleNamespace(logits_output=logits_output),
         )
         sampling_info = SimpleNamespace(
@@ -49,7 +52,17 @@ class TestEagleDraftSamplingPosition(CustomTestCase):
             next_draft_input=SimpleNamespace(),
             prepared_draft_extend_inputs=None,
         )
-        forward_batch = SimpleNamespace(sampling_info=sampling_info)
+        draft_seq_lens = batch.seq_lens + worker.speculative_num_draft_tokens
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            batch_size=2,
+            input_ids=torch.zeros(8, dtype=torch.int64),
+            req_pool_indices=torch.arange(2, dtype=torch.int64),
+            seq_lens=draft_seq_lens,
+            out_cache_loc=torch.arange(8, dtype=torch.int64),
+            seq_lens_sum=int(draft_seq_lens.sum()),
+            sampling_info=sampling_info,
+        )
         sample_result = (
             torch.zeros(2, 16),
             torch.ones(2, 1),

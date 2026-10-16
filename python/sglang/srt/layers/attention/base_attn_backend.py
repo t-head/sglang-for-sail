@@ -113,6 +113,8 @@ class AttentionBackend(ABC):
     prefill_attention_backend_str: Optional[str] = None
     decode_attention_backend_str: Optional[str] = None
 
+    # The backend builds metadata for aligned tail rows and handles them itself.
+    handles_padded_extend: bool = False
     supports_ragged_verify_graph: bool = False
     # Bind-time cap on the window sub-pools one runner's layers attend through.
     max_window_sub_pools: int = 1

@@ -509,10 +509,19 @@ class LogitsProcessor(nn.Module):
         skip_all_gather: bool = False,
         logit_scale: Optional[float] = None,
         return_full_logits: bool = False,
+        valid_vocab_size: Optional[int] = None,
     ):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
+        if valid_vocab_size is not None and (
+            type(valid_vocab_size) is not int
+            or not 0 < valid_vocab_size <= self.vocab_size
+        ):
+            raise ValueError("valid_vocab_size must be in (0, physical vocab_size]")
+        self.valid_vocab_size = (
+            self.vocab_size if valid_vocab_size is None else valid_vocab_size
+        )
         self.logit_scale = logit_scale
         self.use_attn_tp_group = get_parallel().enable_dp_lm_head
         self.use_tp_lm_head_all_to_all = get_parallel().enable_tp_lm_head_all_to_all
@@ -1601,10 +1610,10 @@ class LogitsProcessor(nn.Module):
         softcap: Optional[float] = None,
     ) -> torch.Tensor:
         logits_buffer = logits_metadata.next_token_logits_buffer if use_buffer else None
+        if logits.shape[-1] > self.valid_vocab_size:
+            logits = logits[:, : self.valid_vocab_size]
         if logits is logits_buffer and softcap is None:
             return logits
-        if logits.shape[-1] > self.vocab_size:
-            logits = logits[:, : self.vocab_size]
         logits_width = logits.shape[-1]
         if softcap is not None:
             if logits_buffer is None or tuple(logits_buffer.shape) != tuple(

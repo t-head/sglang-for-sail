@@ -8,9 +8,11 @@ use sglang_mm::pipeline::{Tensor, TensorData};
 use sglang_processor::MmOutput;
 use sglang_processor::dynamo_multimodal::processor::{self as dynamo, PositionOutput};
 
-use super::encoded::{MRope, MmEncodedEntry, MmEncodedItem, MmMeta, MmMetaValue, MmModality};
+use super::encoded::{
+    MRope, MmEncodedEntry, MmEncodedItem, MmMeta, MmMetaValue, MmModality, MmTokenIds,
+};
 use crate::message::buffers::{Buffer, BufferData, BufferStore};
-use crate::message::config::MmSpec;
+use crate::message::config::{MmPipelineSpec, MmSpec};
 use crate::message::request::{MmData, Request, RequestKind};
 use crate::message::types::TokenIds;
 use crate::tokenizer_manager::to_scheduler::{Limits, fit_input};
@@ -225,6 +227,7 @@ fn encode_output(output: MmOutput) -> Result<MmProcessOutput, String> {
         .zip(offsets)
         .map(|(item, span)| {
             Ok(MmEncodedItem {
+                aux: Vec::new(),
                 modality: MmModality::Image,
                 feature: tensor(item.feature)?,
                 hash: item.hash,
@@ -282,6 +285,69 @@ fn aux_meta(name: &str, tensor: Tensor) -> Result<MmMetaValue, String> {
     }
 }
 
+struct Step3VlMmProcessor {
+    family: sglang_mm::step3_vl::Step3VlProcessor,
+}
+
+impl MmProcessor for Step3VlMmProcessor {
+    fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, MediaError> {
+        if !mm.video_data.is_empty() || !mm.audio_data.is_empty() {
+            return Err(MediaError::Client(
+                "unsupported modality: video/audio input".into(),
+            ));
+        }
+        let media = super::payload::resolve_media_work(input_ids, mm)?;
+        let input = sglang_mm::driver::MmInput {
+            input_ids: media.input_ids,
+            images: media
+                .images
+                .into_iter()
+                .map(|bytes| sglang_mm::driver::ImageSource::Bytes(bytes.to_vec()))
+                .collect(),
+        };
+        let output = sglang_mm::driver::process(&self.family, input).map_err(MediaError::Client)?;
+        let image_token_id = self.family.spec().image_token_id;
+        let input_ids = output.input_ids;
+        let mut items = Vec::with_capacity(output.items.len());
+        for (item, &span) in output.items.into_iter().zip(&output.offsets) {
+            let mut model_specific_data = std::collections::BTreeMap::new();
+            let mut aux = Vec::new();
+            for (name, tensor) in item.aux {
+                match (name.as_str(), &tensor.data) {
+                    ("num_patches", sglang_mm::pipeline::TensorData::I64(v)) => {
+                        model_specific_data.insert(
+                            name.clone(),
+                            MmMetaValue::Int(v.first().copied().unwrap_or(0)),
+                        );
+                    }
+                    ("patch_newline_mask", _) => {}
+                    _ => aux.push((name, tensor)),
+                }
+            }
+            items.push(MmEncodedItem {
+                modality: MmModality::Image,
+                feature: item.feature,
+                hash: item.hash,
+                offsets: sglang_mm::step3_vl::image_token_runs(&input_ids, span, image_token_id),
+                model_specific_data,
+                aux,
+            });
+        }
+        Ok(MmProcessOutput {
+            input_ids,
+            result: MmEncodedEntry {
+                items,
+                mrope: None,
+                token_ids: Some(MmTokenIds {
+                    im_token_id: Some(image_token_id),
+                    ..Default::default()
+                }),
+            },
+            extension: None,
+        })
+    }
+}
+
 /// Shared state of the multimodal path, built once at worker startup.
 pub struct MmContext {
     pub processor: Arc<dyn MmProcessor>,
@@ -296,11 +362,25 @@ pub struct MmContext {
 
 impl MmContext {
     pub fn new(spec: MmSpec) -> Result<Self, String> {
-        let pipeline =
-            sglang_processor::MmProcessor::from_spec(spec.pipeline).map_err(|e| e.to_string())?;
+        let feature_shm = spec.feature_shm;
+        let processor: Arc<dyn MmProcessor> = match spec.pipeline {
+            MmPipelineSpec::Step3Vl(step3) => {
+                if feature_shm {
+                    return Err("step3_vl: feature shm is not supported".into());
+                }
+                Arc::new(Step3VlMmProcessor {
+                    family: sglang_mm::step3_vl::Step3VlProcessor::new(step3)?,
+                })
+            }
+            MmPipelineSpec::Image(image) => {
+                let pipeline =
+                    sglang_processor::MmProcessor::from_spec(image).map_err(|e| e.to_string())?;
+                Arc::new(ImageMmProcessor { pipeline })
+            }
+        };
         Ok(Self {
-            processor: Arc::new(ImageMmProcessor { pipeline }),
-            feature_shm: spec.feature_shm,
+            processor,
+            feature_shm,
             limits: None,
         })
     }
@@ -379,10 +459,25 @@ fn place_features(
 fn make_buffers(entry: MmEncodedEntry, feature_shm: bool) -> Result<Vec<Buffer>, String> {
     let meta = MmMeta::of(&entry)?.encode()?;
     let MmEncodedEntry { items, mrope, .. } = entry;
-    let features = items.into_iter().map(|item| item.feature).collect();
+    let mut auxiliary = Vec::new();
+    let features = items
+        .into_iter()
+        .enumerate()
+        .map(|(i, item)| {
+            for (name, tensor) in item.aux {
+                auxiliary.push(Buffer::inline_shaped(
+                    format!("mm.aux.{i}.{name}"),
+                    tensor.shape,
+                    tensor_data(tensor.data),
+                )?);
+            }
+            Ok(item.feature)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let mut buffers = place_features(features, feature_shm, |_| {
         crate::utils::shm::unique_name("mm")
     });
+    buffers.extend(auxiliary);
     if let Some(mrope) = mrope {
         let len = mrope.positions.len() / 3;
         buffers.push(Buffer::inline_shaped(
@@ -551,6 +646,7 @@ mod tests {
                 input_ids,
                 result: MmEncodedEntry {
                     items: vec![MmEncodedItem {
+                        aux: Vec::new(),
                         modality: MmModality::Image,
                         feature: Tensor {
                             shape: self.shape.clone(),
@@ -654,6 +750,7 @@ mod tests {
     /// The built-in Qwen shape: two items with grids, spans and M-RoPE.
     fn qwen_entry() -> MmEncodedEntry {
         let item = |rows: usize, feature: Vec<f32>, grid: [i64; 3], hash, span| MmEncodedItem {
+            aux: Vec::new(),
             modality: MmModality::Image,
             feature: Tensor {
                 shape: vec![rows, 2],
@@ -922,6 +1019,7 @@ mod tests {
                 assert_eq!(parent_hash, 42);
                 entry.items[0].hash = parent_hash + 1;
                 entry.items.push(MmEncodedItem {
+                    aux: Vec::new(),
                     modality: MmModality::Image,
                     feature: Tensor {
                         shape: vec![1],
@@ -1209,11 +1307,7 @@ mod tests {
         );
     }
 
-    /// `processed` sees the ids intake forwards, fitted to the context as
-    /// `check_total_tokens` fits them: a 12-token prompt on an 8-token context
-    /// is truncated under `allow_auto_truncate` (a prefill with a smaller
-    /// context than its decode publishes its own 8 ids), and not observed when
-    /// intake will reject it.
+    /// processed 只观察接纳的完整 prompt；拒绝的 generation prompt 不截断、不观察。
     #[test]
     fn processed_sees_the_ids_fitted_to_the_context() {
         use std::sync::Mutex;
@@ -1236,19 +1330,23 @@ mod tests {
             }
         }
 
-        for (allow_auto_truncate, forwarded, observed) in [(true, 8, 1), (false, 12, 0)] {
+        for (allow_auto_truncate, context_len, observed) in
+            [(true, 8, 0), (false, 8, 0), (false, 16, 1)]
+        {
             let processor = Arc::new(Observing(Mutex::new(Vec::new())));
-            let ctx = MmContext::with_processor(processor.clone(), false).with_limits(Limits {
-                skip_tokenizer_init: false,
-                vocab_size: 1000,
-                context_len: 8,
-                num_reserved_tokens: 0,
+            let args = crate::message::config::ServerArgs {
+                model_config: crate::message::config::ModelConfig {
+                    context_len,
+                    ..Default::default()
+                },
                 allow_auto_truncate,
-                return_hidden_states_mode: HiddenStatesMode::Null,
-            });
+                ..Default::default()
+            };
+            let ctx = MmContext::with_processor(processor.clone(), false)
+                .with_limits(Limits::from(&args));
             let (input_ids, _) =
                 process(&ctx, NO_REQUEST, (0..12).collect(), MmData::default()).unwrap();
-            assert_eq!(input_ids, (0..forwarded).collect::<TokenIds>());
+            assert_eq!(input_ids, (0..12).collect::<TokenIds>());
             let seen = processor.0.lock().unwrap();
             assert_eq!(seen.len(), observed);
             assert!(seen.iter().all(|ids| *ids == input_ids));
@@ -1294,6 +1392,80 @@ mod tests {
             "{:?}",
             req.state
         );
+    }
+
+    const SOLID_800X100_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAyAAAABkCAIAAADxM8PYAAABkUlEQVR42u3WMQEAAAQAQQQRTGKxlDDeRfjpc3sCAIA/JQEAgMECADBYAAAGCwAAgwUAYLAAAAwWAAAGCwDAYAEAGCwAAAwWAIDBAgAwWAAABgsAAIMFAGCwAAAMFgAABgsAwGABABgsAAAMFgCAwQIAMFgAABgsAACDBQBgsAAADBYAAAYLAMBgAQAYLAAADBYAgMECADBYAAAYLAAAgwUAYLAAADBYAAAGCwDAYAEAGCwAAAwWAIDBAgAwWAAAGCwAAIMFAGCwAAAwWAAABgsAwGABAGCwAAAMFgCAwQIAMFgAABgsAACDBQBgsAAAMFgAAAYLAMBgAQBgsAAADBYAgMECADBYAAAYLAAAgwUAYLAAADBYAAAGCwDAYAEAYLAAAAwWAIDBAgDAYAEAGCwAAIMFAGCwAAAwWAAABgsAwGABAGCwAAAMFgCAwQIAwGABABgsAACDBQCAwQIAMFgAAAYLAMBgAQBgsAAADBYAgMECAMBgAQAYLAAAgwUAgMECADBYAAAGCwAAgwUA8O0AvDwCCMkzCdIAAAAASUVORK5CYII=";
+
+    fn step3_spec() -> MmSpec {
+        MmSpec {
+            feature_shm: false,
+            pipeline: MmPipelineSpec::Step3Vl(sglang_mm::step3_vl::Step3VlSpec {
+                image_token_id: 900,
+                image_start_id: 901,
+                image_end_id: 902,
+                patch_start_id: 903,
+                patch_end_id: 904,
+                patch_newline_id: 905,
+                image_size: 728,
+                patch_size: 504,
+                image_feature_tokens: 169,
+                patch_feature_tokens: 81,
+                image_mean: [0.5; 3],
+                image_std: [0.5; 3],
+            }),
+        }
+    }
+
+    #[test]
+    fn step3_vl_processor_emits_named_buffers() {
+        let ctx = MmContext::new(step3_spec()).unwrap();
+        let work = MmData {
+            image_data: vec![crate::message::multimodal::MmItem::Source(format!(
+                "data:image/png;base64,{SOLID_800X100_PNG}"
+            ))],
+            ..Default::default()
+        };
+        let output = ctx.processor.process(vec![1, 900, 2], work).unwrap();
+        let ids = output.input_ids;
+        assert_eq!(ids.len(), 2 + 8 * 83 + 171);
+        let entry = output.result;
+        entry.validate(ids.len()).unwrap();
+        assert_eq!(entry.token_ids.as_ref().unwrap().im_token_id, Some(900));
+        let [item] = entry.items.as_slice() else {
+            panic!("one item per image")
+        };
+        assert_eq!(item.feature.shape, [1, 3, 728, 728]);
+        assert_eq!(
+            item.model_specific_data.get("num_patches"),
+            Some(&MmMetaValue::Int(8))
+        );
+        let aux: std::collections::BTreeMap<_, _> =
+            item.aux.iter().map(|(n, t)| (n.as_str(), t)).collect();
+        assert_eq!(aux["patch_pixel_values"].shape, [8, 3, 504, 504]);
+        assert_eq!(aux.len(), 1);
+        assert_eq!(item.offsets.len(), 9);
+        for &(start, end) in &item.offsets {
+            assert!(ids[start as usize..=end as usize].iter().all(|&t| t == 900));
+        }
+        let runs: usize = item
+            .offsets
+            .iter()
+            .map(|&(s, e)| (e - s + 1) as usize)
+            .sum();
+        assert_eq!(runs, 8 * 81 + 169);
+        assert_eq!(ids.iter().filter(|&&t| t == 900).count(), runs);
+        let buffers = make_buffers(entry, false).unwrap();
+        assert_eq!(
+            find(&buffers, "mm.aux.0.patch_pixel_values").unwrap().shape,
+            [8, 3, 504, 504]
+        );
+    }
+
+    #[test]
+    fn step3_vl_rejects_feature_shm() {
+        let mut spec = step3_spec();
+        spec.feature_shm = true;
+        assert!(MmContext::new(spec).is_err());
     }
 
     /// Caller hashes override computed ones; mismatched lengths and malformed

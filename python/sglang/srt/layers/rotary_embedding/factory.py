@@ -130,6 +130,7 @@ def get_rope(
     rope_scaling: Optional[Dict[str, Any]] = None,
     dtype: Optional[torch.dtype] = None,
     partial_rotary_factor: float = 1.0,
+    cache_dtype: Optional[torch.dtype] = None,
 ) -> RotaryEmbedding:
     if dtype is None:
         dtype = torch.get_default_dtype()
@@ -152,6 +153,8 @@ def get_rope(
         rope_scaling_args,
         dtype,
     )
+    if cache_dtype is not None:
+        key += (cache_dtype,)
     cached = _get_live_rope_cache_entry(key)
     if cached is not None:
         return cached
@@ -408,6 +411,8 @@ def get_rope(
             )
         else:
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+    if cache_dtype is not None:
+        rotary_emb.cos_sin_cache = rotary_emb.cos_sin_cache.to(cache_dtype)
     _ROPE_DICT[key] = rotary_emb
     return rotary_emb
 

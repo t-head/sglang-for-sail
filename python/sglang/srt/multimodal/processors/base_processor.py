@@ -224,10 +224,14 @@ def _init_cpu_worker(media_url_policy: tuple) -> None:
 
 class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
     models = []
+    mm_feature_transport_override = None
     # Redo preprocessing on CPU when the GPU runs out of memory (the tokenizer
     # process shares its GPU with the scheduler).
     retry_on_cpu_after_gpu_oom = False
     prefer_tokenized_input = False
+    # Chat sends this processor its chat-encoded prompt_ids instead of rendered text.
+    accepts_chat_prompt_ids = False
+    precompute_hash_before_cpu_transfer = False
     # Set by processors that already build input_ids from the request's own
     # tokens, so the retokenize-avoidance rebuild below has nothing to add.
     preserve_processor_input_ids = False
@@ -251,7 +255,7 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
         self.server_args = server_args
         self.transport_mode = transport_mode
         self._feature_transport = MultimodalFeatureTransport(
-            get_mm().mm_feature_transport,
+            self.mm_feature_transport_override or get_mm().mm_feature_transport,
             base_gpu_id=server_args.base_gpu_id,
             skip_mm_pool=kwargs.get("skip_mm_pool", False),
         )
@@ -632,6 +636,12 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             return self._processor, self._tokenizer
         return processor, _tokenizer_of(processor)
 
+    def _template_wrote_bos(self, tokenizer, input_text) -> bool:
+        if not self._tokenizer_auto_adds_specials or not isinstance(input_text, str):
+            return False
+        bos = getattr(tokenizer, "bos_token", None)
+        return bool(bos) and input_text.startswith(bos)
+
     def _preprocessing_competes_with_the_scheduler(self) -> bool:
         return preprocessing_competes_with_the_scheduler(
             self._processor,
@@ -719,10 +729,8 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             kwargs["device"] = self.video_preprocessing_device
 
         # Avoid double BOS when the chat template already wrote one.
-        if self._tokenizer_auto_adds_specials and isinstance(input_text, str):
-            bos = getattr(tokenizer, "bos_token", None)
-            if bos and input_text.startswith(bos):
-                kwargs.setdefault("add_special_tokens", False)
+        if self._template_wrote_bos(tokenizer, input_text):
+            kwargs.setdefault("add_special_tokens", False)
 
         try:
             return self._call_processor(processor, input_text, processor_device, kwargs)
@@ -1517,7 +1525,9 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             )
 
         # Split bundled items into per-image/video items for better cache granularity
-        from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
+        from sglang.srt.managers.mm_utils import (
+            get_new_expanded_mm_items,
+        )
 
         all_collected_items = get_new_expanded_mm_items(all_collected_items)
         all_collected_items = self._finalize_mm_items(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import random
@@ -37,6 +38,8 @@ from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_model,
+    get_parallel,
     get_spec,
 )
 from sglang.srt.utils import is_npu
@@ -1200,6 +1203,12 @@ def is_mla_backend(target_kv_pool) -> bool:
     return isinstance(target_kv_pool, (MLAKVView, DeepSeekV4TokenToKVPool))
 
 
+def get_pd_kv_cache_dtype_str(model_runner) -> str:
+    if getattr(model_runner.model, "kv_cache_dtype_full_attention_only", False):
+        return get_model().kv_cache_dtype
+    return model_runner.kv_cache_dtype_str
+
+
 def should_send_replicated_state(
     *,
     src_attn_tp_size: int,
@@ -1513,6 +1522,148 @@ def _draft_entry_layer_ids(*, pool, num_entries: int) -> List[int]:
             f"ids={len(ids)}, entries={num_entries}"
         )
     return ids
+
+
+def encode_step5_pd_layout(kv_args):
+    """Describe the fixed Step5 wire schema; other models emit an empty frame.
+
+    Version 1 means BF16 index K/Z, int64 position tags, uint8 compressed keys
+    and the fixed MTP history dtypes validated by the exporting pools. Rows are
+    FULL pages for compressed keys and request slots for tail/history. Buffer
+    lengths describe capacity, not the number of live request rows.
+    """
+    from sglang.srt.disaggregation.base.conn import StateType
+
+    types = list(getattr(kv_args, "state_types", ()))
+    if StateType.STEP5_DSA_TAIL not in types:
+        return b""
+    return json.dumps(
+        {
+            "version": 1,
+            "types": [x.value for x in types],
+            "page_size": kv_args.page_size,
+            "kv_dtype": kv_args.kv_cache_dtype_str,
+            "data_lens": kv_args.state_data_lens,
+        }
+    ).encode("utf-8")
+
+
+def validate_step5_pd_peer(
+    kv_args,
+    peer_layout,
+    dst_ptrs,
+    dst_items,
+    *,
+    src_tp,
+    dst_tp,
+    pp_size,
+    src_dcp,
+    dst_dcp,
+    src_indices=None,
+    dst_indices=None,
+    require_state=False,
+):
+    """Reject unsupported Step5 peers before any KV/state transfer is posted.
+
+    Only equal-TP, PP1/DCP1 and identical state layouts are supported. Different
+    request/page capacities are legal, but every index is bounded using its own
+    peer's byte capacity. A different ring width needs repacking, not memcpy.
+    """
+    local_frame = encode_step5_pd_layout(kv_args)
+    if not local_frame and not peer_layout:
+        return
+    if not local_frame or not peer_layout:
+        raise RuntimeError("Step5 PD requires explicit layouts on both peers")
+    local = json.loads(local_frame)
+    peer = json.loads(peer_layout)
+    if src_tp != dst_tp or pp_size != 1 or src_dcp != 1 or dst_dcp != 1:
+        raise RuntimeError("Step5 PD requires equal TP and PP1/DCP1")
+    for key in ("version", "types", "page_size", "kv_dtype"):
+        if peer.get(key) != local[key]:
+            raise RuntimeError(f"Step5 PD {key} mismatch")
+    count = len(local["types"])
+    if not (len(dst_ptrs) == len(dst_items) == len(peer.get("data_lens", ())) == count):
+        raise RuntimeError("Step5 PD state component count mismatch")
+    if require_state and not (
+        src_indices is not None
+        and dst_indices is not None
+        and len(src_indices) == len(dst_indices) == count
+    ):
+        raise RuntimeError("Step5 PD final transfer requires every state component")
+    for i, (items, remote_items) in enumerate(zip(kv_args.state_item_lens, dst_items)):
+        local_sizes, remote_sizes = local["data_lens"][i], peer["data_lens"][i]
+        if not (
+            len(items)
+            == len(remote_items)
+            == len(dst_ptrs[i])
+            == len(local_sizes)
+            == len(remote_sizes)
+        ):
+            raise RuntimeError("Step5 PD state entry count mismatch")
+        if any(a <= 0 or a != b for a, b in zip(items, remote_items)):
+            raise RuntimeError(
+                "Step5 PD item length mismatch; ring repacking is unsupported"
+            )
+        for sizes, strides, indices in (
+            (local_sizes, items, src_indices),
+            (remote_sizes, remote_items, dst_indices),
+        ):
+            if any(size <= 0 or size % stride for size, stride in zip(sizes, strides)):
+                raise RuntimeError(
+                    "Step5 PD state capacity is not an integral number of rows"
+                )
+            rows = indices[i] if indices is not None and i < len(indices) else None
+            if rows is not None and any(
+                int(index) < 0
+                or any(
+                    int(index) >= size // stride for size, stride in zip(sizes, strides)
+                )
+                for index in rows
+            ):
+                raise RuntimeError("Step5 PD state index exceeds peer capacity")
+        # Raw rings must be present at handoff even if all KV pages hit.
+        if require_state and local["types"][i] in ("step5_dsa_tail",):
+            if (
+                src_indices[i] is None
+                or dst_indices[i] is None
+                or not (len(src_indices[i]) == len(dst_indices[i]) == 1)
+            ):
+                raise RuntimeError(
+                    "Step5 PD handoff requires one source/destination request slot"
+                )
+
+
+def step5_state_destination_strides(
+    state_type, src_ptrs, dst_ptrs, src_items, dst_items, src_indices, dst_indices
+):
+    """Validate Step5's fixed flat layout before building any transfer descriptors.
+
+    Unequal ring capacities require logical-position repacking, which is not
+    supported. Keep destination strides explicit even when equality is required.
+    Peer registration separately validates dtype, capacity and component order.
+    """
+    from sglang.srt.disaggregation.base.conn import StateType
+
+    if state_type not in (
+        StateType.STEP5_COMPRESSED_INDEX_KEY,
+        StateType.STEP5_DSA_TAIL,
+    ):
+        return {}
+    if dst_items is None or not (
+        len(src_ptrs) == len(dst_ptrs) == len(src_items) == len(dst_items)
+    ):
+        raise RuntimeError("Step5 state pointer/item-length metadata mismatch")
+    if any(a <= 0 or a != b for a, b in zip(src_items, dst_items)):
+        raise RuntimeError(
+            "Step5 state item length mismatch; ring repacking is unsupported"
+        )
+    if len(src_indices) != len(dst_indices) or any(
+        int(index) < 0 for indices in (src_indices, dst_indices) for index in indices
+    ):
+        raise RuntimeError("Step5 state indices must be nonnegative and paired")
+    if len(set(dst_ptrs)) != len(dst_ptrs):
+        raise RuntimeError("Step5 state destination buffers must be distinct")
+    return dict(zip(map(int, dst_ptrs), map(int, dst_items)))
 
 
 def resolve_dcp_dst_entry_indices(
@@ -1835,6 +1986,11 @@ def _nixl_kv_packable(owner_view, draft_token_to_kv_pool) -> bool:
         )
         and pools[0].head_num == pools[1].head_num
     )
+
+
+def aux_state(pool):
+    """The state a pool carries beside its KV buffers, or ``None``."""
+    return getattr(pool, "aux_state", None)
 
 
 def setup_state_kv_args(

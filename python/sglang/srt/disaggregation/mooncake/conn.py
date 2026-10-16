@@ -58,11 +58,14 @@ from sglang.srt.disaggregation.utils import (
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
     draft_kv_ring_row_pairs,
+    encode_step5_pd_layout,
     filter_kv_indices_for_shard_rank,
     is_elided_entry,
     resolve_dcp_dst_entry_indices,
     should_send_replicated_state,
     slice_dsa_tail_dst_ptrs_for_pp,
+    step5_state_destination_strides,
+    validate_step5_pd_peer,
 )
 from sglang.srt.distributed.device_communicators.kv_transfer_engine import (
     TransferIntent,
@@ -98,6 +101,8 @@ _REPLICATED_STATE_TYPES = frozenset(
         StateType.QSA_COMPRESSED,
         StateType.DRAFT_RING,
         StateType.REQUEST_ROW,
+        StateType.STEP5_COMPRESSED_INDEX_KEY,
+        StateType.STEP5_DSA_TAIL,
     }
 )
 
@@ -184,6 +189,7 @@ class KVArgsRegisterInfo:
     dst_state_dim_per_tensor: List[List[int]]
     dst_kv_layer_ids: List[int]
     dst_state_layer_ids: List[List[int]]
+    step5_layout: bytes = b""
     dst_dcp_size: int = 1
     dst_dcp_rank: int = 0
     requires_dcp_relayout: bool = False
@@ -235,6 +241,7 @@ class KVArgsRegisterInfo:
             staging_total_size=(
                 int(msg[16].decode("ascii")) if len(msg) > 16 and msg[16] != b"" else 0
             ),
+            step5_layout=msg[22] if len(msg) > 22 else b"",
             dst_dcp_size=(
                 int(msg[17].decode("ascii")) if len(msg) > 17 and msg[17] != b"" else 1
             ),
@@ -1241,6 +1248,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         even on a non-MLA backend, for K-only state buffers (e.g. MiniMax sparse
         index) whose per-layer list must not be half-split into K/V.
         """
+        destination_strides = step5_state_destination_strides(
+            state_type,
+            src_data_ptrs,
+            dst_data_ptrs,
+            item_lens,
+            dst_item_lens,
+            prefill_data_indices,
+            dst_data_indices,
+        )
         # Host and device buffers may use different destination page spaces.
         # Build both transfer plans once, then select per destination buffer.
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
@@ -1385,7 +1401,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 src_blocks, dst_blocks = prefill_kv_blocks, dst_kv_blocks
             for prefill_index, decode_index in zip(src_blocks, dst_blocks):
                 src_addr = src_ptr + int(prefill_index[0]) * item_len
-                dst_addr = dst_ptr + int(decode_index[0]) * item_len
+                dst_addr = dst_ptr + int(decode_index[0]) * destination_strides.get(
+                    int(dst_ptr), item_len
+                )
                 length = item_len * len(prefill_index)
                 transfer_blocks.append((src_addr, dst_addr, length))
             return transfer_blocks
@@ -1445,7 +1463,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         src_blocks, target_blocks = prefill_blocks, dst_blocks
                     for prefill_index, decode_index in zip(src_blocks, target_blocks):
                         src_addr = src_ptr + int(prefill_index[0]) * item_len
-                        dst_addr = dst_ptr + int(decode_index[0]) * item_len
+                        dst_addr = dst_ptr + int(
+                            decode_index[0]
+                        ) * destination_strides.get(int(dst_ptr), item_len)
                         length = item_len * len(prefill_index)
                         transfer_blocks.append((src_addr, dst_addr, length))
                 return self._transfer_data(mooncake_session_id, transfer_blocks)
@@ -2239,6 +2259,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             StateType.REQUEST_ROW,
             StateType.BLOCK_SCALE,
             StateType.BLOCK_SCALE_SWA,
+            StateType.STEP5_COMPRESSED_INDEX_KEY,
+            StateType.STEP5_DSA_TAIL,
         )
 
     def _requires_exact_state_index_match(self, st: StateType) -> bool:
@@ -2250,6 +2272,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             StateType.DRAFT_RING,
             StateType.DSV4_REQUEST_STATE,
             StateType.REQUEST_ROW,
+            StateType.STEP5_COMPRESSED_INDEX_KEY,
+            StateType.STEP5_DSA_TAIL,
         )
 
     def _prepare_sharded_dsa_indices(self, src_indices, dst_indices):
@@ -2961,7 +2985,25 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 target_rank_registration_info.dst_aux_ptrs,
                                 target_rank_registration_info.dst_aux_item_lens,
                             )
-                        except ValueError as exc:
+                            peer = target_rank_registration_info
+                            if StateType.STEP5_DSA_TAIL in getattr(
+                                self.kv_args, "state_types", ()
+                            ) or getattr(peer, "step5_layout", b""):
+                                validate_step5_pd_peer(
+                                    self.kv_args,
+                                    getattr(peer, "step5_layout", b""),
+                                    peer.dst_state_data_ptrs,
+                                    peer.dst_state_item_lens,
+                                    src_tp=self.attn_tp_size,
+                                    dst_tp=peer.dst_attn_tp_size,
+                                    pp_size=self.pp_size,
+                                    src_dcp=self.dcp_size,
+                                    dst_dcp=peer.dst_dcp_size,
+                                    src_indices=kv_chunk.state_indices,
+                                    dst_indices=req.dst_state_indices,
+                                    require_state=kv_chunk.is_last_chunk,
+                                )
+                        except (ValueError, RuntimeError) as exc:
                             self.conclude_failure(
                                 bootstrap_room=kv_chunk.room, failure_reason=str(exc)
                             )
@@ -3682,6 +3724,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 *self.kv_args.kv_item_lens,
             ),
             b"1" if self.kv_args.draft_rows_dcp_collapsed else b"0",
+            *([layout] if (layout := encode_step5_pd_layout(self.kv_args)) else []),
         ]
 
     def build_receiver_metadata_message(

@@ -3051,6 +3051,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 queue.scheduler = SimpleNamespace(
                     kv_checksum_computer=None,
                     batch_result_processor=SchedulerBatchResultProcessor(**fields),
+                    disagg_decode_prealloc_queue=SimpleNamespace(aux_states=()),
                 )
                 queue.spec_algorithm = SimpleNamespace(is_none=lambda: True)
                 queue.metadata_buffers = buffers
@@ -3109,6 +3110,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 batch_result_processor=SimpleNamespace(
                     _maybe_update_reasoning_tokens=lambda req, token_id: None
                 ),
+                disagg_decode_prealloc_queue=SimpleNamespace(aux_states=()),
             )
             queue.spec_algorithm = SimpleNamespace(is_none=lambda: True)
             queue.metadata_buffers = buffers
@@ -3165,11 +3167,13 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 )
             ),
         )
-        # The draft-input shape comes from the spec bag.
+        # draft 输入形状和 seed backend 都由发布后的配置决定。
         override = get_context().override_server_args(
             speculative_eagle_topk=1,
             speculative_num_steps=5,
             enable_multi_layer_eagle=False,
+            attention_backend="dsa",
+            speculative_draft_attention_backend="dsa",
         )
         override.install()
         self.addCleanup(override.restore)
@@ -3249,6 +3253,8 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             speculative_eagle_topk=1,
             speculative_num_steps=5,
             enable_multi_layer_eagle=False,
+            attention_backend="dsa",
+            speculative_draft_attention_backend="dsa",
             disaggregation_mode="decode",
             enable_hisparse=False,
         )
@@ -3312,6 +3318,8 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             speculative_eagle_topk=1,
             speculative_num_steps=5,
             enable_multi_layer_eagle=False,
+            attention_backend="dsa",
+            speculative_draft_attention_backend="dsa",
             disaggregation_mode="decode",
             enable_hisparse=False,
         )

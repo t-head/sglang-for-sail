@@ -44,6 +44,7 @@ def configure_kv_cache_dtype(
     is_dflash: bool,
     speculative_draft_attention_backend: str,
     speculative_draft_kv_cache_dtype: Optional[str] = None,
+    full_attention_only: bool = False,
 ) -> tuple[str, torch.dtype]:
     """(label, torch dtype) of a runner's KV cache; a pool in the compute
     dtype is labelled "auto", which backends gate FP8 casts and descales on."""
@@ -114,6 +115,8 @@ def configure_kv_cache_dtype(
         # "auto" is the tag for an unquantized pool; backends gate descale on it.
         kv_cache_dtype_str = "auto"
 
+    if full_attention_only and kv_cache_dtype != model_dtype:
+        return "auto", model_dtype
     return kv_cache_dtype_str, kv_cache_dtype
 
 

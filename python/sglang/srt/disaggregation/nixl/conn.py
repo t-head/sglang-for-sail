@@ -48,9 +48,12 @@ from sglang.srt.disaggregation.utils import (
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
+    encode_step5_pd_layout,
     is_elided_entry,
     resolve_dcp_dst_entry_indices,
     slice_dsa_tail_dst_ptrs_for_pp,
+    step5_state_destination_strides,
+    validate_step5_pd_peer,
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_device, get_schedule
@@ -360,6 +363,7 @@ class KVArgsRegisterInfo:
     dst_kv_item_len: int
     dst_kv_item_lens: list[int]
     dst_kv_layer_ids: list[int] = dataclasses.field(default_factory=list)
+    step5_layout: bytes = b""
     dst_dcp_size: int = 1
     dst_dcp_rank: int = 0
     requires_dcp_relayout: bool = False
@@ -437,6 +441,7 @@ class KVArgsRegisterInfo:
             dst_kv_item_lens=dst_kv_item_lens,
             dst_kv_layer_ids=dst_kv_layer_ids,
             # msg[20:22] are the layer-id frames above; DCP trails them.
+            step5_layout=msg[26] if len(msg) > 26 else b"",
             dst_dcp_size=(
                 int(msg[22].decode("ascii")) if len(msg) > 22 and msg[22] != b"" else 1
             ),
@@ -1758,6 +1763,23 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         ) or self._kv_shard_fan_in_mismatch(req.required_dst_info_num)
                         if kv_shard_mismatch is not None:
                             raise RuntimeError(kv_shard_mismatch)
+                    if StateType.STEP5_DSA_TAIL in getattr(
+                        self.kv_args, "state_types", ()
+                    ) or getattr(dst_info, "step5_layout", b""):
+                        validate_step5_pd_peer(
+                            self.kv_args,
+                            getattr(dst_info, "step5_layout", b""),
+                            dst_info.dst_state_data_ptrs,
+                            dst_info.dst_state_item_lens,
+                            src_tp=self.attn_tp_size,
+                            dst_tp=dst_info.decode_tp_size,
+                            pp_size=self.pp_size,
+                            src_dcp=self.dcp_size,
+                            dst_dcp=dst_info.dst_dcp_size,
+                            src_indices=kv_chunk.state_indices,
+                            dst_indices=req.dst_state_indices,
+                            require_state=kv_chunk.is_last_chunk,
+                        )
 
                     # Skip KV RDMA transfer when there are no pages to send
                     # (e.g., decode-side radix cache matched the entire prefix).
@@ -2208,6 +2230,15 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         ``force_flat`` uses the MLA-style flat (single-buffer-per-layer) layout
         even on a non-MLA backend, for K-only state buffers (e.g. MiniMax sparse
         index) whose per-layer list must not be half-split into K/V."""
+        destination_strides = step5_state_destination_strides(
+            state_type,
+            src_data_ptrs,
+            dst_data_ptrs,
+            item_lens,
+            dst_item_lens,
+            prefill_data_indices,
+            dst_data_indices,
+        )
         # Prepped path (KV only; state transfers use the non-prepped path below).
         if (
             not bypass_prepped
@@ -2355,7 +2386,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             lengths = item_len * block_lens
             src_addrs.append(src_ptr + prefill_starts * item_len)
             src_lens.append(lengths)
-            dst_addrs.append(dst_ptr + dst_starts * item_len)
+            dst_addrs.append(
+                dst_ptr + dst_starts * destination_strides.get(int(dst_ptr), item_len)
+            )
             dst_lens.append(lengths)
 
         def make_req_array(addr_chunks, len_chunks, gpu):
@@ -3377,6 +3410,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 StateType.SWA_RING,
                 StateType.DSV4_REQUEST_STATE,
                 StateType.REQUEST_ROW,
+                StateType.STEP5_COMPRESSED_INDEX_KEY,
+                StateType.STEP5_DSA_TAIL,
             ):
                 # QSA state is whole on every rank, so it pairs by state TP.
                 src_tp_size = (
@@ -3408,7 +3443,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     dst_data_indices=np.array(dst_indices, dtype=np.int32),
                     dst_gpu_id=dst_gpu_id,
                     state_type=st,
-                    force_flat=st in (StateType.QSA_PENDING, StateType.QSA_COMPRESSED),
+                    force_flat=st
+                    in (
+                        StateType.QSA_PENDING,
+                        StateType.QSA_COMPRESSED,
+                        StateType.STEP5_COMPRESSED_INDEX_KEY,
+                        StateType.STEP5_DSA_TAIL,
+                    ),
                     src_layer_ids=src_lids,
                     dst_layer_ids=dst_lids,
                     dst_item_lens=dst_lens,
@@ -3688,6 +3729,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             str(self.dcp_rank).encode("ascii"),
             packed_state_data_lens,
             b"1" if self.kv_args.draft_rows_dcp_collapsed else b"0",
+            *([layout] if (layout := encode_step5_pd_layout(self.kv_args)) else []),
         ]
 
     def build_receiver_metadata_message(

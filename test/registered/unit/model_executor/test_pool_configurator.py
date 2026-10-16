@@ -851,6 +851,7 @@ class TestPerWorkerRequestSplit(CustomTestCase):
 
         _publish_config(self, max_running_requests=1)
         kvc = SimpleNamespace(
+            server_args=get_server_args(),
             attn_dp_size=4,
             mambaish_config=None,
             model_config=SimpleNamespace(context_len=8192),

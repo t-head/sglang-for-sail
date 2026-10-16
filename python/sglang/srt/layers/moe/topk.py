@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import IntEnum, auto
 from typing import (
     TYPE_CHECKING,
@@ -263,6 +263,9 @@ class TopKConfig:
     renormalize: bool = True
     shared_experts: SharedExpertsConfig = SharedExpertsConfig()
     custom_routing_function: Optional[Callable] = None
+    # Opt-in callbacks accept the device count and mask CUDA padded IDs.
+    # Postprocessing retains ownership when remapping/capture can alter IDs.
+    custom_routing_handles_padding: bool = False
     correction_bias: Optional[torch.Tensor] = None
     torch_native: bool = False
     routed_scaling_factor: Optional[float] = None
@@ -697,6 +700,7 @@ class TopK(BaseFusedOp):
         num_expert_group: Optional[int] = None,
         renormalize: bool = True,
         custom_routing_function: Optional[Callable] = None,
+        custom_routing_handles_padding: bool = False,
         scoring_func: str = "softmax",
         correction_bias: Optional[torch.Tensor] = None,
         quant_config: Optional[QuantizationConfig] = None,
@@ -708,6 +712,7 @@ class TopK(BaseFusedOp):
         allow_routed_experts_capture: bool = True,
         sqrtsoftplus_log1p: bool = False,
         fused_gate_packed_ids: bool = False,
+        replicated_inputs: bool = False,
     ):
         # NOTE: scoring_func is not used for now, but we keep it for future use
         # see https://github.com/sgl-project/sglang/pull/4505 for more details
@@ -721,6 +726,7 @@ class TopK(BaseFusedOp):
             get_flags().moe.in_speculative_scope if is_draft is None else is_draft
         )
         self._runner_backend_bound = False
+        self.replicated_inputs = replicated_inputs
 
         shared_experts = get_model().shared_experts
         self.enable_waterfill = shared_experts.use_waterfill
@@ -739,6 +745,7 @@ class TopK(BaseFusedOp):
             num_expert_group=num_expert_group,
             shared_experts=shared_experts,
             custom_routing_function=custom_routing_function,
+            custom_routing_handles_padding=custom_routing_handles_padding,
             correction_bias=correction_bias,
             routed_scaling_factor=routed_scaling_factor,
             apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
@@ -755,17 +762,25 @@ class TopK(BaseFusedOp):
         )
 
     def routing_inputs(self):
-        return resolve_routing_inputs(layer_id=self.layer_id, is_draft=self.is_draft)
+        return self._resolve_routing_inputs(None, None)
 
     def _resolve_routing_inputs(
         self, num_token_non_padded, expert_location_dispatch_info
     ):
-        return resolve_routing_inputs(
+        num_token_non_padded, info = resolve_routing_inputs(
             layer_id=self.layer_id,
             is_draft=self.is_draft,
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
         )
+        if self.replicated_inputs and info is not None:
+            # Step5 本地 partial-output 路径要求同行输入在各 rank 选中同一副本。
+            if info.ep_dispatch_algorithm == "fake":
+                raise ValueError(
+                    "Replicated MoE inputs do not support rank-random fake logits"
+                )
+            info = replace(info, rank_invariant=True)
+        return num_token_non_padded, info
 
     def bind_runner_backend(
         self,
@@ -2860,6 +2875,23 @@ def select_experts(
     renormalize = topk_config.renormalize
     num_shared_topk_slots = topk_config.num_shared_topk_slots
     custom_routing_function = topk_config.custom_routing_function
+    # Only fold the final CUDA ID mask into a custom router when no later
+    # routing transform can replace IDs. Capture observes unmasked logical IDs
+    # on the legacy path, so retain that ordering when capture is active.
+    custom_padding_fused = (
+        _is_cuda
+        and custom_routing_function is not None
+        and dynamic_expert_bias is None
+        and not use_grouped_topk
+        and topk_config.custom_routing_handles_padding
+        and num_token_non_padded is not None
+        and expert_location_dispatch_info is None
+        and not is_expert_remapping_enabled()
+        and num_shared_topk_slots == 0
+        and get_global_experts_capturer() is None
+        and not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+        and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+    )
     correction_bias = (
         topk_config.correction_bias
         if dynamic_expert_bias is None
@@ -3127,16 +3159,19 @@ def select_experts(
                 **_fused_topk_kwargs,
             )
     else:
-        # custom_routing_function itself is padding-unaware; its output on
-        # padded rows is garbage. That is fine because _post_process_topk_ids
-        # below masks rows >= num_token_non_padded (-1 on CUDA, 0 + zeroed
-        # weights on HIP) after the logical->physical remap.
+        # 仅在 callback 能负责最终 ID mask 时传入 padding 数量。
         fold_scale_after_routing = True
+        padding_kwargs = (
+            {"num_token_non_padded": num_token_non_padded}
+            if custom_padding_fused
+            else {}
+        )
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,
             gating_output=router_logits,
             topk=top_k_for_gate,
             renormalize=renormalize,
+            **padding_kwargs,
         )
 
     if (
@@ -3165,7 +3200,7 @@ def select_experts(
         topk_weights=topk_weights,
         topk_config=topk_config,
         router_logits=router_logits,
-        num_token_non_padded=num_token_non_padded,
+        num_token_non_padded=None if custom_padding_fused else num_token_non_padded,
         layer_id=layer_id,
         expert_location_dispatch_info=expert_location_dispatch_info,
         padded_rows_masked=padded_rows_masked,

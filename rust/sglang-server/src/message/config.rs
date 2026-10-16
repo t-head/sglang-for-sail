@@ -229,10 +229,10 @@ pub struct ServerArgs {
     /// configured order: Python checks them in that order and reports the first
     /// one exceeded. Empty means no per-modality limit.
     pub limit_mm_data_per_request: Vec<(String, usize)>,
-    /// Over-long inputs are truncated to fit the context instead of 400ing, and
-    /// `max_new_tokens` is clamped rather than rejected (Python
-    /// `TokenizerManager._validate_one_request`).
+    /// Legacy embedding-input truncation flag; generation inputs are never truncated.
     pub allow_auto_truncate: bool,
+    /// Minimum context space a generation prompt must leave for output.
+    pub min_output_token_reserve: u64,
     /// The resolved `--enable-return-hidden-states`;
     /// decides the mode only when `return_hidden_states_mode` is unset.
     pub enable_return_hidden_states: bool,
@@ -330,6 +330,7 @@ impl ServerArgs {
         enable_strict_thinking,
         limit_mm_data_per_request,
         allow_auto_truncate,
+        min_output_token_reserve,
         enable_return_hidden_states,
         return_hidden_states_mode,
         num_reserved_tokens,
@@ -397,6 +398,7 @@ impl ServerArgs {
         enable_strict_thinking: bool,
         limit_mm_data_per_request: Vec<(String, usize)>,
         allow_auto_truncate: bool,
+        min_output_token_reserve: u64,
         enable_return_hidden_states: bool,
         return_hidden_states_mode: Option<String>,
         num_reserved_tokens: u64,
@@ -462,6 +464,7 @@ impl ServerArgs {
             enable_strict_thinking,
             limit_mm_data_per_request,
             allow_auto_truncate,
+            min_output_token_reserve,
             enable_return_hidden_states,
             return_hidden_states_mode,
             num_reserved_tokens,
@@ -534,6 +537,7 @@ impl Default for ServerArgs {
             enable_strict_thinking: false,
             limit_mm_data_per_request: Vec::new(),
             allow_auto_truncate: false,
+            min_output_token_reserve: 1,
             enable_return_hidden_states: false,
             return_hidden_states_mode: None,
             num_reserved_tokens: 0,
@@ -1079,7 +1083,14 @@ pub struct MmSpec {
     /// broadcasts across TP ranks and will unwrap `ShmPointerMMData`.
     pub feature_shm: bool,
     /// The family pipeline and its resolved processor parameters.
-    pub pipeline: sglang_processor::dynamo_multimodal::registry::ProcessorSpec,
+    pub pipeline: MmPipelineSpec,
+}
+
+// 保留目标 Image pipeline；Step3VL 的独立几何由本次移植的处理器负责。
+#[derive(Clone, Debug)]
+pub enum MmPipelineSpec {
+    Image(sglang_processor::dynamo_multimodal::registry::ProcessorSpec),
+    Step3Vl(sglang_mm::step3_vl::Step3VlSpec),
 }
 
 #[pyo3::pymethods]
@@ -1114,11 +1125,16 @@ impl MmSpec {
         image_mean: [f32; 3],
         image_std: [f32; 3],
         resample: MmResample,
-    ) -> Self {
+    ) -> pyo3::PyResult<Self> {
         use sglang_processor::dynamo_multimodal::models::qwen_vl::QwenVlSpec;
         use sglang_processor::dynamo_multimodal::registry::ProcessorSpec;
         let pipeline = match family {
-            MmFamily::QwenVl => ProcessorSpec::QwenVl(QwenVlSpec {
+            MmFamily::Step3Vl => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "MmFamily.Step3Vl is built with MmSpec.step3_vl(...)",
+                ));
+            }
+            MmFamily::QwenVl => MmPipelineSpec::Image(ProcessorSpec::QwenVl(QwenVlSpec {
                 image_token_id,
                 patch_size,
                 merge_size,
@@ -1128,11 +1144,62 @@ impl MmSpec {
                 image_mean,
                 image_std,
                 resample: resample.into(),
-            }),
+            })),
         };
-        Self {
+        Ok(Self {
             feature_shm,
             pipeline,
+        })
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (*,
+        feature_shm,
+        image_token_id,
+        image_start_id,
+        image_end_id,
+        patch_start_id,
+        patch_end_id,
+        patch_newline_id,
+        image_size,
+        patch_size,
+        image_feature_tokens,
+        patch_feature_tokens,
+        image_mean,
+        image_std,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn step3_vl(
+        feature_shm: bool,
+        image_token_id: i64,
+        image_start_id: i64,
+        image_end_id: i64,
+        patch_start_id: i64,
+        patch_end_id: i64,
+        patch_newline_id: i64,
+        image_size: usize,
+        patch_size: usize,
+        image_feature_tokens: usize,
+        patch_feature_tokens: usize,
+        image_mean: [f32; 3],
+        image_std: [f32; 3],
+    ) -> Self {
+        Self {
+            feature_shm,
+            pipeline: MmPipelineSpec::Step3Vl(sglang_mm::step3_vl::Step3VlSpec {
+                image_token_id,
+                image_start_id,
+                image_end_id,
+                patch_start_id,
+                patch_end_id,
+                patch_newline_id,
+                image_size,
+                patch_size,
+                image_feature_tokens,
+                patch_feature_tokens,
+                image_mean,
+                image_std,
+            }),
         }
     }
 }
@@ -1149,6 +1216,7 @@ impl MmSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MmFamily {
     QwenVl,
+    Step3Vl,
 }
 
 /// The HF image processor the Rust resize must reproduce bit-exactly (see

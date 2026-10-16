@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::message::buffers::{Buffer, BufferData, find};
-use crate::message::config::{HiddenStatesMode, ServerArgs};
+use crate::message::config::{HiddenStatesMode, ModelConfig, ServerArgs};
 use crate::message::request::{GenerateRequest, TokenizeInput};
 use crate::message::response::ResponseSink;
 use crate::message::sampling::SamplingParams;
@@ -216,6 +216,7 @@ fn test_limits() -> Limits {
         num_reserved_tokens: 0,
         allow_auto_truncate: false,
         return_hidden_states_mode: HiddenStatesMode::Null,
+        min_output_token_reserve: 1,
     }
 }
 
@@ -234,11 +235,9 @@ fn generate_req(id: u64, sampling_params: SamplingParams) -> Request {
     }
 }
 
-/// `input + max_new_tokens` past the context window is an actionable 400, not a
-/// silently truncated 200 (Python `TokenizerManager._validate_one_request`).
-/// The message names both halves so the client can fix the right one.
+/// 接纳 prompt 后，超出 context 的输出预算被 clamp，prompt 保持完整。
 #[test]
-fn total_tokens_over_context_is_rejected() {
+fn total_tokens_over_context_is_clamped() {
     let limits = Limits {
         context_len: 10,
         ..test_limits()
@@ -251,23 +250,16 @@ fn total_tokens_over_context_is_rejected() {
         },
         ..Default::default()
     };
-    let err = check_total_tokens(&mut g, &limits).unwrap_err();
-    let msg = err.to_string();
-    assert!(matches!(err, Error::Validation(_)));
-    assert!(msg.contains("total of 103 tokens"), "{msg}");
-    assert!(msg.contains("3 tokens from the input"), "{msg}");
-    assert!(msg.contains("100 tokens for the completion"), "{msg}");
-    // Exactly filling the window is allowed (Python compares with `>`).
+    assert!(check_total_tokens(&mut g, &limits).is_ok());
+    assert_eq!(g.sampling_params.max_new_tokens, Some(7));
+    assert_eq!(g.input_ids.as_deref(), Some(&[1, 2, 3][..]));
+    // prompt 与输出恰好填满 context 时预算保持不变。
     g.sampling_params.max_new_tokens = Some(7);
     assert!(check_total_tokens(&mut g, &limits).is_ok());
     assert_eq!(g.sampling_params.max_new_tokens, Some(7), "left alone");
 }
 
-/// A launcher whose default for an omitted `max_new_tokens` is `None` (no
-/// limit) under `--context-length` lets a prompt near the window through
-/// untouched; the scheduler clamps the output to the room the window leaves.
-/// A client-sent 128 or context-length value is a 400; the same values marked
-/// defaulted are left to the scheduler's clamp.
+/// 未指定输出上限时交由 scheduler；显式值和默认值均在接纳后 clamp。
 #[test]
 fn omitted_max_new_tokens_under_a_context_length_passes_a_near_limit_prompt() {
     let limits = Limits {
@@ -289,40 +281,42 @@ fn omitted_max_new_tokens_under_a_context_length_passes_a_near_limit_prompt() {
         "left to the scheduler"
     );
     for max_new_tokens in [Some(128), Some(1000)] {
-        let err = check_total_tokens(&mut request(max_new_tokens), &limits).unwrap_err();
-        assert!(matches!(err, Error::Validation(_)), "{max_new_tokens:?}");
-        let mut g = GenerateRequest {
-            max_new_tokens_defaulted: true,
-            ..request(max_new_tokens)
-        };
-        assert!(check_total_tokens(&mut g, &limits).is_ok());
-        assert_eq!(g.sampling_params.max_new_tokens, max_new_tokens);
+        for max_new_tokens_defaulted in [false, true] {
+            let mut g = GenerateRequest {
+                max_new_tokens_defaulted,
+                ..request(max_new_tokens)
+            };
+            assert!(check_total_tokens(&mut g, &limits).is_ok());
+            assert_eq!(g.sampling_params.max_new_tokens, Some(10));
+        }
     }
 }
 
-/// The reserved slots (eagle draft tokens) count as input, so a request can be
-/// rejected for them even when the prompt alone would fit.
+/// EAGLE draft 的 scratch 槽位不占用用户可见的 context 预算。
 #[test]
-fn reserved_tokens_count_toward_the_limit() {
-    let limits = Limits {
-        context_len: 10,
+fn reserved_tokens_do_not_count_toward_the_limit() {
+    let args = ServerArgs {
+        model_config: ModelConfig {
+            context_len: 10,
+            ..Default::default()
+        },
         num_reserved_tokens: 5,
-        ..test_limits()
+        ..Default::default()
     };
+    let limits = Limits::from(&args);
     let mut g = GenerateRequest {
         input_ids: Some(vec![1, 2, 3]),
         sampling_params: SamplingParams {
-            max_new_tokens: Some(3), // 3 + 3 fits, but 3 + 5 + 3 does not
+            max_new_tokens: Some(3), // prompt 与输出合计 6，scratch 另计。
             ..Default::default()
         },
         ..Default::default()
     };
-    let msg = check_total_tokens(&mut g, &limits).unwrap_err().to_string();
-    assert!(msg.contains("8 tokens from the input"), "{msg}");
+    assert!(check_total_tokens(&mut g, &limits).is_ok());
+    assert_eq!(g.sampling_params.max_new_tokens, Some(3));
 }
 
-/// `--allow-auto-truncate` opts into clamping instead of rejecting; with no
-/// context length, or no `max_new_tokens` cap, there is nothing to check.
+/// 输出预算超过剩余空间时 clamp；充足空间或未设上限时保留原值。
 #[test]
 fn auto_truncate_clamps_and_unknowns_skip() {
     let sp = |max_new_tokens| SamplingParams {
@@ -334,11 +328,15 @@ fn auto_truncate_clamps_and_unknowns_skip() {
         sampling_params: sp(Some(100)),
         ..Default::default()
     };
-    let truncating = Limits {
-        context_len: 10,
+    let args = ServerArgs {
+        model_config: ModelConfig {
+            context_len: 10,
+            ..Default::default()
+        },
         allow_auto_truncate: true,
-        ..test_limits()
+        ..Default::default()
     };
+    let truncating = Limits::from(&args);
     assert!(check_total_tokens(&mut g, &truncating).is_ok());
     assert_eq!(g.sampling_params.max_new_tokens, Some(7), "clamped to fit");
 
@@ -357,17 +355,19 @@ fn auto_truncate_clamps_and_unknowns_skip() {
     assert!(check_total_tokens(&mut g, &roomy).is_ok());
 }
 
-/// A `max_new_tokens` the client did not send (a preferred value or the schema
-/// default) is neither rejected nor clamped here, whatever its size: it reaches
-/// the scheduler as is, which clamps it. The input alone is still checked.
+/// 默认输出预算同样受剩余 context 限制，且不能豁免 prompt 接纳检查。
 #[test]
-fn defaulted_max_new_tokens_is_left_to_the_scheduler() {
+fn defaulted_max_new_tokens_is_clamped_before_the_scheduler() {
     for allow_auto_truncate in [false, true] {
-        let limits = Limits {
-            context_len: 10,
+        let args = ServerArgs {
+            model_config: ModelConfig {
+                context_len: 10,
+                ..Default::default()
+            },
             allow_auto_truncate,
-            ..test_limits()
+            ..Default::default()
         };
+        let limits = Limits::from(&args);
         let mut g = GenerateRequest {
             input_ids: Some(vec![1, 2, 3]),
             sampling_params: SamplingParams {
@@ -378,7 +378,7 @@ fn defaulted_max_new_tokens_is_left_to_the_scheduler() {
             ..Default::default()
         };
         assert!(check_total_tokens(&mut g, &limits).is_ok());
-        assert_eq!(g.sampling_params.max_new_tokens, Some(10), "untouched");
+        assert_eq!(g.sampling_params.max_new_tokens, Some(7), "clamped");
     }
 
     let mut g = GenerateRequest {
@@ -391,7 +391,7 @@ fn defaulted_max_new_tokens_is_left_to_the_scheduler() {
         ..test_limits()
     };
     let err = check_total_tokens(&mut g, &limits).unwrap_err();
-    assert!(err.to_string().contains("longer than the model's context"));
+    assert!(err.to_string().contains("maximum allowed prompt length"));
 }
 
 /// `max_new_tokens: null` means "no cap", NOT "skip the checks" — the input
@@ -417,7 +417,7 @@ fn input_length_is_checked_unconditionally() {
         let err = check_total_tokens(&mut req(max_new_tokens), &limits)
             .expect_err("input == context_len must be rejected (Python uses >=)");
         assert!(matches!(err, Error::Validation(_)));
-        assert!(err.to_string().contains("longer than the model's context"));
+        assert!(err.to_string().contains("maximum allowed prompt length"));
     }
     // One token shorter fits, with or without a cap.
     let mut g = GenerateRequest {
@@ -427,18 +427,22 @@ fn input_length_is_checked_unconditionally() {
     g.sampling_params.max_new_tokens = None;
     assert!(check_total_tokens(&mut g, &limits).is_ok());
 
-    // Under auto-truncate the input is cut to fit instead of rejected.
-    let truncating = Limits {
+    // embedding 的截断开关不能允许截断 generation prompt。
+    let args = ServerArgs {
+        model_config: ModelConfig {
+            context_len: limits.context_len,
+            ..Default::default()
+        },
         allow_auto_truncate: true,
-        ..limits.clone()
+        ..Default::default()
     };
+    let truncating = Limits::from(&args);
     let mut g = req(None);
-    assert!(check_total_tokens(&mut g, &truncating).is_ok());
-    assert_eq!(
-        g.input_ids.as_deref(),
-        Some(&[1, 2, 3][..]),
-        "fits at the cap"
-    );
+    assert!(matches!(
+        check_total_tokens(&mut g, &truncating),
+        Err(Error::Validation(_))
+    ));
+    assert_eq!(g.input_ids.as_deref(), Some(&[1, 2, 3][..]));
 }
 
 /// The clamp runs AFTER `verify` (which happens in `Normalizing`), so lowering
@@ -447,11 +451,15 @@ fn input_length_is_checked_unconditionally() {
 /// verify early-return — so the clamp has to re-assert it here.
 #[test]
 fn auto_truncate_cannot_invert_min_and_max_new_tokens() {
-    let limits = Limits {
-        context_len: 10,
+    let args = ServerArgs {
+        model_config: ModelConfig {
+            context_len: 10,
+            ..Default::default()
+        },
         allow_auto_truncate: true,
-        ..test_limits()
+        ..Default::default()
     };
+    let limits = Limits::from(&args);
     let mut g = GenerateRequest {
         input_ids: Some(vec![1, 2, 3]), // clamps max_new_tokens to 7
         sampling_params: SamplingParams {
@@ -538,13 +546,12 @@ fn limits_resolve_the_hidden_states_mode() {
     assert_eq!(mode(Some("full"), false), HiddenStatesMode::Full);
 }
 
-/// End-to-end through `drive`: an over-context request is rejected on the way
-/// to the channel, after registration -- so it must be deregistered, not leaked.
-/// The same `max_new_tokens` as a default reaches the scheduler unchanged.
+/// drive 必须注销不满足输出预留的请求；接纳的请求在发送前 clamp 输出预算。
 #[test]
-fn over_context_request_deregisters_unless_its_cap_is_defaulted() {
+fn over_context_request_deregisters_and_admitted_cap_is_clamped() {
     let (mut intake, detok_rx, consumer, _tm_tx, _mm_rx) = make_intake_with(Limits {
         context_len: 4,
+        min_output_token_reserve: 2,
         ..test_limits()
     });
     let sampling_params = SamplingParams {
@@ -570,12 +577,13 @@ fn over_context_request_deregisters_unless_its_cap_is_defaulted() {
         unreachable!()
     };
     g.max_new_tokens_defaulted = true;
+    g.input_ids = Some(vec![1, 2]);
     intake.drive(req);
     let pushed = consumer.drain(16);
     assert_eq!(pushed.len(), 1, "must reach the scheduler");
     let header = rmpv::decode::read_value(&mut &pushed[0].header[..]).unwrap();
     let sampling_params = header.as_array().unwrap()[8].as_array().unwrap();
-    assert_eq!(sampling_params[0].as_i64(), Some(64), "max_new_tokens");
+    assert_eq!(sampling_params[0].as_i64(), Some(2), "max_new_tokens");
 }
 
 /// A `Detokenize` request terminates at the detok stage, and the shard must

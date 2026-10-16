@@ -11,7 +11,8 @@
 //
 // The rank-local finalize never materializes in global memory: each thread
 // computes one 16B vector of it and pushes it straight into every peer's push
-// slot with unicast `st.relaxed.sys` stores, so no multicast mapping is needed.
+// slot with unicast `st.relaxed.sys` stores by default. The residual-norm
+// specialization can use multicast stores when the plane has a mapping.
 //
 // Push-plane protocol (see include/sgl_kernel/distributed/communicator.cuh):
 //   * every rank owns 2 phases x kWorldSize slots of `slot_bytes`; a round
@@ -321,7 +322,9 @@ template <
     bool kCollapse = false,
     bool kTwoShot = false,
     uint32_t kVecs = 1,
-    bool kGatedShared = false>
+    bool kGatedShared = false,
+    bool kResidual = false,
+    bool kMulticast = false>
 __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize, kVecs>::kBlockSize)
     __cluster_dims__(1, kClusterSize, 1) void moe_finalize_all_reduce_kernel(
         const __grid_constant__ MoeFinalizeAllReduceParams<kWorldSize, WeightT> params) {
@@ -395,6 +398,8 @@ __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize, kVecs>::k
       } else {
         ptx::st_relaxed_16B(staged, epoch.slot_ptr(/*dst=*/owner, /*src=*/r), vid[v]);
       }
+    } else if constexpr (kMulticast) {
+      ptx::st_multimem_16B(staged, params.ws.mc_workspace + epoch.slot_offset(r), vid[v]);
     } else {
 #pragma unroll
       for (uint32_t i = 0; i < kWorldSize; ++i) {
@@ -480,6 +485,10 @@ __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize, kVecs>::k
     barrier_cluster_wait();
   } else {
     __shared__ float smem_sq[kClusterSize][kNumWarps];
+    if constexpr (kResidual) {
+      // 让后续 GEMM 提前准备权重；其 PDL wait 仍保护激活读取。
+      PDLTriggerSecondary<kUsePDL>();
+    }
     if constexpr (kMhc) {
       ptx::st_global_16B(red[0], params.out, vid[0]);
       red[0] = mhc_post_vec<kHiddenDim, true>(params, red[0], row_idx, hvec);
@@ -501,6 +510,8 @@ __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize, kVecs>::k
           const auto [ra, rb] = cast<fp32x2_t>(res[j]);
           acc[v][j] = fp32x2_t{acc[v][j].x + ra, acc[v][j].y + rb};
           res[j] = cast<bf16x2_t>(acc[v][j]);
+          // Step5 在归一化前截断残差和，原接口仍使用未截断的 FP32 和。
+          if constexpr (kResidual) acc[v][j] = cast<fp32x2_t>(res[j]);
         }
         res.store(params.residual_out + static_cast<int64_t>(row_idx) * kHiddenDim, hvec + v * kBlockSize);
       }
@@ -512,17 +523,39 @@ __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize, kVecs>::k
     }
     sq = warp::reduce_sum(sq);
     const auto lane = tx % kWarpThreads;
-    const auto warp = tx / kWarpThreads;
-    if (lane < kClusterSize) {
-      *cluster.map_shared_rank(&smem_sq[cluster_rank][warp], lane) = sq;
-    }
-    cluster.sync();
+    const auto warp_idx = tx / kWarpThreads;
     float total = 0.0f;
+    if constexpr (kResidual) {
+      // Preserve the BF16 fused RMSNorm's warp -> CTA -> cluster partition.
+      // Summing all warp partials in one linear loop changes FP32 rounding.
+      // Keep CTA scratch separate from the peer-visible cluster partials:
+      // another CTA can publish before this CTA finishes reading its scratch.
+      __shared__ float warp_sums[kNumWarps];
+      if (lane == 0) warp_sums[warp_idx] = sq;
+      __syncthreads();
+      const auto block_sum = warp::reduce_sum(lane < kNumWarps ? warp_sums[lane] : 0.0f);
+      if constexpr (kClusterSize > 1) {
+        if (tx < kClusterSize) {
+          *cluster.map_shared_rank(&smem_sq[cluster_rank][0], tx) = block_sum;
+        }
+        cluster.sync();
 #pragma unroll
-    for (uint32_t c = 0; c < kClusterSize; ++c) {
+        for (uint32_t c = 0; c < kClusterSize; ++c)
+          total += smem_sq[c][0];
+      } else {
+        total = block_sum;
+      }
+    } else {
+      if (lane < kClusterSize) {
+        *cluster.map_shared_rank(&smem_sq[cluster_rank][warp_idx], lane) = sq;
+      }
+      cluster.sync();
 #pragma unroll
-      for (uint32_t wp = 0; wp < kNumWarps; ++wp) {
-        total += smem_sq[c][wp];
+      for (uint32_t c = 0; c < kClusterSize; ++c) {
+#pragma unroll
+        for (uint32_t wp = 0; wp < kNumWarps; ++wp) {
+          total += smem_sq[c][wp];
+        }
       }
     }
     const auto factor = math::rsqrt(total / static_cast<float>(kHiddenDim) + params.norm_eps);
@@ -541,7 +574,7 @@ __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize, kVecs>::k
       if constexpr (kQuant) mhc_quant_vec<kHiddenDim>(params, out, row_idx, hvec);
     }
   }
-  PDLTriggerSecondary<kUsePDL>();
+  if constexpr (!(kNorm && kResidual)) PDLTriggerSecondary<kUsePDL>();
 
   // re-establish the empty markers for the next same-phase round
   StageVec zero_vec;
@@ -573,7 +606,9 @@ template <
     bool kMhc = false,
     bool kQuant = false,
     bool kCollapse = false,
-    bool kGatedShared = false>
+    bool kGatedShared = false,
+    bool kResidual = false,
+    bool kMulticast = false>
 struct MoeFinalizeAllReduceKernel {
  private:
   static_assert(std::is_same_v<WeightT, bf16_t> || std::is_same_v<WeightT, fp32_t>);
@@ -596,7 +631,9 @@ struct MoeFinalizeAllReduceKernel {
       kCollapse,
       kTwoShot,
       kVecs,
-      kGatedShared>;
+      kGatedShared,
+      kResidual,
+      kMulticast>;
   static constexpr bool kTwoVecsFit = Trait::kRowVecs % (kClusterSize * 2 * device::kWarpThreads) == 0;
 
  public:
@@ -628,6 +665,41 @@ struct MoeFinalizeAllReduceKernel {
         std::nullopt,
         std::nullopt,
         std::nullopt);
+  }
+
+  /// Step5 在归一化前使用 BF16 残差和，不改变原 run_residual_norm 的精度契约。
+  static void run_step5_residual_norm(
+      CommunicatorRef ref,
+      TensorView out,
+      TensorView residual_out,
+      TensorView gemm2_out,
+      TensorView permuted_idx,
+      TensorView expert_weights,
+      std::optional<TensorView> shared_output,
+      TensorView residual,
+      TensorView norm_weight,
+      double eps) {
+    static_assert(kResidual && !kMhc && !kQuant);
+    run_impl(
+        ref,
+        out,
+        gemm2_out,
+        permuted_idx,
+        expert_weights,
+        shared_output,
+        norm_weight,
+        eps,
+        false,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        residual,
+        residual_out);
   }
 
   // Preserve routed BF16 rounding, then apply the FP32 shared gate with FMA.
@@ -878,6 +950,7 @@ struct MoeFinalizeAllReduceKernel {
     const auto& push = comm.get_push_obj();
     CHECK_HOST(push.world_size == kWorldSize)
         << "communicator holds " << push.world_size << " ranks, kernel built for " << kWorldSize;
+    if constexpr (kMulticast) CHECK_HOST(push.mc_workspace != nullptr) << "multicast push mapping is required";
 
     auto T = SymbolicSize{"num_tokens"};
     auto P = SymbolicSize{"num_permuted_rows"};
@@ -934,6 +1007,11 @@ struct MoeFinalizeAllReduceKernel {
           .verify(norm_weight.value());
     }
     const auto num_tokens = static_cast<uint32_t>(T.unwrap());
+    if constexpr (kResidual) {
+      static_assert(!kMhc && !kQuant);
+      CHECK_HOST(norm_weight.has_value() && add_residual.has_value());
+      CHECK_HOST(!two_shot && vecs_per_thread == 1) << "Step5 residual norm requires one-shot, one-vector geometry";
+    }
     if constexpr (kQuant) {
       CHECK_HOST(num_tokens <= 128) << "the quant epilogue writes one 128-row scale tile";
       CHECK_HOST(norm_weight.has_value());

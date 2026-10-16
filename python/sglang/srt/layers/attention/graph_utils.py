@@ -73,6 +73,7 @@ def attention_input_scope(
         "topk_indices",
         "rel_bias",
         "q_descale",
+        "head_gate",
         "idx_q",
         "mxfp8_norm_rope_positions",
         "mxfp8_norm_rope_temp_scale",
@@ -145,6 +146,7 @@ def _new_attention_output(
 # Per-row attention inputs beside Q, K and V that the tc-piecewise op schema
 # cannot carry. The padded paths narrow them with the rows they belong to.
 _PER_ROW_EXTRA_KWARGS = (
+    "head_gate",
     "rel_bias",
     "q_descale",
     "k_descale",

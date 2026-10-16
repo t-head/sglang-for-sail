@@ -1519,6 +1519,12 @@ def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
         )
     ):
         return True
+    # Step5 TP4 head gates retain a single K reduction on Blackwell.
+    if 1 <= m <= 32 and (n, k) == (16, 4096):
+        return torch.cuda.get_device_capability() == (10, 3)
+    # Step5 TP8 QKV at 256 token rows, measured with rotating cold weights.
+    if (m, n, k) == (256, 1920, 4096):
+        return torch.cuda.get_device_capability() == (10, 3)
     if m <= 8 and (n, k) in _K3_TGV_WIN_SHAPES:
         return True
     if _model_takes_tgv(m, n, k):

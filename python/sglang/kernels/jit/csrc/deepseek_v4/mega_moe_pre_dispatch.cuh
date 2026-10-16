@@ -46,6 +46,8 @@ struct MegaMoEPreDispatchParams {
   uint32_t num_groups;  // hidden / group_size
   uint32_t top_k;
   float topk_weight_scale;
+  int32_t expert_offset;
+  uint32_t num_local_experts;
 };
 
 // kGroupSize must match the consuming MoE's activation scale group (quant_group_size).
@@ -170,8 +172,11 @@ __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
     // Copy this token's topk row (no alignment assumptions; top_k is small).
     if (kCopyTopk && tid < params.top_k) {
       const uint32_t off = token_id * params.top_k + tid;
-      params.buf_topk_idx[off] = valid ? params.topk_idx[off] : -1;
-      params.buf_topk_weights[off] = valid ? __fmul_rn(params.topk_weights[off], params.topk_weight_scale) : 0.0f;
+      const int64_t local_id = static_cast<int64_t>(params.topk_idx[off]) - params.expert_offset;
+      const bool remap = params.expert_offset != 0 || params.num_local_experts != INT32_MAX;
+      const bool is_local = valid && (!remap || static_cast<uint64_t>(local_id) < params.num_local_experts);
+      params.buf_topk_idx[off] = is_local ? local_id : -1;
+      params.buf_topk_weights[off] = is_local ? __fmul_rn(params.topk_weights[off], params.topk_weight_scale) : 0.0f;
     }
   } else {
     // ---- Pad path: trailing blocks fill [num_tokens, padded_max) with (-1, 0) ----
@@ -248,7 +253,9 @@ struct MegaMoEPreDispatchKernel {
       const tvm::ffi::Optional<tvm::ffi::TensorView> shared_x_sf,
       const int64_t shared_block_m,
       const double topk_weight_scale,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> num_token_non_padded) {
+      const tvm::ffi::Optional<tvm::ffi::TensorView> num_token_non_padded,
+      int64_t expert_offset,
+      int64_t num_local_experts) {
     using namespace host;
 
     auto device = SymbolicDevice{};
@@ -302,6 +309,9 @@ struct MegaMoEPreDispatchKernel {
     const auto num_groups_div_4 = static_cast<uint32_t>(G4.unwrap());
 
     RuntimeCheck(num_tokens <= padded_max, "num_tokens must not exceed padded_max");
+    RuntimeCheck(0 <= expert_offset && expert_offset <= INT32_MAX, "expert_offset must fit nonnegative int32");
+    RuntimeCheck(0 < num_local_experts && num_local_experts <= INT32_MAX, "num_local_experts must fit positive int32");
+    RuntimeCheck(expert_offset + num_local_experts <= INT32_MAX, "local expert range must fit int32");
     RuntimeCheck(hidden % kGroupSize == 0, "hidden must be a multiple of group_size");
     const auto num_groups = hidden / static_cast<uint32_t>(kGroupSize);
     RuntimeCheck(num_groups == num_groups_div_4 * 4u, "num_groups must be a multiple of 4");
@@ -385,6 +395,8 @@ struct MegaMoEPreDispatchKernel {
         .num_groups = num_groups,
         .top_k = top_k,
         .topk_weight_scale = static_cast<float>(topk_weight_scale),
+        .expert_offset = static_cast<int32_t>(expert_offset),
+        .num_local_experts = static_cast<uint32_t>(num_local_experts),
     };
 
     if (num_total_blocks == 0) return;

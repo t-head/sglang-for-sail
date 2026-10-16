@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
+from sglang.kernels.fused_op import register_fused_op
+from sglang.kernels.ops.moe.step5_router_topk import Step5RouterTopKOp
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import (
@@ -396,3 +398,8 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+
+_STEP5_ROUTER_TOPK = register_fused_op(
+    Step5RouterTopKOp(), __name__, "_STEP5_ROUTER_TOPK"
+)
+__all__.append("Step5RouterTopKOp")

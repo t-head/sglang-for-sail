@@ -17,11 +17,15 @@ def _jit_finalize_module(
     hidden: int,
     has_shared: bool,
     use_pdl: bool,
+    output_dtype: torch.dtype = torch.bfloat16,
+    round_routed: bool = False,
 ) -> Module:
-    # Widest bf16 vector dividing the row: the producers (trtllm-gen and our MoE kernels) keep
-    # every row aligned to it, and the launcher checks the alignment.
-    vec = next(v for v in (8, 4, 2) if hidden % v == 0)
-    args = make_cpp_args(weight_dtype, top_k, vec, has_shared, use_pdl)
+    # FP32 输出的向量同样限制在 16 字节，兼容 pre-Blackwell。
+    widths = (8, 4, 2) if output_dtype == torch.bfloat16 else (4, 2)
+    vec = next(v for v in widths if hidden % v == 0)
+    args = make_cpp_args(
+        weight_dtype, top_k, vec, has_shared, use_pdl, output_dtype, round_routed
+    )
     return load_jit(
         "moe_finalize_fuse_shared",
         *args,
@@ -39,38 +43,55 @@ def moe_finalize_fuse_shared(
     enable_pdl: bool = False,
     out: Optional[torch.Tensor] = None,
     routing_ready: bool = True,
+    *,
+    output_dtype: torch.dtype = torch.bfloat16,
+    round_routed: bool = False,
 ) -> torch.Tensor:
-    """out[t] = sum_k expert_weights[t, k] * gemm2_out[permuted_idx[t * top_k + k]]
-    (+ shared_output[t]), accumulated in fp32; rows with index -1 are skipped.
+    """以 FP32 累加路由专家结果，跳过 index=-1 的行，最后加 shared_output。
 
-    gemm2_out: [num_permuted_rows, padded_hidden] bf16 (trtllm deferred output);
-    expanded_idx_to_permuted_idx: [num_tokens * top_k] int32;
-    expert_weights: [num_tokens, top_k] fp32 or bf16;
-    shared_output: optional [num_tokens, hidden] bf16, hidden <= padded_hidden
-    (without it the output keeps the padded width);
-    out: optional [num_tokens, hidden] bf16 destination with unit column stride
-    (e.g. a symmetric-memory buffer), allocated when None;
-    routing_ready: with enable_pdl, the routing tensors are read before the
-    PDL wait (shared_output always after it). Valid when they were complete at
-    this kernel's launch, i.e. the kernel producing gemm2_out triggers its
-    dependents only after its own griddepcontrol.wait, as the trtllm-gen gemm2
-    does (its routing runs in an earlier kernel). Pass False for a producer that triggers before
-    it has waited for the routing.
+    gemm2_out 为 [num_permuted_rows, padded_hidden] BF16；路由 index 为
+    [num_tokens * top_k] INT32，权重为 [num_tokens, top_k] FP32 或 BF16。
+    shared_output 为可选的 [num_tokens, hidden] BF16，hidden <= padded_hidden。
+    out 为可选的单位列步长输出缓冲区，允许行步长和截取 padded hidden；
+    output_dtype 控制最终存储，round_routed 在加 shared 前先将路由结果截为 BF16。
+    默认保持原 FP32 累加后一次 BF16 存储的行为。
+
+    启用 PDL 时，routing_ready=True 表示路由在本 kernel launch 前已经完成，
+    可在 PDL wait 前读取；shared_output 始终在 wait 后读取。若生产者在等待
+    路由之前就触发 dependents，必须传 False。
     """
-    num_tokens = expert_weights.shape[0]
+    assert output_dtype in (torch.bfloat16, torch.float32)
+    assert gemm2_out.dtype == torch.bfloat16 and gemm2_out.dim() == 2
+    assert expert_weights.dtype in (torch.float32, torch.bfloat16)
+    assert expert_weights.dim() == 2
+    assert expanded_idx_to_permuted_idx.dtype == torch.int32
+    num_tokens, top_k_check = expert_weights.shape
+    assert top_k_check == top_k
     hidden_dim = (
-        shared_output.shape[1] if shared_output is not None else gemm2_out.shape[1]
+        out.shape[1]
+        if out is not None
+        else shared_output.shape[1]
+        if shared_output is not None
+        else gemm2_out.shape[1]
     )
+    if shared_output is not None:
+        assert shared_output.dtype == torch.bfloat16 and shared_output.dim() == 2
+        assert shared_output.shape == (num_tokens, hidden_dim)
+    assert 0 < hidden_dim <= gemm2_out.shape[1] and hidden_dim % 2 == 0
     if out is None:
         out = torch.empty(
-            num_tokens, hidden_dim, dtype=torch.bfloat16, device=gemm2_out.device
+            num_tokens, hidden_dim, dtype=output_dtype, device=gemm2_out.device
         )
+    else:
+        assert out.dtype == output_dtype and out.shape == (num_tokens, hidden_dim)
     module = _jit_finalize_module(
         expert_weights.dtype,
         top_k,
         hidden_dim,
         shared_output is not None,
         enable_pdl,
+        output_dtype,
+        round_routed,
     )
     module.run(
         out,

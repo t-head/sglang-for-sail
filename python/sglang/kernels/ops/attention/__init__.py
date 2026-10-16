@@ -767,3 +767,27 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
     )
 )
+
+
+def step5_csa_region(
+    index_key: "torch.Tensor",
+    compression_logits: "torch.Tensor",
+    *,
+    out: "torch.Tensor",
+) -> "torch.Tensor":
+    """Write compressed index keys into caller-owned logical bytes."""
+    return get_kernel("attention.step5_csa_region", KernelBackend.TRITON)(
+        index_key, compression_logits, out=out
+    )
+
+
+__all__.append("step5_csa_region")
+
+register_kernel(
+    KernelSpec(
+        op="attention.step5_csa_region",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.step5.csa:step5_csa_region",
+        capabilities=CUDA_ONLY,
+    )
+)

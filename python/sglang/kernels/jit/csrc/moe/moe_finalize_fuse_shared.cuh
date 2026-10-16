@@ -71,7 +71,7 @@ struct Params {
   const int32_t* __restrict__ permuted_idx;
   const void* __restrict__ expert_weights;
   const bf16_t* __restrict__ shared;
-  bf16_t* __restrict__ out;
+  void* __restrict__ out;
   int64_t out_stride;     // elements per output row
   uint32_t gemm2_stride;  // elements per gemm2_out row
   uint32_t num_tokens;
@@ -117,7 +117,15 @@ struct Token {
 // route_before_wait: the caller guarantees that the route was complete when
 // this kernel launched, so it loads before the PDL wait. The shared row always
 // loads after the wait: in a CUDA graph, its cross-stream join is a PDL edge too.
-template <typename TW, uint32_t K, uint32_t kVec, bool kPersistent, bool kHasShared, bool kUsePDL>
+template <
+    typename TW,
+    uint32_t K,
+    uint32_t kVec,
+    bool kPersistent,
+    bool kHasShared,
+    bool kUsePDL,
+    typename TO,
+    bool kRoundRouted>
 __global__ __launch_bounds__(kBlockSize, 1) void finalize_kernel(const __grid_constant__ Params p) {
   static_assert(K <= 32, "the route is spread over one warp");
   constexpr uint32_t kPairs = kVec / 2;
@@ -175,17 +183,20 @@ __global__ __launch_bounds__(kBlockSize, 1) void finalize_kernel(const __grid_co
         }
       }
     }
-    pairs_t out;
+    using output_pair_t = packed_t<TO>;
+    AlignedVector<output_pair_t, kPairs> out;
 #pragma unroll
     for (uint32_t e = 0; e < kPairs; ++e) {
+      // Step5 先物化 BF16 路由结果，再加 shared；默认不引入此截断。
+      if constexpr (kRoundRouted) acc[e] = cast<fp32x2_t>(cast<bf16x2_t>(acc[e]));
       if constexpr (kHasShared) {
         const auto sh = cast<fp32x2_t>(cur.shared[e]);
         acc[e].x += sh.x;
         acc[e].y += sh.y;
       }
-      out[e] = cast<bf16x2_t>(acc[e]);
+      out[e] = cast<output_pair_t>(acc[e]);
     }
-    if (chunk < p.num_chunks) out.store(p.out + token * p.out_stride, chunk);
+    if (chunk < p.num_chunks) out.store(static_cast<TO*>(p.out) + token * p.out_stride, chunk);
 
     if constexpr (kPersistent) {
       if (next >= p.num_tokens) break;
@@ -200,10 +211,19 @@ __global__ __launch_bounds__(kBlockSize, 1) void finalize_kernel(const __grid_co
 
 // One token per CTA row while the grid fits one resident wave, the persistent
 // kernel past it.
-template <typename TW, uint32_t K, uint32_t kVec, bool kHasShared, bool kUsePDL>
+template <
+    typename TW,
+    uint32_t K,
+    uint32_t kVec,
+    bool kHasShared,
+    bool kUsePDL,
+    typename TO = bf16_t,
+    bool kRoundRouted = false>
 struct MoeFinalizeKernel {
+  static_assert(std::is_same_v<TO, bf16_t> || std::is_same_v<TO, fp32_t>);
   template <bool kPersistent>
-  static constexpr auto kernel = device::moe_finalize::finalize_kernel<TW, K, kVec, kPersistent, kHasShared, kUsePDL>;
+  static constexpr auto kernel =
+      device::moe_finalize::finalize_kernel<TW, K, kVec, kPersistent, kHasShared, kUsePDL, TO, kRoundRouted>;
 
   static void
   run(const tvm::ffi::TensorView out,
@@ -222,9 +242,9 @@ struct MoeFinalizeKernel {
     constexpr std::size_t kVecBytes = kVec * sizeof(bf16_t);
     TensorMatcher({T, H})  // out
         .with_strides({-1, 1})
-        .with_dtype<bf16_t>()
+        .with_dtype<TO>()
         .with_device(device)
-        .ensure_alignment(kVecBytes)
+        .ensure_alignment(kVec * sizeof(TO))
         .verify(out);
     TensorMatcher({-1, -1})  // gemm2_out
         .with_strides({-1, 1})
@@ -261,7 +281,7 @@ struct MoeFinalizeKernel {
         .permuted_idx = static_cast<const int32_t*>(permuted_idx.data_ptr()),
         .expert_weights = expert_weights.data_ptr(),
         .shared = kHasShared ? static_cast<const bf16_t*>(shared.value().data_ptr()) : nullptr,
-        .out = static_cast<bf16_t*>(out.data_ptr()),
+        .out = out.data_ptr(),
         .out_stride = out.stride(0),
         .gemm2_stride = static_cast<uint32_t>(gemm2_out.stride(0)),
         .num_tokens = num_tokens,

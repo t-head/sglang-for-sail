@@ -68,7 +68,13 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.draft_checkpoint import refresh_track_indices, track_indices
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
-from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
+from sglang.srt.speculative.eagle_utils import (
+    get_draft_hidden_state_dtype,
+    get_draft_input_from_target_hidden_dim,
+)
+from sglang.srt.speculative.multi_layer_eagle_utils import (
+    compute_mtp_topk,
+)
 from sglang.srt.speculative.multi_layer_eagle_utils import (
     fill_draft_extend_prepare_buffers_triton as fill_draft_extend_prepare_buffers,
 )
@@ -78,7 +84,6 @@ from sglang.srt.speculative.multi_layer_eagle_utils import (
 )
 from sglang.srt.speculative.spec_utils import fast_sample, resolve_num_tokens_per_req
 from sglang.srt.utils import get_available_gpu_memory, is_npu
-from sglang.srt.utils.common import fast_topk
 from sglang.srt.utils.device_timer import device_timer_ctx
 
 if is_npu():
@@ -370,8 +375,15 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         """Compute top-k on the last accepted token's logits and attach it to
         ``ret``. Overridable so distributed (vocab-sharded) builds can plug in
         an all-reduce-aware sampler."""
-        probs = torch.softmax(self._select_step_logits(ret, bs), dim=-1)
-        ret.topk_p, ret.topk_index = fast_topk(probs, self.topk, dim=-1)
+        ret.topk_p, ret.topk_index = compute_mtp_topk(
+            self._select_step_logits(ret, bs),
+            self.topk,
+            greedy_chain=(
+                self.model_runner.model_config.hf_config.architectures[0] == "Step5MTP"
+                and not self.eagle_worker.use_rejection_sampling
+                and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
+            ),
+        )
 
     def _sample_draft_proposal(self, ret, bs: int):
         """In-graph Leviathan proposal (single-CG runner + rejection sampling):
@@ -651,7 +663,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         num_tokens_per_req = self.captured_req_width
         max_num_token = max_bs * num_tokens_per_req
         hidden_size = get_draft_input_from_target_hidden_dim(model_runner)
-        dtype = model_runner.model_config.dtype
+        dtype = get_draft_hidden_state_dtype(model_runner.model_config)
         vocab_size = self._vocab_size()
 
         seq_lens_cpu = torch.full((max_bs,), self.seq_len_fill_value, dtype=torch.int32)
@@ -882,6 +894,9 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             buffers.sampling_seed[:raw_bs].copy_(
                 forward_batch.sampling_info.sampling_seed[:raw_bs]
             )
+        # Step5 的历史重放可改变最后有效行；显式索引同时用于 logits 和 token 轮转。
+        if forward_batch.spec_info.select_index is not None:
+            buffers.select_index[:raw_bs].copy_(forward_batch.spec_info.select_index)
 
         # Refresh the host mirror only when published; hand replay None
         # otherwise so no consumer reads a stale buffer.
