@@ -472,6 +472,22 @@ def apply_dp_attn_capture_alignment(server_args: Any):
         )
 
 
+def apply_step5_prefill_cuda_graph_max_bs_default(server_args: Any):
+    cfg = resolving_view(server_args)
+    if (
+        cfg.cuda_graph_max_bs_prefill is not None
+        or parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE
+    ):
+        return
+    arch = model_config_of(server_args).hf_config.architectures[0]
+    if arch in ("Step5ForCausalLM", "Step5ForConditionalGeneration"):
+        declare_resolution(
+            server_args,
+            "_apply_step5_prefill_cuda_graph_max_bs_default",
+            cuda_graph_max_bs_prefill=8192,
+        )
+
+
 def handle_cuda_graph_config(server_args: Any):
     cfg = resolving_view(server_args)
 

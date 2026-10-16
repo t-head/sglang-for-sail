@@ -125,67 +125,28 @@ pub(super) fn validate_input_ids(g: &GenerateRequest, vocab_size: u64) -> Result
     Ok(())
 }
 
-/// The context-window checks that need the tokenized length, mirroring Python
-/// `TokenizerManager._validate_one_request`: the input alone must fit, and then
-/// input + the client's own `max_new_tokens` must fit. Without them the
-/// scheduler silently clamps and the client gets a 200 with a truncated
-/// completion instead of an actionable 400. A defaulted `max_new_tokens` (see
-/// [`GenerateRequest::max_new_tokens_defaulted`]) is left to that clamp.
-///
-/// Under `allow_auto_truncate` both clamp instead of rejecting — the launch flag
-/// opted into that.
-/// The input-length half of [`check_total_tokens`]: `input_ids` truncated to
-/// the context under `allow_auto_truncate`, else the rejection of an input that
-/// does not fit. The MM worker applies it too, so its
-/// [`processed`](crate::MmProcessor::processed) hook sees the ids the
-/// scheduler will.
+/// 验证生成 prompt，不截断；供 tokenizer 和 MM processed hook 共用。
 pub(crate) fn fit_input(input_ids: &mut TokenIds, limits: &Limits) -> Result<(), Error> {
+    let input_len = input_ids.len() as u64;
     let max_req_len = limits.context_len;
-    // Python counts the reserved slots as part of the input, so a request can be
-    // rejected for them even when the prompt alone fits.
-    let input_len = input_ids.len() as u64 + limits.num_reserved_tokens;
-    // Python's comparison is `>=` — a prompt that exactly fills the window
-    // leaves no room to generate.
-    if input_len >= max_req_len {
-        if !limits.allow_auto_truncate {
-            return Err(Error::Validation(format!(
-                "The input ({input_len} tokens) is longer than the model's context \
-                 length ({max_req_len} tokens)."
-            )));
-        }
-        input_ids.truncate(max_req_len as usize);
+    let reserve = limits.min_output_token_reserve;
+    if reserve == 0 || reserve >= max_req_len || input_len > max_req_len - reserve {
+        return Err(Error::Validation(format!(
+            "The input ({input_len} tokens) exceeds the maximum allowed prompt length: context length {max_req_len} requires {reserve} output tokens of space."
+        )));
     }
     Ok(())
 }
 
+/// 接纳 prompt 后，将生成长度限制在剩余 context 内。
 pub(super) fn check_total_tokens(g: &mut GenerateRequest, limits: &Limits) -> Result<(), Error> {
-    let max_req_len = limits.context_len;
-    // Input length first, and unconditionally: `max_new_tokens: null` means "no
-    // cap", which must not disable this.
     fit_input(g.input_ids.as_mut().unwrap_or(&mut Vec::new()), limits)?;
-    let input_len =
-        g.input_ids.as_ref().map_or(0, |ids| ids.len()) as u64 + limits.num_reserved_tokens;
-
-    if g.max_new_tokens_defaulted {
-        return Ok(()); // not the client's value → the scheduler clamps it
-    }
+    let input_len = g.input_ids.as_ref().map_or(0, |ids| ids.len()) as u64;
+    let max_req_len = limits.context_len;
     let Some(max_new_tokens) = g.sampling_params.max_new_tokens else {
-        return Ok(()); // no cap requested → nothing to add to the input length
-    };
-    let total = input_len.saturating_add(max_new_tokens.max(0) as u64);
-    if total <= max_req_len {
         return Ok(());
-    }
-    if !limits.allow_auto_truncate {
-        return Err(Error::Validation(format!(
-            "Requested token count exceeds the model's maximum context length of \
-             {max_req_len} tokens. You requested a total of {total} tokens: {input_len} \
-             tokens from the input messages and {max_new_tokens} tokens for the \
-             completion. Please reduce the number of tokens in the input messages or \
-             the completion to fit within the limit."
-        )));
-    }
-    let clamped = max_req_len.saturating_sub(input_len) as i64;
+    };
+    let clamped = max_new_tokens.min((max_req_len - input_len).min(i64::MAX as u64) as i64);
     // Re-check what the clamp can break. `verify` already ran (in Normalizing), so
     // lowering `max_new_tokens` here can leave `min_new_tokens > max_new_tokens` —
     // and `is_normalized: true` stops the scheduler from re-verifying, so nothing

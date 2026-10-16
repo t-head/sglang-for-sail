@@ -112,10 +112,14 @@ def _keeps_global_expert_ids(backend: Optional[MoeRunnerBackendLike]) -> bool:
 
 
 class StandardDispatcher(BaseDispatcher):
-    def __init__(self, moe_runner_config: MoeRunnerConfig):
+    def __init__(self, moe_runner_config: MoeRunnerConfig, runner_backend=None):
         super().__init__()
         self.moe_ep_size = get_parallel().moe_ep_size
-        backend = moe_runner_config.runner_backend
+        backend = (
+            runner_backend
+            if runner_backend is not None
+            else moe_runner_config.runner_backend
+        )
         self.runner_backend = backend
         self.enable_flashinfer_cutlass_moe = (
             backend is not None and backend.is_flashinfer_cutlass()

@@ -392,7 +392,7 @@ class ReqToTokenPool:
     pre_alloc_size: int = 0
     # Class default: some decode pools borrow another __init__ (see
     # DecodeReqToTokenPool) but inherit alloc_rows.
-    _on_alloc_rows: Optional[Callable[[List[int]], None]] = None
+    _on_alloc_rows: tuple[Callable[[List[int]], None], ...] = ()
     # A table without recurrent state holds no state slots: no state pool, slot
     # allocator or checkpoint pool. Tables with state set all three.
     mamba_pool: Optional[MambaPool] = None
@@ -464,8 +464,8 @@ class ReqToTokenPool:
         select_index = self.free_slots[-need_size:]
         del self.free_slots[-need_size:]
         self.req_generation[select_index] += 1
-        if self._on_alloc_rows is not None:
-            self._on_alloc_rows(select_index)
+        for hook in self._on_alloc_rows:
+            hook(select_index)
         return select_index
 
     def free_rows(self, indices: List[int]) -> None:
@@ -494,8 +494,7 @@ class ReqToTokenPool:
         self._aux_cache = aux_cache
 
     def register_on_alloc_rows(self, hook: Callable[[List[int]], None]) -> None:
-        assert self._on_alloc_rows is None
-        self._on_alloc_rows = hook
+        self._on_alloc_rows += (hook,)
 
     def reset_aux_cache_allocator(self) -> None:
         if self._aux_cache is not None:

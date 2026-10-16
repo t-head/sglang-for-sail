@@ -51,6 +51,7 @@ from .tokenizer import (
     _fix_added_tokens_encoding,
     _fix_special_tokens_pattern,
     _fix_v5_add_bos_eos_token,
+    _fix_v5_tokenizer_components,
     _install_tokenizer_warnings_filter,
     _shim_fastokens_backend,
     get_tokenizer,
@@ -328,11 +329,13 @@ def _get_processor(
     # Checkpoints with language_model_only=True are text-only despite their
     # multimodal-family config; route to tokenizer instead of the mm processor.
     if getattr(config, "language_model_only", False):
-        return AutoTokenizer.from_pretrained(
+        return get_tokenizer(
             tokenizer_name,
             *args,
+            tokenizer_mode=tokenizer_mode,
+            tokenizer_backend=tokenizer_backend,
             trust_remote_code=trust_remote_code,
-            revision=revision,
+            tokenizer_revision=revision,
             **kwargs,
         )
 
@@ -443,6 +446,8 @@ def _get_processor(
             processor.tokenizer = tokenizer
 
     _install_tokenizer_warnings_filter(tokenizer)
+    # 修复 v5 构造器覆盖的 tokenizer.json 组件，再恢复目标的 BOS/EOS 行为。
+    _fix_v5_tokenizer_components(tokenizer, tokenizer_name, revision)
     _fix_v5_add_bos_eos_token(tokenizer, tokenizer_name, revision)
 
     if tokenizer.chat_template is None:
