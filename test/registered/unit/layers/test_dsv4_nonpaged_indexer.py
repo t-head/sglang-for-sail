@@ -989,7 +989,7 @@ class TestDeepSelectFullTopKDecode(CustomTestCase):
         indexer.use_deep_select_decode = False
 
         with (
-            patch.object(mod, "decode_scores", return_value=data),
+            patch.object(mod, "decode_score_chunks", return_value=iter([data])),
             patch.object(mod, "topk_page_transform") as page_transform,
             patch.object(mod, "select_decode") as select_decode,
         ):
