@@ -113,6 +113,19 @@ def _resolve_engram_config(server_args: ServerArgs) -> None:
     logger.info("DeepSeek-V4.1 Engram tables: %s", config)
 
 
+def _dsv41_dspark_pd_parallelism_supported(cfg) -> bool:
+    # Preserve v1.0.0's broader attention-DP admission. Sender/receiver layout
+    # compatibility is checked by CommonKVManager using the actual peer sizes.
+    supported_prefill_cp = (
+        cfg.disaggregation_mode == "prefill"
+        and cfg.enable_prefill_cp
+        and cfg.cp_strategy == "interleave"
+    )
+    return cfg.dcp_size == 1 and (
+        not (cfg.enable_prefill_cp or cfg.attn_cp_size != 1) or supported_prefill_cp
+    )
+
+
 def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None:
     """Apply DeepSeek V4 environment defaults, request limits, and validation."""
     cfg = resolving_view(server_args)
@@ -424,20 +437,10 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             read_ragged_verify_mode,
         )
 
-        # CP size may still be implicit here; validate_deepseek_v4_cp resolves it.
-        supported_prefill_cp = (
-            cfg.disaggregation_mode == "prefill"
-            and cfg.enable_prefill_cp
-            and cfg.cp_strategy == "interleave"
-        )
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
             or cfg.disaggregation_transfer_backend not in ("mooncake", "nixl", "mori")
-            or (
-                (cfg.enable_prefill_cp or cfg.attn_cp_size != 1)
-                and not supported_prefill_cp
-            )
-            or cfg.dcp_size != 1
+            or not _dsv41_dspark_pd_parallelism_supported(cfg)
         ):
             raise ValueError(
                 "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, NIXL, "
