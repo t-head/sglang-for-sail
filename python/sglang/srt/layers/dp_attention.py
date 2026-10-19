@@ -1333,7 +1333,9 @@ def require_mlp_tp_gather(*, moe_a2a_backend=None):
     """
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
+    from sglang.srt.arg_groups.engram_config import EngramReplication
     from sglang.srt.layers.moe.utils import MoeA2ABackend, get_moe_a2a_backend
+    from sglang.srt.runtime_context import process_model_config
 
     if moe_a2a_backend is None:
         moe_a2a_backend = get_moe_a2a_backend()
@@ -1345,6 +1347,12 @@ def require_mlp_tp_gather(*, moe_a2a_backend=None):
         assert get_parallel().num_dp_ranks > 1, (
             "attention DP needs more than one DP rank"
         )
+        # Sharded Engram lookup needs DP-wide token metadata even with DeepEP.
+        # Read the resolved target config, including --engram-config overrides.
+        if getattr(process_model_config().hf_config, "engram_layer_ids", ()):
+            config = get_exec().offload.engram_config
+            if config is None or config.replication != EngramReplication.PER_NODE:
+                return True
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import (
                 elastic_expanded_world_enabled,
