@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.topk import biased_grouped_topk_gpu
 from sglang.srt.layers.quantization.w8a8_fp8 import (
     W8A8Fp8Config,
@@ -22,7 +23,10 @@ register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-large")
 
 @contextmanager
 def _front_config(ppu=True):
-    with patch("sglang.srt.models.kimi_k3.is_sail", return_value=ppu):
+    with (
+        patch("sglang.srt.models.kimi_k3.is_sail", return_value=ppu),
+        envs.SGLANG_SAIL_DEEPGEMM_DENSE.override(True),
+    ):
         yield
 
 

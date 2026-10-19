@@ -84,3 +84,25 @@ def test_pool_schedule_uses_backend_builder():
         )
     assert actual is seen[0]
     torch.testing.assert_close(actual, torch.tensor([[1], [4]]))
+
+
+@pytest.mark.parametrize(
+    "mode,expected",
+    [
+        ("fp4", torch.int8),
+        ("int8", torch.int8),
+        ("bf16", torch.bfloat16),
+        ("fp8", torch.float8_e4m3fn),
+    ],
+)
+def test_fallback_metadata_uses_native_logical_format(mode, expected):
+    from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
+
+    indexer = SimpleNamespace(
+        use_fp4=mode == "fp4",
+        use_int8=mode == "int8",
+        bf16_indexer=mode == "bf16",
+        n_heads=32,
+        head_dim=128,
+    )
+    assert Indexer._sail_paged_mqa_metadata_extra(indexer) == (1, 32, 128, expected)

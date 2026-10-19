@@ -1251,14 +1251,21 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 weights.to(torch.bfloat16),
                 cu_seq_len_k_start,
                 cu_seq_len_k_end,
-                max_seqlen_k=0,
+                max_seqlen_k=k_packed.shape[0],
             )
-            # Zero keeps global KV column coordinates for ragged top-k.
-            # The weighted MXFP4 ABI emits BF16; unfused top-k consumes FP32.
-            return (
-                logits.float()
+            from sglang.kernels.ops.attention.dsa.ppu_logits import (
+                restore_ragged_logits,
+            )
+
+            # Native MXFP4 emits compressed rows; the target top-k uses global columns.
+            return restore_ragged_logits(
+                logits,
+                cu_seq_len_k_start,
+                cu_seq_len_k_end,
+                k_packed.shape[0],
+                torch.float32
                 if force_unfused_topk or not envs.SGLANG_DSA_USE_DSV4_BF16_TOPK.get()
-                else logits
+                else torch.bfloat16,
             )
 
         assert isinstance(q, torch.Tensor)
@@ -1307,6 +1314,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 clean_logits=clean_logits,
             )
         raise NotImplementedError
+
+    def _sail_paged_mqa_metadata_extra(self):
+        # Packed MXFP4 bytes are stored as uint8 but the native ABI identifies
+        # this format as int8; dimensions remain logical, not packed.
+        dtype = (
+            torch.int8
+            if self.use_fp4 or self.use_int8
+            else torch.bfloat16
+            if self.bf16_indexer
+            else torch.float8_e4m3fn
+        )
+        return (1, self.n_heads, self.head_dim, dtype)
 
     def _get_paged_mqa_logits_dispatch(
         self,
@@ -1978,12 +1997,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             seqlens_32_2d = seqlens_32.contiguous().view(-1, 1)
         if _is_cuda:
             if schedule_metadata is None:
-                metadata_extra = (
-                    1,  # next_n
-                    q_probe.shape[1],  # num_heads
-                    self.head_dim,  # logical head_dim, including packed MXFP4
-                    q_probe.dtype,
-                )
+                metadata_extra = self._sail_paged_mqa_metadata_extra()
                 schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
                     seqlens_32_2d,
                     blocksize,
@@ -2469,6 +2483,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             get_budget_bytes=lambda: (
                 self._get_mqa_logits_budget_bytes(device_index)
                 * (2 if bf16_logits else 1)
+                // (2 if self.use_fp4 else 1)
             ),
             rocm=_is_hip,
         )
