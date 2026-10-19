@@ -30,6 +30,7 @@ def test_replayssm_pool_and_budget(enabled, kda, gdn, expected):
     config.device = "cpu"
     config.pp_size = 1
     config.attn_dp_size = 1
+    config.extra_mamba_cache_bytes_per_req = 0
     config.extra_mamba_cache_bytes_per_request_row = 0
     config.spec_algorithm = NS(is_none=lambda: False)
     config.allocate_intermediate_ssm = True

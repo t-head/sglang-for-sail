@@ -111,7 +111,10 @@ def test_fp4_fused_norm_rope_store_layout(num_tokens: int) -> None:
     reason="fused_q_indexer_rope_hadamard_fp4_quant is not supported by Intel GPU",
 )
 @pytest.mark.parametrize("batch_size", [1, 5, 17])
-def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int) -> None:
+@pytest.mark.parametrize("input_scale", [0.0, 1e-7, 1.0])
+def test_fp4_fused_q_indexer_rope_hadamard_quant(
+    batch_size: int, input_scale: float
+) -> None:
     torch.manual_seed(batch_size + 200)
     num_heads = 8
     rope_dim = 64
@@ -119,6 +122,7 @@ def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int) -> None:
     q = torch.randn(
         batch_size, num_heads, HEAD_DIM, device=get_device(), dtype=torch.bfloat16
     )
+    q.mul_(input_scale)
     weight = torch.randn(
         batch_size, num_heads, device=get_device(), dtype=torch.bfloat16
     )

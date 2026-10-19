@@ -3183,6 +3183,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
         )
         # The draft-input shape comes from the spec bag.
         override = get_context().override_server_args(
+            attention_backend="dsa",
             speculative_eagle_topk=1,
             speculative_num_steps=5,
             enable_multi_layer_eagle=False,
@@ -3218,6 +3219,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             model_config=SimpleNamespace(hf_config=SimpleNamespace()),
         )
         override = get_context().override_server_args(
+            attention_backend="dsa",
             speculative_eagle_topk=1,
             speculative_num_steps=5,
             enable_multi_layer_eagle=False,
@@ -3262,6 +3264,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             seq_lens_cpu=torch.tensor([4, 4], dtype=torch.int64),
         )
         override = get_context().override_server_args(
+            attention_backend="dsa",
             speculative_eagle_topk=1,
             speculative_num_steps=5,
             enable_multi_layer_eagle=False,
@@ -3325,6 +3328,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             seq_lens_cpu=torch.tensor([4, 3], dtype=torch.int64),
         )
         override = get_context().override_server_args(
+            attention_backend="dsa",
             speculative_eagle_topk=1,
             speculative_num_steps=5,
             enable_multi_layer_eagle=False,

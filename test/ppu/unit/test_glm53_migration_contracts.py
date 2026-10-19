@@ -363,7 +363,7 @@ assert "hf_to_sglang_mapper" in _glm5_attrs, (
 )
 _glm5_mapper_ns = _compile_nodes(
     [_glm5_attrs["hf_to_sglang_mapper"]],
-    {"WeightsMapper": _WEIGHTS_MAPPER},
+    {"WeightsMapper": _WEIGHTS_MAPPER, "is_npu": lambda: False},
 )
 _GLM5_MAPPER = _glm5_mapper_ns["hf_to_sglang_mapper"]
 

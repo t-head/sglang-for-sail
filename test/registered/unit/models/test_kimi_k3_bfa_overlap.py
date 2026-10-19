@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.fp8_utils import apply_fp8_linear
 from sglang.srt.layers.quantization.w8a8_fp8 import (
     W8A8Fp8Config,
@@ -659,6 +660,7 @@ class TestKimiK3BfaOverlap(CustomTestCase):
         ):
             self.assertTrue(torch.equal(got, ref))
 
+    @envs.SGLANG_SAIL_DEEPGEMM_DENSE.override(True)
     def test_fp8_channelwise_merge_matches_unmerged_projections(self):
         if not is_sail():
             self.skipTest("KDA FP8 fused input projection requires PPU")

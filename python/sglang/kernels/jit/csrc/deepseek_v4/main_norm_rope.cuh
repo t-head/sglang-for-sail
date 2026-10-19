@@ -25,12 +25,12 @@ using deepseek_v4::fp8::inv_scale_ue8m0;
 using deepseek_v4::fp8::pack_fp8;
 
 SGL_DEVICE uint8_t quant_fp4_e2m1(float x) {
+  // Match quantize_fp4_indexer_tensor's default strict-threshold rounding.
+  // This storage packer is distinct from the RNE fake-quantization helpers.
   const float mag = fminf(fabsf(x), 6.0f);
-  const float step = mag < 2.0f ? 0.5f : (mag < 4.0f ? 1.0f : 2.0f);
-  const float q = rintf(mag / step) * step;
-  const uint32_t idx = q < 2.0f ? static_cast<uint32_t>(q * 2.0f)
-                                : (q < 4.0f ? static_cast<uint32_t>(q) + 2u : static_cast<uint32_t>(q * 0.5f) + 4u);
-  return static_cast<uint8_t>(idx | (__float_as_uint(x) >> 31 << 3));
+  const uint32_t idx =
+      (mag > 0.25f) + (mag > 0.75f) + (mag > 1.25f) + (mag > 1.75f) + (mag > 2.5f) + (mag > 3.5f) + (mag > 5.0f);
+  return static_cast<uint8_t>(idx | (x < 0.0f && idx != 0 ? 8u : 0u));
 }
 
 // 8 warps per block: warp-per-(token, head) work-item dispatch (Q kernel).
@@ -1083,7 +1083,7 @@ fused_q_indexer_rope_hadamard_fp4_quant(const __grid_constant__ FusedQIndexerRop
       local_max = math::max(local_max, math::abs(data[i]));
     }
     local_max = warp::reduce_max<8>(local_max);
-    const auto scale_raw = fmaxf(1e-4f, local_max) / 6.0f;
+    const auto scale_raw = fmaxf(local_max / 6.0f, 1e-4f);
     const auto scale_ue8m0 = static_cast<uint8_t>(cast_to_ue8m0(scale_raw));
     const auto inv_scale = inv_scale_ue8m0(scale_ue8m0);
     const uint8_t packed0 = quant_fp4_e2m1(data[0] * inv_scale) | (quant_fp4_e2m1(data[1] * inv_scale) << 4);
@@ -1170,7 +1170,7 @@ fused_q_indexer_rope_first_fp4_quant(const __grid_constant__ FusedQIndexerRopeFi
       local_max = math::max(local_max, math::abs(data[i]));
     }
     local_max = warp::reduce_max<8>(local_max);
-    const auto scale_raw = fmaxf(1e-4f, local_max) / 6.0f;
+    const auto scale_raw = fmaxf(local_max / 6.0f, 1e-4f);
     const auto scale_ue8m0 = static_cast<uint8_t>(cast_to_ue8m0(scale_raw));
     const auto inv_scale = inv_scale_ue8m0(scale_ue8m0);
     const uint8_t packed0 = quant_fp4_e2m1(data[0] * inv_scale) | (quant_fp4_e2m1(data[1] * inv_scale) << 4);
