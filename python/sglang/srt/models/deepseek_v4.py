@@ -5040,7 +5040,9 @@ def _is_quark_checkpoint(config: DeepSeekV4Config) -> bool:
 
 def _v41_vision_a2a_supported() -> bool:
     backend = get_moe_a2a_backend()
-    return backend.is_none() or (_is_cuda and backend.is_megamoe())
+    return (
+        backend.is_none() or backend.is_deepep() or (_is_cuda and backend.is_megamoe())
+    )
 
 
 class DeepseekV4ForCausalLM(
@@ -5115,7 +5117,7 @@ class DeepseekV4ForCausalLM(
             ):
                 raise ValueError(
                     "V4.1 vision supports TP/EP/DP and prefill CP without PP; "
-                    "MoE A2A requires CUDA MegaMoE"
+                    "MoE A2A requires DeepEP or CUDA MegaMoE"
                 )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)
@@ -5312,6 +5314,15 @@ class DeepseekV4ForCausalLM(
                 "Quantization keeps shared experts at a higher precision than the "
                 "routed experts, so they cannot be fused into the quantized "
                 "routed-expert path."
+            )
+        if (
+            hf_config.model_type == "deepseek_v41"
+            and hf_config.vision_n_layers > 0
+            and get_moe_a2a_backend().is_deepep()
+        ):
+            return (
+                "V4.1 vision routing with DeepEP requires separate shared experts; "
+                "per-rank fused shared slots are not supported."
             )
         if get_parallel().moe_ep_size > 1 and not uses_per_rank_fused_shared_slots():
             return (
