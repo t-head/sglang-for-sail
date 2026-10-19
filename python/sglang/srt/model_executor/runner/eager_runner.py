@@ -361,18 +361,22 @@ class EagerRunner(BaseRunner):
         rank-local slice, then gather hidden states before the logits step.
         """
         model = self.model_runner.model
-
         input_ids = forward_batch.input_ids
+        input_embeds = kwargs.get("input_embeds")
+        model_kwargs = dict(kwargs)
+
+        # Preserve the target wrapper-aware language preparation, once and
+        # before the CP boundary, including models with prepare_cp_inputs.
+        input_ids, input_embeds = prepare_language_model_inputs(
+            model, input_ids, forward_batch, input_embeds
+        )
+        model_kwargs["input_embeds"] = input_embeds
+
         if prepare_inputs := getattr(model, "prepare_cp_inputs", None):
             input_embeds, positions, model_kwargs = prepare_inputs(
-                forward_batch, **kwargs
+                forward_batch, **model_kwargs
             )
         else:
-            input_embeds = kwargs.get("input_embeds")
-            # Prepare multimodal embeddings and model IDs in global token order.
-            input_ids, input_embeds = prepare_language_model_inputs(
-                model, input_ids, forward_batch, input_embeds
-            )
             if input_embeds is None:
                 input_embeds = model.get_input_embeddings()(input_ids)
             positions = forward_batch.positions
@@ -405,7 +409,9 @@ class EagerRunner(BaseRunner):
         # A model with compact output rows must gather with its output layout and
         # pass matching token indices and lengths to logits/aux-state consumers.
         if postprocess_cp_output := getattr(model, "postprocess_cp_output", None):
-            return postprocess_cp_output(hidden_states, forward_batch)
+            return postprocess_cp_output(
+                hidden_states, forward_batch, input_ids=input_ids
+            )
 
         aux_hidden_states = None
         if getattr(model, "capture_aux_hidden_states", False):

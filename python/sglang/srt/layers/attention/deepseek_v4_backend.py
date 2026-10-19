@@ -1047,6 +1047,19 @@ class LateLayerTail(msgspec.Struct, frozen=True):
     scatter_indices: Optional[torch.Tensor] = None
     real_rows_count: Optional[int] = None
 
+    @property
+    def output_token_indices(self) -> torch.Tensor:
+        indices = (
+            self.global_token_indices
+            if self.global_token_indices is not None
+            else self.token_indices
+        )
+        return (
+            indices[: self.real_rows_count]
+            if self.real_rows_count is not None
+            else indices
+        )
+
     def rows(self, t: torch.Tensor) -> torch.Tensor:
         rows = self.real_rows(t)
         if self.pad_rows:
