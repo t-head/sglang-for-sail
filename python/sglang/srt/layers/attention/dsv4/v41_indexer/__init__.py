@@ -72,7 +72,11 @@ def has_dense_fp4_indexer() -> bool:
 
 @functools.cache
 def _use_deep_gemm_prefill() -> bool:
-    return is_sm100_or_newer() and has_dense_fp4_indexer()
+    from sglang.srt.layers.attention.dsv4.indexer_quant import use_dsv41_int8_indexer
+
+    return (
+        not use_dsv41_int8_indexer() and is_sm100_or_newer() and has_dense_fp4_indexer()
+    )
 
 
 def make_full_topk_indexer(
@@ -80,11 +84,13 @@ def make_full_topk_indexer(
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
     req_to_token: torch.Tensor,
 ) -> FullTopKIndexer:
+    from sglang.srt.layers.attention.dsv4.indexer_quant import use_dsv41_int8_indexer
+
     return FullTopKIndexer(
         token_to_kv_pool=token_to_kv_pool,
         req_to_token=req_to_token,
         use_deep_gemm_prefill=_use_deep_gemm_prefill(),
-        use_deep_gemm_decode=is_sm100_or_newer(),
+        use_deep_gemm_decode=is_sm100_or_newer() and not use_dsv41_int8_indexer(),
     )
 
 
@@ -96,6 +102,9 @@ def make_candidate_indexer(
     candidate_topk_blocks: int,
     candidate_block_size: int,
 ) -> Tuple[PrefillCandidates, DecodeCandidates]:
+    from sglang.srt.layers.attention.dsv4.indexer_quant import (
+        use_dsv41_int8_indexer,
+    )
     from sglang.srt.runtime_context import get_parallel
 
     from .dense_blocks import DenseBlocksBackend
@@ -113,7 +122,7 @@ def make_candidate_indexer(
     # paged sparse mqa-logits, whose kernels assert arch == 10, so widening
     # this gate would only turn the dense-blocks fallback into a startup
     # RuntimeError on SM120 (see #49173).
-    if not is_sm100() or candidate_topk_blocks <= 0:
+    if not is_sm100() or use_dsv41_int8_indexer() or candidate_topk_blocks <= 0:
         return dense_blocks, dense_blocks
 
     from sglang.srt.layers.deep_gemm_wrapper.configurer import (

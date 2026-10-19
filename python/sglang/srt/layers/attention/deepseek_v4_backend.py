@@ -1629,6 +1629,10 @@ class DeepseekV4AttnBackend(
             )
         else:
             raise ValueError(f"Unsupported indexer {compress_ratio = }")
+        # SAIL weighted paged scorers pass one independent query per row.
+        # Plan those same rows instead of the native MTP request grouping.
+        if is_sail() and compress_ratio in (1, 2):
+            rows_per_request = 1
         return PagedIndexerMetadata(
             page_size=self.page_size,
             compressed_page_size=index_page_size or self.page_size // compress_ratio,
@@ -1638,7 +1642,8 @@ class DeepseekV4AttnBackend(
             # The SM120 FP4 kernel schedules split_kv=128, while the generic
             # JIT metadata planner encodes split_kv=256.
             force_deep_gemm_metadata=(
-                self.enable_deepseek_v4_fp4_indexer and get_platform().is_sm120
+                (self.enable_deepseek_v4_fp4_indexer and get_platform().is_sm120)
+                or (is_sail() and compress_ratio in (1, 2))
             ),
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             compress_ratio=compress_ratio,
@@ -4023,10 +4028,22 @@ class DeepseekV4AttnBackend(
         pool = self.token_to_kv_pool
         latent = layer.compressor.finish(pooled)
         freqs = layer.freqs_cis[group_pos]
-        # Index keys come from the pre-RoPE latent, so publish them first. Stored
-        # as fp4 (per-32 ue8m0, no hadamard), matching the reference indexer.
+        # Index keys come from the pre-RoPE latent, so publish them first.
+        # Native FP4 uses per-32 E8M0; opt-in INT8 uses per-token FP32 scales.
+        # Neither path adds the V4 C4 indexer's Hadamard transform.
         if layer.indexer is not None and layer.indexer.owns_k:
-            if (
+            if layer.indexer.use_int8:
+                from sglang.kernels.ops.attention.dsv4.int8_indexer import (
+                    store_int8_index_k,
+                )
+
+                store_int8_index_k(
+                    layer.indexer.index_keys(latent, freqs),
+                    pool.get_index_k_with_scale_buffer(layer.layer_id),
+                    slots,
+                    pool.get_index_k_page_size(layer.compress_ratio),
+                )
+            elif (
                 fuse_index_store
                 and latent.is_cuda
                 and torch.version.cuda is not None
@@ -4205,6 +4222,12 @@ class DeepseekV4AttnBackend(
                 req_pool_indices=forward_batch.req_pool_indices,
                 seq_lens_cpu=seq_lens_cpu,
                 ratio=layer.compress_ratio,
+            )
+        if req is None and layer.indexer.use_int8:
+            req = torch.repeat_interleave(
+                forward_batch.req_pool_indices.to(torch.int64),
+                rows_per_request_device.to(torch.int64),
+                output_size=x.shape[0],
             )
         return PrefillInputs(
             indexer=layer.indexer,
