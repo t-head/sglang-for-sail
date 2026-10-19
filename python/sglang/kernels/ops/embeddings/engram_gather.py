@@ -12,9 +12,25 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.arch import current_arch
+from sglang.srt.utils.device import get_device_sm, is_sail
 
 # e8m0 has no zero: the exponent byte 0 encodes 2**-127.
 _E8M0_ZERO = 2.0**-127
+
+
+@triton.jit
+def _e4m3fn_to_float(payload):
+    # Decode raw E4M3FN bytes without introducing an FP8 type into Triton IR.
+    # This also covers SM80 PPU, where float8e4nv is rejected during lowering.
+    bits = payload.to(tl.uint32)
+    exponent = (bits >> 3) & 15
+    mantissa = bits & 7
+    normal = ((exponent + 120) << 23) | (mantissa << 20)
+    subnormal = (mantissa.to(tl.float32) * (1.0 / 512.0)).to(tl.uint32, bitcast=True)
+    magnitude = tl.where(exponent == 0, subnormal, normal)
+    # E4M3FN has finite exponent-15 values through 448, and two signed NaNs.
+    magnitude = tl.where((bits & 127) == 127, 0x7FC00000, magnitude)
+    return (magnitude | ((bits & 128) << 24)).to(tl.float32, bitcast=True)
 
 
 @triton.jit
@@ -28,6 +44,7 @@ def _dequant_rows(
     BLK: tl.constexpr,
     E8M0_ZERO: tl.constexpr,
     MXFP4: tl.constexpr,
+    DECODE_E4M3_BYTES: tl.constexpr,
 ):
     # Dequantized fp32 values at columns `offs` of table rows `row`, whose payload
     # and e8m0 scales start at byte addresses `w_base` and `s_base`. MXFP4 rows
@@ -45,6 +62,14 @@ def _dequant_rows(
         bits = tl.where(m >= 2, (m + 252) << 22, m * (252 << 22))
         # Set the sign bit: before Triton 3.8, -x is 0 - x, which turns -0 into +0.
         vals = (bits | ((nib & 0x8) << 28)).to(tl.float32, bitcast=True)
+    elif DECODE_E4M3_BYTES:
+        vals = _e4m3fn_to_float(
+            tl.load(
+                w_base.to(tl.pointer_type(tl.uint8)) + row * DIM + offs,
+                mask=mask,
+                other=0,
+            )
+        )
     else:
         vals = tl.load(
             w_base.to(tl.pointer_type(tl.float8e4nv)) + row * DIM + offs,
@@ -59,6 +84,7 @@ def _dequant_rows(
     # 2**(e - 127) from the exponent bits: exact, no exp2 rounding or denormal flush.
     scale = (exps << 23).to(tl.float32, bitcast=True)
     scale = tl.where(exps == 0, E8M0_ZERO, scale)
+    scale = tl.where(exps == 255, float("nan"), scale)
     return vals * scale
 
 
@@ -88,6 +114,7 @@ def _engram_gather_kernel(
     E8M0_ZERO: tl.constexpr,
     HAS_DST: tl.constexpr,
     MXFP4: tl.constexpr,
+    DECODE_E4M3_BYTES: tl.constexpr,
 ):
     # ROWS rows per program, so the dependent loads of a row (id, payload,
     # scales) overlap with those of the program's other rows.
@@ -110,6 +137,7 @@ def _engram_gather_kernel(
         BLK,
         E8M0_ZERO,
         MXFP4,
+        DECODE_E4M3_BYTES,
     )
     out = tl.where(owned[:, None], vals, 0.0)
     tl.store(
@@ -178,6 +206,7 @@ def engram_gather(
             E8M0_ZERO=_E8M0_ZERO,
             HAS_DST=dst is not None,
             MXFP4=mxfp4,
+            DECODE_E4M3_BYTES=is_sail() and get_device_sm() < 89,
         )
     return out
 

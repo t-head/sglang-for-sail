@@ -6184,7 +6184,6 @@ def _dequant_fp8_wo_a_streaming(
     weights: Iterable[Tuple[str, torch.Tensor]],
 ) -> Iterable[Tuple[str, torch.Tensor]]:
     pending: dict[str, dict[str, torch.Tensor]] = {}
-    saw_wo_a_scale = False
     emitted = False
 
     for name, tensor in weights:
@@ -6200,9 +6199,16 @@ def _dequant_fp8_wo_a_streaming(
                 bucket["weight"] = _clone_if_runai_streamed_tensor(tensor)
             continue
 
-        if name.endswith(".wo_a.scale"):
-            saw_wo_a_scale = True
-            prefix = name[: -len(".scale")]
+        scale_suffix = next(
+            (
+                suffix
+                for suffix in (".scale", ".weight_scale", ".weight_scale_inv")
+                if name.endswith(".wo_a" + suffix)
+            ),
+            None,
+        )
+        if scale_suffix is not None:
+            prefix = name[: -len(scale_suffix)]
             bucket = pending.setdefault(prefix, {})
             weight = bucket.pop("weight", None)
             if weight is not None:
@@ -6216,13 +6222,16 @@ def _dequant_fp8_wo_a_streaming(
         yield name, tensor
 
     if emitted:
-        logger.info("Finished streaming dequant fp8 wo_a")
+        logger.info("Finished streaming dequant FP8/INT8 wo_a to BF16")
     for prefix, bucket in pending.items():
         if "weight" in bucket:
-            assert not saw_wo_a_scale, f"{prefix}.scale is missing"
+            if bucket["weight"].dtype in (torch.int8, torch.float8_e4m3fn):
+                raise ValueError(
+                    f"{prefix}: quantized wo_a weight is missing its scale"
+                )
             yield prefix + ".weight", bucket["weight"]
         if "scale" in bucket:
-            yield prefix + ".scale", bucket["scale"]
+            raise ValueError(f"{prefix}: wo_a scale is missing its weight")
 
 
 def _dequant_fp8_wo_a(

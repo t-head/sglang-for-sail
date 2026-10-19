@@ -1,0 +1,25 @@
+"""Shared V4.1 indexer format selection for allocation and execution."""
+
+from sglang.srt.environ import envs
+from sglang.srt.utils.device import get_device_sm, is_sail
+
+
+def dsv41_requires_int8_indexer() -> bool:
+    return is_sail() and get_device_sm() < 89
+
+
+def use_dsv41_int8_indexer() -> bool:
+    # PPU below SM89 cannot use the V4.1 FP4 indexer, including when the legacy
+    # opt-in is explicitly set to zero. All low-ratio consumers share this
+    # decision so Q/K computation, cache layout and memory sizing agree.
+    if is_sail() and get_device_sm() >= 89 and envs.SGLANG_SAIL_DSV4_USE_INT8.get():
+        raise ValueError(
+            "The installed PPU DeepGEMM INT8 indexer supports 810E only; "
+            "M890 requires the default packed MXFP4 indexer"
+        )
+    if is_sail() and get_device_sm() >= 89 and envs.SGLANG_SAIL_DSV4_USE_INT8.get():
+        raise ValueError(
+            "The installed PPU DeepGEMM INT8 indexer supports 810E only; "
+            "M890 requires the default packed MXFP4 indexer"
+        )
+    return dsv41_requires_int8_indexer()
