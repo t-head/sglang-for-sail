@@ -25,6 +25,17 @@ def _default_hip() -> bool:
         return False
 
 
+@functools.lru_cache(maxsize=1)
+def _default_sail() -> bool:
+    """Keep environ stdlib-only until a SAIL-dependent default is read."""
+    try:
+        from sglang.srt.utils.device import is_sail
+
+        return is_sail()
+    except (ImportError, OSError, RuntimeError):
+        return False
+
+
 _NON_UTF8_PREFIX = "base64:"
 
 
@@ -2056,7 +2067,6 @@ class Envs:
     # are read only by _resolve_engram_config.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
     SGLANG_OPT_ENGRAM_EXTEND_HASH = EnvBool(False)
-    SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(False)
     # Deprecated for --engram-config "replication".
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("per_rank")
     # Scheduler-side staging of shared host-table rows on GPUs without ATS
@@ -2067,6 +2077,8 @@ class Envs:
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
+    # Auto-enable only on SAIL; still requires SM89+ and a compatible MegaMHC API.
+    SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(_default_sail)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
