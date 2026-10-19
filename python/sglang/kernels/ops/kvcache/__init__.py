@@ -18,6 +18,15 @@ if TYPE_CHECKING:
 
 register_kernel(
     KernelSpec(
+        op="kvcache.dequantize_k_cache_paged_dsv4_v2",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.kvcache.dsv4_dequant:dequantize_k_cache_paged_v2_cuda",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="kvcache.dequantize_k_cache_paged_dsv4",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.kvcache.dsv4_dequant:dequantize_k_cache_paged_cuda",
