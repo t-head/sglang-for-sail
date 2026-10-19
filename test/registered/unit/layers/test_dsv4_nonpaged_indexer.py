@@ -300,6 +300,12 @@ class TestDSV4TopKDispatch(CustomTestCase):
 
 
 class TestDSV4NonPagedIndexer(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        platform = patch(f"{_INDEXER}.is_sail", return_value=False)
+        platform.start()
+        self.addCleanup(platform.stop)
+
     def _is_eligible(self, **overrides):
         backend = SimpleNamespace(hisparse_coordinator=None)
         c4_indexer = SimpleNamespace(use_fp4_indexer=overrides.get("fp4", False))
@@ -740,6 +746,12 @@ class TestMqaLogitsBudgetArithmetic(CustomTestCase):
 
 
 class TestPagedIndexerMetadataChunking(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        platform = patch(f"{_METADATA}.is_sail", return_value=False)
+        platform.start()
+        self.addCleanup(platform.stop)
+
     """The schedule list and the top-k plan list must be built over the exact
     row chunks the indexer loops over; a mismatch would silently score rows
     with another chunk's schedule."""
@@ -989,7 +1001,7 @@ class TestDeepSelectFullTopKDecode(CustomTestCase):
         indexer.use_deep_select_decode = False
 
         with (
-            patch.object(mod, "decode_scores", return_value=data),
+            patch.object(mod, "decode_score_chunks", return_value=iter([data])),
             patch.object(mod, "topk_page_transform") as page_transform,
             patch.object(mod, "select_decode") as select_decode,
         ):
@@ -1211,6 +1223,14 @@ class TestGroupedVerifyRows(CustomTestCase):
 
 
 class TestCandidateIndexerGating(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        platform = patch(
+            "sglang.srt.layers.attention.dsv4.v41_indexer.is_sail", return_value=False
+        )
+        platform.start()
+        self.addCleanup(platform.stop)
+
     def test_candidate_indexer_gating(self):
         from sglang.srt.layers.attention.dsv4 import v41_indexer
         from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
