@@ -114,7 +114,7 @@ class TestInt8IndexerCache(CustomTestCase):
         q_int8, folded = quantize_query(q, weights)
         ref_q, ref_s = per_token_quant_int8(q.flatten(0, 1).contiguous())
         self.assertEqual(tuple(q_int8.shape), (3, 32, 128))
-        self.assertTrue(torch.equal(q_int8, ref_q.view(3, 32, 128)))
+        self.assertTrue(torch.equal(q_int8[:, :4], ref_q.view(3, 4, 128)))
         self.assertTrue(torch.equal(folded[:, :4], weights * ref_s.view(3, 4)))
         # Dequantized error stays within one rounding step of the per-token scale.
         self.assertTrue((q_int8[:, 4:] == 0).all())

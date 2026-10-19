@@ -17,9 +17,4 @@ def use_dsv41_int8_indexer() -> bool:
             "The installed PPU DeepGEMM INT8 indexer supports 810E only; "
             "M890 requires the default packed MXFP4 indexer"
         )
-    if is_sail() and get_device_sm() >= 89 and envs.SGLANG_SAIL_DSV4_USE_INT8.get():
-        raise ValueError(
-            "The installed PPU DeepGEMM INT8 indexer supports 810E only; "
-            "M890 requires the default packed MXFP4 indexer"
-        )
     return dsv41_requires_int8_indexer()
