@@ -24,6 +24,7 @@ from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.platforms.mps import MpsSRTPlatform
 from sglang.srt.platforms.musa import MusaSRTPlatform
 from sglang.srt.platforms.npu import NPUSRTPlatform
+from sglang.srt.platforms.ppu import PPUSRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
 from sglang.srt.platforms.xpu import XpuSRTPlatform
 from sglang.srt.plugins import PLATFORM_PLUGINS_GROUP, load_plugins_by_group
@@ -39,6 +40,12 @@ def _is_cuda_available() -> bool:
 
 def _is_rocm_available() -> bool:
     return bool(torch.cuda.is_available() and torch.version.hip is not None)
+
+
+def _is_ppu_available() -> bool:
+    # The vendor environment advertises the SAIL runtime with PPU_SDK.
+    # A marker alone must not select PPU on CPU-only or ROCm installations.
+    return bool(os.getenv("PPU_SDK") and _is_cuda_available())
 
 
 def _is_cpu_available() -> bool:
@@ -86,6 +93,7 @@ def _resolve_platform() -> SRTPlatform:
          - 0 activated + SGLANG_USE_CPU_ENGINE=1 → fallback CpuSRTPlatform
            (checked first; an explicit opt-in wins over CUDA/ROCm availability,
            so developers on GPU hosts can intentionally exercise the CPU path)
+         - 0 activated + PPU_SDK + CUDA-compatible runtime → fallback PPUSRTPlatform
          - 0 activated + CUDA available → fallback CudaSRTPlatform
          - 0 activated + NPU available  → fallback NPUSRTPlatform
          - 0 activated + ROCm available → fallback RocmSRTPlatform
@@ -146,6 +154,9 @@ def _resolve_platform() -> SRTPlatform:
         if _is_cpu_available():
             logger.debug("SGLANG_USE_CPU_ENGINE=1. Using CPU SRTPlatform defaults.")
             return CpuSRTPlatform()
+        if _is_ppu_available():
+            logger.debug("SAIL runtime detected. Using PPU SRTPlatform defaults.")
+            return PPUSRTPlatform()
         if _is_cuda_available():
             logger.debug(
                 "No platform plugin detected. Using CUDA SRTPlatform defaults."
