@@ -4,6 +4,20 @@
 import torch
 
 
+def _can_use_prefill_union_cute(device: torch.device) -> bool:
+    """The CuTe DSL union needs Hopper/Blackwell; other devices use the Triton port.
+
+    The CuTe DSL cannot run on sm80 PPU (the driver reports CUDA 13.0, below the
+    13.4 the prebuilt cutlass-dsl requires), so route capability 9/10 to CuTe and
+    everything else to ``prefill_union_triton``, matching the rest of Step5.
+    """
+    return (
+        device.type == "cuda"
+        and torch.version.hip is None
+        and torch.cuda.get_device_capability(device)[0] in (9, 10)
+    )
+
+
 def step5_build_prefill_union(
     logical_starts: torch.Tensor,
     physical_regions: torch.Tensor,
@@ -79,25 +93,50 @@ def step5_build_prefill_union(
         ):
             raise ValueError(f"Step5 prefill union invalid {name}")
     if groups:
-        from sglang.kernels.ops.attention.step5.cute.cute_utils import device_cache_key
-        from sglang.kernels.ops.attention.step5.cute.prefill_union import _compile_union
+        if _can_use_prefill_union_cute(logical_starts.device):
+            from sglang.kernels.ops.attention.step5.cute.cute_utils import (
+                device_cache_key,
+            )
+            from sglang.kernels.ops.attention.step5.cute.prefill_union import (
+                _compile_union,
+            )
 
-        _compile_union(
-            num_region_bins,
-            capacity,
-            device_cache_key(logical_starts.device),
-            selection_stride,
-        )(
-            logical_starts,
-            physical_regions,
-            counts,
-            group_query_start,
-            group_query_end,
-            bitset,
-            union_physical,
-            union_logical,
-            union_counts,
-            membership,
-            groups,
-            rows,
-        )
+            _compile_union(
+                num_region_bins,
+                capacity,
+                device_cache_key(logical_starts.device),
+                selection_stride,
+            )(
+                logical_starts,
+                physical_regions,
+                counts,
+                group_query_start,
+                group_query_end,
+                bitset,
+                union_physical,
+                union_logical,
+                union_counts,
+                membership,
+                groups,
+                rows,
+            )
+        else:
+            from sglang.kernels.ops.attention.step5.prefill_union_triton import launch
+
+            launch(
+                logical_starts,
+                physical_regions,
+                counts,
+                group_query_start,
+                group_query_end,
+                bitset,
+                union_physical,
+                union_logical,
+                union_counts,
+                membership,
+                groups,
+                rows,
+                num_region_bins=num_region_bins,
+                capacity=capacity,
+                selection_stride=selection_stride,
+            )

@@ -268,7 +268,12 @@ class Step5Router(nn.Module):
 def _step5_keep_bf16_experts(quant_config, prefix: str) -> bool:
     if quant_config is None:
         return True
-    ignored = quant_config.ignored_layers
+    # Different quantization configs expose the ignore list under different
+    # attribute names: Fp8Config/MixedPrecisionW4 use ``ignored_layers`` while
+    # CompressedTensorsConfig uses ``ignore``.
+    ignored = getattr(quant_config, "ignored_layers", None)
+    if ignored is None:
+        ignored = getattr(quant_config, "ignore", None) or []
     w13_skipped = is_layer_skipped(f"{prefix}.w13_weight", ignored)
     w2_skipped = is_layer_skipped(f"{prefix}.w2_weight", ignored)
     if w13_skipped != w2_skipped:
@@ -532,8 +537,14 @@ class Step5MoE(nn.Module):
                 use_flashinfer_trtllm_moe=self.bf16_trtllm,
                 use_flashinfer_cutlass=False,
             )
-        else:
+        elif isinstance(quant_config, Fp8Config):
             quant_method = Fp8MoEMethod(quant_config)
+        else:
+            # Non-FP8 routed experts (e.g. compressed-tensors INT8 W8A8): pass
+            # None so FusedMoE derives the matching method via
+            # quant_config.get_quant_method(self, prefix), which also sets the
+            # layer scheme. Fp8MoEMethod must only be built from an Fp8Config.
+            quant_method = None
         self.experts = FusedMoE(
             num_experts=num_experts,
             hidden_size=hidden_size,
@@ -562,7 +573,14 @@ class Step5MoE(nn.Module):
             is_gated=True,
             gate_up_interleaved=False,
             fp8_use_rn_division=(
-                not self.keep_bf16_experts and get_moe_runner_backend().is_triton()
+                # RN (round-to-nearest) division is an FP8 block-wise accuracy
+                # feature: invoke_fused_moe_kernel rejects it unless the MoE is
+                # CUDA block-wise FP8. Keep it off for INT8 (compressed-tensors
+                # W8A8), nvfp4, per-tensor FP8, and BF16 routed experts.
+                not self.keep_bf16_experts
+                and isinstance(quant_config, Fp8Config)
+                and getattr(quant_config, "weight_block_size", None) is not None
+                and get_moe_runner_backend().is_triton()
             ),
             quant_method=quant_method,
             routing_method_type=RoutingMethodType.SigmoidBiasOrderedRenorm
@@ -955,6 +973,16 @@ class Step5Attention(nn.Module):
             and self.qkv_proj.weight.shape in ((1920, 4096), (3456, 4096))
             else 255
         )
+        # The fused CuTe Q/K-norm + RoPE kernel only supports Hopper/Blackwell
+        # (capability 9/10); see cute/qknorm_dispatch.py. On other devices (e.g.
+        # sm80 PPU) route to the module-level reference ops instead, matching the
+        # capability gating the rest of the Step5 kernels already use.
+        self._fused_qknorm = (
+            self.qkv_proj.weight.is_cuda
+            and torch.version.hip is None
+            and torch.cuda.get_device_capability(self.qkv_proj.weight.device)[0]
+            in (9, 10)
+        )
 
     def _apply(self, fn, recurse=True):
         super()._apply(fn, recurse=recurse)
@@ -1025,6 +1053,7 @@ class Step5Attention(nn.Module):
                         indexer_metadata,
                         # TODO(yhyang201): frozen SGLANG_OPT_STEP5_INDEXER_WEIGHT_FIRST; prune dead paths.
                         weights_first=step5_options.INDEXER_WEIGHT_FIRST,
+                        forward_batch=forward_batch,
                     )
             return None
 
@@ -1061,6 +1090,9 @@ class Step5Attention(nn.Module):
         if (
             not self.is_dsa
             and not idle
+            # The fused SWA KV store is only reproduced by the CuTe kernel; the
+            # generic fallback keeps kv_write=None so the backend saves KV.
+            and self._fused_qknorm
             # TODO(yhyang201): frozen SGLANG_OPT_STEP5_SWA_FUSED_QKNORM_STORE; prune dead paths.
             and step5_options.SWA_FUSED_QKNORM_STORE
         ):
@@ -1082,7 +1114,7 @@ class Step5Attention(nn.Module):
                 eps=self.eps,
                 kv_write=kv_write,
             )
-        else:
+        elif self._fused_qknorm:
             q, k, v = step5_qknorm_rope(
                 qkv,
                 self.q_norm.weight,
@@ -1092,9 +1124,16 @@ class Step5Attention(nn.Module):
                 eps=self.eps,
                 kv_write=kv_write,
             )
+        else:
+            q, k, v = self._qknorm_rope_generic(qkv, positions)
         if self.is_dsa:
             if not idle and not use_indexer_alt_stream:
-                selection = self.indexer(hidden_states, positions, indexer_metadata)
+                selection = self.indexer(
+                    hidden_states,
+                    positions,
+                    indexer_metadata,
+                    forward_batch=forward_batch,
+                )
 
             def prepare_selection_and_gate():
                 nonlocal gate
@@ -1161,6 +1200,36 @@ class Step5Attention(nn.Module):
             -1, self.num_heads, self.head_dim
         ) * gate.sigmoid().unsqueeze(-1)
 
+    def _qknorm_rope_generic(
+        self, qkv: torch.Tensor, positions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reference Q/K-norm + RoPE for platforms without the CuTe kernel.
+
+        Mirrors ``step5_qknorm_rope`` for the non-gated packed row
+        ``qkv = [T, (heads + 2) * head_dim]`` laid out as ``[Q | K | V]``:
+        GemmaRMSNorm (FP32 zero-centered weights) on Q/K, this layer's partial
+        NeoX rotary, and V passed through. Returns contiguous BF16
+        ``Q[T, heads, D]`` and ``K/V[T, 1, D]``. The fused SWA KV store is not
+        reproduced; callers keep ``kv_write=None`` so the backend saves KV.
+        """
+        tokens = qkv.shape[0]
+        heads = self.num_heads
+        head_dim = self.head_dim
+        packed = qkv.view(tokens, heads + 2, head_dim)
+        q = self.q_norm.forward_native(packed[:, :heads, :])
+        k = self.k_norm.forward_native(packed[:, heads : heads + 1, :])
+        v = packed[:, heads + 1 :, :].contiguous()
+        q, k = self.rotary_emb.forward_native(
+            positions,
+            q.reshape(tokens, heads * head_dim),
+            k.reshape(tokens, head_dim),
+        )
+        return (
+            q.reshape(tokens, heads, head_dim),
+            k.reshape(tokens, 1, head_dim),
+            v,
+        )
+
     def _forward_breakable_extend(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
@@ -1177,15 +1246,18 @@ class Step5Attention(nn.Module):
         else:
             qkv, _ = self.qkv_proj(hidden_states)
             gate, _ = self.g_proj(hidden_states)
-            q, k, v = step5_qknorm_rope(
-                qkv,
-                self.q_norm.weight,
-                self.k_norm.weight,
-                positions,
-                self.rotary_emb.cos_sin_cache,
-                eps=self.eps,
-                kv_write=None,
-            )
+            if self._fused_qknorm:
+                q, k, v = step5_qknorm_rope(
+                    qkv,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    positions,
+                    self.rotary_emb.cos_sin_cache,
+                    eps=self.eps,
+                    kv_write=None,
+                )
+            else:
+                q, k, v = self._qknorm_rope_generic(qkv, positions)
         use_gate_epilogue = (
             not self.is_dsa
             # TODO(yhyang201): frozen SGLANG_OPT_STEP5_SWA_FA4_GATE_EPILOGUE; prune dead paths.
@@ -1304,11 +1376,18 @@ class Step5DecoderLayer(nn.Module):
     @staticmethod
     def stage_facts(config: Step5Config, layer_id: int):
         # Local MegaMoE experts consume attention-TP rows and return TP partials.
+        is_moe = layer_id in config.moe_layer_list
         return (
             declare_attn(),
             declare_ffn(
-                sparse=layer_id in config.moe_layer_list
-                and not get_moe_a2a_backend().is_megamoe()
+                sparse=is_moe and not get_moe_a2a_backend().is_megamoe(),
+                # The dense MLP shards over attention TP, so its output owes
+                # the attention-TP sum: with attention CP the full-TP group
+                # replicates each partial across the CP pair and would double
+                # the summed output.
+                dense_tp_size=None
+                if is_moe
+                else get_parallel().attn_tp_size,
             ),
         )
 
@@ -1322,9 +1401,25 @@ class Step5DecoderLayer(nn.Module):
             return routed + shared
         shared, routed = self.moe(
             hidden_states,
-            num_token_non_padded=forward_batch.num_token_non_padded,
+            # The method returns None when the MoE input is a CP/DP gathered
+            # buffer whose real rows are not a prefix (interleave prefill CP
+            # gathers rank-major padded shards); the raw field would wrongly
+            # mask the non-prefix real rows as padding in the router topk.
+            num_token_non_padded=forward_batch.moe_num_token_non_padded(),
             forward_batch=forward_batch,
         )
+        parallel = get_parallel()
+        # The shared expert's weights shard over attention TP, so its partial
+        # is replicated across the attention-CP pair, while the post-experts
+        # sum spans the full TP group and would count each shard once per
+        # replica: only one CP replica may contribute it.
+        if (
+            parallel.attn_cp_size > 1
+            and parallel.moe_dp_size == 1
+            and parallel.moe_ep_size * parallel.moe_tp_size == parallel.tp_size
+            and parallel.attn_cp_rank != 0
+        ):
+            shared = torch.zeros_like(shared)
         if isinstance(routed, FlashInferTrtllmDeferredFinalizeOutput):
             if get_forward().defer_moe_finalize and self.boundary_fusions.can_fuse_moe(
                 shared, routed
@@ -1641,6 +1736,9 @@ class Step5ForCausalLM(nn.Module):
             for suffix, scale_suffix in (
                 ("weight", ""),
                 ("weight_scale_inv", "_scale_inv"),
+                # compressed-tensors INT8 W8A8 checkpoints store per-channel
+                # weight scales as ``*_proj.weight_scale`` -> ``w13/w2_weight_scale``.
+                ("weight_scale", "_scale"),
             )
         }
 

@@ -7,6 +7,15 @@ import math
 import torch
 
 
+def _can_use_sparse_decode_cute(device: torch.device) -> bool:
+    """CuTe DSL sparse decode needs sm90/sm100; other devices use the Triton path."""
+    return (
+        device.type == "cuda"
+        and torch.version.hip is None
+        and torch.cuda.get_device_capability(device)[0] in (9, 10)
+    )
+
+
 def _add_periodic_work(sm_work, *, start, tasks, weight):
     if tasks <= 0:
         return
@@ -143,7 +152,7 @@ def step5_sparse_decode_partials(
 ) -> None:
     """Write BF16 final output or FP32 split partials with FP32 natural LSE.
 
-    Q is [T,H,192], H in (8,16); native contiguous K/V are [slots,1,192], page64-aligned.
+    Q is [T,H,192], H in (4,8,16); native contiguous K/V are [slots,1,192], page64-aligned.
     The page16 views share storage, addresses and token numbering with native KV.
     Counts and causal lengths are int32 [T]; packed int64 regions [T,513/514/516]
     come from step5_pack_decode_regions. Counts outside valid_rows[0] must be
@@ -165,8 +174,8 @@ def step5_sparse_decode_partials(
     """
     if q.device.type != "cuda" or torch.version.hip is not None:
         raise ValueError("Step5 sparse decode requires NVIDIA CUDA")
-    if q.ndim != 3 or q.shape[1] not in (8, 16) or q.shape[2] != 192:
-        raise ValueError("Step5 Q requires shape [T,8 or 16,192]")
+    if q.ndim != 3 or q.shape[1] not in (4, 8, 16) or q.shape[2] != 192:
+        raise ValueError("Step5 Q requires shape [T,4/8/16,192]")
     rows, heads, _ = q.shape
     if not 1 <= mtp_q_len <= 16:
         raise ValueError("Step5 mtp_q_len must be in [1,16]")
@@ -228,6 +237,33 @@ def step5_sparse_decode_partials(
         ),
     )
     if rows:
+        if not _can_use_sparse_decode_cute(q.device):
+            # PPU fallback (sm80 and sm89+): single-pass Triton decode, no split-KV,
+            # no merge.
+            if kv_fp8 or out.dtype != torch.bfloat16:
+                raise ValueError(
+                    "Step5 Triton sparse decode supports only single-partition BF16 output"
+                )
+            if n_split4 or n_split2 or dynamic_splits or mtp_q_len != 1 or work != rows:
+                raise ValueError(
+                    "Step5 Triton sparse decode requires the no-split schedule"
+                )
+            from sglang.kernels.ops.attention.step5.sparse_decode_triton import launch
+
+            launch(
+                q,
+                k,
+                v,
+                packed_regions,
+                counts,
+                causal_lengths,
+                valid_rows,
+                out,
+                lse,
+                softmax_scale=softmax_scale,
+            )
+            return
+
         from sglang.kernels.ops.attention.step5.cute.cute_utils import device_cache_key
         from sglang.kernels.ops.attention.step5.cute.decode_dispatch import (
             compile_decode,
@@ -355,10 +391,20 @@ def _validate_tensors(device, tensors):
 
 def build_step5_sparse_decode_schedule(*, rows, request_rows, device_index):
     """Shape/device policy, evaluated once per forward/capture before layers."""
-    from sglang.kernels.ops.attention.step5.cute.decode_dispatch import device_sm_count
-
     dynamic = request_rows == 1 and rows in (1, 4)
     split4 = split2 = 0
+    if not _can_use_sparse_decode_cute(torch.device("cuda", device_index)):
+        # The Triton decode path runs a single pass per row; force the no-split
+        # schedule so ``step5_sparse_decode_selected`` skips partitioning/merge.
+        # Avoid importing the CuTe dispatch here: it is unavailable on sm80.
+        return dict(
+            decode_dynamic_splits=False,
+            decode_split4_rows=0,
+            decode_split2_rows=0,
+            decode_work_rows=rows,
+        )
+    from sglang.kernels.ops.attention.step5.cute.decode_dispatch import device_sm_count
+
     if dynamic:
         work = 16 * rows
     else:

@@ -13,6 +13,7 @@ from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
+    prepare_mm_inputs,
 )
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -90,6 +91,38 @@ class Step3p7ForConditionalGeneration(nn.Module):
             prefix=add_prefix("language_model", prefix),
             **language_kwargs,
         )
+        self.pp_group = get_parallel().pp_group
+
+    @property
+    def model(self):
+        # The CP runner drives the language body directly and applies the
+        # logits step itself on the gathered hidden states.
+        return self.language_model.model
+
+    @property
+    def lm_head(self):
+        return self.language_model.lm_head
+
+    @property
+    def logits_processor(self):
+        return self.language_model.logits_processor
+
+    def get_input_embeddings(self):
+        return self.language_model.get_input_embeddings()
+
+    def prepare_cp_inputs(self, forward_batch, **kwargs):
+        """Finish full-sequence embedding injection before the runner shards tokens."""
+        input_embeds = kwargs.pop("input_embeds", None)
+        if input_embeds is None or forward_batch.contains_mm_inputs():
+            input_embeds = prepare_mm_inputs(
+                forward_batch.input_ids,
+                forward_batch,
+                self.language_model,
+                kwargs,
+                multimodal_model=self,
+                data_embedding_funcs={Modality.IMAGE: self.get_image_feature},
+            )
+        return input_embeds, forward_batch.positions, kwargs
 
     @property
     def layer_selection(self):

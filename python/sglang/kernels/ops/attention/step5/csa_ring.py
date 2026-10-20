@@ -27,7 +27,73 @@ def _fresh_product(weight, value):
 
 
 @triton.jit
-def _compressed_index_key_bytes(index_keys, compression_logits):
+def _f32_to_e4m3(x):
+    """Portable FP32 -> E4M3FN byte encoder (RNE round + satfinite saturate).
+
+    Mirrors the sm89+ PTX ``cvt.rn.satfinite.e4m3x2.f32`` for devices that
+    cannot assemble it (sm80 PPU, arch ``ppu0010``), and is the exact inverse
+    of ``scoring_triton._e4m3_to_bf16``. Pure integer/bit ops, so it compiles
+    on every backend. E4M3FN: 1 sign, 4 exponent (bias 7), 3 mantissa; no
+    inf, 0x7F/0xFF = NaN, max finite 448 (0x7E/0xFE).
+
+    The fp32 significand (24 bits with the implicit leading 1) is rounded to
+    the 4 significand bits E4M3 can hold (3 stored + implicit) with an explicit
+    round-half-to-even on the dropped bits. ``ec`` is the fp32 unbiased exponent
+    clamped so the value still lands in the E4M3 normal range; below that the
+    target is an E4M3 subnormal and more bits are shifted out. ``x`` must be
+    finite and bf16-representable (the caller rounds to bf16 first), so ``ec``
+    stays >= -14 and every shift count is in [20, 28] -- no int32 overflow.
+    satfinite clamps |x| >= 464 (the RNE midpoint between 448 and the NaN slot)
+    to the max finite code, detected as an exponent/mantissa overflow to NaN.
+    """
+    f = x.to(tl.float32)
+    b = f.to(tl.int32, bitcast=True)
+    fexp = (b >> 23) & 0xFF
+    # Enforce the encoder precondition: x is finite (a finite fp32 has exponent
+    # bits < 0xFF). The caller rounds to bf16 first, so this holds by
+    # construction; finiteness plus the ec clamp below keeps every shift inside
+    # int32, and the bf16 pre-rounding keeps ec in the documented range so the
+    # shift counts stay in [20, 28]. Integer-only guard (no FP8/inline-asm PTX),
+    # so it stays portable to sm80 PPU. Checked with one aggregate assert.
+    tl.device_assert(
+        tl.min((fexp < 0xFF).to(tl.int32), axis=0) == 1,
+        "_f32_to_e4m3 input must be finite",
+    )
+    sign = ((b >> 31) & 1).to(tl.uint8)
+    fmant = b & 0x7FFFFF
+    ec = tl.maximum(fexp - 127, -15)  # clamp keeps shifts bounded; tiny -> 0
+    mant = fmant | (1 << 23)  # fp32 normals carry the implicit leading 1
+    is_sub = ec < -6  # below the smallest E4M3 normal -> subnormal target
+    # Normal: shrink the 24-bit significand (1.f * 2^23) to E4M3's 4 significant
+    # bits (1.f * 2^3) -> shift 20. Subnormal: align to the 2^-9 subnormal step
+    # -> shift 14 - ec (which is also 20 at the ec == -6 boundary, so the two
+    # arms agree there and q lands in [8, 15] normal / [0, 8] subnormal).
+    shift = tl.where(is_sub, 14 - ec, 20)
+    q = mant >> shift
+    rem = mant - (q << shift)
+    half = 1 << (shift - 1)
+    # Round half to even: bump when the dropped bits exceed half, or equal
+    # half with an odd retained significand.
+    q = q + tl.where((rem > half) | ((rem == half) & ((q & 1) != 0)), 1, 0)
+    # Normal path: q in [8, 16]; a carry to 16 rolls into the exponent.
+    e_field_n = (ec + 7) + tl.where(q >= 16, 1, 0)
+    m_n = tl.where(q >= 16, 0, q & 0x7)
+    # Subnormal path: q in [0, 8]; a carry to 8 becomes the smallest normal.
+    e_field_s = tl.where(q >= 8, 1, 0)
+    m_s = tl.where(q >= 8, 0, q & 0x7)
+    e_field = tl.where(is_sub, e_field_s, e_field_n)
+    m = tl.where(is_sub, m_s, m_n)
+    # satfinite: an exponent/mantissa that would reach the NaN code saturates to
+    # the max finite (e_field 15, m 6 -> 0x7E).
+    over = (e_field > 15) | ((e_field == 15) & (m >= 7))
+    e_field = tl.where(over, 15, e_field)
+    m = tl.where(over, 6, m)
+    code = ((e_field & 0xF) << 3) | (m & 0x7)
+    return (code | (sign.to(tl.int32) << 7)).to(tl.uint8)
+
+
+@triton.jit
+def _compressed_index_key_bytes(index_keys, compression_logits, USE_NATIVE_FP8: tl.constexpr):
     # raw payloads retain their BF16 bits, including unused NaN slots, until
     # all eight tokens are ready for the numerical reduction.
     maximum = tl.full((256,), -float("inf"), tl.float32)
@@ -57,21 +123,29 @@ def _compressed_index_key_bytes(index_keys, compression_logits):
     )
     mean = tl.where(denominator > 0.0, mean, 0.0)
     rounded = mean.to(tl.bfloat16).to(tl.float32)
-    packed = tl.inline_asm_elementwise(
-        """{
-            .reg .b16 pair;
-            .reg .f32 zero;
-            mov.f32 zero, 0f00000000;
-            cvt.rn.satfinite.e4m3x2.f32 pair, zero, $1;
-            cvt.u32.u16 $0, pair;
-        }""",
-        constraints="=r,f",
-        args=[rounded],
-        dtype=tl.uint32,
-        is_pure=True,
-        pack=1,
-    )
-    return packed.to(tl.uint8)
+    if USE_NATIVE_FP8:
+        # sm89+ assembles the packed FP32 -> 2x E4M3 convert directly; keep the
+        # native instruction (and its exact satfinite/RNE semantics) there.
+        packed = tl.inline_asm_elementwise(
+            """{
+                .reg .b16 pair;
+                .reg .f32 zero;
+                mov.f32 zero, 0f00000000;
+                cvt.rn.satfinite.e4m3x2.f32 pair, zero, $1;
+                cvt.u32.u16 $0, pair;
+            }""",
+            constraints="=r,f",
+            args=[rounded],
+            dtype=tl.uint32,
+            is_pure=True,
+            pack=1,
+        )
+        return packed.to(tl.uint8)
+    else:
+        # sm80 PPU cannot assemble cvt.rn.satfinite.e4m3x2.f32; encode with
+        # portable integer bit ops instead (constexpr branch -> the native
+        # inline_asm above is dead-code-eliminated and never reaches ptxas).
+        return _f32_to_e4m3(rounded)
 
 
 @triton.jit
@@ -157,6 +231,7 @@ def _compress(
     ROWS: tl.constexpr,
     FUSE_WRITE: tl.constexpr,
     Z_ROW: tl.constexpr,
+    USE_NATIVE_FP8: tl.constexpr,
     USE_PDL: tl.constexpr = False,
 ):
     region_offset, row = tl.program_id(0), tl.program_id(1)
@@ -229,7 +304,9 @@ def _compress(
                     0,
                 )
             packed = _compressed_index_key_bytes(
-                tl.where(history[:, None], rk, ik), tl.where(history[:, None], rz, iz)
+                tl.where(history[:, None], rk, ik),
+                tl.where(history[:, None], rz, iz),
+                USE_NATIVE_FP8,
             )
             dest = tl.load(physical + region_offset * ROWS + row).to(tl.int64)
             within = dest % 8
@@ -402,6 +479,15 @@ def append_ring(
     """
     rows = slots.numel()
     capacity = index_key_ring.shape[1]
+    # FP32 -> E4M3FN encoding: sm89+ (e.g. 890P, capability (8,9)) assembles the
+    # native cvt.rn.satfinite.e4m3x2.f32; sm80 PPU (810E, (8,0)) cannot and takes
+    # the portable integer encoder instead. Decided once on the host so the
+    # constexpr branch is resolved (and the unused side DCE'd) at compile time.
+    use_native_fp8 = (
+        torch.cuda.get_device_capability(index_key.device) >= (8, 9)
+        if rows
+        else False
+    )
     if rows:
         fuse_write = (
             max_regions == 1
@@ -449,6 +535,7 @@ def append_ring(
                 rows,
                 fuse_write,
                 compression_logits.stride(0),
+                use_native_fp8,
                 USE_PDL=use_pdl and fuse_write,
                 launch_pdl=use_pdl and fuse_write,
                 num_warps=8,

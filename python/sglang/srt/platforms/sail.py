@@ -39,6 +39,7 @@ class SailSRTPlatform(SailDeviceMixin, SRTPlatform):
         supports_triton=True,
         graph_capture=True,
         piecewise_graph=True,
+        hicache_device_kernels=True,
         supports_pynccl=True,
     )
 
