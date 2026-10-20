@@ -468,12 +468,14 @@ class Step5PoolConfigurator(MemoryPoolConfigurator):
                 (4, 4, 4, 1, 1, 1, 1, 1),
                 (8, 8, 8, 1, 1, 1, 1, 1),
                 (8, 8, 4, 1, 1, 2, 1, 1),
+                (16, 16, 16, 1, 1, 1, 1, 1),
             )
             or actual != declared
         ):
             raise ValueError(
-                "runtime parallel topology must match TP4/EP1, TP4/EP4, TP8/EP8, or "
-                "DP2/TP4/EP8 with PP1/CP1"
+                "runtime parallel topology must match TP4/EP1, TP4/EP4, TP8/EP8, "
+                "TP16/EP16, or DP2/TP4/EP8 with PP1/CP1; got "
+                f"(tp,ep,attn_tp,pp,dp,attn_dp,attn_cp,attn_dcp)={declared}"
             )
 
     @staticmethod

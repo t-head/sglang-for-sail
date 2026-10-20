@@ -10,6 +10,20 @@ _QKV_WIDTHS = (1920, 3456)
 _QKV_GATE_WIDTHS = (1928, 3472)
 
 
+def _can_use_qknorm_cute(device: torch.device) -> bool:
+    """The fused CuTe Q/K-norm + RoPE kernel only supports Hopper/Blackwell.
+
+    Capability 9/10 routes to ``cute/qknorm_dispatch.py``; everything else (e.g.
+    sm80 PPU) falls back to the portable Triton port, matching the capability
+    gating the rest of the Step5 kernels already use.
+    """
+    return (
+        device.type == "cuda"
+        and torch.version.hip is None
+        and torch.cuda.get_device_capability(device)[0] in (9, 10)
+    )
+
+
 def step5_qknorm_rope(
     qkv: torch.Tensor,
     q_weight: torch.Tensor,
@@ -146,39 +160,64 @@ def _qknorm_rope(
     v = qkv.new_empty((tokens, 192))
     gate = qkv.new_empty((tokens, heads)) if gated else None
     if tokens:
-        from sglang.kernels.ops.attention.step5.cute.cute_utils import device_cache_key
-        from sglang.kernels.ops.attention.step5.cute.qknorm_dispatch import (
-            compile_qknorm,
-        )
-
         width = rotary_cache.shape[1]
         cos, sin = rotary_cache.split(width // 2, dim=-1)
-        compile_qknorm(
-            width,
-            device_cache_key(qkv.device),
-            logical_q_heads=heads,
-            store_cache=store_cache,
-            gate=gated,
-        )(
-            qkv,
-            q_weight,
-            k_weight,
-            cos,
-            sin,
-            positions,
-            q,
-            k,
-            v,
-            gate,
-            k_cache,
-            v_cache,
-            loc,
-            192,
-            heads,
-            1,
-            eps,
-            1.0,
-        )
+        if _can_use_qknorm_cute(qkv.device):
+            from sglang.kernels.ops.attention.step5.cute.cute_utils import (
+                device_cache_key,
+            )
+            from sglang.kernels.ops.attention.step5.cute.qknorm_dispatch import (
+                compile_qknorm,
+            )
+
+            compile_qknorm(
+                width,
+                device_cache_key(qkv.device),
+                logical_q_heads=heads,
+                store_cache=store_cache,
+                gate=gated,
+            )(
+                qkv,
+                q_weight,
+                k_weight,
+                cos,
+                sin,
+                positions,
+                q,
+                k,
+                v,
+                gate,
+                k_cache,
+                v_cache,
+                loc,
+                192,
+                heads,
+                1,
+                eps,
+                1.0,
+            )
+        else:
+            from sglang.kernels.ops.attention.step5.qknorm_rope_triton import launch
+
+            launch(
+                qkv,
+                q_weight,
+                k_weight,
+                cos,
+                sin,
+                positions,
+                q,
+                k,
+                v,
+                gate,
+                k_cache,
+                v_cache,
+                loc,
+                heads=heads,
+                gated=gated,
+                store_cache=store_cache,
+                eps=eps,
+            )
     return (
         q.view(tokens, heads, 192),
         k.view(tokens, 1, 192),

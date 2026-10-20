@@ -1,9 +1,11 @@
 """Bound score workspace while retaining the native per-row selection contract."""
 
+import numpy as np
 import torch
 
 from sglang.kernels.ops.attention.step5 import options as step5_options
 from sglang.kernels.ops.attention.step5.scoring import (
+    STEP5_SCORE_SPAN_ROWS,
     can_use_step5_scoring_cute,
     step5_paged_scores,
 )
@@ -23,11 +25,39 @@ from sglang.kernels.ops.attention.step5.selection_deepselect import (
     step5_select_regions_deepselect,
 )
 from sglang.kernels.ops.attention.step5.sparse_metadata import step5_pack_decode_regions
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.step5.metadata import (
     STEP5_SCORE_WORKSPACE_ELEMENTS,
     Step5SelectionWorkspace,
+    query_group_spans,
     selection_tile_rows,
 )
+from sglang.srt.utils.common import async_h2d
+
+
+def _score_group_spans(rows, lengths, device):
+    """Cut (start, end, rows) spans from per-request packed lengths, or None.
+
+    Spans follow the real row layout, so a span never crosses a request boundary
+    and ragged lengths group without the divisibility the static hint needs.
+    """
+    if lengths is None:
+        return None
+    lengths = np.asarray(lengths, dtype=np.int64).reshape(-1)
+    if not lengths.size or int(lengths.sum()) != rows:
+        return None
+    widest = int(lengths.max())
+    if widest < 2:
+        return None
+    span_rows = max(cand for cand in STEP5_SCORE_SPAN_ROWS if cand <= widest)
+    starts, ends, _ = query_group_spans(lengths, span_rows)
+    if not starts.size:
+        return None
+    return (
+        async_h2d(starts.astype(np.int32), dtype=torch.int32, device=device),
+        async_h2d(ends.astype(np.int32), dtype=torch.int32, device=device),
+        span_rows,
+    )
 
 
 def allocate_selection_workspace(
@@ -39,6 +69,7 @@ def allocate_selection_workspace(
     prefill=False,
     max_score_width=None,
     prefill_spans=None,
+    score_lengths=None,
     req_to_token=None,
     row_to_req=None,
     positions=None,
@@ -82,6 +113,15 @@ def allocate_selection_workspace(
         (score_rows, score_width), dtype=torch.float32, device=device
     )
     use_cute = can_use_step5_selection_cute(region_scores)
+    scoring_cute = can_use_step5_scoring_cute(region_scores.device)
+    score_groups = None
+    if (
+        prefill
+        and prefill_scoring is None
+        and not scoring_cute
+        and envs.SGLANG_STEP5_SCORING_REGION_OPT.get()
+    ):
+        score_groups = _score_group_spans(rows, score_lengths, region_scores.device)
     topk_lengths, topk_lengths_ready = None, False
     if use_deepselect:
         topk_lengths = torch.empty(rows, dtype=torch.int32, device=device)
@@ -90,7 +130,7 @@ def allocate_selection_workspace(
             topk_lengths_ready = True
     scoring_workspace = None
     scoring_metadata_ready = False
-    if capacity and can_use_step5_scoring_cute(region_scores.device):
+    if capacity and scoring_cute:
         from sglang.kernels.ops.attention.step5.scoring_cute import (
             allocate_scoring_workspace,
             prepare_scoring,
@@ -128,6 +168,7 @@ def allocate_selection_workspace(
         ),
         use_deepselect=use_deepselect,
         prefill_scoring=prefill_scoring,
+        score_groups=score_groups,
         topk_lengths=topk_lengths,
         topk_lengths_ready=topk_lengths_ready,
         topk_ids=(
@@ -221,6 +262,11 @@ def select_step5_regions(
                 group_rows=score_group_rows,
                 workspace=workspace.scoring_workspace,
                 weight_scale=scoring_weight_scale,
+                # Tiled rows are sliced before scoring, so spans only describe the
+                # whole layout when one tile covers every row.
+                score_groups=(
+                    workspace.score_groups if len(workspace.tiles) == 1 else None
+                ),
             )
         if workspace.use_deepselect:
             step5_select_regions_deepselect(
