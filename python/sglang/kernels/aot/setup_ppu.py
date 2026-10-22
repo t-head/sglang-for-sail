@@ -80,7 +80,7 @@ ALL_REPOS = [
 
 # ======================= Version ======================= #
 def _get_version():
-    with open(root / "pyproject_ppu.toml") as f:
+    with open(root / "pyproject.toml") as f:
         for line in f:
             if line.startswith("version"):
                 return line.split("=")[1].strip().strip('"')
