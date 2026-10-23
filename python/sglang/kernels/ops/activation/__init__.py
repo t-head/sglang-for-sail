@@ -280,3 +280,18 @@ for _fn in ("situ_and_mul_post_quant_mxfp4", "situ_and_mul_masked_post_quant_mxf
         )
     )
 del _fn
+
+
+# Masked SiLU+mul fused with per-token FP8 quantization. SAIL exposes a CUDA
+# device; the wrapper gates dispatch on is_sail().
+register_kernel(
+    KernelSpec(
+        op="activation.silu_and_mul_masked_post_per_token_quant_fp8",
+        backend=KernelBackend.JIT,
+        target=(
+            "sglang.kernels.ops.activation.silu_mul_quant:"
+            "silu_and_mul_masked_post_per_token_quant_fp8"
+        ),
+        capabilities=CUDA_ONLY,
+    )
+)
