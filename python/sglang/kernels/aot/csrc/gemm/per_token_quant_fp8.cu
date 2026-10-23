@@ -80,7 +80,8 @@ __global__ void per_token_quant_fp8_kernel(
     DST_DTYPE* __restrict__ output_q,
     float* __restrict__ output_s,
     const int64_t hidden_dim,
-    const int64_t num_tokens) {
+    const int64_t num_tokens,
+    const float scale_multiplier) {
   const int warp_id = threadIdx.x / kWarpSize;        // 0‑7  (8 warps)
   const int lane_id = threadIdx.x & (kWarpSize - 1);  // 0‑31
   const int token_id = blockIdx.x * kTokensPerCTA + warp_id;
@@ -135,7 +136,7 @@ __global__ void per_token_quant_fp8_kernel(
   const float scale = warp_max / FP8_E4M3_MAX;
   // Broadcast scale
   if (lane_id == 0) {
-    token_scale[0] = scale;
+    token_scale[0] = scale * scale_multiplier;
   }
   const float scale_inv = (scale == 0.f) ? 0.f : 1.0f / scale;
 
@@ -271,7 +272,8 @@ __global__ void per_token_quant_fp8_persistent_kernel(
     DST_DTYPE* __restrict__ output_q,
     float* __restrict__ output_s,
     const int64_t hidden_dim,
-    const int64_t num_tokens) {
+    const int64_t num_tokens,
+    const float scale_multiplier) {
   const int warp_id = threadIdx.x / kWarpSize;
   const int lane_id = threadIdx.x & (kWarpSize - 1);
   const int64_t first_token = static_cast<int64_t>(blockIdx.x) * kTokensPerCTA + warp_id;
@@ -407,7 +409,7 @@ __global__ void per_token_quant_fp8_persistent_kernel(
 
     const float scale = warp_max_result / FP8_E4M3_MAX;
     if (lane_id == 0) {
-      output_s[token_id] = scale;
+      output_s[token_id] = scale * scale_multiplier;
     }
     const float scale_inv = (scale == 0.f) ? 0.f : 1.0f / scale;
 
@@ -521,7 +523,8 @@ __global__ void per_token_quant_fp8_small_batch_kernel(
     DST_DTYPE* __restrict__ output_q,
     float* __restrict__ output_s,
     const int64_t hidden_dim,
-    const int64_t num_tokens) {
+    const int64_t num_tokens,
+    const float scale_multiplier) {
   const int token_idx = blockIdx.x;
   if (token_idx >= num_tokens) return;
 
@@ -554,7 +557,7 @@ __global__ void per_token_quant_fp8_small_batch_kernel(
   __shared__ float scale;
   if (tid == 0) {
     scale = max_value / FP8_E4M3_MAX;
-    output_s[token_idx] = scale;
+    output_s[token_idx] = scale * scale_multiplier;
   }
   __syncthreads();
 
@@ -664,7 +667,8 @@ static inline void launch_per_token_quant_fp8_warp_kernel(
     torch::Tensor output_q,
     torch::Tensor output_s,
     const int64_t hidden_dim,
-    const int64_t num_tokens) {
+    const int64_t num_tokens,
+    const float scale_multiplier) {
   const size_t smem_size = USE_SMEM ? dynamicSmemSz : 0;
 
   if (use_vec16) {
@@ -674,7 +678,8 @@ static inline void launch_per_token_quant_fp8_warp_kernel(
             static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
             static_cast<float*>(output_s.data_ptr()),
             hidden_dim,
-            num_tokens);
+            num_tokens,
+            scale_multiplier);
   } else if (use_vec8) {
     per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 8, USE_SMEM>
         <<<grid, block, smem_size, stream>>>(
@@ -682,7 +687,8 @@ static inline void launch_per_token_quant_fp8_warp_kernel(
             static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
             static_cast<float*>(output_s.data_ptr()),
             hidden_dim,
-            num_tokens);
+            num_tokens,
+            scale_multiplier);
   } else {
     per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 4, USE_SMEM>
         <<<grid, block, smem_size, stream>>>(
@@ -690,11 +696,13 @@ static inline void launch_per_token_quant_fp8_warp_kernel(
             static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
             static_cast<float*>(output_s.data_ptr()),
             hidden_dim,
-            num_tokens);
+            num_tokens,
+            scale_multiplier);
   }
 }
 
-void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch::Tensor output_s) {
+void sgl_per_token_quant_fp8(
+    torch::Tensor input, torch::Tensor output_q, torch::Tensor output_s, double scale_multiplier) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_q);
   CHECK_INPUT(output_s);
@@ -826,7 +834,8 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
                       static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
                       static_cast<float*>(output_s.data_ptr()),
                       hidden_dim,
-                      num_tokens);
+                      num_tokens,
+                      scale_multiplier);
               break;
             case 4:
               per_token_quant_fp8_persistent_kernel<scalar_t, __nv_fp8_e4m3, 4, 16, true>
@@ -835,7 +844,8 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
                       static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
                       static_cast<float*>(output_s.data_ptr()),
                       hidden_dim,
-                      num_tokens);
+                      num_tokens,
+                      scale_multiplier);
               break;
             case 8:
               per_token_quant_fp8_persistent_kernel<scalar_t, __nv_fp8_e4m3, 8, 16, true>
@@ -844,7 +854,8 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
                       static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
                       static_cast<float*>(output_s.data_ptr()),
                       hidden_dim,
-                      num_tokens);
+                      num_tokens,
+                      scale_multiplier);
               break;
           }
         } else {
@@ -856,7 +867,8 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
                       static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
                       static_cast<float*>(output_s.data_ptr()),
                       hidden_dim,
-                      num_tokens);
+                      num_tokens,
+                      scale_multiplier);
               break;
             case 4:
               per_token_quant_fp8_persistent_kernel<scalar_t, __nv_fp8_e4m3, 4, 16, false>
@@ -865,7 +877,8 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
                       static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
                       static_cast<float*>(output_s.data_ptr()),
                       hidden_dim,
-                      num_tokens);
+                      num_tokens,
+                      scale_multiplier);
               break;
             case 8:
               per_token_quant_fp8_persistent_kernel<scalar_t, __nv_fp8_e4m3, 8, 16, false>
@@ -874,7 +887,8 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
                       static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
                       static_cast<float*>(output_s.data_ptr()),
                       hidden_dim,
-                      num_tokens);
+                      num_tokens,
+                      scale_multiplier);
               break;
           }
         }
@@ -896,10 +910,32 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
 
       if (use_smem) {
         launch_per_token_quant_fp8_warp_kernel</*USE_SMEM=*/true, scalar_t, TOKENS_PER_CTA>(
-            grid, block, dynamicSmemSz, stream, use_vec16, use_vec8, input, output_q, output_s, hidden_dim, num_tokens);
+            grid,
+            block,
+            dynamicSmemSz,
+            stream,
+            use_vec16,
+            use_vec8,
+            input,
+            output_q,
+            output_s,
+            hidden_dim,
+            num_tokens,
+            scale_multiplier);
       } else {
         launch_per_token_quant_fp8_warp_kernel</*USE_SMEM=*/false, scalar_t, TOKENS_PER_CTA>(
-            grid, block, dynamicSmemSz, stream, use_vec16, use_vec8, input, output_q, output_s, hidden_dim, num_tokens);
+            grid,
+            block,
+            dynamicSmemSz,
+            stream,
+            use_vec16,
+            use_vec8,
+            input,
+            output_q,
+            output_s,
+            hidden_dim,
+            num_tokens,
+            scale_multiplier);
       }
     } else {
       // -------- baseline -----------------------------------------------------
@@ -913,21 +949,24 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
             static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
             static_cast<float*>(output_s.data_ptr()),
             hidden_dim,
-            num_tokens);
+            num_tokens,
+            scale_multiplier);
       } else if (use_vec8) {
         per_token_quant_fp8_small_batch_kernel<scalar_t, __nv_fp8_e4m3, 8><<<grid, block, 0, stream>>>(
             static_cast<const scalar_t*>(input.data_ptr()),
             static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
             static_cast<float*>(output_s.data_ptr()),
             hidden_dim,
-            num_tokens);
+            num_tokens,
+            scale_multiplier);
       } else {
         per_token_quant_fp8_small_batch_kernel<scalar_t, __nv_fp8_e4m3, 4><<<grid, block, 0, stream>>>(
             static_cast<const scalar_t*>(input.data_ptr()),
             static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
             static_cast<float*>(output_s.data_ptr()),
             hidden_dim,
-            num_tokens);
+            num_tokens,
+            scale_multiplier);
       }
     }
     return true;
