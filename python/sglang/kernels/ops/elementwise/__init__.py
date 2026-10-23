@@ -98,7 +98,6 @@ register_kernel(
     )
 )
 
-
 # Beam fused op, built per layer: inventoried through its class methods.
 for _bk in ("torch", "triton"):
     register_kernel(
