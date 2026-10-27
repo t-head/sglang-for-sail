@@ -42,6 +42,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_sail,
     is_xpu,
     set_weight_attrs,
 )
@@ -143,6 +144,9 @@ class SiluAndMul(BaseFusedOp):
         return F.silu(x[..., :d]) * x[..., d:]
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        if is_sail():
+            # FlashInfer's fused activation needs nvcc; SAIL uses the native op.
+            return self.forward_native(x)
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)

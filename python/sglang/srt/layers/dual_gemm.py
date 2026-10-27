@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.runtime_context import get_forward, get_parallel
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_sail
 
 if TYPE_CHECKING:
     from sglang.kernels.ops.gemm.cutedsl_dual_gemm import DualGemmQuantMode
@@ -34,7 +34,9 @@ class DualGemm:
         gate_up_proj: "MergedColumnParallelLinear",
         hidden_size: int,
     ) -> Optional["DualGemmQuantMode"]:
-        if not is_cuda():
+        if not is_cuda() or is_sail():
+            # The dual-GEMM fast path is implemented with NVIDIA CUTLASS DSL,
+            # which the PPU SDK does not ship. SAIL uses the regular GEMM path.
             return None
 
         from sglang.kernels.ops.gemm.cutedsl_dual_gemm import (

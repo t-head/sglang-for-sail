@@ -43,6 +43,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_sail,
     is_xpu,
 )
 
@@ -523,6 +524,10 @@ class RMSNorm(BaseFusedOp):
                     residual = residual + post_residual_addition
                 return x, residual
             return x
+        if is_sail():
+            # SAIL has no CUDA toolkit for FlashInfer's JIT norm kernels; the
+            # native path is plain PyTorch and numerically equivalent.
+            return self.forward_native(x, residual, post_residual_addition)
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
@@ -1032,6 +1037,8 @@ class LayerNorm(BaseFusedOp):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
+        if is_sail():
+            return self.forward_native(x)
         if (
             _flashinfer_layernorm_available
             and x.dtype == torch.bfloat16
@@ -1164,6 +1171,10 @@ class GemmaRMSNorm(BaseFusedOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if is_sail():
+            # SAIL has no CUDA toolkit for FlashInfer's JIT norm kernels; the
+            # native path is plain PyTorch and numerically equivalent.
+            return self.forward_native(x, residual, post_residual_addition)
         return self._forward_impl(x, residual, post_residual_addition)
 
     def forward_hip(

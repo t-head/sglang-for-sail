@@ -70,9 +70,11 @@ except Exception as exc:
     # failure to the first DeepEP use so other models still start.
     use_deepep = False
     _deepep_import_error = exc
+    Buffer = None
+    Config = None
 
-DEEPEP_SUPPORT_TIMEOUT_CONTROL = hasattr(Buffer, "set_timeout_seconds")
-DEEPEP_SUPPORT_USE_FABRIC = (
+DEEPEP_SUPPORT_TIMEOUT_CONTROL = Buffer is not None and hasattr(Buffer, "set_timeout_seconds")
+DEEPEP_SUPPORT_USE_FABRIC = Buffer is not None and (
     "use_fabric" in inspect.signature(Buffer.__init__).parameters
 )
 
