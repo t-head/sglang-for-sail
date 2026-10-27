@@ -16,6 +16,32 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
+def _manual_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    scaling: float | None,
+    enable_gqa: bool,
+) -> torch.Tensor:
+    """Plain matmul/softmax attention for the small-query paths.
+
+    The PPU SDPA kernel is extremely slow for single-token decode and
+    cross-attention shapes; these are tiny matmuls that run fast through the
+    regular GEMM/softmax kernels. Causal masking is unnecessary for a
+    single-token decode (it attends the whole cache) and for cross-attention.
+    """
+    if enable_gqa and key.shape[1] != query.shape[1]:
+        repeat = query.shape[1] // key.shape[1]
+        key = key.repeat_interleave(repeat, dim=1)
+        value = value.repeat_interleave(repeat, dim=1)
+    scores = torch.matmul(query, key.transpose(-2, -1))
+    if scaling is not None:
+        scores = scores * scaling
+    probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
+    return torch.matmul(probs, value)
+
+
 class TorchNativeAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
@@ -125,6 +151,36 @@ class TorchNativeAttnBackend(AttentionBackend):
                 start_kv = 0
                 end_kv = start_kv + seq_len_kv
             per_req_query = query[:, start_q:end_q, :]
+
+            if is_cross_attn:
+                # Decoder queries attend to the encoder KV block once; there is
+                # no causal/prefix alignment between the two sequences.
+                assert encoder_lens is not None
+                end_kv = int(encoder_lens[seq_idx].item())
+                req_pool_idx = req_pool_indices[seq_idx]
+                per_req_tokens = req_to_token[req_pool_idx, 0:end_kv]
+                per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
+                per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
+                if not (
+                    per_req_query.dtype == per_req_key.dtype == per_req_value.dtype
+                ):
+                    per_req_key = per_req_key.to(per_req_query.dtype)
+                    per_req_value = per_req_value.to(per_req_query.dtype)
+                per_req_out = (
+                    _manual_attention(
+                        per_req_query.unsqueeze(0),
+                        per_req_key.unsqueeze(0),
+                        per_req_value.unsqueeze(0),
+                        scaling=scaling,
+                        enable_gqa=enable_gqa,
+                    )
+                    .squeeze(0)
+                    .movedim(query.dim() - 2, 0)
+                )
+                output[start_q:end_q, :, :] = per_req_out
+                start_q, start_kv = end_q, end_kv
+                continue
+
             per_req_query_redudant = torch.empty(
                 (per_req_query.shape[0], seq_len_kv, per_req_query.shape[2]),
                 dtype=per_req_query.dtype,
@@ -258,8 +314,16 @@ class TorchNativeAttnBackend(AttentionBackend):
                 )
                 is_causal = False
 
-            per_req_out = (
-                scaled_dot_product_attention(
+            if attn_mask is None:
+                per_req_out = _manual_attention(
+                    per_req_query.unsqueeze(0),
+                    per_req_key.unsqueeze(0),
+                    per_req_value.unsqueeze(0),
+                    scaling=scaling,
+                    enable_gqa=enable_gqa,
+                )
+            else:
+                per_req_out = scaled_dot_product_attention(
                     per_req_query.unsqueeze(0),
                     per_req_key.unsqueeze(0),
                     per_req_value.unsqueeze(0),
@@ -268,9 +332,7 @@ class TorchNativeAttnBackend(AttentionBackend):
                     scale=scaling,
                     is_causal=is_causal,
                 )
-                .squeeze(0)
-                .movedim(query.dim() - 2, 0)
-            )
+            per_req_out = per_req_out.squeeze(0).movedim(query.dim() - 2, 0)
             output[start_q:end_q, :, :] = per_req_out
             start_q, start_kv = end_q, end_kv
 
