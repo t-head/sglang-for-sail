@@ -392,7 +392,7 @@ def kda_extend_in_graph(
             h_track=h_track,
         )
     else:
-        core_attn_out = kernel_dispatcher.extend(
+        core_attn_out, _ = kernel_dispatcher.extend(
             q=q,
             k=k,
             v=v,
