@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 from functools import lru_cache
 from typing import Any
 
@@ -714,7 +715,7 @@ class WanTransformerBlock(nn.Module):
 
         # Apply rotary embeddings
         cos, sin = freqs_cis
-        if _is_cuda and query.shape == key.shape:
+        if _is_cuda and not (os.environ.get("PYTORCH_SAIL_ARCH") or "PPU_SDK" in os.environ) and query.shape == key.shape:
             # The concatenated cache only depends on freqs_cis, which is fixed
             # for the whole forward; the transformer builds it once per call.
             cos_sin_cache = rope_cos_sin_cache

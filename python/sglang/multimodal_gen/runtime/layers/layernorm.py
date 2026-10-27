@@ -48,6 +48,11 @@ _is_xpu = current_platform.is_xpu()
 _use_rocm_flydsl = get_bool_env_var("SGLANG_USE_ROCM_FLYDSL")
 _has_attentions = False
 
+
+def _ppu_native_norm() -> bool:
+    # PPU has no NVIDIA cutlass DSL/FlashInfer norm kernels; use PyTorch native.
+    return "PPU_SDK" in os.environ or bool(os.environ.get("PYTORCH_SAIL_ARCH"))
+
 if _is_cuda or _is_xpu:
     from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
@@ -125,6 +130,8 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if _ppu_native_norm():
+            return self.forward_native(x, residual)
         shape = x.shape
         x = x.reshape(-1, shape[-1])
         if residual is not None:
@@ -616,7 +623,7 @@ class _ScaleResidualNormScaleShift(CustomOp):
         shift: torch.Tensor,
         scale: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if residual.numel() == 0 or x.numel() == 0:
+        if _ppu_native_norm() or residual.numel() == 0 or x.numel() == 0:
             return self.forward_native(residual, x, gate, shift, scale)
 
         if x.shape[-1] % 256 != 0 or x.shape[-1] > 8192:
@@ -628,10 +635,15 @@ class _ScaleResidualNormScaleShift(CustomOp):
             )
             return self.forward_native(residual, x, gate, shift, scale)
 
-        from sglang.kernels.ops.diffusion import fused_scale_residual_norm_scale_shift
+        try:
+            from sglang.kernels.ops.diffusion import (
+                fused_scale_residual_norm_scale_shift,
+            )
+        except ImportError:
+            # PPU has no NVIDIA cutlass DSL; use the PyTorch native path.
+            return self.forward_native(residual, x, gate, shift, scale)
 
-        if isinstance(gate, int) and gate != 1:
-            raise ValueError(
+        if isinstance(gate, int) and gate != 1:            raise ValueError(
                 f"Only gate value of 1 is supported for int type, but got {gate}"
             )
 
@@ -858,6 +870,8 @@ class _NormScaleShift(CustomOp):
     def forward_cuda(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
+        if _ppu_native_norm():
+            return self.forward_native(x, shift, scale)
         if x.shape[-1] % 256 != 0 or x.shape[-1] > 8192:
             import warnings
 
@@ -867,7 +881,11 @@ class _NormScaleShift(CustomOp):
             )
             return self.forward_native(x, shift, scale)
 
-        from sglang.kernels.ops.diffusion import fused_norm_scale_shift
+        try:
+            from sglang.kernels.ops.diffusion import fused_norm_scale_shift
+        except ImportError:
+            # PPU has no NVIDIA cutlass DSL; use the PyTorch native path.
+            return self.forward_native(x, shift, scale)
 
         return fused_norm_scale_shift(
             x.contiguous(),

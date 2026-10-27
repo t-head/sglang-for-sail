@@ -5,6 +5,7 @@
 Decoding stage for diffusion pipelines.
 """
 
+import os
 import weakref
 
 import torch
@@ -53,6 +54,36 @@ from sglang.multimodal_gen.runtime.utils.torch_compile import (
 )
 
 logger = init_logger(__name__)
+
+
+_CPU_WAN_VAE = None
+_GPU_WAN_VAE = None
+
+
+def _get_gpu_wan_vae():
+    global _GPU_WAN_VAE
+    if _GPU_WAN_VAE is None:
+        from wan.modules.vae import WanVAE
+
+        _GPU_WAN_VAE = WanVAE(
+            vae_pth="/models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
+            dtype=torch.float,
+            device="cuda",
+        )
+    return _GPU_WAN_VAE
+
+
+def _get_cpu_wan_vae():
+    global _CPU_WAN_VAE
+    if _CPU_WAN_VAE is None:
+        from wan.modules.vae import WanVAE
+
+        _CPU_WAN_VAE = WanVAE(
+            vae_pth="/models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
+            dtype=torch.float,
+            device="cpu",
+        )
+    return _CPU_WAN_VAE
 
 
 def scale_and_shift_latents(latents: torch.Tensor, server_args, vae) -> torch.Tensor:
@@ -259,6 +290,40 @@ class DecodingStage(PipelineStage):
         on_frames=None,
     ) -> torch.Tensor:
         """Decode without pixel normalization, including for inter-clip conditioning."""
+        use_cpu_vae = os.environ.get("SGLANG_VAE_CPU") == "1"
+        if os.environ.get("SGLANG_SAVE_LATENTS"):
+            torch.save(latents.detach().cpu(), os.environ["SGLANG_SAVE_LATENTS"])
+        if os.environ.get("SGLANG_VAE_OFFICIAL_GPU") == "1":
+            # SGLang denoising + the original Wan VAE on GPU. The Wan VAE
+            # module is built with slow_conv_dilated3d + math attention via
+            # WAN_VAE_CONV3D=slow / WAN_VAE_MATH_SDPA=1 (PPU avoids acdnn ldsm).
+            vae = _get_gpu_wan_vae()
+            # Match CPU/FP32 reference: SGLang may enable TF32 globally, while
+            # the Wan VAE was validated in full FP32.
+            prev_mm = torch.backends.cuda.matmul.allow_tf32
+            prev_cudnn = torch.backends.cudnn.allow_tf32
+            prev_prec = torch.get_float32_matmul_precision()
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
+            torch.set_float32_matmul_precision("highest")
+            try:
+                outs = [
+                    vae.model.decode(z.unsqueeze(0), vae.scale)[0] for z in latents
+                ]
+            finally:
+                torch.backends.cuda.matmul.allow_tf32 = prev_mm
+                torch.backends.cudnn.allow_tf32 = prev_cudnn
+                torch.set_float32_matmul_precision(prev_prec)
+            return torch.stack(outs, dim=0).cpu()
+        if use_cpu_vae:
+            # Bypass SGLang's residency/offload-wrapped VAE; decode the raw
+            # latents with the original Wan VAE on CPU (fast enough on PPU).
+            vae = _get_cpu_wan_vae()
+            outs = [
+                vae.model.decode(z.unsqueeze(0), vae.scale)[0]
+                for z in latents.detach().cpu().float()
+            ]
+            return torch.stack(outs, dim=0)
         latents = latents.to(get_local_torch_device())
         # The caller resolves the decode-only override before component use so
         # residency and execution agree on the target dtype.

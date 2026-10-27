@@ -17,6 +17,8 @@
 # limitations under the License.
 
 import contextvars
+import math
+import os
 from contextlib import contextmanager, nullcontext
 from functools import partial
 
@@ -209,6 +211,30 @@ class WanCausalConv3d(nn.Conv3d):
 
     def forward(self, x, cache_x=None):
         padding = list(self._padding)
+        if os.environ.get("SGLANG_VAE_GPU_FALLBACK") == "1" and self.groups == 1:
+            # PPU: bypass acdnn tensor-core conv3d (ldsm stub) with im2col+GEMM.
+            if cache_x is not None and padding[4] > 0:
+                cache_x = cache_x.to(x.device)
+                x = torch.cat([cache_x, x], dim=2)
+                padding[4] -= cache_x.shape[2]
+            if any(padding):
+                x = F.pad(x, padding)
+            weight = self.weight.contiguous()
+            x = x.to(weight.dtype).contiguous()
+            bias = (
+                self.bias.to(weight.dtype).contiguous()
+                if self.bias is not None
+                else None
+            )
+            return torch.ops.aten.slow_conv_dilated3d(
+                x,
+                weight,
+                list(self.kernel_size),
+                bias,
+                list(self.stride),
+                [0, 0, 0],
+                list(self.dilation),
+            )
         if (
             any(padding)
             and _fused_conv_cache_supported(self, x)
@@ -410,7 +436,13 @@ def attention_block_forward(self, x):
     qkv = qkv.permute(0, 1, 3, 2).contiguous()
     q, k, v = qkv.chunk(3, dim=-1)
 
-    x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    if os.environ.get("SGLANG_VAE_GPU_FALLBACK") == "1":
+        scale = 1.0 / math.sqrt(q.shape[-1])
+        x = torch.matmul(
+            torch.softmax(torch.matmul(q, k.transpose(-2, -1)) * scale, dim=-1), v
+        )
+    else:
+        x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
 
     x = (
         x.squeeze(1)

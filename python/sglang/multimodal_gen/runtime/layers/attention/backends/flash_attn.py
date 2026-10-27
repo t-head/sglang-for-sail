@@ -1,5 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 # SPDX-License-Identifier: Apache-2.0
+import os
 from dataclasses import dataclass
 from numbers import Integral
 from typing import Any, List, Optional, Tuple
@@ -25,6 +26,11 @@ from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_c
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
 )
+
+try:
+    from flash_attn import flash_attn_func as fa2_flash_attn_func
+except ImportError:
+    fa2_flash_attn_func = None
 
 
 def maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -446,6 +452,23 @@ class FlashAttentionImpl(AttentionImpl):
         else:
             max_seqlen_q = query.shape[1]
             max_seqlen_k = key.shape[1]
+
+        # PPU has no FA3/FA4 kernels; use the FA2 wheel when available.
+        if os.environ.get("PYTORCH_SAIL_ARCH") or "PPU_SDK" in os.environ:
+            if fa2_flash_attn_func is None:
+                raise RuntimeError("PPU FA backend requires the flash_attn (FA2) package")
+            output = fa2_flash_attn_func(
+                query,
+                key,
+                value,
+                dropout_p=0.0,
+                softmax_scale=self.softmax_scale,
+                causal=self.causal,
+                return_attn_probs=return_softmax_lse,
+            )
+            if return_softmax_lse:
+                return output[0], output[1]
+            return output
 
         # FA version selection:
         # - fa_ver == 3: call python function (can return Tensor or (Tensor, Tensor) depending on flag)
