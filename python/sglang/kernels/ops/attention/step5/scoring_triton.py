@@ -31,6 +31,23 @@ def _e4m3_to_bf16(bits):
     return value.to(tl.bfloat16)
 
 
+@triton.jit
+def _decode_e4m3(bits, NATIVE_FP8: tl.constexpr):
+    """E4M3FN byte to BF16: hardware widen on sm89+, integer math below it."""
+    if NATIVE_FP8:
+        return bits.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16)
+    return _e4m3_to_bf16(bits)
+
+
+def _native_fp8_decode(device: torch.device) -> bool:
+    """sm89+ widens E4M3 in hardware; sm80 PPU keeps the integer decoder."""
+    return (
+        device.type == "cuda"
+        and torch.version.hip is None
+        and torch.cuda.get_device_capability(device) >= (8, 9)
+    )
+
+
 @triton.jit(
     do_not_specialize=("REGIONS",),
     do_not_specialize_on_alignment=("REGIONS",),
@@ -50,6 +67,7 @@ def _score_regions(
     GRID_TILES: tl.constexpr,
     CLEAR_FUTURE: tl.constexpr,
     WEIGHT_SCALE: tl.constexpr,
+    NATIVE_FP8: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     first_tile = tl.program_id(1)
@@ -57,12 +75,13 @@ def _score_regions(
     channel = tl.arange(0, 256)
     request = tl.load(RowToReq + row).to(tl.int64)
     position = tl.load(Positions + row)
-    query = _e4m3_to_bf16(
+    query = _decode_e4m3(
         tl.load(
             Q + (row * HEADS + head[:, None]) * 256 + channel[None, :],
             (request > 0) & (head[:, None] < HEADS),
             other=0,
-        )
+        ),
+        NATIVE_FP8,
     )
     weights = (
         tl.load(W + row * HEADS + head, (request > 0) & (head < HEADS), other=0).to(
@@ -101,7 +120,7 @@ def _score_regions(
                 + channel[:, None] % 16
             )
             packed = tl.load(CompressedIndexKeys + offset, valid[None, :], other=0)
-            keys = _e4m3_to_bf16(packed)
+            keys = _decode_e4m3(packed, NATIVE_FP8)
             products = tl.dot(query, keys)
             score = tl.sum(tl.maximum(products, 0.0) * weights[:, None], axis=0)
             score = tl.where(valid, score, -float("inf"))
@@ -165,6 +184,8 @@ def _score_regions_ppu_opt(
     RowToReq,
     Positions,
     Out,
+    SpanStart,
+    SpanEnd,
     HEADS: tl.constexpr,
     ROWS,
     MAP_STRIDE: tl.constexpr,
@@ -176,6 +197,7 @@ def _score_regions_ppu_opt(
     GROUP_ROWS: tl.constexpr,
     HEAD_BLOCK: tl.constexpr,
     MIXED: tl.constexpr,
+    HAS_SPANS: tl.constexpr,
 ):
     """GROUP_ROWS 行一起算：同一个 request 下的多行共用一次键 tile gather。
 
@@ -192,23 +214,33 @@ def _score_regions_ppu_opt(
     group = tl.program_id(0).to(tl.int64)
     first_tile = tl.program_id(1)
     row_index = tl.arange(0, GROUP_ROWS)
-    rows = group * GROUP_ROWS + row_index
-    row_valid = rows < ROWS
+    if HAS_SPANS:
+        # Spans are cut from the per-request packed lengths, so every span holds
+        # rows of one request and its length never exceeds GROUP_ROWS.
+        row_base = tl.load(SpanStart + group).to(tl.int64)
+        row_limit = tl.load(SpanEnd + group).to(tl.int64)
+    else:
+        row_base = group * GROUP_ROWS
+        row_limit = ROWS
+    rows = row_base + row_index
+    row_valid = rows < row_limit
     request = tl.load(RowToReq + rows, row_valid, other=0)
     position = tl.load(Positions + rows, row_valid, other=0)
     base_request = tl.max(request, axis=0)
-    # Prefill/verify 里同一 chunk 的相邻行共用一个 request；混合时走慢路径。
-    uniform = tl.sum(((request != base_request) & row_valid).to(tl.int32), axis=0) == 0
+    # Padding rows carry request slot zero, so they neither gather keys nor write
+    # a live score; only the owned rows have to agree for the hot path.
+    mixed = (request != base_request) & (request != 0) & row_valid
+    uniform = tl.sum(mixed.to(tl.int32), axis=0) == 0
 
     matrix_row = tl.arange(0, GROUP_ROWS * HEAD_BLOCK)
     channel = tl.arange(0, 256)
     head_index = tl.arange(0, HEAD_BLOCK)
-    query_row = group * GROUP_ROWS + matrix_row // HEAD_BLOCK
+    query_row = row_base + matrix_row // HEAD_BLOCK
     head = matrix_row % HEAD_BLOCK
     query = _e4m3_bytes_to_fp8(
         tl.load(
             Q + (query_row[:, None] * HEADS + head[:, None]) * 256 + channel[None, :],
-            (query_row[:, None] < ROWS) & (head[:, None] < HEADS),
+            (query_row[:, None] < row_limit) & (head[:, None] < HEADS),
             other=0,
         )
     )
@@ -274,8 +306,8 @@ def _score_regions_ppu_opt(
             # 结果：那样会把热路径的 fp8 query tile 挤出寄存器，实测 capture 从
             # 5.9us 退化到 20us 以上。冷路径只占用单行的活跃值。
             for r in tl.range(0, GROUP_ROWS, loop_unroll_factor=1):
-                row = group * GROUP_ROWS + r
-                row_ok = row < ROWS
+                row = row_base + r
+                row_ok = row < row_limit
                 request_r = tl.load(RowToReq + row, row_ok, other=0)
                 position_r = tl.load(Positions + row, row_ok, other=0)
                 live_r = tl.maximum(position_r // 8, 0)
@@ -348,6 +380,7 @@ def _score_four_rows_per_request(
     BLOCK_R: tl.constexpr,
     GRID_TILES: tl.constexpr,
     WEIGHT_SCALE: tl.constexpr,
+    NATIVE_FP8: tl.constexpr,
 ):
     """Fill four MTP verifier rows with one fully occupied 16x256 dot."""
     group = tl.program_id(0).to(tl.int64)
@@ -363,12 +396,13 @@ def _score_four_rows_per_request(
     # Verify metadata guarantees four consecutive rows for one request. Padding
     # groups carry request slot zero in all four rows.
     base_request = tl.load(RowToReq + group * 4).to(tl.int64)
-    query = _e4m3_to_bf16(
+    query = _decode_e4m3(
         tl.load(
             Q + (query_row[:, None] * HEADS + head[:, None]) * 256 + channel[None, :],
             (query_row[:, None] < ROWS) & (head[:, None] < HEADS) & (base_request > 0),
             other=0,
-        )
+        ),
+        NATIVE_FP8,
     )
     weights = (
         tl.load(
@@ -401,7 +435,7 @@ def _score_four_rows_per_request(
             + channel[:, None] % 16
         )
         packed = tl.load(CompressedIndexKeys + offset, valid[None, :], other=0)
-        keys = _e4m3_to_bf16(packed)
+        keys = _decode_e4m3(packed, NATIVE_FP8)
         products = tl.dot(query, keys)
         weighted = tl.maximum(products, 0.0) * tl.reshape(weights, (16, 1))
         region_scores = tl.sum(tl.reshape(weighted, (4, 4, BLOCK_R)), axis=1)
@@ -432,6 +466,7 @@ def _score_thirty_two_rows_per_request(
     BLOCK_R: tl.constexpr,
     GRID_TILES: tl.constexpr,
     WEIGHT_SCALE: tl.constexpr,
+    NATIVE_FP8: tl.constexpr,
 ):
     group = tl.program_id(0).to(tl.int64)
     first_tile = tl.program_id(1)
@@ -447,12 +482,13 @@ def _score_thirty_two_rows_per_request(
         position = tl.load(Positions + rows, row_valid, other=0)
         base_request = tl.load(RowToReq + group_base).to(tl.int64)
         query_row = group_base + subgroup * 8 + matrix_row // 4
-        query = _e4m3_to_bf16(
+        query = _decode_e4m3(
             tl.load(
                 Q + (query_row[:, None] * HEADS + head[:, None]) * 256 + channel[None, :],
                 (query_row[:, None] < ROWS) & (head[:, None] < HEADS) & (base_request > 0),
                 other=0,
-            )
+            ),
+            NATIVE_FP8,
         )
         weights = (
             tl.load(
@@ -485,7 +521,7 @@ def _score_thirty_two_rows_per_request(
                 + channel[:, None] % 16
             )
             packed = tl.load(CompressedIndexKeys + offset, valid[None, :], other=0)
-            keys = _e4m3_to_bf16(packed)
+            keys = _decode_e4m3(packed, NATIVE_FP8)
             products = tl.dot(query, keys)
             weighted = tl.maximum(products, 0.0) * tl.reshape(weights, (32, 1))
             # Preserve group1's 16-lane reduction; compact reduction changes rounding.
@@ -544,6 +580,7 @@ def _launch_reference(
     # reduces that pressure and gives small batches more independent CTAs.
     block_regions = 32
     grid_tiles = min(triton.cdiv(out.shape[1], block_regions), 128)
+    native_fp8 = _native_fp8_decode(q.device)
     if group_rows == 32 and not clear_future:
         _score_thirty_two_rows_per_request[(triton.cdiv(q.shape[0], 32), grid_tiles)](
             q,
@@ -560,6 +597,7 @@ def _launch_reference(
             block_regions,
             grid_tiles,
             weight_scale,
+            native_fp8,
             num_warps=4,
         )
         return
@@ -586,6 +624,7 @@ def _launch_reference(
             block_regions,
             grid_tiles,
             weight_scale,
+            native_fp8,
             num_warps=4,
         )
         return
@@ -604,7 +643,57 @@ def _launch_reference(
         grid_tiles,
         clear_future,
         weight_scale,
+        native_fp8,
         num_warps=4,
+    )
+
+
+def _launch_spans(
+    q,
+    weights,
+    compressed_index_keys,
+    req_to_token,
+    row_to_req,
+    positions,
+    out,
+    *,
+    score_groups,
+    clear_future,
+    weight_scale,
+):
+    """Score one request's row span per CTA so ragged batches group as well.
+
+    Spans are cut from the packed lengths, so the hot path always applies; the
+    per-row cold path stays compiled as the guard against a mis-cut span.
+    """
+    starts, ends, span_rows = score_groups
+    regions = out.shape[1]
+    heads = q.shape[1]
+    block_regions = 8
+    grid_tiles = min(triton.cdiv(regions, block_regions), _MAX_GRID_TILES)
+    _score_regions_ppu_opt[(starts.numel(), grid_tiles)](
+        q,
+        weights,
+        compressed_index_keys,
+        req_to_token,
+        row_to_req,
+        positions,
+        out,
+        starts,
+        ends,
+        heads,
+        q.shape[0],
+        req_to_token.stride(0),
+        regions,
+        block_regions,
+        grid_tiles,
+        clear_future,
+        weight_scale,
+        span_rows,
+        max(4, heads + (-heads % 4)),
+        True,
+        True,
+        num_warps=2,
     )
 
 
@@ -620,6 +709,7 @@ def launch(
     clear_future,
     group_rows=1,
     weight_scale=1.0,
+    score_groups=None,
 ):
     if not envs.SGLANG_STEP5_SCORING_REGION_OPT.get():
         _launch_reference(
@@ -638,6 +728,20 @@ def launch(
     rows = q.shape[0]
     regions = out.shape[1]
     heads = q.shape[1]
+    if score_groups is not None:
+        _launch_spans(
+            q,
+            weights,
+            compressed_index_keys,
+            req_to_token,
+            row_to_req,
+            positions,
+            out,
+            score_groups=score_groups,
+            clear_future=clear_future,
+            weight_scale=weight_scale,
+        )
+        return
     group = _group_plan(rows, group_rows)
     # 分组时 M = group*head_block 已经够宽，BLOCK_R 取 8 摊薄 gather 的固定开销；
     # 每组只有一行时 gather 无法复用，BLOCK_R=4 + 单 warp 的 CTA 吞吐更好。
@@ -652,6 +756,10 @@ def launch(
         row_to_req,
         positions,
         out,
+        # HAS_SPANS=False: the span pointers are never loaded, so the position
+        # tensor stands in for both and keeps the argument type int32*.
+        positions,
+        positions,
         heads,
         rows,
         req_to_token.stride(0),
@@ -663,5 +771,6 @@ def launch(
         group,
         head_block,
         True,
+        False,
         num_warps=1 if group == 1 else 2,
     )

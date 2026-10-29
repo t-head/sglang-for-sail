@@ -134,6 +134,7 @@ def _build_attention_metadata(
     decode,
     valid_rows,
     prefill_spans=None,
+    score_lengths=None,
 ) -> Step5AttentionMetadata:
     """Assemble complete attention/indexer metadata once before layer execution.
 
@@ -177,6 +178,7 @@ def _build_attention_metadata(
                 prefill=not decode,
                 max_score_width=req_to_token.shape[1] // 8,
                 prefill_spans=prefill_spans,
+                score_lengths=score_lengths,
                 req_to_token=req_to_token,
                 row_to_req=row_to_req,
                 positions=positions,
@@ -558,6 +560,7 @@ class Step5AttentionBackend(AttentionBackend):
                     lengths[: fb.batch_size],
                     compression_inputs["request_slots"][: fb.batch_size],
                 ),
+                score_lengths=lengths,
             )
         self.swa_backend.init_forward_metadata(forward_batch)
 

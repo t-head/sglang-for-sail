@@ -5,6 +5,10 @@ import torch
 
 from sglang.kernels.ops.attention.step5 import options as step5_options
 
+# Rows per scoring tile, from the narrowest span that still groups to the widest
+# the grouped Triton kernel compiles for.
+STEP5_SCORE_SPAN_ROWS = (1, 2, 4, 8)
+
 
 def can_use_step5_scoring_cute(device: torch.device) -> bool:
     return (
@@ -53,6 +57,7 @@ def step5_paged_scores(
     group_rows: int = 1,
     workspace=None,
     weight_scale: float | None = None,
+    score_groups: tuple[torch.Tensor, torch.Tensor, int] | None = None,
 ) -> torch.Tensor:
     """Score completed historical regions for flattened ragged query rows.
 
@@ -66,6 +71,9 @@ def step5_paged_scores(
     at logical offset 8*r must be an aligned physical start of a complete region.
     Native 64-token pages retain their contiguous logical offsets. Groups of
     4 or 32 rows share one request owner, with optional padding rows.
+    ``score_groups`` replaces that divisibility-based grouping with explicit
+    (start, end, rows) spans cut from the per-request packed lengths, so ragged
+    batches group as well; each span stays inside one request.
     Output width must cover all positions//8, including Graph replay inputs.
     With ``clear_future=True``, invalid/future output columns are always -inf.
     The SM10x live-length selector may set it false because it never reads those
@@ -123,6 +131,25 @@ def step5_paged_scores(
         _check(value, shape=shape, dtype=value.dtype, device=q.device, name=name)
     if group_rows == 32:
         _assert_group32_ownership(row_to_req)
+    if score_groups is not None:
+        starts, ends, span_rows = score_groups
+        for name, value in (("score_group_start", starts), ("score_group_end", ends)):
+            if (
+                value.ndim != 1
+                or value.dtype != torch.int32
+                or value.device != q.device
+                or not value.is_contiguous()
+            ):
+                raise ValueError(
+                    f"Step5 scoring {name} requires a contiguous 1-D int32 tensor "
+                    "on the query device"
+                )
+        if starts.numel() != ends.numel():
+            raise ValueError("Step5 scoring group start/end lengths differ")
+        if span_rows not in STEP5_SCORE_SPAN_ROWS:
+            raise ValueError(
+                f"Step5 scoring span rows must be one of {STEP5_SCORE_SPAN_ROWS}"
+            )
     if (
         out.ndim != 2
         or not 1 <= out.shape[1] < 2**31
@@ -188,5 +215,6 @@ def step5_paged_scores(
             clear_future=clear_future,
             group_rows=group_rows,
             weight_scale=weight_scale,
+            score_groups=score_groups,
         )
     return out

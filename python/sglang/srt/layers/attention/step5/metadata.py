@@ -83,6 +83,9 @@ class Step5SelectionWorkspace(msgspec.Struct, frozen=True, kw_only=True):
     topk_lengths_ready: bool = False
     topk_ids: torch.Tensor | None = None
     prefill_scoring: dict | None = None
+    # (start, end, rows) spans cut from the per-request packed lengths; indexing
+    # the score tile per span beats the divisibility-based row grouping.
+    score_groups: tuple[torch.Tensor, torch.Tensor, int] | None = None
 
 
 class Step5IndexerMetadata(msgspec.Struct, frozen=True, kw_only=True):
