@@ -21,8 +21,8 @@ kernel body):
 * empty rows -- zero output and ``-inf`` LSE, never NaN.
 
 Group sizes, union lengths (including tails that are not a multiple of the
-kernel's ``BLOCK_N``) and head counts 4/8/16 -- i.e. the ``Q_TILE`` splits
-``16/8/4`` the launcher derives from them -- are covered by the case matrix.
+kernel's ``BLOCK_N``) and head counts 4/8/16 -- i.e. the head blocks the
+launcher derives from them -- are covered by the case matrix.
 
 Run standalone on one idle PPU device::
 

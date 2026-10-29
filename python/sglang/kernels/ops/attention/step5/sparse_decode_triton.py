@@ -2,32 +2,40 @@
 """Step5 sparse decode over native FULL KV in portable Triton (SM90 replacement).
 
 Mirrors ``cute/sm90/decode_sm90_gqa.py`` for devices that cannot run the CuTe DSL
-kernel (e.g. sm80 PPU). Grid is ``(row, head)``; each program owns one query row
-and runs an online softmax over that row's own packed region list, writing the
-final BF16 output and FP32 natural LSE directly.
+kernel, which is every PPU part: sm80 and sm89+ both take this path. One program
+owns one query row plus a block of ``BLOCK_M`` logical heads, and runs an online
+softmax over that row's own packed region list, writing the final BF16 output and
+FP32 natural LSE directly.
 
-The SM90 split-KV path (1/2/4-way partitions plus a separate natural-LSE merge)
-is bypassed entirely here: every row is computed in a single pass. This trades
-decode-batch occupancy for simplicity and is correctness-first, not yet tuned.
+QK^T and PV run as ``tl.dot`` MMAs: the query heads fill the M dimension and the
+row's selected tokens the N dimension, with the 192-wide head dim split into
+128 + 64 dot columns so no operand is padded to 256. Softmax runs in base-2
+space and the PV accumulation absorbs the online-softmax rescale through the dot
+accumulator. The SM90 split-KV schedule (1/2/4-way partitions plus a separate
+natural-LSE merge) stays bypassed: every row is computed in one pass.
 
 Each row's ``packed_regions[row, win]`` is an int64 whose high word is the
-physical region id and low word the logical start token::
+physical region id and low word the logical start token. The kernel reads it as
+the reinterpreted int32 pair view, so on a little-endian device::
 
-    phys_region = packed >> 32          # -> K/V slot region
-    start_tok   = packed & 0xFFFFFFFF    # -> logical position of lane 0
+    start_tok   = packed32[2 * win]       # low word: logical position of lane 0
+    phys_region = packed32[2 * win + 1]   # high word: -> K/V slot region
     phys_tok    = phys_region * 8 + lane
     logical_tok = start_tok + lane
 
 A key is usable only when all hold, matching the SM90 ``_mask_scores``:
 
-1. ``packed >= 0``
+1. ``start_tok >= 0`` and ``phys_region >= 0`` (both words of a packed ``-1``)
 2. physical slot valid: ``0 <= phys_region < slots // 8``
 3. within the row's selection: ``tok < counts[row] * 8``
 4. causal: ``logical_tok < causal_lengths[row]``
 
-GQA has a single KV head, so all logical heads share K/V. Rows at or beyond
-``valid_rows[0]`` (or with zero counts) write zero output and ``-inf`` LSE.
-Only BF16 K/V is supported; the FP8 paged path is not implemented.
+GQA has a single KV head, so all logical heads share K/V. ``BLOCK_M`` is the
+16-row MMA minimum, so the 4 and 8 head layouts (TP16/TP8) leave part of the M
+tile idle; that padding still costs less than the per-(row, head) scalar dot it
+replaces, and TP16 is measured separately. Rows at or beyond ``valid_rows[0]``
+(or with zero counts) write zero output and ``-inf`` LSE. Only BF16 K/V is
+supported; the FP8 paged path is not implemented.
 """
 
 import torch
@@ -35,95 +43,129 @@ import triton
 import triton.language as tl
 
 REGION_TOKENS = tl.constexpr(8)
+# 192 = BLOCK_D1 + BLOCK_D2 keeps both dots on real data: padding the head dim to
+# 256 made every K/V tile load and MMA 33% wider than the row it carries.
+BLOCK_D1 = 128
+BLOCK_D2 = 64
+# MMA minimum along the query-head axis, and 16 windows of 8 tokens along the
+# selected-token axis.
+BLOCK_M = 16
+BLOCK_N = 128
 
 
-@triton.jit(
-    do_not_specialize=("ROWS", "MAX_PHYS_REGIONS", "VALID_ROWS"),
-    do_not_specialize_on_alignment=("ROWS", "MAX_PHYS_REGIONS", "VALID_ROWS"),
-)
+@triton.jit
 def _sparse_decode(
     Q,
     K,
     V,
-    PACKED,
+    PACKED32,
     COUNTS,
     CAUSAL_LEN,
     VALID_ROWS,
     OUT,
     LSE,
-    ROWS,
-    MAX_PHYS_REGIONS,
-    SOFTMAX_SCALE,
+    num_slots,
+    softmax_scale,
     HEADS: tl.constexpr,
-    PACKED_WIDTH: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_D1: tl.constexpr,
+    BLOCK_D2: tl.constexpr,
+    WIDTH: tl.constexpr,
+    BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    row = tl.program_id(0).to(tl.int64)
-    head = tl.program_id(1).to(tl.int64)
+    row = tl.program_id(0)
+    head_block = tl.program_id(1)
+    heads = head_block * BLOCK_M + tl.arange(0, BLOCK_M)
+    head_valid = heads < HEADS
 
     valid_row = row < tl.load(VALID_ROWS)
-    count = tl.load(COUNTS + row, mask=valid_row, other=0)
-    windows = tl.minimum(count, PACKED_WIDTH)
-    count_tokens = windows * REGION_TOKENS
-    causal_len = tl.maximum(tl.load(CAUSAL_LEN + row, mask=valid_row, other=0), 0)
+    count = tl.minimum(tl.load(COUNTS + row), WIDTH)
+    count = tl.where(valid_row, count, 0)
+    count_tokens = count * REGION_TOKENS
+    causal_len = tl.load(CAUSAL_LEN + row)
 
-    channel = tl.arange(0, 256)
-    cmask = channel < 192
-
-    q_vec = tl.load(
-        Q + row * (HEADS * 192) + head * 192 + channel,
-        mask=cmask & valid_row,
+    dims1 = tl.arange(0, BLOCK_D1)
+    dims2 = tl.arange(0, BLOCK_D2)
+    q_off = row * (HEADS * D) + heads[:, None] * D
+    q1 = tl.load(Q + q_off + dims1[None, :], mask=head_valid[:, None], other=0.0)
+    q2 = tl.load(
+        Q + q_off + BLOCK_D1 + dims2[None, :],
+        mask=head_valid[:, None],
         other=0.0,
-    ).to(tl.float32)
+    )
 
-    m_i = float("-inf")
-    l_i = 0.0
-    acc = tl.zeros((256,), dtype=tl.float32)
+    acc1 = tl.zeros((BLOCK_M, BLOCK_D1), dtype=tl.float32)
+    acc2 = tl.zeros((BLOCK_M, BLOCK_D2), dtype=tl.float32)
+    m_i = tl.full((BLOCK_M,), float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    num_slots_div8 = num_slots // REGION_TOKENS
+    # Base-2 softmax: fold log2(e) into the scale and convert the LSE back once.
+    scale2 = softmax_scale * 1.4426950408889634
 
     for start in range(0, count_tokens, BLOCK_N):
         tok = start + tl.arange(0, BLOCK_N)
-        tvalid = tok < count_tokens
+        in_range = tok < count_tokens
         win = tok // REGION_TOKENS
         lane = tok - win * REGION_TOKENS
 
-        packed = tl.load(PACKED + row * PACKED_WIDTH + win, mask=tvalid, other=-1)
-        phys_region = (packed >> 32).to(tl.int32)
-        start_tok = (packed & 0xFFFFFFFF).to(tl.int32)
-        logical_tok = start_tok + lane
-        phys_tok = (phys_region.to(tl.int64) * REGION_TOKENS + lane)
-
-        keep = (
-            tvalid
-            & (packed >= 0)
-            & (phys_region >= 0)
-            & (phys_region < MAX_PHYS_REGIONS)
-            & (logical_tok < causal_len)
+        # The int64 packing is read as its low/high int32 words, so no 64-bit
+        # shift is needed per token and a packed -1 negates both words.
+        pack_off = row * (2 * WIDTH) + 2 * win
+        start_tok = tl.load(PACKED32 + pack_off, mask=in_range, other=-1)
+        physical = tl.load(PACKED32 + pack_off + 1, mask=in_range, other=-1)
+        key_valid = (
+            in_range
+            & (start_tok >= 0)
+            & (physical >= 0)
+            & (physical < num_slots_div8)
+            & ((start_tok + lane) < causal_len)
         )
+        phys_tok = tl.where(key_valid, physical * REGION_TOKENS + lane, 0)
+        kv_row = phys_tok[:, None] * D
+        kv_mask = key_valid[:, None]
 
-        kmask = keep[:, None] & cmask[None, :]
-        k = tl.load(K + phys_tok[:, None] * 192 + channel[None, :], mask=kmask, other=0.0).to(tl.float32)
-        score = tl.sum(k * q_vec[None, :], axis=1) * SOFTMAX_SCALE
-        score = tl.where(keep, score, float("-inf"))
-        v = tl.load(V + phys_tok[:, None] * 192 + channel[None, :], mask=kmask, other=0.0).to(tl.float32)
+        k1 = tl.load(K + kv_row + dims1[None, :], mask=kv_mask, other=0.0)
+        k2 = tl.load(K + kv_row + BLOCK_D1 + dims2[None, :], mask=kv_mask, other=0.0)
+        score = (
+            tl.dot(q1, tl.trans(k1), out_dtype=tl.float32)
+            + tl.dot(q2, tl.trans(k2), out_dtype=tl.float32)
+        ) * scale2
+        score = tl.where(key_valid[None, :], score, float("-inf"))
 
-        m_new = tl.maximum(m_i, tl.max(score, axis=0))
+        m_new = tl.maximum(m_i, tl.max(score, axis=1))
         m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
-        p = tl.exp(score - m_safe)
-        alpha = tl.exp(m_i - m_safe)
-        l_i = l_i * alpha + tl.sum(p, axis=0)
-        acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
+        alpha = tl.exp2(m_i - m_safe)
+        p = tl.exp2(score - m_safe[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+
+        v1 = tl.load(V + kv_row + dims1[None, :], mask=kv_mask, other=0.0)
+        v2 = tl.load(V + kv_row + BLOCK_D1 + dims2[None, :], mask=kv_mask, other=0.0)
+        p_bf16 = p.to(tl.bfloat16)
+        # The online-softmax rescale rides on the dot accumulator instead of a
+        # separate multiply of the whole (M, D) tile.
+        acc1 = tl.dot(p_bf16, v1, acc=acc1 * alpha[:, None], out_dtype=tl.float32)
+        acc2 = tl.dot(p_bf16, v2, acc=acc2 * alpha[:, None], out_dtype=tl.float32)
         m_i = m_new
 
     has = l_i > 0.0
     l_safe = tl.where(has, l_i, 1.0)
-    out_val = tl.where(has, acc / l_safe, 0.0)
-    lse_val = tl.where(has, m_i + tl.log(l_safe), float("-inf"))
+    inv_sum = 1.0 / l_safe
+    # m_i/p live in base-2 space; the natural LSE needs one log2 and one rescale.
+    lse_val = tl.where(has, (m_i + tl.log2(l_safe)) * 0.6931471805599453, float("-inf"))
+    out_off = row * (HEADS * D) + heads[:, None] * D
+    out_mask = head_valid[:, None]
     tl.store(
-        OUT + row * (HEADS * 192) + head * 192 + channel,
-        out_val.to(tl.bfloat16),
-        mask=cmask,
+        OUT + out_off + dims1[None, :],
+        (acc1 * inv_sum[:, None]).to(OUT.dtype.element_ty),
+        mask=out_mask,
     )
-    tl.store(LSE + row * HEADS + head, lse_val)
+    tl.store(
+        OUT + out_off + BLOCK_D1 + dims2[None, :],
+        (acc2 * inv_sum[:, None]).to(OUT.dtype.element_ty),
+        mask=out_mask,
+    )
+    tl.store(LSE + row * HEADS + heads, lse_val, mask=head_valid)
 
 
 def launch(
@@ -139,34 +181,41 @@ def launch(
     *,
     softmax_scale: float,
 ) -> None:
-    """Run one program per (row, head); K/V are native [slots,1,192] BF16.
+    """Run one program per (row, head block); K/V are native [slots,1,192] BF16.
 
     Single-pass decode with no split-KV partitioning or merge, so ``out`` is the
     final BF16 attention of shape ``[rows, heads, 192]`` and ``lse`` the FP32
-    natural log-sum-exp ``[rows, heads]``. ``heads`` and ``packed_width`` are
-    compile-time specialization keys.
+    natural log-sum-exp ``[rows, heads]``. ``heads``, the packed width and the
+    head-dim split are compile-time specialization keys.
     """
     if k.dtype != torch.bfloat16:
         raise ValueError("Step5 Triton sparse decode supports only BF16 K/V")
-    rows, heads, _ = q.shape
-    packed_width = packed_regions.shape[1]
-    max_phys_regions = k.shape[0] // 8
-    _sparse_decode[(rows, heads)](
+    rows, heads, head_dim = q.shape
+    if not rows:
+        return
+    if head_dim != BLOCK_D1 + BLOCK_D2:
+        raise NotImplementedError("Step5 Triton sparse decode requires head_dim=192")
+    _sparse_decode[(rows, triton.cdiv(heads, BLOCK_M))](
         q,
         k,
         v,
-        packed_regions,
+        # Two int32 words per packed int64: the low word is the logical start and
+        # the high word the physical region, matching the CuTe fixed-layout view.
+        packed_regions.view(torch.int32),
         counts,
         causal_lengths,
         valid_rows,
         out,
         lse,
-        rows,
-        max_phys_regions,
+        k.shape[0],
         softmax_scale,
         heads,
-        packed_width,
-        32,
+        head_dim,
+        BLOCK_D1,
+        BLOCK_D2,
+        packed_regions.shape[1],
+        BLOCK_M,
+        BLOCK_N,
         num_warps=4,
-        enable_fp_fusion=False,
+        num_stages=2,
     )

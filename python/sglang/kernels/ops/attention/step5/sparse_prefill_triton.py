@@ -2,19 +2,24 @@
 """Step5 grouped-union sparse paged-KV prefill in portable Triton (SM90 replacement).
 
 Mirrors ``cute/sm90/prefill_union_paged_sm90_gqa.py`` for devices that cannot run
-the CuTe DSL kernel (e.g. sm80 PPU) and keeps its work decomposition: one program
-covers a tile of a group's query rows for *all* logical heads, flattened into the
-MMA M dimension as ``q_slot * HEADS + head``. GQA has a single KV head, so a
-per-head program (the previous layout) re-read this layer's union from HBM once
-per head; merging heads into one M tile reduces that traffic by ``HEADS`` and
-lets QK^T / PV run as real MMAs.
+the CuTe DSL kernel, which is every PPU part: sm80 and sm89+ both take this path.
+GQA has a single KV head, so the gather of K/V over a group's union is identical
+for every query head: one program covers a block of query heads (``HB``, at most
+8) and one group's query rows, loading each union token once and reusing it for
+all of those heads' QK and PV products.
+
+QK^T and PV run as ``tl.dot`` MMAs with the flattened (query row, head) pairs on
+the M axis. The 192-wide head dim is split into 128 + 64 dot columns so neither
+the operands nor the MMA touch the 256-wide padding the previous layout needed;
+softmax runs in base-2 space and the online-softmax rescale is fused into the PV
+dot accumulator.
 
 A union entry ``window_idx`` expands to eight KV tokens::
 
-    phys_region   = union_physical[group, window_idx]   # physical region id
+    phys_region    = union_physical[group, window_idx]   # physical region id
     logical_region = union_logical[group, window_idx]    # logical region id
-    phys_tok      = phys_region * 8 + lane               # -> K/V slot
-    logical_tok   = logical_region * 8 + lane            # -> causal position
+    phys_tok       = phys_region * 8 + lane              # -> K/V slot
+    logical_tok    = logical_region * 8 + lane           # -> causal position
 
 A key is usable only when all three hold, exactly as the SM90 exact-union mask:
 
@@ -32,14 +37,18 @@ import triton
 import triton.language as tl
 
 REGION_TOKENS = tl.constexpr(8)
-HEAD_DIM = tl.constexpr(192)
-PAD_DIM = tl.constexpr(256)
+# 192 = BLOCK_D1 + BLOCK_D2 keeps the dots on real data instead of padding every
+# K/V tile and MMA to 256.
+BLOCK_D1 = 128
+BLOCK_D2 = 64
+BLOCK_N = 64
+# Query rows the union builder packs per group, and the head block a single CTA
+# covers; the launcher adds a second grid block (NB) for the 16-head layout.
+GROUP_ROWS = 16
+MAX_HEADS_PER_CTA = 8
 
 
-@triton.jit(
-    do_not_specialize=("ROWS", "SLOTS_DIV8"),
-    do_not_specialize_on_alignment=("ROWS", "SLOTS_DIV8"),
-)
+@triton.jit
 def _sparse_prefill(
     Q,
     K,
@@ -53,104 +62,130 @@ def _sparse_prefill(
     QPOS,
     OUT,
     LSE,
-    ROWS,
-    SLOTS_DIV8,
-    SOFTMAX_SCALE,
+    num_rows,
+    num_slots,
+    softmax_scale,
     HEADS: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_D1: tl.constexpr,
+    BLOCK_D2: tl.constexpr,
+    HB: tl.constexpr,
+    NB: tl.constexpr,
     CAPACITY: tl.constexpr,
+    BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    Q_GROUP: tl.constexpr,
-    Q_TILE: tl.constexpr,
 ):
-    group = tl.program_id(0).to(tl.int64)
-    slot_base = tl.program_id(1) * Q_TILE
+    # Head blocks of one group stay adjacent so their identical K/V streams share
+    # cache, and groups never hit grid.y's 65535 limit.
+    pid = tl.program_id(0)
+    group = pid // NB
+    head_block = pid % NB
 
     q_base = tl.load(GSTART + group)
     q_end = tl.load(GEND + group)
-    q_tile_count = tl.minimum(tl.maximum(q_end - q_base, 0), Q_GROUP)
-    if slot_base < q_tile_count:
-        union_count = tl.minimum(tl.load(UNION_COUNTS + group), CAPACITY)
-        count_tokens = union_count * REGION_TOKENS
+    q_len = tl.minimum(q_end - q_base, BLOCK_M)
+    union_count = tl.minimum(tl.load(UNION_COUNTS + group), CAPACITY)
+    count_tokens = union_count * REGION_TOKENS
 
-        # M rows of the MMA tile: one (query slot, head) pair each, the same
-        # layout the SM90 warpgroup uses for its query rows.
-        m = tl.arange(0, Q_TILE * HEADS)
-        slot = slot_base + m // HEADS
-        head = m % HEADS
-        row = (q_base + slot).to(tl.int64)
-        mmask = (slot < q_tile_count) & (row < ROWS)
+    # M row m is query (m % BLOCK_M) of head (head_block * HB + m // BLOCK_M), so
+    # the group's rows and the CTA's heads fill one MMA tile.
+    m = tl.arange(0, HB * BLOCK_M)
+    h_local = m // BLOCK_M
+    q_local = m % BLOCK_M
+    head = head_block * HB + h_local
+    q_row = q_base + q_local
+    mmask = (q_local < q_len) & (q_row < num_rows) & (head < HEADS)
+    q_pos = tl.load(QPOS + q_row, mask=mmask, other=0)
 
-        channel = tl.arange(0, PAD_DIM)
-        cmask = channel < HEAD_DIM
-        q_vec = tl.load(
-            Q + row[:, None] * (HEADS * HEAD_DIM) + head[:, None] * HEAD_DIM + channel[None, :],
-            mask=mmask[:, None] & cmask[None, :],
-            other=0.0,
+    dims1 = tl.arange(0, BLOCK_D1)
+    dims2 = tl.arange(0, BLOCK_D2)
+    q_off = q_row[:, None] * (HEADS * D) + head[:, None] * D
+    q1 = tl.load(Q + q_off + dims1[None, :], mask=mmask[:, None], other=0.0)
+    q2 = tl.load(Q + q_off + BLOCK_D1 + dims2[None, :], mask=mmask[:, None], other=0.0)
+
+    acc1 = tl.zeros((HB * BLOCK_M, BLOCK_D1), dtype=tl.float32)
+    acc2 = tl.zeros((HB * BLOCK_M, BLOCK_D2), dtype=tl.float32)
+    m_i = tl.full((HB * BLOCK_M,), float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros((HB * BLOCK_M,), dtype=tl.float32)
+    slots_div8 = num_slots // REGION_TOKENS
+    # Base-2 softmax: fold log2(e) into the scale and convert the LSE back once.
+    scale2 = softmax_scale * 1.4426950408889634
+
+    for start in range(0, count_tokens, BLOCK_N):
+        tok = start + tl.arange(0, BLOCK_N)
+        in_range = tok < count_tokens
+        win = tok // REGION_TOKENS
+        lane = tok - win * REGION_TOKENS
+        union_off = group * CAPACITY + win
+
+        phys_region = tl.load(UNION_PHYS + union_off, mask=in_range, other=-1)
+        logical_region = tl.load(UNION_LOGICAL + union_off, mask=in_range, other=-1)
+        memb = tl.load(MEMBERSHIP + union_off, mask=in_range, other=0)
+
+        # Every (row, head) of the CTA reuses this gather; only the masks below
+        # differ along the M axis.
+        key_valid = (
+            in_range
+            & (phys_region >= 0)
+            & (phys_region < slots_div8)
+            & (logical_region >= 0)
         )
-        q_pos = tl.load(QPOS + row, mask=mmask, other=0)
+        phys_tok = tl.where(key_valid, phys_region * REGION_TOKENS + lane, 0)
+        kv_row = phys_tok[:, None] * D
+        kv_mask = key_valid[:, None]
 
-        m_i = tl.full((Q_TILE * HEADS,), float("-inf"), dtype=tl.float32)
-        l_i = tl.zeros((Q_TILE * HEADS,), dtype=tl.float32)
-        acc = tl.zeros((Q_TILE * HEADS, PAD_DIM), dtype=tl.float32)
+        k1 = tl.load(K + kv_row + dims1[None, :], mask=kv_mask, other=0.0)
+        k2 = tl.load(K + kv_row + BLOCK_D1 + dims2[None, :], mask=kv_mask, other=0.0)
+        score = (
+            tl.dot(q1, tl.trans(k1), out_dtype=tl.float32)
+            + tl.dot(q2, tl.trans(k2), out_dtype=tl.float32)
+        ) * scale2
 
-        for start in range(0, count_tokens, BLOCK_N):
-            tok = start + tl.arange(0, BLOCK_N)
-            tvalid = tok < count_tokens
-            win = tok // REGION_TOKENS
-            lane = tok - win * REGION_TOKENS
-
-            phys_region = tl.load(UNION_PHYS + group * CAPACITY + win, mask=tvalid, other=-1)
-            logical_region = tl.load(UNION_LOGICAL + group * CAPACITY + win, mask=tvalid, other=-1)
-            memb = tl.load(MEMBERSHIP + group * CAPACITY + win, mask=tvalid, other=0)
-
-            valid_phys = (phys_region >= 0) & (phys_region < SLOTS_DIV8)
-            load_ok = tvalid & valid_phys
-            phys_tok = (phys_region * REGION_TOKENS + lane).to(tl.int64)
-            logical_tok = logical_region * REGION_TOKENS + lane
-            # Membership is per query slot, causality per query row: both ride
-            # along the M axis of the score tile.
-            selected = ((memb[None, :] >> slot[:, None]) & 1) != 0
-            keep = (
-                tvalid[None, :]
-                & valid_phys[None, :]
-                & selected
-                & (logical_region >= 0)[None, :]
-                & (logical_tok[None, :] <= q_pos[:, None])
-            )
-
-            # K is read transposed so QK^T is a single MMA over the 256-wide
-            # (192 real) head dimension; the same 192-wide rows then feed PV.
-            k = tl.load(
-                K + phys_tok[None, :] * HEAD_DIM + channel[:, None],
-                mask=load_ok[None, :] & cmask[:, None],
-                other=0.0,
-            )
-            score = tl.dot(q_vec, k) * SOFTMAX_SCALE
-            score = tl.where(keep, score, float("-inf"))
-            v = tl.load(
-                V + phys_tok[:, None] * HEAD_DIM + channel[None, :],
-                mask=load_ok[:, None] & cmask[None, :],
-                other=0.0,
-            )
-
-            m_new = tl.maximum(m_i, tl.max(score, axis=1))
-            m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
-            p = tl.exp(score - m_safe[:, None])
-            alpha = tl.exp(m_i - m_safe)
-            l_i = l_i * alpha + tl.sum(p, axis=1)
-            acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
-            m_i = m_new
-
-        has = l_i > 0.0
-        l_safe = tl.where(has, l_i, 1.0)
-        out_val = tl.where(has[:, None], acc / l_safe[:, None], 0.0)
-        lse_val = tl.where(has, m_i + tl.log(l_safe), float("-inf"))
-        tl.store(
-            OUT + row[:, None] * (HEADS * HEAD_DIM) + head[:, None] * HEAD_DIM + channel[None, :],
-            out_val.to(tl.bfloat16),
-            mask=mmask[:, None] & cmask[None, :],
+        # Membership is per query slot, causality per query row: both ride
+        # along the M axis of the score tile.
+        selected = ((memb[None, :] >> q_local[:, None]) & 1) != 0
+        logical_tok = logical_region * REGION_TOKENS + lane
+        keep = (
+            key_valid[None, :]
+            & selected
+            & (logical_tok[None, :] <= q_pos[:, None])
+            & mmask[:, None]
         )
-        tl.store(LSE + row * HEADS + head, lse_val, mask=mmask)
+        score = tl.where(keep, score, float("-inf"))
+
+        m_new = tl.maximum(m_i, tl.max(score, axis=1))
+        m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
+        alpha = tl.exp2(m_i - m_safe)
+        p = tl.exp2(score - m_safe[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+
+        v1 = tl.load(V + kv_row + dims1[None, :], mask=kv_mask, other=0.0)
+        v2 = tl.load(V + kv_row + BLOCK_D1 + dims2[None, :], mask=kv_mask, other=0.0)
+        p_bf16 = p.to(tl.bfloat16)
+        # The online-softmax rescale rides on the dot accumulator instead of a
+        # separate multiply of the whole (M, D) tile.
+        acc1 = tl.dot(p_bf16, v1, acc=acc1 * alpha[:, None], out_dtype=tl.float32)
+        acc2 = tl.dot(p_bf16, v2, acc=acc2 * alpha[:, None], out_dtype=tl.float32)
+        m_i = m_new
+
+    has = l_i > 0.0
+    l_safe = tl.where(has, l_i, 1.0)
+    inv_sum = 1.0 / l_safe
+    out_off = q_row[:, None] * (HEADS * D) + head[:, None] * D
+    out_mask = mmask[:, None]
+    tl.store(
+        OUT + out_off + dims1[None, :],
+        (acc1 * inv_sum[:, None]).to(OUT.dtype.element_ty),
+        mask=out_mask,
+    )
+    tl.store(
+        OUT + out_off + BLOCK_D1 + dims2[None, :],
+        (acc2 * inv_sum[:, None]).to(OUT.dtype.element_ty),
+        mask=out_mask,
+    )
+    # m_i/p live in base-2 space; the natural LSE needs one log2 and one rescale.
+    lse_val = tl.where(has, (m_i + tl.log2(l_safe)) * 0.6931471805599453, float("-inf"))
+    tl.store(LSE + q_row * HEADS + head, lse_val, mask=mmask)
 
 
 def launch(
@@ -169,25 +204,30 @@ def launch(
     *,
     softmax_scale: float,
 ) -> None:
-    """Run one program per (group, query-row tile); K/V are native [slots,1,192] BF16.
+    """Run grouped-union prefill; K/V are native [slots,1,192] BF16.
 
     Argument order mirrors the CuTe ``compile_prefill`` call so
     ``step5_sparse_prefill`` can pick a backend without reshaping its call site.
-    ``heads`` and ``capacity`` are compile-time specialization keys, matching the
-    CuTe dispatch cache key.
+    ``heads``, ``capacity`` and the head-dim split are compile-time specialization
+    keys, matching the CuTe dispatch cache key.
 
-    ``Q_TILE * heads`` is the MMA M dimension. 64 rows keeps the 8-warp tile
-    resident and was the fastest split measured on PPU for heads 4/8/16; a whole
-    group is one program when the head count allows (heads=4).
+    One program owns one group and one block of ``HB`` heads, so its union K/V
+    gather is shared by ``HB * BLOCK_M`` MMA rows. ``BLOCK_M`` is the group row cap
+    the caller already enforces (``16`` rows, or ``128 // heads`` below that), so
+    the M tile stays fully occupied for 4, 8 and 16 heads per rank.
     """
-    rows, heads, _ = q.shape
+    rows, heads, head_dim = q.shape
     groups, capacity = union_physical.shape
-    slots_div8 = k.shape[0] // 8
-    # Max packed query rows per group: the caller's ranges hold at most 16 rows,
-    # and the head count caps the CuTe q_group contract below that.
-    q_group = min(16, 128 // heads)
-    q_tile = min(q_group, 64 // heads)
-    _sparse_prefill[(groups, triton.cdiv(q_group, q_tile))](
+    if not groups or not rows:
+        return
+    if head_dim != BLOCK_D1 + BLOCK_D2:
+        raise NotImplementedError("Step5 Triton sparse prefill requires head_dim=192")
+    # Max packed query rows per group, matching the CuTe q_group contract and the
+    # union builder's 16-slot packing.
+    q_group = min(GROUP_ROWS, 128 // heads)
+    head_block = min(heads, MAX_HEADS_PER_CTA)
+    num_blocks = triton.cdiv(heads, head_block)
+    _sparse_prefill[(num_blocks * groups,)](
         q,
         k,
         v,
@@ -201,13 +241,17 @@ def launch(
         out,
         lse,
         rows,
-        slots_div8,
+        k.shape[0],
         softmax_scale,
         heads,
+        head_dim,
+        BLOCK_D1,
+        BLOCK_D2,
+        head_block,
+        num_blocks,
         capacity,
-        64,
         q_group,
-        q_tile,
+        BLOCK_N,
         num_warps=8,
         num_stages=2,
     )

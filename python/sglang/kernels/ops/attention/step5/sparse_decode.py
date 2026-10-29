@@ -238,7 +238,8 @@ def step5_sparse_decode_partials(
     )
     if rows:
         if not _can_use_sparse_decode_cute(q.device):
-            # PPU/sm80 fallback: single-pass Triton decode, no split-KV, no merge.
+            # PPU fallback (sm80 and sm89+): single-pass Triton decode, no split-KV,
+            # no merge.
             if kv_fp8 or out.dtype != torch.bfloat16:
                 raise ValueError(
                     "Step5 Triton sparse decode supports only single-partition BF16 output"
