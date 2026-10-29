@@ -175,8 +175,9 @@ def step5_paged_scores(
             weights = weights.float() * weight_scale
             weight_scale = 1.0
         launch(
-            # Pass the E4M3 bytes as uint8: the portable Triton kernel decodes
-            # them with integer math because ``tl.float8e4nv`` needs sm89+.
+            # Pass the E4M3 bytes as uint8: the kernel bitcasts them straight
+            # into fp8e4b15 MMA operands (``tl.float8e4nv`` needs sm89+), so no
+            # per-element software decode is needed on the PPU path.
             q.to(torch.float8_e4m3fn).view(torch.uint8),
             weights,
             compressed_index_keys,
