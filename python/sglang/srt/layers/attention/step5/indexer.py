@@ -243,8 +243,13 @@ class Step5Indexer(nn.Module):
         metadata: Step5IndexerMetadata,
         *,
         weights_first: bool = False,
+        forward_batch=None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         tokens = hidden_states.shape[0]
+        # Interleave CP: hidden_states/positions are local rows while the
+        # compression plan above stays full-batch. K/Z gather to the full
+        # packed layout before compression; selection consumes local rows.
+        cp_local = metadata.cp_local
         index_weights = self._project_weights(hidden_states) if weights_first else None
         projections = (
             self.sparse_indexer_q,
@@ -290,6 +295,7 @@ class Step5Indexer(nn.Module):
         use_ring_pdl = (
             self.use_cutedsl_qkz
             and tokens in (4, 8, 12, 16)
+            and cp_local is None
             and not torch.compiler.is_compiling()
             and not get_exec().deterministic.enable_deterministic_inference
             and metadata.request_slots.numel() == tokens // 4
@@ -299,6 +305,7 @@ class Step5Indexer(nn.Module):
         selection_workspace = metadata.selection_workspace
         packed_qw_ready = (
             selection_workspace.scoring_metadata_ready
+            and cp_local is None
             and tokens == metadata.query_positions.numel()
             and tokens == metadata.query_request_slots.numel()
             and self.num_heads in (2, 4)
@@ -338,6 +345,37 @@ class Step5Indexer(nn.Module):
         if normalized_q is not None:
             index_q = normalized_q
         # In the packed path index_q is used only for row/head shape metadata.
+        if cp_local is not None:
+            if forward_batch is None:
+                raise RuntimeError(
+                    "Interleave CP indexer requires the forward batch to gather K/Z"
+                )
+            from sglang.srt.layers.cp.base import get_cp_strategy
+
+            strategy = get_cp_strategy()
+            index_key = strategy.gather_kv_cache(
+                index_key.contiguous(), forward_batch
+            )
+            compression_logits = strategy.gather_kv_cache(
+                compression_logits.contiguous(), forward_batch
+            )
+            # Zero-pad to the full packed capacity (ownerless DP tail rows).
+            pad_rows = metadata.num_input_tokens - index_key.shape[0]
+            if pad_rows > 0:
+                index_key = torch.cat(
+                    [
+                        index_key,
+                        index_key.new_zeros(pad_rows, *index_key.shape[1:]),
+                    ]
+                )
+                compression_logits = torch.cat(
+                    [
+                        compression_logits,
+                        compression_logits.new_zeros(
+                            pad_rows, *compression_logits.shape[1:]
+                        ),
+                    ]
+                )
         compressed_index_keys = pool.get_compressed_index_key_buffer(self.layer_id)
         # Read the old ring before publishing this forward's pending inputs.
         compress_index_keys(
@@ -353,16 +391,26 @@ class Step5Indexer(nn.Module):
             success=metadata.compression_success,
             use_pdl=use_ring_pdl,
         )
+        row_to_req = metadata.query_request_slots
+        query_positions = metadata.query_positions
+        workspace = metadata.selection_workspace
+        score_group_rows = metadata.score_group_rows
+        if cp_local is not None:
+            row_to_req = cp_local.indexer_metadata.query_request_slots
+            query_positions = cp_local.indexer_metadata.query_positions
+            workspace = cp_local.indexer_metadata.selection_workspace
+            # Interleaved local rows cannot share 4/32-row request groups.
+            score_group_rows = cp_local.indexer_metadata.score_group_rows
         return select_step5_regions(
             index_q=index_q,
             index_weights=index_weights,
             compressed_index_keys=compressed_index_keys,
             req_to_token=metadata.req_to_token,
-            row_to_req=metadata.query_request_slots,
-            positions=metadata.query_positions,
+            row_to_req=row_to_req,
+            positions=query_positions,
             score_width=metadata.score_width,
-            score_group_rows=metadata.score_group_rows,
+            score_group_rows=score_group_rows,
             scoring_weight_scale=scoring_weight_scale,
             packed_qw_ready=packed_qw_ready,
-            workspace=metadata.selection_workspace,
+            workspace=workspace,
         )

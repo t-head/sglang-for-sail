@@ -60,6 +60,8 @@ class Step5DraftModel(nn.Module):
             (8, 1, 8),
             (8, 2, 4),
             (16, 1, 16),
+            (16, 1, 8),
+            (16, 1, 4),
         ) or parallel.pp_size != 1:
             raise ValueError(
                 "Step5 draft requires TP4, TP8, TP16, or DP2/TP4 with PP1"
