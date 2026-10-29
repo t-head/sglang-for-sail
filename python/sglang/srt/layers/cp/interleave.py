@@ -47,6 +47,8 @@ from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     is_allocation_symmetric,
 )
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -76,6 +78,9 @@ class InterleaveContextParallelMetadata(BaseContextParallelMetadata):
     gather_index: Optional[torch.Tensor] = None
     local_index: Optional[torch.Tensor] = None
     moe_local_token_count: Optional[torch.Tensor] = None
+    # Per-row local-q geometry stashed by the FlashAttention backend's
+    # init_forward_metadata: (cu_seqlens_q, cache_seqlens, max_seqlen_q).
+    fa3_local_q: Optional[Any] = None
 
 
 def is_interleave_extend(forward_batch):
@@ -343,9 +348,22 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         attention_backend: CPAttentionBackendKind = CPAttentionBackendKind.FLASH_ATTENTION,
         **kwargs,
     ) -> Any:
-        # No-op: run_attention is the FlashAttention/zigzag dispatch hook.
-        # Interleave serves the DSA backend, which runs attention itself.
-        return None
+        # Each local row is its own 1-row query sequence: causal right-aligned
+        # semantics make the block read exactly [0, position]. The FlashAttention
+        # backend stashed the per-row geometry during init_forward_metadata.
+        if attention_backend != CPAttentionBackendKind.FLASH_ATTENTION:
+            raise NotImplementedError(
+                f"{self.name} CP does not support attention_backend={attention_backend}"
+            )
+        metadata = forward_batch.attn_cp_metadata
+        local_q = metadata.fa3_local_q
+        if local_q is None:
+            raise RuntimeError(
+                "Interleave CP run_attention requires the FlashAttention backend "
+                "to stash fa3_local_q metadata during init_forward_metadata."
+            )
+        cu_seqlens_q, cache_seqlens, max_seqlen_q = local_q
+        return attn_fn(q, cu_seqlens_q, cache_seqlens, max_seqlen_q)
 
     def all_gather_dsa_trtllm_fp8_kv(self, forward_batch, k: Any, k_rope: Any) -> Any:
         kv_lora_rank = k.shape[-1]
@@ -366,8 +384,28 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         v: Any = None,
         swa_loc: Optional[Any] = None,
     ) -> Any:
-        raise NotImplementedError(
-            f"{self.name} strategy does not support dense K/V materialization"
+        cache_loc = (
+            forward_batch.out_cache_loc
+            if not layer.is_cross_attention
+            else forward_batch.encoder_out_cache_loc
+        )
+        if swa_loc is not None:
+            swa_loc = swa_loc[: cache_loc.shape[0]]
+        k_dim = k.shape[-1]
+        v_dim = v.shape[-1]
+        kv_cache = torch.cat([k, v], dim=-1).contiguous()
+        key_cache_full, value_cache_full = self.gather_kv_cache(
+            kv_cache, forward_batch
+        ).split([k_dim, v_dim], dim=-1)
+        key_cache_full = key_cache_full.contiguous()
+        value_cache_full = value_cache_full.contiguous()
+        get_token_to_kv_pool().set_kv_buffer(
+            layer,
+            KVWriteLoc.for_layer(forward_batch, layer, swa_loc=swa_loc),
+            key_cache_full,
+            value_cache_full,
+            layer.k_scale,
+            layer.v_scale,
         )
 
     def materialize_full_mla_kv(

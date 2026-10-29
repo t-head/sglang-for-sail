@@ -38,6 +38,9 @@ from sglang.srt.layers.attention.step5.metadata import (
 from sglang.srt.layers.attention.step5.region_selection import (
     allocate_selection_workspace,
 )
+from sglang.srt.layers.cp.base import get_cp_strategy
+from sglang.srt.layers.cp.interleave import InterleaveContextParallelMetadata
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.step5_kv_pool import Step5TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -135,6 +138,7 @@ def _build_attention_metadata(
     valid_rows,
     prefill_spans=None,
     score_lengths=None,
+    cp_local=None,
 ) -> Step5AttentionMetadata:
     """Assemble complete attention/indexer metadata once before layer execution.
 
@@ -189,7 +193,9 @@ def _build_attention_metadata(
             compression_success=torch.empty_like(
                 compression_inputs["request_slots"], dtype=torch.bool
             ),
+            cp_local=cp_local,
         ),
+        cp_local=cp_local,
         **schedule,
         **_allocate_attention_buffers(
             rows=rows,
@@ -508,12 +514,22 @@ class Step5AttentionBackend(AttentionBackend):
                 ((requests == 0) | (fb.positions == positions)).all(),
                 "Step5 positions differ from native packed spans",
             )
-            torch._assert_async(
-                (
-                    fb.out_cache_loc == req_to_token[requests.long(), positions.long()]
-                ).all(),
-                "Step5 write locations differ from FULL mapping",
-            )
+            if not (
+                is_cp_active(forward_batch)
+                and isinstance(
+                    forward_batch.attn_cp_metadata,
+                    InterleaveContextParallelMetadata,
+                )
+            ):
+                # Interleave CP truncates out_cache_loc to the extend rows and
+                # writes gathered full-batch K/V instead of local rows.
+                torch._assert_async(
+                    (
+                        fb.out_cache_loc
+                        == req_to_token[requests.long(), positions.long()]
+                    ).all(),
+                    "Step5 write locations differ from FULL mapping",
+                )
             width = max(
                 1,
                 (max((p + n for p, n in zip(prefixes, lengths)), default=0) + 7) // 8,
@@ -526,6 +542,24 @@ class Step5AttentionBackend(AttentionBackend):
                 score_group_rows = 1
             if score_group_rows == 32:
                 _assert_group32_ownership(requests)
+            cp_local = None
+            if is_cp_active(forward_batch) and isinstance(
+                forward_batch.attn_cp_metadata, InterleaveContextParallelMetadata
+            ):
+                cp_local = self._build_interleave_cp_local_metadata(
+                    forward_batch=forward_batch,
+                    positions=positions,
+                    requests=requests,
+                    lengths=lengths,
+                    query_group=query_group,
+                    compression_inputs=compression_inputs,
+                    score_width=width,
+                    prefill_spans=(
+                        prefixes[: fb.batch_size],
+                        lengths[: fb.batch_size],
+                        compression_inputs["request_slots"][: fb.batch_size],
+                    ),
+                )
             if self.fp8_full_kv:
                 pages, page_map = step5_fp8_prefill_pages(
                     req_to_token,
@@ -561,8 +595,90 @@ class Step5AttentionBackend(AttentionBackend):
                     compression_inputs["request_slots"][: fb.batch_size],
                 ),
                 score_lengths=lengths,
+                cp_local=cp_local,
             )
         self.swa_backend.init_forward_metadata(forward_batch)
+
+    def _build_interleave_cp_local_metadata(
+        self,
+        *,
+        forward_batch,
+        positions,
+        requests,
+        lengths,
+        query_group,
+        compression_inputs,
+        score_width,
+        prefill_spans,
+    ) -> Step5AttentionMetadata:
+        """Local-row metadata for interleave CP extend: rows this rank owns.
+
+        Compression/ring plans stay full-batch (the gathered packed layout);
+        only the query side (rows, spans, workspace, lse) describes the padded
+        local shard, matching the sharded q/k/v rows the model produced.
+        """
+        from sglang.srt.layers.cp.interleave import interleave_rows_per_request
+        from sglang.srt.layers.cp.padding import pad_local_rows
+
+        cp_meta = forward_batch.attn_cp_metadata
+        strategy = get_cp_strategy()
+        device = positions.device
+        num_tokens = positions.numel()
+        local_idx = strategy.local_q_indices(num_tokens, forward_batch).to(
+            device=device, dtype=torch.long
+        )
+        # Same bound the runner uses to shard model inputs (x[:total_seq_lens]).
+        shard_bound = int(getattr(cp_meta, "total_seq_lens", num_tokens))
+        local_idx = local_idx[local_idx < shard_bound]
+        local_positions = positions.index_select(0, local_idx)
+        local_requests = requests.index_select(0, local_idx).to(torch.int32)
+        local_positions = pad_local_rows(local_positions, cp_meta, dim=0)
+        pad_rows = local_positions.shape[0] - local_requests.shape[0]
+        if pad_rows > 0:
+            local_requests = torch.cat(
+                [local_requests, local_requests.new_zeros(pad_rows)]
+            )
+
+        local_lengths = interleave_rows_per_request(
+            [int(x) for x in lengths], strategy.cp_rank, strategy.cp_size
+        )
+        # Interleave's interleaved rows break the "adjacent rows share one
+        # request" grouping contract of score_group_rows 4/32: force 1 so each
+        # local row scores independently (also keeps every row count valid,
+        # e.g. a 4-token verify shard's local half is not divisible by 4).
+        local_score_group_rows = 1
+        starts, ends, boundaries = query_group_spans(
+            lengths=local_lengths, query_group=query_group
+        )
+        local_query_start_loc = torch.from_numpy(boundaries).to(
+            device=device, dtype=torch.int32
+        )
+        local_group_start = torch.from_numpy(starts).to(
+            device=device, dtype=torch.int32
+        )
+        local_group_end = torch.from_numpy(ends).to(
+            device=device, dtype=torch.int32
+        )
+        local_valid_rows = torch.tensor(
+            [int(np.sum(local_lengths))], dtype=torch.int32, device=device
+        )
+        return _build_attention_metadata(
+            token_to_kv_pool=self.token_to_kv_pool,
+            req_to_token=self.req_to_token_pool.req_to_token,
+            attention_shape=self.attention_shape,
+            compression_inputs=compression_inputs,
+            row_to_req=local_requests,
+            positions=local_positions,
+            query_start_loc=local_query_start_loc,
+            group_start=local_group_start,
+            group_end=local_group_end,
+            score_width=score_width,
+            region_bins=1 << (score_width - 1).bit_length(),
+            score_group_rows=local_score_group_rows,
+            decode=False,
+            valid_rows=local_valid_rows,
+            prefill_spans=prefill_spans,
+        )
 
     def _build_decode_verify_index_plan(
         self,
@@ -814,14 +930,31 @@ class Step5AttentionBackend(AttentionBackend):
     ):
         if self.forward_metadata is None:
             raise RuntimeError("Step5 backend metadata has not been initialized")
+        metadata = self.forward_metadata
+        cp_local = metadata.cp_local
         if save_kv_cache:
             if k is None or v is None:
                 raise ValueError("Step5 DSA KV store requires both K and V")
-            self.token_to_kv_pool.set_kv_buffer(
-                layer, KVWriteLoc(forward_batch.out_cache_loc), k, v
-            )
+            if cp_local is not None:
+                # Interleave CP: gather local K/V rows to the full layout and
+                # write the whole batch; CP ranks repeat identical full rows.
+                strategy = get_cp_strategy()
+                kv_cache = torch.cat([k, v], dim=-1).contiguous()
+                kv_full = strategy.gather_kv_cache(kv_cache, forward_batch)
+                k_full, v_full = kv_full.split(
+                    [k.shape[-1], v.shape[-1]], dim=-1
+                )
+                self.token_to_kv_pool.set_kv_buffer(
+                    layer,
+                    KVWriteLoc(forward_batch.out_cache_loc),
+                    k_full.contiguous(),
+                    v_full.contiguous(),
+                )
+            else:
+                self.token_to_kv_pool.set_kv_buffer(
+                    layer, KVWriteLoc(forward_batch.out_cache_loc), k, v
+                )
         k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        metadata = self.forward_metadata
         softmax_scale = layer.scaling
         # Capture may defer the independent Indexer branch until the main KV
         # write is recorded. The fork is unchanged; record it before the join
@@ -849,6 +982,8 @@ class Step5AttentionBackend(AttentionBackend):
                 )
         out = torch.empty_like(q)
         lse = metadata.lse
+        if cp_local is not None:
+            lse = cp_local.lse
         fuse_head_gate = (
             head_gate is not None
             and self.supports_dsa_head_gate()
@@ -881,15 +1016,23 @@ class Step5AttentionBackend(AttentionBackend):
             )
         else:
             workspace = metadata.prefill
+            query_positions = metadata.indexer_metadata.query_positions
+            group_query_start = metadata.group_start
+            group_query_end = metadata.group_end
+            if cp_local is not None:
+                workspace = cp_local.prefill
+                query_positions = cp_local.indexer_metadata.query_positions
+                group_query_start = cp_local.group_start
+                group_query_end = cp_local.group_end
             step5_sparse_prefill_selected(
                 q,
                 k_cache,
                 v_cache,
                 packed=packed,
                 counts=counts,
-                query_positions=metadata.indexer_metadata.query_positions,
-                group_query_start=metadata.group_start,
-                group_query_end=metadata.group_end,
+                query_positions=query_positions,
+                group_query_start=group_query_start,
+                group_query_end=group_query_end,
                 num_region_bins=metadata.region_bins,
                 logical_starts=workspace.logical_starts,
                 physical_regions=workspace.physical_regions,

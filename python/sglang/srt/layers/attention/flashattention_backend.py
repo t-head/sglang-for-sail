@@ -1522,7 +1522,110 @@ class FlashAttentionBackend(AttentionBackend):
                 self.forward_metadata_spec_decode_expand.page_table = expand_page_table
 
         self._fill_swa_window_align(metadata)
+        if (
+            is_cp_active(forward_batch)
+            and metadata.local_attn_metadata is None
+            and not forward_batch.forward_mode.is_target_verify()
+        ):
+            self._init_interleave_cp_extend_metadata(forward_batch, metadata)
         self.forward_metadata = metadata
+
+    def _init_interleave_cp_extend_metadata(
+        self, forward_batch: ForwardBatch, metadata: FlashAttentionMetadata
+    ) -> bool:
+        """Rewrite the extend metadata for interleave CP's local q rows.
+
+        Each local row becomes its own 1-row query sequence; causal
+        right-alignment makes the block read exactly [0, position], so a
+        sliding window (-W, 0) stays correct too. Pad rows reuse request 0's
+        page table (in-bounds) and clamp seqused_kv to 1. The per-row geometry
+        is also stashed on the CP metadata for run_attention dispatch.
+        """
+        from sglang.srt.layers.cp.interleave import InterleaveContextParallelMetadata
+        from sglang.srt.layers.cp.padding import pad_local_rows
+
+        cp_meta = forward_batch.attn_cp_metadata
+        if not isinstance(cp_meta, InterleaveContextParallelMetadata):
+            return False
+
+        strategy = get_cp_strategy()
+        if strategy is None or strategy.cp_size <= 1:
+            return False
+
+        global_positions = forward_batch.positions
+        if global_positions is None:
+            return False
+        device = global_positions.device
+        num_tokens = int(global_positions.shape[0])
+        local_idx = strategy.local_q_indices(num_tokens, forward_batch).to(
+            device=device, dtype=torch.long
+        )
+        # Same bound the runner uses to shard model inputs (x[:total_seq_lens]).
+        shard_bound = int(getattr(cp_meta, "total_seq_lens", num_tokens))
+        if local_idx.numel() > 0:
+            local_idx = local_idx[local_idx < shard_bound]
+        local_positions = global_positions.index_select(0, local_idx)
+        # Sharded model inputs are padded to per_rank_actual_token; pad rows get
+        # position 0 so per-row metadata matches the sharded q length.
+        local_positions = pad_local_rows(local_positions, cp_meta, dim=0)
+
+        extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        if extend_lens is None:
+            extend_lens = [num_tokens]
+        extend_lens = [int(x) for x in extend_lens]
+        real_num_tokens = min(sum(extend_lens), num_tokens)
+
+        batch_ids_parts = [
+            torch.full((length,), batch_id, dtype=torch.long, device=device)
+            for batch_id, length in enumerate(extend_lens)
+            if length > 0
+        ]
+        batch_ids = (
+            torch.cat(batch_ids_parts, dim=0)
+            if batch_ids_parts
+            else torch.empty(0, dtype=torch.long, device=device)
+        )
+        if batch_ids.shape[0] < num_tokens:
+            pad_len = num_tokens - batch_ids.shape[0]
+            batch_ids = torch.cat(
+                [batch_ids, torch.zeros(pad_len, dtype=torch.long, device=device)]
+            )
+        elif batch_ids.shape[0] > num_tokens:
+            batch_ids = batch_ids[:num_tokens]
+
+        local_batch_ids = batch_ids.index_select(0, local_idx)
+        valid_rows = local_idx < real_num_tokens
+        pad_rows = local_positions.shape[0] - local_batch_ids.shape[0]
+        if pad_rows > 0:
+            local_batch_ids = torch.cat(
+                [local_batch_ids, local_batch_ids.new_zeros(pad_rows)]
+            )
+            valid_rows = torch.cat([valid_rows, valid_rows.new_zeros(pad_rows)])
+        seqused_kv = torch.where(
+            valid_rows,
+            local_positions.to(torch.int32) + 1,
+            torch.ones_like(local_positions, dtype=torch.int32),
+        ).clamp(min=1)
+
+        if local_batch_ids.numel() > 0:
+            metadata.page_table = metadata.page_table.index_select(
+                0, local_batch_ids
+            )
+            if metadata.swa_page_table is not None:
+                metadata.swa_page_table = metadata.swa_page_table.index_select(
+                    0, local_batch_ids
+                )
+
+        local_t = int(local_positions.shape[0])
+        metadata.cu_seqlens_q = torch.arange(
+            0, local_t + 1, dtype=torch.int32, device=device
+        )
+        metadata.cache_seqlens_int32 = seqused_kv
+        metadata.max_seq_len_q = 1
+        metadata.cu_seqlens_k = None
+        metadata.scheduler_metadata = None
+        cp_meta.fa3_local_q = (metadata.cu_seqlens_q, seqused_kv, 1)
+        return True
 
     def get_paged_mha_kv_cache(
         self,
@@ -1619,7 +1722,12 @@ class FlashAttentionBackend(AttentionBackend):
         if return_lse and self.use_mla:
             raise NotImplementedError("MLA extend does not return an LSE.")
         extend_lse = None
-        cp_active = is_cp_active(forward_batch)
+        # Non-CP forwards under a CP config (e.g. EAGLE draft extends) carry a
+        # null attn_cp_metadata; only a batch the runner actually sharded has
+        # the CP metadata this branch consumes.
+        cp_active = is_cp_active(forward_batch) and (
+            forward_batch.attn_cp_metadata is not None
+        )
 
         if k is not None:
             assert v is not None

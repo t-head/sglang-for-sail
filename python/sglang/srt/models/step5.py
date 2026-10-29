@@ -1044,6 +1044,7 @@ class Step5Attention(nn.Module):
                         indexer_metadata,
                         # TODO(yhyang201): frozen SGLANG_OPT_STEP5_INDEXER_WEIGHT_FIRST; prune dead paths.
                         weights_first=step5_options.INDEXER_WEIGHT_FIRST,
+                        forward_batch=forward_batch,
                     )
             return None
 
@@ -1118,7 +1119,12 @@ class Step5Attention(nn.Module):
             q, k, v = self._qknorm_rope_generic(qkv, positions)
         if self.is_dsa:
             if not idle and not use_indexer_alt_stream:
-                selection = self.indexer(hidden_states, positions, indexer_metadata)
+                selection = self.indexer(
+                    hidden_states,
+                    positions,
+                    indexer_metadata,
+                    forward_batch=forward_batch,
+                )
 
             def prepare_selection_and_gate():
                 nonlocal gate
@@ -1361,11 +1367,18 @@ class Step5DecoderLayer(nn.Module):
     @staticmethod
     def stage_facts(config: Step5Config, layer_id: int):
         # Local MegaMoE experts consume attention-TP rows and return TP partials.
+        is_moe = layer_id in config.moe_layer_list
         return (
             declare_attn(),
             declare_ffn(
-                sparse=layer_id in config.moe_layer_list
-                and not get_moe_a2a_backend().is_megamoe()
+                sparse=is_moe and not get_moe_a2a_backend().is_megamoe(),
+                # The dense MLP shards over attention TP, so its output owes
+                # the attention-TP sum: with attention CP the full-TP group
+                # replicates each partial across the CP pair and would double
+                # the summed output.
+                dense_tp_size=None
+                if is_moe
+                else get_parallel().attn_tp_size,
             ),
         )
 
@@ -1379,9 +1392,25 @@ class Step5DecoderLayer(nn.Module):
             return routed + shared
         shared, routed = self.moe(
             hidden_states,
-            num_token_non_padded=forward_batch.num_token_non_padded,
+            # The method returns None when the MoE input is a CP/DP gathered
+            # buffer whose real rows are not a prefix (interleave prefill CP
+            # gathers rank-major padded shards); the raw field would wrongly
+            # mask the non-prefix real rows as padding in the router topk.
+            num_token_non_padded=forward_batch.moe_num_token_non_padded(),
             forward_batch=forward_batch,
         )
+        parallel = get_parallel()
+        # The shared expert's weights shard over attention TP, so its partial
+        # is replicated across the attention-CP pair, while the post-experts
+        # sum spans the full TP group and would count each shard once per
+        # replica: only one CP replica may contribute it.
+        if (
+            parallel.attn_cp_size > 1
+            and parallel.moe_dp_size == 1
+            and parallel.moe_ep_size * parallel.moe_tp_size == parallel.tp_size
+            and parallel.attn_cp_rank != 0
+        ):
+            shared = torch.zeros_like(shared)
         if isinstance(routed, FlashInferTrtllmDeferredFinalizeOutput):
             if get_forward().defer_moe_finalize and self.boundary_fusions.can_fuse_moe(
                 shared, routed

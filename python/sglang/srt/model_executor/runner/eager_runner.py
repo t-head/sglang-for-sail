@@ -278,6 +278,16 @@ class EagerRunner(BaseRunner):
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
 
         cp_active = is_cp_active(forward_batch)
+        if cp_active and (
+            not get_parallel().enable_cp_tp_group_sharing
+            and getattr(model_runner.model, "prepare_cp_inputs", None) is None
+        ):
+            # Models without a CP boundary (e.g. EAGLE draft towers) run the
+            # batch unsharded: their token counts sit far below the CP
+            # strategy's minimum, and they lack the pp_group/logits delegation
+            # the CP extend runner requires.
+            cp_active = False
+            forward_batch.attn_cp_metadata = None
         if cp_active:
             prepare_cp_forward(forward_batch)
 

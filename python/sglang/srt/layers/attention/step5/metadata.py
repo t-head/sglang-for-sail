@@ -133,6 +133,10 @@ class Step5IndexerMetadata(msgspec.Struct, frozen=True, kw_only=True):
     compression_enabled: torch.Tensor  # bool [R], input AND layer-ring admission
     compression_success: torch.Tensor  # bool [R], success (including inert padding)
     selection_workspace: Step5SelectionWorkspace
+    # Interleave-CP local layout: the fields above keep the full-batch packed
+    # layout for compression, while select consumes the local q rows described
+    # by this local Step5AttentionMetadata (its indexer_metadata query side).
+    cp_local: object | None = None
 
 
 class Step5AttentionMetadata(msgspec.Struct, frozen=True, kw_only=True):
@@ -164,3 +168,7 @@ class Step5AttentionMetadata(msgspec.Struct, frozen=True, kw_only=True):
     partial: torch.Tensor | None
     partial_lse: torch.Tensor | None
     prefill: Step5PrefillWorkspace | None
+    # Interleave-CP local metadata: a full Step5AttentionMetadata describing
+    # the padded local q shard; kernels read it via this handle while the
+    # full-batch fields above keep the gathered packed layout.
+    cp_local: object | None = None
