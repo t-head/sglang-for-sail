@@ -3107,7 +3107,7 @@ class DeepseekV4AttnBackend(
             and not get_platform().is_sm120
             and self.forward_metadata.late_layer_tail is None
             and (
-                cp_sparse_prefill
+                (cp_sparse_prefill and not is_sail())
                 or num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
                 or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
             )
