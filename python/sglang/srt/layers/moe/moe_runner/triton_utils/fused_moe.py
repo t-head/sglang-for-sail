@@ -98,11 +98,17 @@ elif _is_musa:
 
     _silu_and_mul_musa = torch.nn.SwishGLU()
 
-if _is_sail:
+# The PPU optimal fused-MoE helpers are imported lazily: the fused_moe_triton
+# package __init__ pulls in the token dispatchers, which reach back through
+# eplb/metrics to configs.model_config and close an import cycle when
+# model_config itself is still initializing (quantization -> gguf -> here).
+def _ppu_optimal_fused_moe_impl():
     from sglang.srt.layers.moe.fused_moe_triton.fused_valu_moe import (
         invoke_special_optimal_fused_moe_impl,
         prepare_for_dispatch,
     )
+
+    return invoke_special_optimal_fused_moe_impl, prepare_for_dispatch
 
 # Try to import vllm_ops for non-CUDA/HIP/XPU platforms
 _has_vllm_ops = False
@@ -718,8 +724,9 @@ def _fused_moe_kernel_sequence(
         assert not fuse_swiglu_interleaved, (
             "PPU optimal fused MoE path does not support fuse_swiglu_interleaved"
         )
-        dispatch_tuple = prepare_for_dispatch(topk_ids, config, E)
-        invoke_special_optimal_fused_moe_impl(
+        invoke_impl, prepare_dispatch = _ppu_optimal_fused_moe_impl()
+        dispatch_tuple = prepare_dispatch(topk_ids, config, E)
+        invoke_impl(
             hidden_states,
             w1,
             intermediate_cache1,
@@ -974,7 +981,8 @@ def _fused_moe_kernel_sequence(
         )
 
     if use_ppu_optimal_fusedmoe:
-        invoke_special_optimal_fused_moe_impl(
+        invoke_impl, _ = _ppu_optimal_fused_moe_impl()
+        invoke_impl(
             intermediate_cache2,
             w2,
             intermediate_cache3 if _use_intermediate else out_hidden_states,

@@ -32,6 +32,7 @@ from sglang.srt.utils.common import (
     is_hip,
     is_musa,
     is_npu,
+    is_sail,
     is_xpu,
 )
 from sglang.utils import LazyImport
@@ -78,7 +79,14 @@ if is_npu():
 
 logger = logging.getLogger(__name__)
 
-SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
+# PPU TP ranks are not bit-identical through the final lm_head matmul /
+# all-reduce, so unsynced samples finish requests on different steps and then
+# deadlock the decode collectives. Sync there unless explicitly overridden.
+SYNC_TOKEN_IDS_ACROSS_TP = (
+    envs.SGLANG_SYNC_TOKEN_IDS_ACROSS_TP.get()
+    if envs.SGLANG_SYNC_TOKEN_IDS_ACROSS_TP.is_set()
+    else is_sail()
+)
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 

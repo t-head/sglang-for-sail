@@ -195,6 +195,9 @@ class _DeprecatedEnvFallback:
                 os.environ[self.name] = fallback
         return super().get()
 
+    def is_set(self) -> bool:
+        return super().is_set() or self.deprecated_name in os.environ
+
 
 class EnvBoolWithAlias(_DeprecatedEnvFallback, EnvBool):
     pass
@@ -807,7 +810,11 @@ class Envs:
     # Set to "env://" to use an externally-created TCPStore via MASTER_ADDR/MASTER_PORT.
     SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE = EnvStr(None)
     SGLANG_IS_FIRST_RANK_ON_NODE = EnvBool(True)
-    SGLANG_SYNC_TOKEN_IDS_ACROSS_TP = EnvBool(False)
+    # PPU TP ranks do not sample bit-identically, so the sync defaults on
+    # there (see layers/sampler.py); the old unprefixed name still works.
+    SGLANG_SYNC_TOKEN_IDS_ACROSS_TP = EnvBoolWithAlias(
+        False, deprecated_name="SYNC_TOKEN_IDS_ACROSS_TP"
+    )
     SGLANG_ENABLE_COLOCATED_BATCH_GEN = EnvBool(False)
     SGLANG_SHARED_EXPERT_TP1 = EnvBool(False)
     # Replicate the input embedding across TP ranks instead of sharding it
@@ -2091,6 +2098,10 @@ class Envs:
     SGLANG_SAIL_MINIMAX_M3_MSA_ATTEND = EnvBool(True)
     SGLANG_SAIL_MINIMAX_M3_MSA_INDEXER_FP8 = EnvBool(True)
     SGLANG_SAIL_MINIMAX_M3_MSA_INDEXER_SCORE_BF16 = EnvBool(True)
+    # Use the FP8 decode indexer instead of MSA-v1 Q8KV4 on the NVFP4 KV cache.
+    SGLANG_DISABLE_MSA_V1_Q8KV4 = EnvBool(False)
+    # Vision tokens per block in the ViT MLP and projector; <= 0 runs all at once.
+    SGLANG_MINIMAX_VIT_TOKEN_BLOCK = EnvInt(32768)
     # MiniMax-M3 sparse decode indexer: single JIT radix-select kernel replaces the 2-stage split-K Triton topk.
     SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX = EnvBool(True)
     # Fused JIT store (minimax_store_kv_index) of main+index K/V instead of separate
