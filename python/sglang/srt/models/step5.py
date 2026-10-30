@@ -325,6 +325,13 @@ _STEP5_NVFP4_PARAM_SOURCES = {
         target for target, _ in _STEP5_NVFP4_EXPERT_SOURCES.values()
     )
 }
+# mxfp4 registers zero-initialised expert biases on every non-ROCm platform, but
+# Step5 checkpoints never carry them and the kernels only read them when
+# FusedMoE.with_bias is set, which Step5 never does.
+_STEP5_EXPERT_BIAS_PARAMS = (
+    ".moe.experts.w13_weight_bias",
+    ".moe.experts.w2_weight_bias",
+)
 
 
 def _step5_indexed_nvfp4_layers(checkpoint_path) -> dict[int, str] | None:
@@ -1755,6 +1762,8 @@ class Step5ForCausalLM(nn.Module):
         # Expand actual parameters into external shards to detect partial QKV/MLP loads.
         expected = set()
         for name in params_dict:
+            if name.endswith(_STEP5_EXPERT_BIAS_PARAMS):
+                continue
             head, marker, target = name.rpartition(".moe.experts.")
             if marker and _step5_layer_index(head) in self.nvfp4_expert_layers:
                 sources = _STEP5_NVFP4_PARAM_SOURCES.get(target)
