@@ -14,7 +14,7 @@ import torch
 
 from sglang.srt.platforms.cuda import CudaDeviceMixin
 from sglang.srt.platforms.device_mixin import PlatformEnum
-from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.interface import PlatformCapabilities, SRTPlatform
 
 _ZW_TAG = "ZW"
 _ZW810E_NAME = "ZW810E"
@@ -45,6 +45,18 @@ class SailSRTPlatform(SailDeviceMixin, SRTPlatform):
     Inherits CUDA capability flags since SAIL exposes CUDA-compatible APIs
     (fp8, cuda graph, piecewise cuda graph are supported on SAIL).
     """
+
+    # Declare every CUDA-family capability explicitly: SRTPlatform defaults to
+    # an all-False PlatformCapabilities(), which silently skips decode graph
+    # capture (leaving decode/target-verify eager) and routes KV allocation /
+    # position / req-to-token kernels through their slow torch fallbacks.
+    # Verified on PPU-ZW810E with triton 3.7.0.
+    capabilities = PlatformCapabilities(
+        supports_triton=True,
+        graph_capture=True,
+        piecewise_graph=True,
+        hicache_device_kernels=True,
+    )
 
     def supports_fp8(self) -> bool:
         return self.get_device_capability().to_int() >= 89
