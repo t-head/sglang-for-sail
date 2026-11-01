@@ -48,6 +48,15 @@ def _native_fp8_decode(device: torch.device) -> bool:
     )
 
 
+@triton.jit
+def _plus_zero(score):
+    # FlashInfer's radix key orders floats by bit pattern, where -0.0 sorts below
+    # +0.0; folding here keeps the tie-break on the region id without a copy pass.
+    bits = score.to(tl.uint32, bitcast=True)
+    bits = tl.where((bits & 0x7FFFFFFF) == 0, 0, bits)
+    return bits.to(tl.float32, bitcast=True)
+
+
 @triton.jit(
     do_not_specialize=("REGIONS",),
     do_not_specialize_on_alignment=("REGIONS",),
@@ -126,7 +135,7 @@ def _score_regions(
             score = tl.where(valid, score, -float("inf"))
         else:
             score = tl.full((BLOCK_R,), -float("inf"), tl.float32)
-        tl.store(Out + row * REGIONS + regions, score, regions < REGIONS)
+        tl.store(Out + row * REGIONS + regions, _plus_zero(score), regions < REGIONS)
 
 
 # E4M3FN has exponent bias 7 while fp8e4b15, which this backend supports
@@ -319,7 +328,7 @@ def _score_regions_ppu_opt(
             score = tl.where(regions[None, :] < live[:, None], score, -float("inf"))
             tl.store(
                 Out + rows[:, None] * REGIONS + regions[None, :],
-                score,
+                _plus_zero(score),
                 row_valid[:, None] & written,
             )
         elif MIXED:
@@ -373,13 +382,17 @@ def _score_regions_ppu_opt(
                     products_r = tl.dot(query_r, _e4m3_bytes_to_fp8(packed_r)) * FP8_RESCALE
                     score_r = tl.sum(tl.maximum(products_r, 0.0) * weight_r[:, None], axis=0)
                     score_r = tl.where(regions < live_r, score_r, -float("inf"))
-                tl.store(Out + row * REGIONS + regions, score_r, row_ok & row_written)
+                tl.store(
+                    Out + row * REGIONS + regions,
+                    _plus_zero(score_r),
+                    row_ok & row_written,
+                )
         else:
             score = tl.zeros((GROUP_ROWS, BLOCK_R), tl.float32)
             score = tl.where(regions[None, :] < live[:, None], score, -float("inf"))
             tl.store(
                 Out + rows[:, None] * REGIONS + regions[None, :],
-                score,
+                _plus_zero(score),
                 row_valid[:, None] & written,
             )
 
@@ -465,7 +478,7 @@ def _score_four_rows_per_request(
         output_valid = row_valid[:, None] & (regions[None, :] < live[:, None])
         tl.store(
             Out + group_rows[:, None] * REGIONS + regions[None, :],
-            region_scores,
+            _plus_zero(region_scores),
             output_valid,
         )
 
@@ -557,7 +570,7 @@ def _score_thirty_two_rows_per_request(
             output_valid = row_valid[:, None] & (regions[None, :] < live[:, None])
             tl.store(
                 Out + rows[:, None] * REGIONS + regions[None, :],
-                region_scores,
+                _plus_zero(region_scores),
                 output_valid,
             )
 

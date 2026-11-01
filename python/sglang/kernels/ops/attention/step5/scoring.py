@@ -76,6 +76,9 @@ def step5_paged_scores(
     batches group as well; each span stays inside one request.
     Output width must cover all positions//8, including Graph replay inputs.
     With ``clear_future=True``, invalid/future output columns are always -inf.
+    Zeros are written as +0.0, never -0.0: ``step5_select_regions`` hands the
+    values to a radix top-k, which orders by bit pattern and would rank -0.0
+    below +0.0, breaking the small-region-id tie-break.
     The SM10x live-length selector may set it false because it never reads those
     columns. Inputs are immutable; output must not share storage with them.
     Warm up before Graph capture.
@@ -195,6 +198,13 @@ def step5_paged_scores(
                 weight_scale=weight_scale,
                 workspace=workspace,
             )
+            # The CuTe epilogue is library code, so this path folds -0.0 into
+            # +0.0 with a pass; the Triton stores fold it inline instead.
+            from sglang.kernels.ops.attention.step5.selection_triton import (
+                canonicalize_zero,
+            )
+
+            canonicalize_zero(out, out)
             return out
         from sglang.kernels.ops.attention.step5.scoring_triton import launch
 
