@@ -6,8 +6,11 @@ from typing import Optional
 
 import torch
 
-_QKV_WIDTHS = (1920, 3456)
-_QKV_GATE_WIDTHS = (1928, 3472)
+_QKV_WIDTHS = (1152, 1920, 3456)
+_QKV_GATE_WIDTHS = (1156, 1928, 3472)
+
+# CuTe compiles one kernel per Q-head count; TP16 (4 heads) is Triton-only.
+_CUTE_Q_HEADS = (8, 16)
 
 
 def _can_use_qknorm_cute(device: torch.device) -> bool:
@@ -24,6 +27,28 @@ def _can_use_qknorm_cute(device: torch.device) -> bool:
     )
 
 
+def _can_use_qknorm_triton(device: torch.device) -> bool:
+    """The portable Triton port runs on every CUDA device the CuTe one misses."""
+    # Imported here, not at module scope: `current_platform` is a lazy module
+    # attribute, so a top-level import would resolve the platform too early.
+    from sglang.srt.platforms import current_platform
+
+    return (
+        device.type == "cuda"
+        and torch.version.hip is None
+        and current_platform.capabilities.supports_triton
+    )
+
+
+def supports_fused_qknorm_rope(device: torch.device) -> bool:
+    """Whether a fused Q/K-norm + RoPE backend covers ``device``.
+
+    The model asks this instead of restating the capability gate, so the CuTe
+    and Triton halves of ``_qknorm_rope``'s dispatch cannot drift apart.
+    """
+    return _can_use_qknorm_cute(device) or _can_use_qknorm_triton(device)
+
+
 def step5_qknorm_rope(
     qkv: torch.Tensor,
     q_weight: torch.Tensor,
@@ -34,7 +59,7 @@ def step5_qknorm_rope(
     eps: float,
     kv_write: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Source CuTe math for local Q8 or Q16/KV1/D192, with FP32 zero-centered weights.
+    """Source CuTe math for local Q4/Q8/Q16 -> KV1/D192, FP32 zero-centered weights.
 
     QKV is contiguous BF16 [T,(Qheads+2)*192]. The model-owned table is contiguous BF16
     [capacity,64 or 192], merged [cos,sin]. This entry creates views, never a
@@ -162,7 +187,7 @@ def _qknorm_rope(
     if tokens:
         width = rotary_cache.shape[1]
         cos, sin = rotary_cache.split(width // 2, dim=-1)
-        if _can_use_qknorm_cute(qkv.device):
+        if heads in _CUTE_Q_HEADS and _can_use_qknorm_cute(qkv.device):
             from sglang.kernels.ops.attention.step5.cute.cute_utils import (
                 device_cache_key,
             )

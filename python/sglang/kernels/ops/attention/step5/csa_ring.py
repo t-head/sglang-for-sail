@@ -4,7 +4,8 @@ compressed index keys, then write ring.
 
 The shared BF16/FP8 rounding-contract reduction
 (_compressed_index_key_bytes) lives here with its sole consumer; no
-separate module.
+separate module. The portable E4M3 encoder next to it is shared with the
+indexer norm port, which cannot name ``fp8e4nv`` on sm80.
 """
 
 import dataclasses
@@ -12,6 +13,28 @@ import dataclasses
 import torch
 import triton
 import triton.language as tl
+
+
+def native_fp8_encoding(device: torch.device) -> bool:
+    """Whether the backend can assemble E4M3 converts natively (sm89 and newer)."""
+    return torch.cuda.get_device_capability(device) >= (8, 9)
+
+
+def supports_fused_ring_append(device: torch.device) -> bool:
+    """Whether one launch can compress a region and publish the ring.
+
+    The fused form needs only what every Triton port offers: one CTA per
+    request, a block barrier before the ring write, and the integer E4M3
+    encoder. PDL stays a separate launch option (SM103-only), so its absence
+    does not block the fusion.
+    """
+    from sglang.srt.platforms import current_platform
+
+    return (
+        device.type == "cuda"
+        and torch.version.hip is None
+        and current_platform.capabilities.supports_triton
+    )
 
 
 @triton.jit
@@ -483,19 +506,13 @@ def append_ring(
     # native cvt.rn.satfinite.e4m3x2.f32; sm80 PPU (810E, (8,0)) cannot and takes
     # the portable integer encoder instead. Decided once on the host so the
     # constexpr branch is resolved (and the unused side DCE'd) at compile time.
-    use_native_fp8 = (
-        torch.cuda.get_device_capability(index_key.device) >= (8, 9)
-        if rows
-        else False
-    )
+    use_native_fp8 = native_fp8_encoding(index_key.device) if rows else False
     if rows:
         fuse_write = (
             max_regions == 1
             and capacity == 16
             and rows <= 64
-            and torch.version.hip is None
-            and index_key.is_cuda
-            and torch.cuda.get_device_capability(index_key.device) == (10, 3)
+            and supports_fused_ring_append(index_key.device)
         )
         if max_regions != 1:
             _admit[(rows,)](

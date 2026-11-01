@@ -23,11 +23,14 @@ def step5_select_regions(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select <=512 historical regions, sort IDs, then append current exactly once.
 
-    Inputs follow step5_paged_scores: finite history and -inf future scores.
-    Width covers positions//8. Slot zero is padding. Output IDs are logical,
-    ascending, int32 [T,513], padded with -1; counts are int32 [T]. Caller must
-    keep outputs disjoint from inputs and each other. Warm FlashInfer outside
-    capture and use its shared device scratch on the sequential forward stream.
+    Inputs follow step5_paged_scores, which owns the +0/-0 fold: the radix top-k
+    orders by bit pattern, so a -0.0 would rank below a +0.0 and beat the smaller
+    region id. Only the first positions//8 columns are ranked, and scores are read
+    as given, so the future tail may hold stale values. Width covers positions//8.
+    Slot zero is padding. Output IDs are logical, ascending, int32 [T,513], padded
+    with -1; counts are int32 [T]. Caller must keep outputs disjoint from inputs
+    and each other. Warm FlashInfer outside capture and use its shared device
+    scratch on the sequential forward stream.
     """
     if scores.device.type != "cuda" or torch.version.hip is not None:
         raise ValueError("Step5 selection requires NVIDIA CUDA")
@@ -90,20 +93,21 @@ def step5_select_regions(
         import flashinfer
 
         from sglang.kernels.ops.attention.step5.selection_triton import (
-            canonicalize_zero,
+            scan_lengths,
         )
 
-        # Numerical equality includes +0/-0; the library's radix key does not.
-        # Keep the caller's scores intact, including during graph replay.
-        ordered_scores = torch.empty_like(scores)
-        canonicalize_zero(scores, ordered_scores)
-        _, indices = flashinfer.top_k(
-            ordered_scores,
+        # The plain entry always scans the full width; the ragged one takes a
+        # per-row length, and only live regions can be selected. Deterministic
+        # mode also returns the IDs ascending, which _pack_regions relies on.
+        meta = torch.empty(2 * rows, dtype=torch.int32, device=scores.device)
+        offsets, lengths = scan_lengths(positions, row_to_req, meta, width)
+        indices = flashinfer.top_k_ragged_transform(
+            scores,
+            offsets,
+            lengths,
             512,
-            sorted=False,
             deterministic=True,
             tie_break=1,
-            dsa_graph_safe=True,
         )
         selected_k = 512
     from sglang.kernels.ops.attention.step5.selection_triton import launch

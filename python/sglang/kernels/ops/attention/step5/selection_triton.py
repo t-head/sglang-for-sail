@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Sort Step5 region IDs, append the current region and optionally pack addresses."""
+"""Append the current Step5 region and optionally pack its addresses."""
 
 import triton
 import triton.language as tl
@@ -18,6 +18,31 @@ def _canonicalize_zero(Scores, Out, N: tl.constexpr, BLOCK: tl.constexpr):
 def canonicalize_zero(scores, out):
     size = scores.numel()
     _canonicalize_zero[(triton.cdiv(size, 1024),)](scores, out, size, 1024, num_warps=4)
+
+
+@triton.jit
+def _scan_lengths(
+    Positions, Requests, Offsets, Lengths, ROWS, WIDTH, BLOCK: tl.constexpr
+):
+    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = row < ROWS
+    position = tl.load(Positions + row, mask, other=0).to(tl.int64)
+    request = tl.load(Requests + row, mask, other=0).to(tl.int64)
+    # Region IDs are numbered by position, so slots past positions//8 hold
+    # future regions and cannot win; a padding row scans nothing.
+    length = tl.where(request > 0, position // 8, 0)
+    tl.store(Offsets + row, tl.zeros([BLOCK], tl.int32), mask)
+    tl.store(Lengths + row, tl.minimum(length, WIDTH).to(tl.int32), mask)
+
+
+def scan_lengths(positions, row_to_req, meta, width):
+    """Write per-row (ID offset, live region count) into the two halves of meta."""
+    rows = positions.numel()
+    offsets, lengths = meta[:rows], meta[rows:]
+    _scan_lengths[(triton.cdiv(rows, 256),)](
+        positions, row_to_req, offsets, lengths, rows, width, 256, num_warps=1
+    )
+    return offsets, lengths
 
 
 @triton.jit
@@ -42,9 +67,10 @@ def _pack_regions(
     live = request > 0
     count = tl.minimum(current, 512)
     if K > 0:
+        # The deterministic ragged entry ranks by ID before returning: IDs come
+        # back ascending with the -1 padding last and below the live count, so
+        # filtering and re-sorting here would be no-ops.
         ids = tl.load(Indices + row * K + lane, lane < K, other=2147483647).to(tl.int32)
-        ids = tl.where((ids >= 0) & (ids < current), ids, 2147483647)
-        ids = tl.sort(ids, descending=False)
     else:
         ids = lane
     result = tl.where(lane < count, ids, tl.where(lane == count, current, -1))

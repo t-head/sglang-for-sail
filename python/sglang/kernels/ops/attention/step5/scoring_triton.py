@@ -48,6 +48,15 @@ def _native_fp8_decode(device: torch.device) -> bool:
     )
 
 
+@triton.jit
+def _plus_zero(score):
+    # FlashInfer's radix key orders floats by bit pattern, where -0.0 sorts below
+    # +0.0; folding here keeps the tie-break on the region id without a copy pass.
+    bits = score.to(tl.uint32, bitcast=True)
+    bits = tl.where((bits & 0x7FFFFFFF) == 0, 0, bits)
+    return bits.to(tl.float32, bitcast=True)
+
+
 @triton.jit(
     do_not_specialize=("REGIONS",),
     do_not_specialize_on_alignment=("REGIONS",),
@@ -126,19 +135,21 @@ def _score_regions(
             score = tl.where(valid, score, -float("inf"))
         else:
             score = tl.full((BLOCK_R,), -float("inf"), tl.float32)
-        tl.store(Out + row * REGIONS + regions, score, regions < REGIONS)
+        tl.store(Out + row * REGIONS + regions, _plus_zero(score), regions < REGIONS)
 
 
-# E4M3FN 的指数偏置是 7，本后端原生支持的 fp8e4b15 偏置是 15 —— 同一个字节在
-# b15 下的数值恰好是 E4M3FN 的 2^-8（阶码、3 位尾数、非规格化约定完全一致）。
-# 于是可以直接把原始字节 bitcast 成 fp8e4b15 送 MMA，再把累加结果乘 2^16 还原，
-# 数值恒等（map 是 2 的幂，不引入任何舍入），却省掉了每个元素 7 条 FP32 解码指令。
+# E4M3FN has exponent bias 7 while fp8e4b15, which this backend supports
+# natively, has bias 15: the same byte read as b15 is exactly 2^-8 of its E4M3FN
+# value (identical exponent field, 3-bit mantissa, denormal convention). So the
+# raw bytes can be bitcast to fp8e4b15 and fed to the MMA, and the accumulator is
+# rescaled by 2^16 to restore the value. The map is a power of two, hence exact,
+# and it removes ~7 FP32 decode instructions per element.
 FP8_RESCALE = tl.constexpr(65536.0)
 
 
 @triton.jit
 def _e4m3_bytes_to_fp8(bits):
-    """E4M3FN 原始字节 → 数值等于原值的 2^-8 的 fp8e4b15。"""
+    """E4M3FN raw bytes, read as fp8e4b15 worth 2^-8 of the original value."""
     return bits.to(tl.float8e4b15, bitcast=True)
 
 
@@ -148,28 +159,67 @@ def _load_keys_tile(
     ReqToToken,
     request,
     regions,
-    channel,
     valid,
     MAP_STRIDE: tl.constexpr,
     BLOCK_R: tl.constexpr,
 ):
-    """取一个 (256, BLOCK_R) 的 E4M3FN 键 tile（SW128 swizzle 布局）。"""
+    """Load one (256, BLOCK_R) E4M3FN key tile from the SW128-swizzled layout.
+
+    The swizzle splits the 256 channels into 16 segments of 16 bytes, and the
+    bytes inside one segment are physically contiguous. Addressing them as
+    (segment, region, byte-in-segment) lets Triton fuse each segment into a
+    single vector load. Computing a flat (256, BLOCK_R) offset instead makes
+    every lane fetch one byte: measured 4.5 bytes per sector, 3.87x load
+    wavefront over-issue and 41% of the issued instructions on IALU, while the
+    MMA itself is 2.5% of the 235us this takes at rows=32 / 16384 live regions.
+    The 3-D form reaches 57 bytes per sector and a 1.91x wavefront.
+    """
     token = tl.load(
         ReqToToken + request * MAP_STRIDE + regions * 8, valid, other=0
     ).to(tl.int32)
-    # int32 偏移：tile 内地址只跨 page，2^31 字节以内，省掉一半整型指令。
     page, slot = token >> 6, (token & 63) >> 3
-    ch = channel[:, None]
-    # Each page contains two 128-byte channel atoms, each with eight
-    # swizzled region rows. XOR uses the physical row, never logical ID.
-    offset = (
+    # Each page contains two 128-byte channel atoms, each with eight swizzled
+    # region rows; the XOR uses the physical row, never the logical ID.
+    seg = tl.arange(0, 16)
+    base = (
         page[None, :] * 2048
-        + (ch >> 7) * 1024
+        + (seg[:, None] >> 3) * 1024
         + slot[None, :] * 128
-        + (((ch & 127) >> 4) ^ slot[None, :]) * 16
-        + (ch & 15)
+        + (((seg[:, None] & 7) ^ slot[None, :]) * 16)
     )
-    return tl.load(CompressedIndexKeys + offset, valid[None, :], other=0)
+    packed = tl.load(
+        CompressedIndexKeys + base[:, :, None] + tl.arange(0, 16)[None, None, :],
+        valid[None, :, None],
+        other=0,
+    )
+    # (segment, region, byte-in-segment) -> channel = segment * 16 + byte
+    return tl.reshape(tl.permute(packed, (0, 2, 1)), (256, BLOCK_R))
+
+
+@triton.jit
+def _live_extent(
+    position,
+    row_valid,
+    request,
+    BLOCK_R: tl.constexpr,
+    REGIONS,
+    CLEAR_FUTURE: tl.constexpr,
+):
+    """Live region count per row and the last tile any row of the group needs.
+
+    A 1M graph capture has 4096 capacity tiles while a 60K request has about
+    235 live tiles, so both modes stop at live history. The portable FlashInfer
+    fallback (CLEAR_FUTURE) needs -inf past live to make a full-width top-k
+    replay safe; ``launch`` covers that part of every row with the flat
+    ``_wipe_scores`` pass instead of a per-tile full-width store.
+    """
+    live = tl.where(row_valid & (request > 0), tl.maximum(position // 8, 0), 0)
+    max_live = tl.max(live, axis=0)
+    last_tile = tl.minimum(tl.cdiv(max_live, BLOCK_R), tl.cdiv(REGIONS, BLOCK_R))
+    if not CLEAR_FUTURE:
+        # Selecting every historical region does not consume region_scores.
+        last_tile = tl.where(max_live <= 512, 0, last_tile)
+    return live, max_live, last_tile
 
 
 @triton.jit(
@@ -193,23 +243,35 @@ def _score_regions_ppu_opt(
     BLOCK_R: tl.constexpr,
     GRID_TILES: tl.constexpr,
     CLEAR_FUTURE: tl.constexpr,
+    EARLY_EXIT: tl.constexpr,
     WEIGHT_SCALE: tl.constexpr,
     GROUP_ROWS: tl.constexpr,
     HEAD_BLOCK: tl.constexpr,
     MIXED: tl.constexpr,
     HAS_SPANS: tl.constexpr,
 ):
-    """GROUP_ROWS 行一起算：同一个 request 下的多行共用一次键 tile gather。
+    """Score GROUP_ROWS rows together so they share one key-tile gather.
 
-    与原 ``_score_regions`` 的三个差别：
-    1. 键/查询字节直接送 fp8 MMA，不再逐元素软件解码 E4M3（原路径一半的指令）；
-    2. M = GROUP_ROWS * HEAD_BLOCK 由同一 request 的相邻行拼满，键 tile 在组内
-       复用，gather 次数降到 1/GROUP_ROWS；
-    3. 整个 tile 落在 live 之外时直接跳过 gather/MMA，只写 -inf。
+    Four differences from the original ``_score_regions``:
+    1. key/query bytes go straight into the fp8 MMA instead of an element-wise
+       software E4M3 decode (half of the instructions on the old path);
+    2. M = GROUP_ROWS * HEAD_BLOCK is filled with adjacent rows of the same
+       request, so the key tile is reused inside the group and the gather count
+       drops to 1/GROUP_ROWS;
+    3. a tile that lies entirely past live skips gather/MMA; under CLEAR_FUTURE
+       its -inf columns are pre-filled by ``_wipe_scores`` instead of being
+       written full width by every tile;
+    4. a CTA whose whole tile range lies past live returns before the query tile
+       is loaded, so the fixed per-CTA cost is skipped together with the work.
+       ``EARLY_EXIT`` enables that only when the launch can have an empty CTA;
+       otherwise the bound is computed below the query load where the gather's
+       latency hides it, and no CTA pays for a test that cannot fire.
 
-    组内 request 不一致（request 边界落在组内）时走逐行冷路径。冷路径必须「每行
-    算完立刻写 Out」，不能在寄存器里累积组级 (GROUP_ROWS, BLOCK_R) 结果：那样会把
-    热路径的 fp8 query tile 挤出寄存器，实测让 capture 用例从 5.9us 退化到 20us 以上。
+    When the group spans several requests (a request boundary falls inside it)
+    the kernel takes the per-row cold path. That path must store Out as soon as
+    a row is done and must not accumulate a group-level (GROUP_ROWS, BLOCK_R)
+    result in registers: doing so evicts the hot-path fp8 query tile and was
+    measured to push the capture case from 5.9us to over 20us.
     """
     group = tl.program_id(0).to(tl.int64)
     first_tile = tl.program_id(1)
@@ -231,6 +293,19 @@ def _score_regions_ppu_opt(
     # a live score; only the owned rows have to agree for the hot path.
     mixed = (request != base_request) & (request != 0) & row_valid
     uniform = tl.sum(mixed.to(tl.int32), axis=0) == 0
+
+    if EARLY_EXIT:
+        live, max_live, last_tile = _live_extent(
+            position, row_valid, request, BLOCK_R, REGIONS, CLEAR_FUTURE
+        )
+        # Leave before the query tile is read: a CTA with no live tile writes
+        # nothing, yet that tile is GROUP_ROWS * HEAD_BLOCK * 256 bytes (8KB at
+        # group 8 / head block 4) plus its MMA operand staging. Whenever REGIONS
+        # over-provisions live -- a decode step whose context is far below
+        # capacity, or a replay with padded positions -- those CTA are the
+        # majority and their prologue is the whole kernel.
+        if first_tile >= last_tile:
+            return
 
     matrix_row = tl.arange(0, GROUP_ROWS * HEAD_BLOCK)
     channel = tl.arange(0, 256)
@@ -254,24 +329,22 @@ def _score_regions_ppu_opt(
         ).to(tl.float32)
         * WEIGHT_SCALE
     )
+    if not EARLY_EXIT:
+        # Every CTA of this launch has work, so the bound must not gate the query
+        # load: computing it here lets the reduction overlap the gather latency,
+        # which is why the long-prefill configuration keeps this order.
+        live, max_live, last_tile = _live_extent(
+            position, row_valid, request, BLOCK_R, REGIONS, CLEAR_FUTURE
+        )
 
-    live = tl.where(row_valid & (request > 0), tl.maximum(position // 8, 0), 0)
-    max_live = tl.max(live, axis=0)
-    # A 1M graph capture has 4096 capacity tiles while a 60K request has about
-    # 235 live tiles. The SM10x selector consumes positions directly, so its
-    # path can stop at live history. The portable FlashInfer fallback still
-    # overwrites future tiles to make a full-width top-k replay safe.
-    if CLEAR_FUTURE:
-        last_tile = tl.cdiv(REGIONS, BLOCK_R)
-    else:
-        last_tile = tl.minimum(tl.cdiv(max_live, BLOCK_R), tl.cdiv(REGIONS, BLOCK_R))
-        # Selecting every historical region does not consume region_scores.
-        last_tile = tl.where(max_live <= 512, 0, last_tile)
     for tile in range(first_tile, last_tile, GRID_TILES):
         regions = tile * BLOCK_R + tl.arange(0, BLOCK_R)
         in_range = regions < REGIONS
-        # CLEAR_FUTURE 下要覆盖满宽；否则只写到本行 live 所在的 tile 边界为止，
-        # 与原实现「不碰 live 之后」的写入范围保持一致（live<=512 一行都不写）。
+        # Under CLEAR_FUTURE the whole tile is written: lanes past live get -inf,
+        # the same value ``_wipe_scores`` already laid down, so the duplicate
+        # store is idempotent. Otherwise stop at the tile edge that holds this
+        # row's live range, matching the original "never touch past live" extent
+        # (live<=512 writes nothing).
         if CLEAR_FUTURE:
             written = in_range[None, :]
         else:
@@ -284,7 +357,6 @@ def _score_regions_ppu_opt(
                 ReqToToken,
                 base_request,
                 regions,
-                channel,
                 in_range & (regions < max_live),
                 MAP_STRIDE,
                 BLOCK_R,
@@ -297,14 +369,16 @@ def _score_regions_ppu_opt(
             score = tl.where(regions[None, :] < live[:, None], score, -float("inf"))
             tl.store(
                 Out + rows[:, None] * REGIONS + regions[None, :],
-                score,
+                _plus_zero(score),
                 row_valid[:, None] & written,
             )
         elif MIXED:
-            # 组内跨 request（request 边界落在组内）：键 tile 没法在组内复用，只能
-            # 按行做。这里刻意让每行算完立刻写 Out，不在 kernel 里累积组级 (G,B)
-            # 结果：那样会把热路径的 fp8 query tile 挤出寄存器，实测 capture 从
-            # 5.9us 退化到 20us 以上。冷路径只占用单行的活跃值。
+            # The group spans several requests (a request boundary falls inside
+            # it): the key tile cannot be shared, so do the work per row. Each
+            # row stores Out as soon as it is done instead of accumulating a
+            # group-level (G, B) result, which would evict the hot-path fp8
+            # query tile and was measured to push the capture case from 5.9us to
+            # over 20us. The cold path only keeps one row's live values alive.
             for r in tl.range(0, GROUP_ROWS, loop_unroll_factor=1):
                 row = row_base + r
                 row_ok = row < row_limit
@@ -342,7 +416,6 @@ def _score_regions_ppu_opt(
                         ReqToToken,
                         request_r,
                         regions,
-                        channel,
                         in_range & (regions < live_r),
                         MAP_STRIDE,
                         BLOCK_R,
@@ -350,13 +423,17 @@ def _score_regions_ppu_opt(
                     products_r = tl.dot(query_r, _e4m3_bytes_to_fp8(packed_r)) * FP8_RESCALE
                     score_r = tl.sum(tl.maximum(products_r, 0.0) * weight_r[:, None], axis=0)
                     score_r = tl.where(regions < live_r, score_r, -float("inf"))
-                tl.store(Out + row * REGIONS + regions, score_r, row_ok & row_written)
+                tl.store(
+                    Out + row * REGIONS + regions,
+                    _plus_zero(score_r),
+                    row_ok & row_written,
+                )
         else:
             score = tl.zeros((GROUP_ROWS, BLOCK_R), tl.float32)
             score = tl.where(regions[None, :] < live[:, None], score, -float("inf"))
             tl.store(
                 Out + rows[:, None] * REGIONS + regions[None, :],
-                score,
+                _plus_zero(score),
                 row_valid[:, None] & written,
             )
 
@@ -442,7 +519,7 @@ def _score_four_rows_per_request(
         output_valid = row_valid[:, None] & (regions[None, :] < live[:, None])
         tl.store(
             Out + group_rows[:, None] * REGIONS + regions[None, :],
-            region_scores,
+            _plus_zero(region_scores),
             output_valid,
         )
 
@@ -534,17 +611,22 @@ def _score_thirty_two_rows_per_request(
             output_valid = row_valid[:, None] & (regions[None, :] < live[:, None])
             tl.store(
                 Out + rows[:, None] * REGIONS + regions[None, :],
-                region_scores,
+                _plus_zero(region_scores),
                 output_valid,
             )
 
 
 def _group_plan(rows, group_rows):
-    """每多少个相邻行拼一次 MMA。
+    """How many adjacent rows to fold into one MMA.
 
-    ``group_rows`` 是调用方给出的「一个 request 占多少行」提示（prefill 的 chunk、
-    MTP 校验的 4 行），只有它是候选值的整数倍时才能保证组内同 request。行数太少时
-    分组会带来大量空转的 CTA，所以要求至少能凑够 8 个满组。
+    ``group_rows`` is the caller's hint for how many rows one request owns (a
+    prefill chunk, the 4 rows of an MTP verify); only a divisor of it keeps a
+    group inside a single request. A group may not be wider than the row count,
+    but there is no need to collect N full groups: grouping only narrows the
+    first grid dimension, while the second one, ``grid_tiles`` (capped at 128),
+    already fills the machine. Measured: decode at batch 1~3 (rows=4/8/12) is
+    faster with the full group=4 (147us -> 47us at 16384 live regions) because
+    the key-tile gather count drops to a quarter.
     """
     want = 1
     if group_rows and group_rows > 1:
@@ -552,14 +634,59 @@ def _group_plan(rows, group_rows):
             if group_rows % cand == 0:
                 want = cand
                 break
-    while want > 1 and rows // want < 8:
+    while want > 1 and rows < want:
         want //= 2
     return want
 
 
-# grid 第二维上限：REGIONS 很大时（1M graph capture 有 4096 个 region）不需要每 tile
-# 一个 CTA，留下 128 个足以填满机器，其余 tile 在 kernel 内循环。
+# Upper bound on the second grid dimension: when REGIONS is huge (a 1M graph
+# capture has 4096 region tiles) one CTA per tile is unnecessary; 128 of them
+# already fill the machine and the remaining tiles are looped inside the kernel.
 _MAX_GRID_TILES = 128
+
+
+def _early_exit_worthwhile(rows: int, block_regions: int, grid_tiles: int) -> bool:
+    """Whether any CTA of this launch can end before its query tile.
+
+    Rows of one launch carry consecutive token positions, so the row count
+    lower-bounds how far live reaches: the last row sits at least ``rows - 1``
+    tokens past the first. When even that bound already covers every grid tile,
+    no CTA can exit and pulling the bound ahead of the query tile only makes the
+    gather wait for it. Shapes are fixed at graph capture, so this decision is
+    identical on every replay.
+    """
+    live_lower_bound = max(rows - 1, 0) // 8
+    return triton.cdiv(live_lower_bound, block_regions) < grid_tiles
+
+
+# region_scores comes from torch.empty and the portable selector runs top-k over
+# the whole row, so columns past live must be -inf. Keeping that sweep inside the
+# scoring kernel forces stores no wider than BLOCK_R elements: measured 425us out
+# of the 441us it takes for (16, 131080) went into laying down -inf. As its own
+# flat kernel the same 8MB write costs ~4us, because every store is a 16B vector
+# (BLOCK=4096 / 4 warps, measured 3.9us, 2.2TB/s, on par with torch fill_).
+_WIPE_BLOCK = 4096
+
+
+@triton.jit(
+    do_not_specialize=("TOTAL",),
+    do_not_specialize_on_alignment=("TOTAL",),
+)
+def _wipe_scores(Out, TOTAL, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tl.store(
+        Out + offsets,
+        tl.full((BLOCK,), -float("inf"), tl.float32),
+        offsets < TOTAL,
+    )
+
+
+def _wipe_region_scores(out):
+    """Fill region_scores with -inf; the live part is overwritten afterwards."""
+    total = out.numel()
+    _wipe_scores[(triton.cdiv(total, _WIPE_BLOCK),)](
+        out, total, _WIPE_BLOCK, num_warps=4
+    )
 
 
 def _launch_reference(
@@ -671,6 +798,7 @@ def _launch_spans(
     heads = q.shape[1]
     block_regions = 8
     grid_tiles = min(triton.cdiv(regions, block_regions), _MAX_GRID_TILES)
+    early_exit = _early_exit_worthwhile(q.shape[0], block_regions, grid_tiles)
     _score_regions_ppu_opt[(starts.numel(), grid_tiles)](
         q,
         weights,
@@ -688,6 +816,7 @@ def _launch_spans(
         block_regions,
         grid_tiles,
         clear_future,
+        early_exit,
         weight_scale,
         span_rows,
         max(4, heads + (-heads % 4)),
@@ -728,6 +857,11 @@ def launch(
     rows = q.shape[0]
     regions = out.shape[1]
     heads = q.shape[1]
+    # ``clear_future`` means the portable selector reads the whole row, so future
+    # columns must be -inf. One flat fill replaces the per-tile full-width store
+    # of the scoring kernel (the values written are identical).
+    if clear_future and rows:
+        _wipe_region_scores(out)
     if score_groups is not None:
         _launch_spans(
             q,
@@ -743,11 +877,18 @@ def launch(
         )
         return
     group = _group_plan(rows, group_rows)
-    # 分组时 M = group*head_block 已经够宽，BLOCK_R 取 8 摊薄 gather 的固定开销；
-    # 每组只有一行时 gather 无法复用，BLOCK_R=4 + 单 warp 的 CTA 吞吐更好。
-    block_regions = 4 if group == 1 else 8
+    # Now that the key tile is addressed as (segment, region, byte-in-segment),
+    # widening BLOCK_R no longer inflates the address math; instead it lifts the
+    # per-row score store from 32B to 128B and cuts the tile count by 4x (16384
+    # live regions: rows=32 goes from 223us to 85us of kernel time).
+    # A single scoring grid does not fill the CUs with one warp per CTA, and two
+    # warps are never slower across the rows/group combinations (a tie at
+    # group=1); four warps lose to register spilling.
+    block_regions = 32
+    num_warps = 2
     grid_tiles = min(triton.cdiv(regions, block_regions), _MAX_GRID_TILES)
     head_block = max(4, heads + (-heads % 4))
+    early_exit = _early_exit_worthwhile(rows, block_regions, grid_tiles)
     _score_regions_ppu_opt[(triton.cdiv(rows, group), grid_tiles)](
         q,
         weights,
@@ -767,10 +908,11 @@ def launch(
         block_regions,
         grid_tiles,
         clear_future,
+        early_exit,
         weight_scale,
         group,
         head_block,
         True,
         False,
-        num_warps=1 if group == 1 else 2,
+        num_warps=num_warps,
     )
