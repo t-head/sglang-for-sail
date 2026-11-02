@@ -5,11 +5,22 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.step5.csa_ring import (
+    _f32_to_e4m3,
+    native_fp8_encoding,
+)
+
 
 @triton.jit
-def _fp8_bits(value, SATURATE: tl.constexpr):
+def _fp8_bits(value, SATURATE: tl.constexpr, NATIVE_FP8: tl.constexpr):
     f = value.to(tl.float32)
-    bits = f.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+    if NATIVE_FP8:
+        bits = f.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+    else:
+        # sm80 PPU has no fp8e4nv dtype at all. The ring's integer encoder
+        # produces the same RNE/satfinite bytes there, so Q can still leave the
+        # norm as E4M3 instead of taking a separate Torch cast pass.
+        bits = _f32_to_e4m3(f)
     if not SATURATE:
         # 464 is the RNE midpoint between max finite 448 and the NaN encoding
         # at 480. Preserve the caller's probed Torch overflow policy.
@@ -46,6 +57,7 @@ def _indexer_norm_rope(
     ZERO_CENTERED: tl.constexpr,
     WRITE_Q_E4M3: tl.constexpr,
     FP8_SATURATE: tl.constexpr,
+    NATIVE_FP8: tl.constexpr,
     USE_PDL: tl.constexpr = False,
 ):
     if USE_PDL:
@@ -97,7 +109,7 @@ def _indexer_norm_rope(
         if head < HEADS:
             # Match both existing cast paths: fused norm honors the probed Torch
             # policy; BF16 norm -> prepare_scoring uses Triton saturating conversion.
-            bits = _fp8_bits(result, not WRITE_Q_E4M3 or FP8_SATURATE)
+            bits = _fp8_bits(result, not WRITE_Q_E4M3 or FP8_SATURATE, NATIVE_FP8)
             bits = tl.where(live_q, bits, 0).to(tl.uint8)
             packed_h = group * 16 + (head // 2) * 8 + slot * 2 + head % 2
             tl.store(QOut + packed_h * 256 + channel, bits)
@@ -124,11 +136,8 @@ def _indexer_norm_rope(
     else:
         if head < HEADS:
             if WRITE_Q_E4M3:
-                bits = _fp8_bits(result, FP8_SATURATE)
-                tl.store(
-                    QOut + (token * HEADS + head) * 256 + channel,
-                    bits.to(tl.float8e4nv, bitcast=True),
-                )
+                bits = _fp8_bits(result, FP8_SATURATE, NATIVE_FP8)
+                tl.store(QOut + (token * HEADS + head) * 256 + channel, bits)
             else:
                 tl.store(QOut + (token * HEADS + head) * 256 + channel, result)
     if head == HEADS:
@@ -159,6 +168,14 @@ def launch(
     packed = packed_workspace is not None
     group = packed_workspace.rows_per_group if packed else 1
     grid_rows = triton.cdiv(q.shape[0], 4) * 4 if packed and group == 4 else q.shape[0]
+    if packed:
+        q_dst = packed_workspace.q_runtime.view(torch.uint8)
+    elif q_e4m3:
+        # E4M3 bytes travel as uint8: naming fp8e4nv as a pointer element type
+        # already fails to compile where Triton has no such dtype (sm80 PPU).
+        q_dst = q_out.view(torch.uint8)
+    else:
+        q_dst = q_out
     _indexer_norm_rope[(grid_rows, q.shape[1] + 1)](
         q,
         k,
@@ -167,7 +184,7 @@ def launch(
         kb,
         cache,
         positions,
-        packed_workspace.q_runtime.view(torch.uint8) if packed else q_out,
+        q_dst,
         k_out,
         requests,
         weights,
@@ -183,6 +200,7 @@ def launch(
         int(zero_centered),
         int(q_e4m3),
         int(fp8_saturate),
+        int(native_fp8_encoding(q.device)),
         USE_PDL=use_pdl,
         launch_pdl=use_pdl,
         num_warps=4,

@@ -6,6 +6,23 @@ import math
 import torch
 
 
+def supports_fused_fp8_cast(device: torch.device) -> bool:
+    """Whether the norm kernel can emit Q as E4M3 bytes on ``device``.
+
+    Ports without a native ``fp8e4nv`` dtype encode with the ring's integer
+    encoder, which reproduces the Torch ``to(float8_e4m3fn)`` bytes exactly, so
+    the separate cast pass is removable there too. The model asks this instead
+    of restating the backend capability.
+    """
+    from sglang.srt.platforms import current_platform
+
+    return (
+        device.type == "cuda"
+        and torch.version.hip is None
+        and current_platform.capabilities.supports_triton
+    )
+
+
 def _check_tensor(value, *, shape, dtype, device, name, contiguous=True):
     if (
         value.layout != torch.strided
