@@ -545,8 +545,12 @@ class FlashAttentionBackend(AttentionBackend):
 
         q_len = max(int(getattr(metadata, "max_seq_len_q", 1) or 1), 1)
         # TODO(yhyang201): frozen SGLANG_OPT_STEP5_SWA_FA4_WINDOW_ALIGN; prune dead paths.
-        if not step5_options.SWA_FA4_WINDOW_ALIGN or (
-            not swa_window_align_supported(q_len)
+        # Only FA4 reads the aligned pair; FA3 hands the unaligned seqlens to
+        # ``_swa_window_aligned_kvcache`` whatever this would fill in.
+        if (
+            self.fa_impl_ver != 4
+            or not step5_options.SWA_FA4_WINDOW_ALIGN
+            or not swa_window_align_supported(q_len)
         ):
             metadata.swa_aligned_seqlens = None
             metadata.swa_cache_leftpad = None
@@ -617,45 +621,65 @@ class FlashAttentionBackend(AttentionBackend):
         return False
 
     def swa_kv_write_target(
-        self, layer: RadixAttention
+        self, layer: RadixAttention, forward_batch: ForwardBatch
     ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """Physical SWA K/V rows and loc for a fused QK-norm store, or None.
+        """Physical K/V rows and loc for a fused QK-norm store, or None.
 
-        Returns ``(k_cache[slots, 192], v_cache[slots, 192], swa_out_cache_loc)``
-        when this layer can write the paged cache inside ``step5_qknorm_rope``.
-        Callers must skip ``set_kv_buffer`` when the return is not None.
+        Returns ``(k_cache[slots, 192], v_cache[slots, 192], loc)`` when this
+        layer's paged write is a plain row scatter that ``step5_qknorm_rope`` can
+        absorb. Callers must skip ``set_kv_buffer`` when the return is not None.
+
+        A SWA sub-pool is written at the forward's pre-translated window loc; a
+        batch without one is written at its own ``out_cache_loc``. Both are the
+        locs ``KVWriteLoc.for_layer`` hands ``set_kv_buffer``, on every FA
+        version: the windows only change what attention reads.
         """
-        if not (
-            self.use_sliding_window_kv_pool
-            and self.fa_impl_ver == 4
-            and not self.kv_cache_is_mxfp8
-            and self.attn_cp_size <= 1
-        ):
+        if self.kv_cache_is_mxfp8 or self.attn_cp_size > 1 or self.fa_skip_kv_cache:
             return None
         if layer.sliding_window_size is None or layer.sliding_window_size <= -1:
+            return None
+        # One 192-wide row per slot: a second KV head would fold two heads into
+        # one row, so the row view below would scatter the wrong bytes.
+        if layer.tp_k_head_num != 1 or layer.tp_v_head_num != 1:
+            return None
+        # A pool that demands physical locs rejects a batch whose ids still need
+        # translating; the fused store cannot prove they were, so stay on the door.
+        if (
+            self.token_to_kv_pool.requires_physical_write_loc
+            and not forward_batch.out_cache_loc_is_physical
+        ):
             return None
         if not (
             self._is_identity_kv_scale(layer.k_scale)
             and self._is_identity_kv_scale(layer.v_scale)
         ):
             return None
-        metadata = self.forward_metadata
-        if metadata is None or metadata.swa_out_cache_loc is None:
-            return None
-        loc = metadata.swa_out_cache_loc
-        if loc.ndim != 1 or loc.numel() == 0:
+        if self.use_sliding_window_kv_pool:
+            metadata = self.forward_metadata
+            loc = metadata.swa_out_cache_loc if metadata is not None else None
+        else:
+            # The same loc ``KVWriteLoc.for_layer`` hands ``set_kv_buffer``.
+            loc = (
+                forward_batch.encoder_out_cache_loc
+                if layer.is_cross_attention
+                else forward_batch.out_cache_loc
+            )
+        if loc is None or loc.ndim != 1 or loc.numel() == 0:
             return None
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
-        if k_cache.shape[-1] != 192 or v_cache.shape[-1] != 192:
+        if (
+            k_cache.shape[-1] != 192
+            or v_cache.shape[-1] != 192
+            or not k_cache.is_contiguous()
+            or not v_cache.is_contiguous()
+        ):
             return None
         k_rows = k_cache.view(-1, 192)
         v_rows = v_cache.view(-1, 192)
         if (
             k_rows.dtype != torch.bfloat16
             or v_rows.dtype != torch.bfloat16
-            or not k_rows.is_contiguous()
-            or not v_rows.is_contiguous()
             or loc.dtype != torch.int64
             or not loc.is_contiguous()
         ):

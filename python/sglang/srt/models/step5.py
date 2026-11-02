@@ -22,6 +22,7 @@ from sglang.kernels.ops.attention.step5 import options as step5_options
 from sglang.kernels.ops.attention.step5.qknorm_rope import (
     step5_qknorm_rope,
     step5_qknorm_rope_gated,
+    supports_fused_qknorm_rope,
 )
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 from sglang.kernels.ops.moe.step5_router_topk import Step5RouterTopKOp
@@ -971,16 +972,10 @@ class Step5Attention(nn.Module):
             and self.qkv_proj.weight.shape in ((1920, 4096), (3456, 4096))
             else 255
         )
-        # The fused CuTe Q/K-norm + RoPE kernel only supports Hopper/Blackwell
-        # (capability 9/10); see cute/qknorm_dispatch.py. On other devices (e.g.
-        # sm80 PPU) route to the module-level reference ops instead, matching the
-        # capability gating the rest of the Step5 kernels already use.
-        self._fused_qknorm = (
-            self.qkv_proj.weight.is_cuda
-            and torch.version.hip is None
-            and torch.cuda.get_device_capability(self.qkv_proj.weight.device)[0]
-            in (9, 10)
-        )
+        # The fused Q/K-norm + RoPE port dispatches CuTe on Hopper/Blackwell and
+        # the portable Triton kernel elsewhere (e.g. sm80 PPU). Ask the port
+        # itself, so this flag cannot drift from its backend dispatch.
+        self._fused_qknorm = supports_fused_qknorm_rope(self.qkv_proj.weight.device)
 
     def _apply(self, fn, recurse=True):
         super()._apply(fn, recurse=recurse)
@@ -1088,13 +1083,14 @@ class Step5Attention(nn.Module):
         if (
             not self.is_dsa
             and not idle
-            # The fused SWA KV store is only reproduced by the CuTe kernel; the
-            # generic fallback keeps kv_write=None so the backend saves KV.
+            # Both qknorm backends reproduce the fused store; the attention
+            # backend only offers a target where its own paged write is a plain
+            # row scatter at a loc it can name up front.
             and self._fused_qknorm
             # TODO(yhyang201): frozen SGLANG_OPT_STEP5_SWA_FUSED_QKNORM_STORE; prune dead paths.
             and step5_options.SWA_FUSED_QKNORM_STORE
         ):
-            candidate = backend.swa_kv_write_target(self.attn)
+            candidate = backend.swa_kv_write_target(self.attn, forward_batch)
             if (
                 candidate is not None
                 and candidate[2].shape == (qkv.shape[0],)
@@ -1201,7 +1197,7 @@ class Step5Attention(nn.Module):
     def _qknorm_rope_generic(
         self, qkv: torch.Tensor, positions: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Reference Q/K-norm + RoPE for platforms without the CuTe kernel.
+        """Reference Q/K-norm + RoPE for platforms the fused port does not cover.
 
         Mirrors ``step5_qknorm_rope`` for the non-gated packed row
         ``qkv = [T, (heads + 2) * head_dim]`` laid out as ``[Q | K | V]``:

@@ -866,9 +866,9 @@ class Step5AttentionBackend(AttentionBackend):
             and torch.cuda.get_device_capability(metadata.partial.device) == (10, 3)
         )
 
-    def swa_kv_write_target(self, layer):
+    def swa_kv_write_target(self, layer, forward_batch):
         fn = getattr(self.swa_backend, "swa_kv_write_target", None)
-        return fn(layer) if fn is not None else None
+        return fn(layer, forward_batch) if fn is not None else None
 
     def forward_decode(
         self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs
