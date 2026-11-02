@@ -145,3 +145,56 @@ def softcap_inplace_logits(full_logits, final_logit_softcapping):
 def softcap_to_float32_logits(logits, final_logit_softcapping, output):
     """Write softcapped FP32 logits to an equally shaped, row-contiguous output."""
     return _softcap_logits(logits, final_logit_softcapping, output)
+
+
+@triton.jit
+def _gathered_softcap_logits_kernel(
+    gathered_ptr,
+    output_ptr,
+    num_tokens,
+    shard_width,
+    vocab_size,
+    output_row_stride,
+    softcapping_value,
+    BLOCK_SIZE: tl.constexpr,
+    APPLY_SOFTCAP: tl.constexpr = True,
+):
+    row = tl.program_id(1).to(tl.int64)
+    cols = tl.program_id(0).to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = cols < vocab_size
+    shard = cols // shard_width
+    x = tl.load(
+        gathered_ptr
+        + (shard * num_tokens + row) * shard_width
+        + cols
+        - shard * shard_width,
+        mask=mask,
+    ).to(tl.float32)
+    if APPLY_SOFTCAP:
+        x = x / softcapping_value
+        x = libdevice.tanh(x)
+        x = x * softcapping_value
+    tl.store(output_ptr + row * output_row_stride + cols, x, mask=mask)
+
+
+def gathered_softcap_logits(gathered, final_logit_softcapping, output):
+    """Reorder gathered TP shards into FP32 logits, optionally applying softcap."""
+    world, num_tokens, shard_width = gathered.shape
+    vocab_size = output.shape[1]
+    assert gathered.is_contiguous() and output.stride(1) == 1
+    assert output.shape[0] == num_tokens and vocab_size <= world * shard_width
+    block_size = 1024
+    _gathered_softcap_logits_kernel[
+        (triton.cdiv(vocab_size, block_size), num_tokens)
+    ](
+        gathered,
+        output,
+        num_tokens,
+        shard_width,
+        vocab_size,
+        output.stride(0),
+        final_logit_softcapping,
+        BLOCK_SIZE=block_size,
+        APPLY_SOFTCAP=final_logit_softcapping is not None,
+    )
+    return output

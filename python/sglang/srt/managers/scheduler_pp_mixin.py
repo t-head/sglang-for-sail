@@ -1017,6 +1017,9 @@ class SchedulerPPMixin:
     ):
         from sglang.srt.managers.scheduler import GenerationBatchResult
 
+        self._pp_apply_linker_failures(
+            batch, pp_outputs.tensors.get("__linker_failed_rids__", [])
+        )
         logits_output = None
         extend_input_len_per_req = None
         extend_logprob_start_len_per_req = None
