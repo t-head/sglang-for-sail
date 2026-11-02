@@ -8,7 +8,10 @@ from torch import nn
 from torch.nn import functional as F
 
 from sglang.kernels.ops.attention.step5 import options as step5_options
-from sglang.kernels.ops.attention.step5.indexer_norm import step5_indexer_norm_rope
+from sglang.kernels.ops.attention.step5.indexer_norm import (
+    step5_indexer_norm_rope,
+    supports_fused_fp8_cast,
+)
 from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
 from sglang.srt.configs.step5 import get_step5_position_padding
 from sglang.srt.layers.attention.step5.compressor import compress_index_keys
@@ -179,7 +182,7 @@ class Step5Indexer(nn.Module):
             # TODO(yhyang201): frozen SGLANG_OPT_STEP5_FUSE_INDEXER_FP8_CAST; prune dead paths.
             step5_options.FUSE_INDEXER_FP8_CAST
             if step5_options.FUSE_INDEXER_FP8_CAST is not None
-            else use_b300_fusions
+            else (use_b300_fusions or supports_fused_fp8_cast(weight.device))
         )
         self.fp8_saturate = (
             _cuda_fp8_saturates(weight.device)
