@@ -63,7 +63,7 @@ def pcg_dsa_indexer_prefill_split(
     query_tokens = extend_num_tokens
     logical_tokens = extend_num_tokens
     if cp:
-        from sglang.srt.layers.cp.bcg.interleave_bcg import cp_interleave_indexer_rows
+        from sglang.srt.layers.cp.interleave import cp_interleave_indexer_rows
 
         query_tokens, logical_tokens = cp_interleave_indexer_rows(forward_batch)
         parts = x if isinstance(x, tuple) else (x,)

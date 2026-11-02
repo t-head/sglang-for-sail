@@ -27,9 +27,13 @@ module = (SITE / "sgl_kernel/flashmla_ops.abi3.so").read_bytes()
 missing = [op for op in ops if op.encode() not in module]
 print(f"flashmla_ops: {len(ops) - len(missing)}/{len(ops)} registered ops present")
 if not ops or missing:
-    errors.append(f"flashmla_ops lacks {missing or 'all ops'}: the PyPI build is installed")
+    errors.append(
+        f"flashmla_ops lacks {missing or 'all ops'}: the PyPI build is installed"
+    )
 
-header = SITE / "flashinfer/data/include/flashinfer/trtllm/fused_moe/RoutingCustomPolicy.cuh"
+header = (
+    SITE / "flashinfer/data/include/flashinfer/trtllm/fused_moe/RoutingCustomPolicy.cuh"
+)
 match = re.search(r"DynBlockKernelMaxNumExperts = (\d+);", header.read_text())
 print(f"flashinfer DynBlockKernelMaxNumExperts: {match and match.group(1)}")
 if not match or int(match.group(1)) < 896:
@@ -41,7 +45,9 @@ modules = [
     for path in SITE.glob(f"flashinfer*/**/{name}.so")
 ]
 if not modules:
-    errors.append("no installed fused_moe_trtllm_sm100 / trtllm_gen_routing module found")
+    errors.append(
+        "no installed fused_moe_trtllm_sm100 / trtllm_gen_routing module found"
+    )
 for module_path in modules:
     marker_path = module_path.parent / "k31-dynblock.json"
     marker = json.loads(marker_path.read_text()) if marker_path.exists() else {}
@@ -49,7 +55,9 @@ for module_path in modules:
         marker.get("header_sha256") != header_sha256
         or marker.get("DynBlockKernelMaxNumExperts") != 1024
     )
-    print(f"{module_path.relative_to(SITE)}: {'stale' if stale else 'rebuilt for 1024 experts'}")
+    print(
+        f"{module_path.relative_to(SITE)}: {'stale' if stale else 'rebuilt for 1024 experts'}"
+    )
     if stale:
         errors.append(
             f"{module_path} was not rebuilt from the patched header (build_flashinfer_dynblock.py)"

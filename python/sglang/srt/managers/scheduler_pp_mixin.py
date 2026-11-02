@@ -31,7 +31,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_BUILD_BATCH,
-    SCHEDULER_STAGE_DISAGG_BOOKKEEPING,
     SCHEDULER_STAGE_LAUNCH_BATCH,
     SCHEDULER_STAGE_PD_CONSENSUS,
     SCHEDULER_STAGE_PP_COMM_WAIT,
@@ -45,7 +44,7 @@ from sglang.srt.sampling.sampling_observer_pp import (
     pop_auxiliary_output_from_pp_tensors,
 )
 from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj
-from sglang.srt.utils.common import is_npu, is_xpu
+from sglang.srt.utils.common import async_d2h, is_npu, is_xpu
 
 _is_npu = is_npu()
 logger = logging.getLogger(__name__)

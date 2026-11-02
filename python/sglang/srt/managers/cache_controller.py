@@ -19,7 +19,7 @@ import threading
 import time
 from dataclasses import dataclass
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional
 
 import torch
 
@@ -581,6 +581,35 @@ class HiCacheController:
         """
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
+        if get_parallel().attn_dcp_size > 1:
+            if self.host_memory_mode == "buffer_only":
+                raise NotImplementedError(
+                    "HiCache L3 with DCP does not support buffer_only host memory."
+                )
+            from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+
+            if storage_backend not in ("file", "mooncake"):
+                raise NotImplementedError(
+                    "HiCache L3 with DCP requires file or Mooncake storage."
+                )
+            if (
+                not isinstance(self.storage_host_pool, MLATokenToKVPoolHost)
+                or self.storage_host_pool.kv_buffer is None
+            ):
+                raise NotImplementedError(
+                    "HiCache L3 with DCP requires a materialized MLA host pool."
+                )
+            if self.mem_pool_host is not self.storage_host_pool:
+                for entry in self.mem_pool_host.entries:
+                    check_dcp_l3_extra_pool(entry, self.storage_host_pool)
+            if self.storage_host_pool.layout not in (
+                "layer_first",
+                "page_first",
+                "page_first_direct",
+            ):
+                raise NotImplementedError(
+                    "HiCache L3 with DCP requires a generic MLA page layout."
+                )
 
         # Defensive: a previous partial detach may have flipped `enable_storage` but
         # left background threads alive. Attaching on top of them is unsafe.

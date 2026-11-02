@@ -17,6 +17,10 @@ from unittest import mock
 import torch
 
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
+from sglang.srt.managers.cache_controller import check_dcp_l3_extra_pool
+from sglang.srt.mem_cache.hicache_storage import PoolName, l3_page_span
+from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
+from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -216,8 +220,8 @@ def _make_indexer_host(anchor: MLATokenToKVPoolHost, stride: int = 6):
         else (pool.indexer_page_num, pool.layer_num, 1, stride)
     )
     pool.index_k_with_scale_buffer = (
-        torch.arange(torch.Size(shape).numel()) % 251
-    ).to(torch.uint8).reshape(shape)
+        (torch.arange(torch.Size(shape).numel()) % 251).to(torch.uint8).reshape(shape)
+    )
     return pool
 
 
@@ -243,9 +247,7 @@ class TestDcpIndexerStoragePages(CustomTestCase):
                     self.assertEqual(span, PHYSICAL_PAGE * dcp)
                     self.assertEqual(span, anchor.logical_page_size)
                     payload = source.get_data_page(3 * span)
-                    torch.testing.assert_close(
-                        payload, self._page(source, 3).flatten()
-                    )
+                    torch.testing.assert_close(payload, self._page(source, 3).flatten())
                     target.set_from_flat_data_page(5 * span, payload)
                     torch.testing.assert_close(
                         self._page(target, 5), self._page(source, 3)

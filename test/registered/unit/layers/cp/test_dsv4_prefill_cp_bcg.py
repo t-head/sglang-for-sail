@@ -7,13 +7,19 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.arg_groups.cuda_graph_hook import (
+    apply_kimi_k31_prefill_cp_cuda_graph_default,
+)
 from sglang.srt.layers.cp.base import get_cp_strategy, init_cp_strategy
 from sglang.srt.layers.cp.bcg import (
+    KimiK31CPBCGInput,
     PrefillCPBCGInput,
     execute_prefill_cp_bcg,
     filter_prefill_cp_bcg_capture_num_tokens,
     supports_prefill_cp_bcg,
 )
+from sglang.srt.layers.cp.interleave import cp_interleave_indexer_rows
+from sglang.srt.model_executor.cuda_graph_config import Phase
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -73,7 +79,13 @@ class TestDSV4PrefillCPBCG(unittest.TestCase):
             )
             # No core attention metadata or pool is present: the invariant
             # must fail before accessing either or launching the index combiner.
-            with self.assertRaisesRegex(AssertionError, "allocated 16384.*32768"):
+            with (
+                patch(
+                    "sglang.srt.layers.attention.deepseek_v4_backend.can_dsa_prefill_cp_round_robin_split",
+                    return_value=False,
+                ),
+                self.assertRaisesRegex(AssertionError, "allocated 16384.*32768"),
+            ):
                 DeepseekV4AttnBackend._build_sparse_prefill_chunk_cache(
                     backend, batch, core_attn_metadata=None, num_qo_tokens=16384
                 )
@@ -203,6 +215,146 @@ class TestDSV4PrefillCPBCG(unittest.TestCase):
             self.assertFalse(supports_prefill_cp_bcg(cfg))
             self.assertEqual(
                 filter_prefill_cp_bcg_capture_num_tokens([1, 2, 4, 8], cfg), [4, 8]
+            )
+
+    def test_kimi_k31_bcg_enablement_does_not_change_other_models(self):
+        cfg = SimpleNamespace(
+            enable_prefill_cp=True,
+            pp_size=1,
+            tp_size=8,
+            cp_strategy="interleave",
+            dp_size=1,
+            moe_dp_size=1,
+        )
+        view = SimpleNamespace(attn_cp_size=8, ep_size=8, moe_a2a_backend="megamoe")
+        model = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["KimiK31ForConditionalGeneration"])
+        )
+        with (
+            patch("sglang.srt.layers.cp.bcg.resolving_view", return_value=cfg),
+            patch("sglang.srt.layers.cp.bcg.resolved_view", return_value=view),
+            patch("sglang.srt.layers.cp.bcg.model_config_of", return_value=model),
+            patch(
+                "sglang.srt.layers.cp.bcg.attention_backends_of",
+                return_value=("dsa", "dsa"),
+            ),
+        ):
+            self.assertTrue(supports_prefill_cp_bcg(cfg))
+            model.hf_config.architectures = ["KimiK3ForConditionalGeneration"]
+            self.assertFalse(supports_prefill_cp_bcg(cfg))
+            model.hf_config.architectures = ["KimiK31ForConditionalGeneration"]
+            view.ep_size = 2
+            self.assertFalse(supports_prefill_cp_bcg(cfg))
+
+    def test_kimi_k31_graph_default_respects_explicit_selection(self):
+        cfg = SimpleNamespace(enable_prefill_cp=True, cuda_graph_config=object())
+        model = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["KimiK31ForConditionalGeneration"])
+        )
+        args = SimpleNamespace(_cuda_graph_config_locked=set())
+        with (
+            patch(
+                "sglang.srt.arg_groups.cuda_graph_hook.resolving_view",
+                return_value=cfg,
+            ),
+            patch(
+                "sglang.srt.arg_groups.cuda_graph_hook.model_config_of",
+                return_value=model,
+            ),
+            patch(
+                "sglang.srt.layers.cp.bcg.supports_prefill_cp_bcg",
+                return_value=True,
+            ),
+            patch("sglang.srt.arg_groups.cuda_graph_hook.with_phase") as with_phase,
+            patch(
+                "sglang.srt.arg_groups.cuda_graph_hook.declare_resolution"
+            ) as declare,
+            patch(
+                "sglang.srt.arg_groups.cuda_graph_hook.apply_cuda_graph_compatibility"
+            ),
+            patch(
+                "sglang.srt.arg_groups.cuda_graph_hook.apply_cuda_graph_disaggregation_roles"
+            ),
+            patch("sglang.srt.arg_groups.cuda_graph_hook.apply_deepep_adjustments"),
+        ):
+            apply_kimi_k31_prefill_cp_cuda_graph_default(args)
+            self.assertEqual(declare.call_count, 1)
+            self.assertEqual(
+                declare.call_args.kwargs["cuda_graph_config"], with_phase.return_value
+            )
+            args._cuda_graph_config_locked.add((Phase.PREFILL, "backend"))
+            apply_kimi_k31_prefill_cp_cuda_graph_default(args)
+            self.assertEqual(declare.call_count, 1)
+            args._cuda_graph_config_locked.clear()
+            model.hf_config.architectures = ["KimiK3ForConditionalGeneration"]
+            apply_kimi_k31_prefill_cp_cuda_graph_default(args)
+            self.assertEqual(declare.call_count, 1)
+
+    def test_kimi_k31_replay_keeps_live_indexer_and_moe_lengths(self):
+        cp_size, bucket = 4, 16
+        init_cp_strategy(
+            enable_prefill_cp=True, cp_size=cp_size, cp_strategy="interleave"
+        )
+        model = SimpleNamespace(
+            get_input_embeddings=lambda: lambda ids: ids[:, None].float()
+        )
+        runner = SimpleNamespace(
+            device="cpu",
+            max_num_tokens=bucket,
+            model_runner=SimpleNamespace(
+                dtype=torch.float32,
+                model_config=SimpleNamespace(hidden_size=1),
+                model=model,
+            ),
+        )
+        with get_parallel().override(
+            attn_cp_rank=0,
+            attn_cp_size=cp_size,
+            enable_cp_tp_group_sharing=True,
+        ):
+            inputs = KimiK31CPBCGInput.create(runner)
+            for lengths, capture in (([2, 9], True), ([1, 5], False)):
+                batch = self._batch(lengths, bucket)
+                global_positions = batch.positions
+                cache_locs = batch.out_cache_loc
+                with (
+                    patch(
+                        "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
+                        return_value=cp_size,
+                    ),
+                    patch(
+                        "sglang.srt.layers.cp.bcg.cp_interleave_input_ids",
+                        side_effect=lambda ids, _: ids.clone(),
+                    ),
+                ):
+                    inputs.prepare(
+                        runner, batch, static_num_tokens=bucket, capture=capture
+                    )
+                live = sum(lengths)
+                self.assertIs(batch.positions, global_positions)
+                self.assertIs(batch.out_cache_loc, cache_locs)
+                self.assertEqual(batch.attn_cp_metadata.graph_num_tokens, bucket)
+                self.assertEqual(batch.attn_cp_metadata.total_seq_lens, live)
+                self.assertEqual(
+                    batch.attn_cp_metadata.moe_local_token_count.item(),
+                    (live + cp_size - 1) // cp_size,
+                )
+                self.assertEqual(
+                    inputs.model_positions(batch).shape[0],
+                    batch.input_embeds.shape[0],
+                )
+                torch.testing.assert_close(
+                    batch.input_ids_global, batch.input_ids[:live]
+                )
+
+    def test_kimi_indexer_rows_keep_live_count_inside_capture_capacity(self):
+        metadata = SimpleNamespace(
+            per_rank_actual_token=[4, 4], per_rank_logical_token=[4, 3]
+        )
+        with get_parallel().override(attn_cp_rank=1):
+            self.assertEqual(
+                cp_interleave_indexer_rows(SimpleNamespace(attn_cp_metadata=metadata)),
+                (4, 3),
             )
 
     def test_interleave_capacity_is_independent_of_request_boundaries(self):

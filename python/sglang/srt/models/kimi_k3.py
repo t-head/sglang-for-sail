@@ -827,6 +827,7 @@ class KimiK3MoE(nn.Module):
             hidden=self.moe_hidden_size,
             intermediate_hidden=self._mega_intermediate_size,
             mma_type=_mega_moe_mma_type(self.experts),
+            **({"activation": "situ"} if is_sail() else {}),
         )
 
     def _forward_mega_experts(
@@ -843,12 +844,14 @@ class KimiK3MoE(nn.Module):
         applies the norm)."""
         import deep_gemm
 
-        from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
         from sglang.srt.environ import envs
         from sglang.srt.layers.moe.mega_moe import (
             _configure_mega_moe_deep_gemm_num_sms,
             _mega_moe_mma_type,
         )
+
+        if not is_sail():
+            from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
 
         # Under SP-MoE these rows are this rank's shard of the batch; an unpadded
         # batch stays on every row.
@@ -877,7 +880,7 @@ class KimiK3MoE(nn.Module):
             )
 
         valid_rows = None
-        if valid_token_count is not None and mma_type == "mxf4xmxf4":
+        if valid_token_count is not None and (is_sail() or mma_type == "mxf4xmxf4"):
             # The graph bucket is static; its live CP prefix changes on replay.
             # Mask NaNs as well as routes before quantization/dispatch.
             valid_rows = (
@@ -886,6 +889,11 @@ class KimiK3MoE(nn.Module):
             routed_input = routed_input.masked_fill(~valid_rows[:, None], 0)
             topk_ids_in = topk_ids_in.masked_fill(~valid_rows[:, None], -1)
             topk_weights_in = topk_weights_in.masked_fill(~valid_rows[:, None], 0)
+
+        if is_sail():
+            routed_input = routed_input.contiguous()
+            topk_ids_in = topk_ids_in.contiguous()
+            topk_weights_in = topk_weights_in.contiguous()
 
         dispatch_args = (
             routed_input,
@@ -896,7 +904,7 @@ class KimiK3MoE(nn.Module):
             buf.topk_idx,
             buf.topk_weights,
         )
-        if mma_type == "mxf4xmxf4":
+        if is_sail() or mma_type == "mxf4xmxf4":
             # The SGLang dispatcher writes FP8; packed E2M1 uses DeepGEMM.
             deep_gemm.mega_moe_pre_dispatch(
                 *dispatch_args,
@@ -917,7 +925,22 @@ class KimiK3MoE(nn.Module):
             device=routed_input.device,
         )
         with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
-            deep_gemm.fp8_fp4_mega_moe(
+            mega_moe_kernel = (
+                deep_gemm.fp4_fp4_mega_moe
+                if is_sail() and buf.mma_type == "mxf4xmxf4"
+                else deep_gemm.fp8_fp4_mega_moe
+            )
+            situ_kwargs = (
+                {
+                    "situ_beta": self.experts.moe_runner_config.gemm1_alpha,
+                    "situ_linear_beta": (
+                        self.experts.moe_runner_config.gemm1_clamp_limit
+                    ),
+                }
+                if is_sail()
+                else {}
+            )
+            mega_moe_kernel(
                 y,
                 self.experts.mega_l1_weights,
                 self.experts.mega_l2_weights,
@@ -925,6 +948,7 @@ class KimiK3MoE(nn.Module):
                 recipe=(1, 1, 32),
                 activation="situ",
                 fast_math=True,
+                **situ_kwargs,
             )
         y = y[:num_tokens]
         # fp8xfp4: the pre-dispatch routes rows past valid_token_count to -1 and

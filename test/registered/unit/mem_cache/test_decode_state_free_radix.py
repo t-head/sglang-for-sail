@@ -10,15 +10,17 @@ from dataclasses import replace
 from types import MethodType, SimpleNamespace
 from unittest import mock
 
+from test_unified_radix_cache_unittest import CacheConfig, build_fixture
+
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
 from sglang.srt.mem_cache.allocation import ensure_mamba_capacity
+from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.unified_radix_cache.config import CacheConfig
-from sglang.test.kits.unified_radix_cache.fixtures import build_fixture, match_prefix
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="stage-b", runner_config="1-gpu-small")
@@ -89,7 +91,10 @@ class TestDecodeStateFreeRadix(CustomTestCase):
         self.assertFalse(req.kv.holds_mamba)
         self.assertEqual(req_to_token_pool.mamba_allocator.available_size(), mamba_free)
         # Every page of the prompt is cached; no checkpoint caps the insert.
-        self.assertEqual(match_prefix(cache, tokens).device_prefix_len, len(tokens))
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(token_ids=array("q", tokens)))
+        )
+        self.assertEqual(match.device_prefix_len, len(tokens))
         cache.sanity_check()
 
     def test_request_released_before_kv_frees_its_slot(self):

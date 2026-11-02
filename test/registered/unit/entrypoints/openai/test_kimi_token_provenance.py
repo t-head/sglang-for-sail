@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+
 from sglang.srt.entrypoints.openai.kimi_token_provenance import KimiTokenProvenance
 from sglang.srt.function_call.kimik3_format import RESPONSE_OPEN, THINK_CLOSE
 from sglang.test.ci.ci_register import register_cpu_ci

@@ -3282,6 +3282,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
         threading.Thread(target=bootstrap_thread_guarded).start()
 
+
 class NixlKVSender(CommonKVSender):
     def __init__(
         self,
@@ -3603,7 +3604,9 @@ class NixlKVReceiver(CommonKVReceiver):
                             packed_kv_layer_ids,
                             str(self.kv_mgr.dcp_size).encode("ascii"),
                             str(self.kv_mgr.dcp_rank).encode("ascii"),
-                            b"1" if self.kv_mgr.kv_args.draft_rows_dcp_collapsed else b"0",
+                            b"1"
+                            if self.kv_mgr.kv_args.draft_rows_dcp_collapsed
+                            else b"0",
                         ]
                     )
             except zmq.ZMQError:

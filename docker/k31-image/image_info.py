@@ -42,7 +42,8 @@ values = {
     "PREV_DIGEST": digest,
     "PREV_SRC": labels.get("ai.radixark.source.commit", ""),
     # Builds before the incremental scheme only had base.image (the nightly).
-    "PREV_NIGHTLY": labels.get("ai.radixark.nightly.image") or labels.get("ai.radixark.base.image", ""),
+    "PREV_NIGHTLY": labels.get("ai.radixark.nightly.image")
+    or labels.get("ai.radixark.base.image", ""),
     "PREV_LAYERS": labels.get("ai.radixark.overlay.layers", "1"),
     # Git tree of python/sglang/kernels/aot that its flashmla_ops was built from.
     "PREV_FLASHMLA_TREE": labels.get("ai.radixark.flashmla.tree", ""),

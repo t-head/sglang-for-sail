@@ -27,7 +27,9 @@ def _layout(seq_lens, dcp, with_v2p, seed):
     cycle = PAGE * dcp
     runs = [-(-s // cycle) for s in seq_lens]
     order = torch.randperm(sum(runs) + 1, generator=g)[: len(seq_lens)] + 1
-    req_to_token = torch.full((len(seq_lens) + 3, max(seq_lens) + 16), -1, dtype=torch.int32)
+    req_to_token = torch.full(
+        (len(seq_lens) + 3, max(seq_lens) + 16), -1, dtype=torch.int32
+    )
     pool_idx = torch.randperm(req_to_token.shape[0], generator=g)[: len(seq_lens)]
     base = 0
     for i, s in enumerate(seq_lens):
@@ -62,7 +64,9 @@ def test_window_indices(dcp, window_left, with_v2p):
     q_len = 8
     ctx = [0, 5, window_left - 3, window_left, window_left + 1, 3 * window_left + 77]
     seq_lens = [c + q_len for c in ctx]
-    req_to_token, pool_idx, v2p = _layout(seq_lens, dcp, with_v2p, seed=dcp + window_left)
+    req_to_token, pool_idx, v2p = _layout(
+        seq_lens, dcp, with_v2p, seed=dcp + window_left
+    )
     positions = torch.tensor(
         [c + i for c in ctx for i in range(q_len)], dtype=torch.int64
     )
@@ -80,7 +84,9 @@ def test_window_indices(dcp, window_left, with_v2p):
             v2p=None if v2p is None else v2p.cuda(),
         )
         assert indices.shape == (positions.numel(), top_k)
-        ref = _reference(req_to_token, pool_idx, positions, q_len, window_left, dcp, rank, v2p)
+        ref = _reference(
+            req_to_token, pool_idx, positions, q_len, window_left, dcp, rank, v2p
+        )
         indices, counts = indices.cpu(), counts.cpu()
         for r, keys in enumerate(ref):
             assert int(counts[r]) == len(keys), (rank, r)
