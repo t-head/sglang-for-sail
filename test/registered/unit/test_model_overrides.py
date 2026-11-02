@@ -2911,6 +2911,21 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"]),
             )
         )
+        self.assertTrue(
+            supports_mamba_cache_extra_buffer(
+                SimpleNamespace(linear_attn_backend="flashkda"),
+                SimpleNamespace(architectures=["KimiK31ForConditionalGeneration"]),
+            )
+        )
+        self.assertEqual(
+            _mamba_radix_cache_resolution(
+                _view(
+                    "KimiK31ForConditionalGeneration",
+                    linear_attn_backend="flashkda",
+                )
+            )["mamba_radix_cache_strategy"],
+            "extra_buffer",
+        )
         # The mamba pass runs before FlashMLA snaps page_size to 64. With PP
         # already disabling overlap, its explicit decode backend must still
         # select extra_buffer rather than the page_size=1-only no_buffer mode.
@@ -2952,6 +2967,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 mamba_radix_cache_strategy="auto",
                 disable_overlap_schedule=False,
                 page_size=None,
+                attention_backend=None,
+                decode_attention_backend=None,
                 linear_attn_backend="triton",
                 linear_attn_prefill_backend=None,
             )
@@ -3042,6 +3059,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 attention_backend=None,
                 prefill_attention_backend=None,
                 decode_attention_backend=None,
+                disaggregation_mode="null",
                 mamba_radix_cache_strategy="auto",
                 disable_radix_cache=False,
                 speculative_algorithm=None,
@@ -3957,6 +3975,7 @@ class TestKimiK3DcpSpeculativeAttentionMode(CustomTestCase):
 
         args = SimpleNamespace(
             dcp_size=8,
+            enable_prefill_cp=False,
             dcp_comm_backend="fi_a2a",
             dcp_replicate_q_proj=None,
             enable_symm_mem=False,
@@ -4110,20 +4129,156 @@ class TestKimiK31DsaBackends(CustomTestCase):
         )
 
     def test_rejects_mixed_backends(self):
-        with self.assertRaisesRegex(ValueError, "same --dsa-prefill-backend"):
-            self._resolve(
-                dsa_prefill_backend="flashmla_kv", dsa_decode_backend="trtllm"
-            )
+        with patch("sglang.srt.arg_groups.overrides.is_sail", return_value=False):
+            with self.assertRaisesRegex(ValueError, "same --dsa-prefill-backend"):
+                self._resolve(
+                    dsa_prefill_backend="flashmla_kv", dsa_decode_backend="trtllm"
+                )
 
     def test_rejects_unsupported_backend(self):
-        with self.assertRaisesRegex(ValueError, "--dsa-decode-backend"):
-            self._resolve(dsa_decode_backend="flashmla_sparse")
+        with patch(
+            "sglang.srt.arg_groups.overrides._KIMI_K31_DSA_BACKENDS",
+            ("flashmla_kv", "trtllm"),
+        ):
+            with self.assertRaisesRegex(ValueError, "--dsa-decode-backend"):
+                self._resolve(dsa_decode_backend="flashmla_sparse")
+
+    def test_ppu_sparse_is_available_in_both_phases(self):
+        with (
+            patch("sglang.srt.arg_groups.overrides.is_sail", return_value=True),
+            patch(
+                "sglang.srt.arg_groups.overrides._KIMI_K31_DSA_BACKENDS",
+                ("flashmla_kv", "trtllm", "flashmla_sparse"),
+            ),
+        ):
+            self.assertEqual(
+                self._resolve(dsa_prefill_backend="flashmla_sparse"),
+                {"dsa_decode_backend": "flashmla_sparse"},
+            )
+            self.assertEqual(
+                self._resolve(dsa_decode_backend="flashmla_sparse"),
+                {"dsa_prefill_backend": "flashmla_sparse"},
+            )
+            self.assertEqual(
+                self._resolve(
+                    dsa_prefill_backend="flashmla_sparse",
+                    dsa_decode_backend="flashmla_kv",
+                ),
+                {},
+            )
+            self.assertEqual(
+                self._resolve(
+                    dsa_prefill_backend="flashmla_kv",
+                    dsa_decode_backend="flashmla_sparse",
+                ),
+                {},
+            )
+            self.assertEqual(
+                self._resolve(
+                    dsa_prefill_backend="flashmla_sparse",
+                    dsa_decode_backend="flashmla_kv",
+                    dcp_size=2,
+                ),
+                {},
+            )
+
+    def test_ppu_sparse_prefill_falls_back_to_auto(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _ppu_flashmla_fp8_kv_cache_fallback,
+        )
+
+        def view(arch, decode="flashmla_kv", dcp_size=1):
+            return ResolvedView(
+                SimpleNamespace(
+                    _model_config=SimpleNamespace(
+                        hf_config=SimpleNamespace(architectures=[arch], index_topk=2048)
+                    ),
+                    kv_cache_dtype="fp8_e4m3",
+                    decode_attention_backend=None,
+                    dsa_prefill_backend="flashmla_sparse",
+                    dsa_decode_backend=decode,
+                    dcp_size=dcp_size,
+                )
+            )
+
+        with patch("sglang.srt.utils.common.is_sail", return_value=True):
+            self.assertEqual(
+                _ppu_flashmla_fp8_kv_cache_fallback(
+                    view("KimiK31ForConditionalGeneration")
+                ),
+                {"kv_cache_dtype": "auto"},
+            )
+            self.assertEqual(
+                _ppu_flashmla_fp8_kv_cache_fallback(
+                    view("KimiK31ForConditionalGeneration", dcp_size=2)
+                ),
+                {"kv_cache_dtype": "auto"},
+            )
+            for cfg in (
+                view("KimiK31ForConditionalGeneration", decode="trtllm"),
+                view("KimiK31ForConditionalGeneration", decode="flashmla_sparse"),
+                view("GlmMoeDsaForCausalLM"),
+            ):
+                self.assertEqual(
+                    _ppu_flashmla_fp8_kv_cache_fallback(cfg),
+                    {"kv_cache_dtype": "auto"},
+                )
+
+    def test_sparse_prefill_rejected_off_ppu(self):
+        with patch(
+            "sglang.srt.arg_groups.overrides._KIMI_K31_DSA_BACKENDS",
+            ("flashmla_kv", "trtllm"),
+        ):
+            with self.assertRaisesRegex(ValueError, "--dsa-prefill-backend"):
+                self._resolve(dsa_prefill_backend="flashmla_sparse")
 
     def test_trtllm_with_dcp(self):
         self.assertEqual(
             self._resolve(dsa_decode_backend="trtllm", dcp_size=8),
             {"dsa_prefill_backend": "trtllm"},
         )
+
+
+class TestKimiK31PpuContextParallel(CustomTestCase):
+    @staticmethod
+    def _resolve(arch, tp_size, *, sail):
+        from sglang.srt.arg_groups.model_overrides.deepseek_v2 import (
+            _deepseek_family_overrides,
+        )
+        from sglang.srt.server_args import ServerArgs
+
+        args = ServerArgs(
+            model_path="dummy",
+            tp_size=tp_size,
+            enable_prefill_cp=True,
+            attn_cp_size=tp_size,
+            cp_strategy="interleave",
+        )
+        hf_config = SimpleNamespace(architectures=[arch], index_topk=2048)
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            patch("sglang.srt.utils.common.is_sail", return_value=sail),
+            patch(
+                "sglang.srt.arg_groups.model_overrides.deepseek_v2.current_platform",
+                SimpleNamespace(get_device_name=lambda: "ZW-M890P"),
+            ),
+            override_platform(is_npu=False, is_xpu=False, is_hip=False),
+        ):
+            return _deepseek_family_overrides(args, hf_config)
+
+    def test_ppu_k31_interleave_allows_cross_node_cp16(self):
+        result = self._resolve("KimiK31ForConditionalGeneration", 16, sail=True)
+        self.assertEqual(result["attn_cp_size"], 16)
+        self.assertEqual(result["dp_size"], 1)
+
+    def test_cp16_keeps_other_platform_and_model_limits(self):
+        with self.assertRaisesRegex(AssertionError, "single machine"):
+            self._resolve("KimiK31ForConditionalGeneration", 16, sail=False)
+        with self.assertRaisesRegex(AssertionError, "single machine"):
+            self._resolve("DeepseekV32ForCausalLM", 16, sail=True)
+        with self.assertRaisesRegex(AssertionError, "Kimi-K3.1.*tp_size <= 16"):
+            self._resolve("KimiK31ForConditionalGeneration", 32, sail=True)
 
 
 class TestKimiK31LosslessDefaults(CustomTestCase):

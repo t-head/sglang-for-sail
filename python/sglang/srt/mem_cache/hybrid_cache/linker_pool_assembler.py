@@ -481,7 +481,9 @@ def _mha_device_pool_entry(
     )
 
 
-def _mamba_device_pool_entry(req_to_token_pool: Any, start_layer: int) -> DevicePoolEntry:
+def _mamba_device_pool_entry(
+    req_to_token_pool: Any, start_layer: int
+) -> DevicePoolEntry:
     from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
         _stage_local_layer_mapping,
     )

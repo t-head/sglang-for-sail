@@ -76,12 +76,20 @@ class InterleaveContextParallelMetadata(BaseContextParallelMetadata):
     gather_index: Optional[torch.Tensor] = None
     local_index: Optional[torch.Tensor] = None
     moe_local_token_count: Optional[torch.Tensor] = None
+    graph_num_tokens: Optional[int] = None
 
 
 def is_interleave_extend(forward_batch):
     return forward_batch.forward_mode.is_context_parallel_extend() and isinstance(
         forward_batch.attn_cp_metadata, InterleaveContextParallelMetadata
     )
+
+
+def cp_interleave_indexer_rows(forward_batch):
+    metadata = forward_batch.attn_cp_metadata
+    rank = get_parallel().attn_cp_rank
+    logical = metadata.per_rank_logical_token or metadata.per_rank_actual_token
+    return metadata.per_rank_actual_token[rank], logical[rank]
 
 
 def cp_interleave_to_sequence_order(hidden_states, forward_batch):

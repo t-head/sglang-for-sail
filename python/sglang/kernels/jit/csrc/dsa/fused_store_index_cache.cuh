@@ -146,7 +146,10 @@ __global__ void fused_store_indexer_mxfp4_cache(const __grid_constant__ FusedSto
   constexpr int kLanesPerBlock = kMxfp4Block / kElemsPerLane;  // 8
   constexpr int64_t kPageBytes = static_cast<int64_t>((kPackedBytesPerToken + kScaleBytesPerToken) << kPageBits);
 
-  const auto& [input, cache, indices, num_tokens] = param;
+  const auto* input = param.input;
+  auto* cache = param.cache;
+  const auto* indices = param.indices;
+  const auto num_tokens = param.num_tokens;
   const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
   const auto global_wid = global_tid / 32;
   const auto lane_id = threadIdx.x % 32;
@@ -202,21 +205,23 @@ __global__ void fused_store_indexer_mxfp4_cache(const __grid_constant__ FusedSto
   //   [0, kPageSize * 64):           packed FP4 (64 bytes/token)
   //   [kPageSize * 64, +kPageSize*4): ue8m0 scales (4 bytes/token)
   // DeepGEMM treats each token's 4 ue8m0 bytes as a single int32 (kv_sf).
-  const int32_t page = index >> kPageBits;
-  const int32_t offset = index & ((1 << kPageBits) - 1);
-  const auto page_ptr = pointer::offset(cache, page * kPageBytes);
-  const auto value_ptr = pointer::offset(page_ptr, offset * kPackedBytesPerToken);
-  const auto scale_ptr = pointer::offset(page_ptr, kPackedBytesPerToken << kPageBits, offset * kScaleBytesPerToken);
+  if (index >= 0) {
+    const int32_t page = index >> kPageBits;
+    const int32_t offset = index & ((1 << kPageBits) - 1);
+    const auto page_ptr = pointer::offset(cache, page * kPageBytes);
+    const auto value_ptr = pointer::offset(page_ptr, offset * kPackedBytesPerToken);
+    const auto scale_ptr = pointer::offset(page_ptr, kPackedBytesPerToken << kPageBits, offset * kScaleBytesPerToken);
 
-  // Streaming store: bypass L1/L2 cache for large sequential KV writes.
-  {
-    const uint16_t* store_addr = reinterpret_cast<const uint16_t*>(value_ptr) + lane_id;
-    asm volatile("st.global.cs.u16 [%0], %1;" ::"l"(store_addr), "h"(packed) : "memory");
-  }
-  // The first lane in each 8-lane group writes its block's ue8m0 byte.
-  if ((lane_id % kLanesPerBlock) == 0) {
-    const uint8_t* scale_addr = static_cast<const uint8_t*>(scale_ptr) + block_idx_in_token;
-    asm volatile("st.global.cs.u8 [%0], %1;" ::"l"(scale_addr), "r"((uint32_t)ue8m0) : "memory");
+    // Streaming store: bypass L1/L2 cache for large sequential KV writes.
+    {
+      const uint16_t* store_addr = reinterpret_cast<const uint16_t*>(value_ptr) + lane_id;
+      asm volatile("st.global.cs.u16 [%0], %1;" ::"l"(store_addr), "h"(packed) : "memory");
+    }
+    // The first lane in each 8-lane group writes its block's ue8m0 byte.
+    if ((lane_id % kLanesPerBlock) == 0) {
+      const uint8_t* scale_addr = static_cast<const uint8_t*>(scale_ptr) + block_idx_in_token;
+      asm volatile("st.global.cs.u8 [%0], %1;" ::"l"(scale_addr), "r"((uint32_t)ue8m0) : "memory");
+    }
   }
 
   PDLTriggerSecondary<kUsePDL>();

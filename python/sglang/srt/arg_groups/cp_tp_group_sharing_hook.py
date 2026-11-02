@@ -66,7 +66,9 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
             or cfg.speculative_draft_model_path not in (None, cfg.model_path)
             or cfg.speculative_eagle_topk not in (None, 1)
         ):
-            raise ValueError("CP/TP group sharing only supports native MTP with top-k 1.")
+            raise ValueError(
+                "CP/TP group sharing only supports native MTP with top-k 1."
+            )
 
     unsupported = {
         "enable-dsa-cache-layer-split": cfg.enable_dsa_cache_layer_split,

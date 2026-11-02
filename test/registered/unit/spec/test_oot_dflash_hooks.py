@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, patch, sentinel
 
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
 from sglang.srt.arg_groups.overrides import resolution_result
@@ -138,7 +138,9 @@ class TestDFlashDraftBackendResolution(CustomTestCase):
             patch(f"{HOOK_MODULE}.current_platform", platform),
             patch(
                 f"{HOOK_MODULE}.get_platform",
-                return_value=SimpleNamespace(is_xpu=False, is_hip=False, is_sm100=False),
+                return_value=SimpleNamespace(
+                    is_xpu=False, is_hip=False, is_sm100=False
+                ),
             ),
             patch(
                 f"{HOOK_MODULE}.attention_backends_of",

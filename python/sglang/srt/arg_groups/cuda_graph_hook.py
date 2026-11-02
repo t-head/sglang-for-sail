@@ -30,6 +30,32 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 
 
+def apply_kimi_k31_prefill_cp_cuda_graph_default(server_args: Any):
+    """Select breakable prefill capture once K3.1 CP topology has resolved."""
+    from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
+
+    cfg = resolving_view(server_args)
+    if (
+        not cfg.enable_prefill_cp
+        or (Phase.PREFILL, "backend")
+        in getattr(server_args, "_cuda_graph_config_locked", set())
+        or "KimiK31ForConditionalGeneration"
+        not in (model_config_of(server_args).hf_config.architectures or ())
+        or not supports_prefill_cp_bcg(server_args)
+    ):
+        return
+    declare_resolution(
+        server_args,
+        "apply_kimi_k31_prefill_cp_cuda_graph_default",
+        cuda_graph_config=with_phase(
+            cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.BREAKABLE
+        ),
+    )
+    apply_cuda_graph_compatibility(server_args)
+    apply_cuda_graph_disaggregation_roles(server_args)
+    apply_deepep_adjustments(server_args)
+
+
 def parse_cuda_graph_config(server_args: Any):
     """Resolve cuda_graph_config from explicit JSON, per-phase
     convenience flags, legacy global flags, and defaults.
@@ -152,11 +178,16 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
     rules = [
         (
             "KDA hybrid linear attention",
-            # GLM-5.3 Flash is BCG-validated; other KDA models stay off by default.
+            # GLM-5.3 Flash and eligible K3.1 interleave CP have BCG paths.
             lambda: (
                 uses_kda_attention(model_config_of(server_args).hf_config)
                 and "Glm5NextForConditionalGeneration"
                 not in model_config_of(server_args).hf_config.architectures
+                and not (
+                    "KimiK31ForConditionalGeneration"
+                    in model_config_of(server_args).hf_config.architectures
+                    and supports_prefill_cp_bcg(server_args)
+                )
             ),
         ),
         # DSV4 is BCG-compatible but introduces heavy memory pressure: the

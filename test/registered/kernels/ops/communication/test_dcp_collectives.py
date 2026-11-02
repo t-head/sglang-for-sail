@@ -4,10 +4,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-import sglang.srt.distributed.parallel_state as ps
 import test_ar_fusion as fixture
 import torch
 import torch.distributed as dist
+
+import sglang.srt.distributed.parallel_state as ps
 from sglang.kernels.ops.attention.dcp_kernels import (
     DcpDirectAllToAll,
     dcp_lse_combine_triton,
@@ -253,7 +254,7 @@ def test_token_packing_after_dcp_gather():
         flashmla_kv_token_packed,
         flashmla_token_pack_available,
     )
-    from sglang.kernels.ops.quantization.dsa_quant_k_cache import quantize_k_cache
+    from sglang.kernels.ops.attention.dsa.quant_k_cache import quantize_k_cache
     from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 
     if not flashmla_token_pack_available():

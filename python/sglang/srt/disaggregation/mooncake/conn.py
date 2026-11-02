@@ -74,7 +74,9 @@ from sglang.srt.observability.trace import (
 from sglang.srt.runtime_context import (
     get_memory,
     get_observability,
+    get_parallel,
     get_schedule,
+    get_spec,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
@@ -261,6 +263,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             enable_custom_mem_pool, custom_mem_pool_type
         )
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self.state_tp_size = get_parallel().tp_size
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -920,6 +923,39 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         a reason rejects the peer, ``fully_checked`` retires the per-transfer
         check.
         """
+        if (
+            get_spec().speculative_algorithm == "DFLASH"
+            and self.state_tp_size != self.attn_tp_size
+            and registration_info.dst_attn_tp_size != self.state_tp_size
+            and not registration_info.dst_draft_rows_dcp_collapsed
+        ):
+            num_draft = getattr(self.kv_args, "num_draft_entries", 0)
+            draft_ids = getattr(self.kv_args, "kv_layer_ids", ())[-num_draft:]
+            src_lens = getattr(self.kv_args, "kv_item_lens", ())[-num_draft:]
+            dst_ids = getattr(registration_info, "dst_kv_layer_ids", ())
+            dst_lens = getattr(registration_info, "dst_kv_item_lens", ())[-num_draft:]
+            dst_page_scale = (
+                getattr(registration_info, "dst_dcp_size", 1)
+                if getattr(registration_info, "requires_dcp_relayout", False)
+                else 1
+            )
+            replicated_draft = (
+                num_draft > 0
+                and len(draft_ids) == len(set(draft_ids)) == num_draft
+                and dst_ids[-num_draft:] == draft_ids
+                and not set(draft_ids).intersection(dst_ids[:-num_draft])
+                and len(src_lens) == len(dst_lens) == num_draft
+                and all(
+                    src > 0 and dst == src * dst_page_scale
+                    for src, dst in zip(src_lens, dst_lens)
+                )
+            )
+            if not replicated_draft:
+                return False, (
+                    "CP/TP-sharing DFLASH PD requires the same physical TP size: "
+                    f"prefill={self.state_tp_size}, "
+                    f"decode={registration_info.dst_attn_tp_size}"
+                )
         state_types = getattr(self.kv_args, "state_types", [])
         fully_checked = True
         for i, st in enumerate(state_types):
@@ -3313,6 +3349,7 @@ class MooncakeFailureExceptionMixin:
             self.bootstrap_room, failure_reason, is_from_another_rank=is_propagated
         )
 
+
 class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
     def __init__(
         self,
@@ -3515,7 +3552,9 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                                 f"{len(self.kv_mgr.kv_args.kv_item_lens)}Q",
                                 *self.kv_mgr.kv_args.kv_item_lens,
                             ),
-                            b"1" if self.kv_mgr.kv_args.draft_rows_dcp_collapsed else b"0",
+                            b"1"
+                            if self.kv_mgr.kv_args.draft_rows_dcp_collapsed
+                            else b"0",
                         ]
                     )
             except zmq.ZMQError:

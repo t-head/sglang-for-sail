@@ -1838,6 +1838,7 @@ def pre_capture_activation_reserve_mb(gpu_mem: float | None) -> float:
 _PLATFORM_PROBES: Dict[str, str] = {
     "is_cuda": "is_cuda",
     "is_hip": "is_hip",
+    "is_sail": "is_sail",
     "is_npu": "is_npu",
     "is_xpu": "is_xpu",
     "is_musa": "is_musa",

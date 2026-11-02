@@ -15,7 +15,6 @@ from sglang.srt.disaggregation.common.utils import (
     build_dcp_token_transfer_plan,
     group_concurrent_contiguous,
 )
-from sglang.srt.disaggregation.common.utils import build_dcp_token_transfer_plan
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager, NixlKVSender
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.runtime_context import get_context

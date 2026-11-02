@@ -288,7 +288,7 @@ def _native_flashmla():
 @pytest.mark.parametrize("batch", [1, 64, 80])
 @pytest.mark.parametrize("mode", ["mixed", "zeros"])
 def test_native_heads_schedule_and_output(heads, batch, mode):
-    from sglang.kernels.ops.quantization.dsa_quant_k_cache import quantize_k_cache
+    from sglang.kernels.ops.attention.dsa.quant_k_cache import quantize_k_cache
     from sglang.srt.layers.attention.deepseek_v4_backend import (
         _maybe_precompute_flashmla_sched_meta,
     )

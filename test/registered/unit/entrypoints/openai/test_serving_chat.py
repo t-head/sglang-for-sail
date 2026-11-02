@@ -39,7 +39,6 @@ from sglang.srt.entrypoints.openai.serving_chat import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
-from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.jinja_template_utils import (

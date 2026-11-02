@@ -780,6 +780,35 @@ class _PageInterleaveIndexKeyCache(IndexKeyCache):
             max_seq_len,
         )
 
+    def write_targets(
+        self, layer_id: int, loc: torch.Tensor
+    ) -> List[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]:
+        """Return scratch and owner-local targets for a shard-aware index-K write."""
+        if loc.numel() == 0:
+            return []
+        pool = self.pool
+        local = self._kernel_view(self.buffer[layer_id - pool.start_layer])
+        assert local.shape[0], "cannot write indexer keys for a skip-topk layer"
+        targets = []
+        if pool._shard_extend_active:
+            targets.append(
+                (
+                    pool._slots[layer_id % 2].tensors["index_k"],
+                    pool.translate_loc_to_scratch(loc),
+                    None,
+                )
+            )
+        # Indexer callers may reuse or mutate their location tensors. Compute
+        # fresh indices instead of memoizing only their pointer and length.
+        owned_idx = torch.nonzero(
+            pool.placement.local_mask(loc, pool.shard_rank)
+        ).squeeze(1)
+        if owned_idx.numel():
+            targets.append(
+                (local, pool.placement.local_index(loc[owned_idx]), owned_idx)
+            )
+        return targets
+
     def store_quantized(
         self,
         layer_id: int,
@@ -787,32 +816,17 @@ class _PageInterleaveIndexKeyCache(IndexKeyCache):
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
     ) -> None:
-        if loc.numel() == 0:
-            return
-        pool = self.pool
-        assert self.buffer[layer_id - pool.start_layer].shape[0], (
-            "cannot write indexer keys for a skip-topk layer"
-        )
-        if pool._shard_extend_active:
+        for buf, slots, rows in self.write_targets(layer_id, loc):
             index_buf_accessor.SetKAndS.execute(
-                pool=pool,
-                buf=pool._slots[layer_id % 2].tensors["index_k"],
-                loc=pool.translate_loc_to_scratch(loc),
-                index_k=index_k,
-                index_k_scale=index_k_scale,
-            )
-        # Indexer callers may reuse or mutate their location tensors. Compute
-        # fresh indices instead of memoizing only their pointer and length.
-        owned_idx = torch.nonzero(
-            pool.placement.local_mask(loc, pool.shard_rank)
-        ).squeeze(1)
-        local_rows = pool.placement.local_index(loc[owned_idx])
-        if owned_idx.numel():
-            super().store_quantized(
-                layer_id,
-                local_rows,
-                index_k.index_select(0, owned_idx),
-                index_k_scale.index_select(0, owned_idx),
+                pool=self.pool,
+                buf=buf,
+                loc=slots,
+                index_k=index_k if rows is None else index_k.index_select(0, rows),
+                index_k_scale=(
+                    index_k_scale
+                    if rows is None
+                    else index_k_scale.index_select(0, rows)
+                ),
             )
 
 

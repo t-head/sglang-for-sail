@@ -4285,7 +4285,7 @@ class Scheduler(
                 req.rid for req in self.waiting_queue[:lookup_window]
             )
         # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        for index, req in enumerate(self.waiting_queue):
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
 

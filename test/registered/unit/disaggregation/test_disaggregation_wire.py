@@ -38,7 +38,12 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVSender,
     TransferInfo,
 )
-from sglang.srt.disaggregation.nixl.conn import NixlKVManager
+from sglang.srt.disaggregation.nixl.conn import (
+    KVArgsRegisterInfo as NixlKVArgsRegisterInfo,
+)
+from sglang.srt.disaggregation.nixl.conn import (
+    NixlKVManager,
+)
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     build_dsa_tail_transfer_blocks,
@@ -434,6 +439,23 @@ class TestDisaggregationWire(unittest.TestCase):
                     self.assertFalse(fully_checked)
                     self.assertIn("same physical TP size", reason)
 
+        manager.kv_args = SimpleNamespace(
+            state_types=[], num_draft_entries=1, kv_layer_ids=[7], kv_item_lens=[64]
+        )
+        registration_info = SimpleNamespace(
+            dst_attn_tp_size=8,
+            dst_draft_rows_dcp_collapsed=False,
+            dst_kv_layer_ids=[7],
+            dst_kv_item_lens=[64],
+            dst_dcp_size=1,
+            requires_dcp_relayout=False,
+        )
+        with get_context().override_server_args(speculative_algorithm="DFLASH"):
+            self.assertEqual(
+                manager._validate_peer_state_layout(registration_info),
+                (True, None),
+            )
+
     def test_mooncake_unpublished_state_metadata_keeps_the_transfer_check(self):
         """An unpublished component cannot be judged; keep the transfer check."""
         manager = object.__new__(MooncakeKVManager)
@@ -675,6 +697,44 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertEqual(info.dst_kv_item_lens, [])
         info = KVArgsRegisterInfo.from_zmq(msg + [b"", struct.pack("Q", 128)])
         self.assertEqual(info.dst_kv_item_lens, [128])
+        self.assertFalse(info.dst_draft_rows_dcp_collapsed)
+        info = KVArgsRegisterInfo.from_zmq(msg + [b"", struct.pack("Q", 128), b"1"])
+        self.assertTrue(info.dst_draft_rows_dcp_collapsed)
+
+    def test_nixl_registration_dcp_collapsed_flag_is_backward_compatible(self):
+        frames = [
+            b"room",
+            b"127.0.0.1",
+            b"1234",
+            b"nixl",
+            b"",
+            struct.pack("Q", 0x1000),
+            b"",
+            b"",
+            b"0",
+            b"1",
+            b"0",
+            b"128",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"1",
+            b"",
+            struct.pack("Q", 128),
+            b"",
+            struct.pack("I", 7),
+            b"4",
+            b"2",
+        ]
+        self.assertFalse(
+            NixlKVArgsRegisterInfo.from_zmq(frames).dst_draft_rows_dcp_collapsed
+        )
+        self.assertTrue(
+            NixlKVArgsRegisterInfo.from_zmq(
+                frames + [b"1"]
+            ).dst_draft_rows_dcp_collapsed
+        )
 
     def test_int_lists_roundtrip(self):
         cases = [
@@ -2034,6 +2094,12 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
         )
         override.install()
         self.addCleanup(override.restore)
+        seed_backend = patch(
+            "sglang.srt.speculative.eagle_disaggregation.dsa_seed_backend_enabled",
+            return_value=True,
+        )
+        seed_backend.start()
+        self.addCleanup(seed_backend.stop)
         last_tokens = torch.tensor([11, 12], dtype=torch.int64)
 
         draft_input = build_eagle_disagg_draft_input(batch, last_tokens, None)
@@ -2114,6 +2180,12 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
         )
         override.install()
         self.addCleanup(override.restore)
+        seed_backend = patch(
+            "sglang.srt.speculative.eagle_disaggregation.dsa_seed_backend_enabled",
+            return_value=True,
+        )
+        seed_backend.start()
+        self.addCleanup(seed_backend.stop)
 
         local_slots = [[309, 101, -1], [801, 990, -1]]
         unremapped = [[2, 0, -1], [1, 3, -1]]
@@ -2218,6 +2290,7 @@ class TestDSAKPoolDisaggregationState(unittest.TestCase):
         pool.full_kv_pool = SimpleNamespace(
             get_state_buf_infos=lambda: ([30, 31], [300, 310], [40, 41]),
             kpool_use_compress=True,
+            index_kpool=4,
             get_compress_tail_buf_infos=lambda: (
                 [50, 51],
                 [500, 510],

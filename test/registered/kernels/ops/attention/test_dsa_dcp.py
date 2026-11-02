@@ -20,10 +20,10 @@ import torch
 from sglang.kernels.ops.attention.dcp_kernels import CPTritonContext, correct_attn_out
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import dequantize_k_cache
 from sglang.kernels.ops.attention.dsa.indexer_k import fused_k_indexer_norm_rope
-from sglang.kernels.ops.attention.dsa.metadata import fused_dsa_decode_metadata
 from sglang.kernels.ops.attention.dsa.paged_mqa_logits import (
     deepgemm_paged_mqa_logits_native,
 )
+from sglang.kernels.ops.attention.dsa_metadata import fused_dsa_decode_metadata
 from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
 from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import (
     _scatter_candidates_kernel,

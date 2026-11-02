@@ -56,6 +56,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     resolve_paged_mqa_logits_metadata_fn,
 )
 from sglang.srt.layers.attention.graph_variants import DSA_DENSE
+from sglang.srt.layers.attention.kv_shard_hooks import get_kv_shard_pool
 from sglang.srt.layers.attention.mqa_logits_utils import (
     MQA_LOGITS_BYTES_PER_ELEM,
     MQA_LOGITS_MAX_BYTES_ROCM,
@@ -1529,17 +1530,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and not dsa_shards_index_k()
             and can_use_dsa_fused_store(torch.bfloat16, out_cache_loc.dtype, page_size)
         ):
-            fused_k_indexer_norm_rope_store(
-                key_raw,
-                pool.get_index_k_with_scale_buffer(layer_id=layer_id),
-                out_cache_loc,
-                self.k_norm.weight,
-                self.k_norm.bias,
-                self.k_norm.variance_epsilon,
-                self._indexer_cos_sin_cache,
-                positions,
-                page_size,
-            )
+            for buf, loc, rows in _index_k_write_targets(pool, layer_id, out_cache_loc):
+                fused_k_indexer_norm_rope_store(
+                    key_raw if rows is None else key_raw.index_select(0, rows),
+                    buf,
+                    loc,
+                    self.k_norm.weight,
+                    self.k_norm.bias,
+                    self.k_norm.variance_epsilon,
+                    self._indexer_cos_sin_cache,
+                    positions if rows is None else positions.index_select(0, rows),
+                    page_size,
+                )
             return
 
         # Fallback: compute normalized/rotated K as bf16, then use the
@@ -2160,7 +2162,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if _is_hip and not _use_aiter_preshuffle:
             block_tables = metadata.get_page_table_1()
         else:
-            block_tables = metadata.get_page_table_64()
+            block_tables = metadata.get_logical_page_table()
 
         assert (
             forward_batch.seq_lens_cpu is not None

@@ -28,6 +28,7 @@ from sglang.srt.layers.dcp import (
 from sglang.srt.layers.dcp.layout import dsa_shards_index_k
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
+from sglang.srt.layers.quantization.unquant import bf16_gemm_dispatch
 from sglang.srt.layers.radix_attention import (
     padded_extend_real_tokens,
     unified_attention_with_output,
@@ -41,8 +42,6 @@ from sglang.srt.lora.deepseek_mla_correction import (
 from sglang.srt.lora.deepseek_mla_correction import (
     is_kv_b_lora_active,
 )
-from sglang.srt.layers.quantization.unquant import bf16_gemm_dispatch
-from sglang.srt.lora.utils import kv_b_lora_correction
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,

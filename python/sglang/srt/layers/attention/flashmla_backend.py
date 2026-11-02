@@ -576,7 +576,16 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         k_rope: Optional[torch.Tensor] = None,
     ):
         if forward_batch.forward_mode == ForwardMode.EXTEND:
-            return super().forward_extend(q, k, v, layer, forward_batch, save_kv_cache)
+            return super().forward_extend(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache,
+                q_rope=q_rope,
+                k_rope=k_rope,
+            )
         else:
             # target_verify / draft_extend_v2: fixed-q decode-style kernel.
 
@@ -620,10 +629,12 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             num_total_tokens = q.shape[0]
             real_bs = self.forward_metadata.block_kv_indices.shape[0]
             num_tokens_per_req = self.speculative_num_steps + 1
-            if (
-                forward_batch.forward_mode.is_target_verify()
-                and forward_batch.spec_algorithm.is_dspark()
+            if forward_batch.forward_mode.is_target_verify() and (
+                forward_batch.spec_algorithm.is_dspark()
+                or forward_batch.spec_algorithm.is_dflash()
             ):
+                # Block drafters do not encode their verify width in num_steps.
+                # DFLASH pins num_steps=1 even when its verify block has 8+ rows.
                 num_tokens_per_req = forward_batch.spec_info.draft_token_num
             strip_pad = (
                 forward_batch.forward_mode.is_draft_extend_v2()

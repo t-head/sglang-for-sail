@@ -23,15 +23,16 @@ import torch
 
 from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
+    model_config_of,
     resolved_view,
     resolving_view,
 )
-from sglang.srt.arg_groups.model_override_base import model_config_of
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
 from sglang.srt.layers.cp.padding import get_cp_padding_align_size
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
+    cp_interleave_input_ids,
     cp_shard_position_ids,
     cp_split_before_forward,
     prepare_cp_forward,
@@ -54,9 +55,9 @@ def supports_prefill_cp_bcg(server_args: ServerArgs) -> bool:
     cfg = resolving_view(server_args)
     resolved = resolved_view(server_args)
     prefill_attention_backend, _ = attention_backends_of(resolved_view(server_args))
-    is_kimi_k31 = "KimiK31ForConditionalGeneration" in model_config_of(
-        server_args
-    ).hf_config.architectures
+    is_kimi_k31 = "KimiK31ForConditionalGeneration" in (
+        model_config_of(server_args).hf_config.architectures or ()
+    )
     kimi_ep = (
         is_kimi_k31
         and resolved.ep_size == cfg.tp_size == resolved.attn_cp_size
@@ -324,6 +325,58 @@ class PrefillCPBCGInput:
                 base + int(rank < remainder) for rank in range(cp_size)
             ]
             forward_batch.out_cache_loc = out_cache_loc
+
+
+class KimiK31CPBCGInput(PrefillCPBCGInput):
+    @classmethod
+    def create(cls, runner: PrefillCudaGraphRunner) -> KimiK31CPBCGInput:
+        result = super().create(runner)
+        alignment = get_parallel().attn_cp_size ** 2
+        capacity = (runner.max_num_tokens + alignment - 1) // alignment * alignment
+        result.input_ids_global = torch.zeros(
+            capacity, dtype=torch.int64, device=runner.device
+        )
+        result.moe_local_token_count = torch.zeros(
+            (), dtype=torch.int32, device=runner.device
+        )
+        return result
+
+    def model_positions(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        return self.positions[: forward_batch.input_embeds.shape[0]]
+
+    def prepare(
+        self,
+        runner: PrefillCudaGraphRunner,
+        forward_batch: ForwardBatch,
+        *,
+        static_num_tokens: int,
+        capture: bool,
+    ) -> None:
+        global_positions = forward_batch.positions
+        raw_num_tokens = int(forward_batch.extend_num_tokens)
+        super().prepare(
+            runner, forward_batch, static_num_tokens=static_num_tokens, capture=capture
+        )
+        metadata = forward_batch.attn_cp_metadata
+        cp_size = get_parallel().attn_cp_size
+        base, remainder = divmod(raw_num_tokens, cp_size)
+        metadata.graph_num_tokens = static_num_tokens
+        metadata.total_seq_lens = raw_num_tokens
+        metadata.per_rank_logical_token = [
+            base + int(rank < remainder) for rank in range(cp_size)
+        ]
+        self.moe_local_token_count.fill_(
+            metadata.per_rank_logical_token[get_parallel().attn_cp_rank]
+        )
+        metadata.moe_local_token_count = self.moe_local_token_count
+        forward_batch.positions = global_positions
+        ids = cp_interleave_input_ids(
+            forward_batch.input_ids[:raw_num_tokens], forward_batch
+        )
+        if ids.shape[0] > self.input_ids_global.shape[0]:
+            raise RuntimeError("Kimi-K3.1 CP graph input IDs exceed capture capacity")
+        self.input_ids_global[: ids.shape[0]].copy_(ids)
+        forward_batch.input_ids_global = self.input_ids_global[: ids.shape[0]]
 
 
 def execute_prefill_cp_bcg(

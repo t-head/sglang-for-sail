@@ -13,11 +13,11 @@ import torch
 import triton
 
 from sglang.kernels.ops.attention.dcp_kernels import create_mla_kv_page_table_for_dcp
-from sglang.kernels.ops.attention.mla_window_indices import mla_window_sparse_indices
 from sglang.kernels.ops.attention.fixup_zero_kv import (
     _jit_fixup_module,
     fixup_zero_kv_rows,
 )
+from sglang.kernels.ops.attention.mla_window_indices import mla_window_sparse_indices
 from sglang.kernels.ops.attention.pad import (
     pad_draft_extend_query as pad_draft_extend_query_triton,
 )

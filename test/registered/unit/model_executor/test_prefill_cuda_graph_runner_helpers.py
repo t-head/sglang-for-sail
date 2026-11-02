@@ -237,7 +237,9 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
                     buffers.pp_proxy_tensors[name][:rows].copy_(value)
                 runner._zero_stale_cp_pp_proxy_rows(received, 8)
                 replay_input = buffers.pp_proxy_tensors["hidden_states"][:4]
-                torch.testing.assert_close(replay_input[:rows], received["hidden_states"])
+                torch.testing.assert_close(
+                    replay_input[:rows], received["hidden_states"]
+                )
                 self.assertTrue(torch.all(replay_input[rows:] == 0))
                 for name in ("residual", "dspark_hidden_states"):
                     expected = 7.0 if rows == 4 else 0.0

@@ -56,6 +56,7 @@ from sglang.srt.configs.model_config import is_qwen4_exp
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.bcg import (
+    KimiK31CPBCGInput,
     PrefillCPBCGInput,
 )
 from sglang.srt.layers.cp.bcg import (
@@ -592,7 +593,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.capture_num_tokens = filter_prefill_cp_bcg_capture_num_tokens(
                 self.capture_num_tokens, server_args
             )
-            self.prefill_cp_bcg_input = PrefillCPBCGInput.create(self)
+            cp_input_type = (
+                KimiK31CPBCGInput
+                if "KimiK31ForConditionalGeneration"
+                in (model_runner.model_config.hf_config.architectures or ())
+                else PrefillCPBCGInput
+            )
+            self.prefill_cp_bcg_input = cp_input_type.create(self)
             logger.info(
                 "Prefill CP breakable CUDA graph enabled: strategy=%s, cp_size=%d",
                 get_parallel().cp_strategy,
@@ -755,6 +762,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def _get_layer_model_positions(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Mirror outer multimodal wrappers when BCG captures layer_model directly."""
+        if isinstance(self.prefill_cp_bcg_input, KimiK31CPBCGInput):
+            return self.prefill_cp_bcg_input.model_positions(forward_batch)
         if forward_batch.mrope_positions is None:
             return forward_batch.positions
 
@@ -1303,6 +1312,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ``capture_hidden_mode=None`` when unknown at the call site (it is
         rank-uniform; forward-time-only checking cannot split the group).
         """
+        if isinstance(
+            getattr(self, "prefill_cp_bcg_input", None), KimiK31CPBCGInput
+        ) and (batch_size == 0 or prefix_lens is None or contains_mm_inputs):
+            return False
         if contains_mm_inputs and (
             self._qwen_bcg_hc_sidechannel or self._qwen_bcg_mtp_draft
         ):

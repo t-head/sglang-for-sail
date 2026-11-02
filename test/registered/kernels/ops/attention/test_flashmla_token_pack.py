@@ -133,7 +133,7 @@ def test_attention(heads, tokens, topk, pattern):
     from sglang.kernels.ops.attention.dsa.flashmla_token_pack import (
         flashmla_kv_token_packed,
     )
-    from sglang.kernels.ops.quantization.dsa_quant_k_cache import quantize_k_cache
+    from sglang.kernels.ops.attention.dsa.quant_k_cache import quantize_k_cache
 
     torch.manual_seed(42)
     slots = 16384
@@ -191,7 +191,7 @@ def test_packed_attention_graph():
     from sglang.kernels.ops.attention.dsa.flashmla_token_pack import (
         flashmla_kv_token_packed,
     )
-    from sglang.kernels.ops.quantization.dsa_quant_k_cache import quantize_k_cache
+    from sglang.kernels.ops.attention.dsa.quant_k_cache import quantize_k_cache
 
     torch.manual_seed(43)
     q = torch.randn(7, 12, 576, device="cuda", dtype=torch.bfloat16)

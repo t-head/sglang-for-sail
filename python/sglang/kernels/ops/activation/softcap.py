@@ -184,9 +184,7 @@ def gathered_softcap_logits(gathered, final_logit_softcapping, output):
     assert gathered.is_contiguous() and output.stride(1) == 1
     assert output.shape[0] == num_tokens and vocab_size <= world * shard_width
     block_size = 1024
-    _gathered_softcap_logits_kernel[
-        (triton.cdiv(vocab_size, block_size), num_tokens)
-    ](
+    _gathered_softcap_logits_kernel[(triton.cdiv(vocab_size, block_size), num_tokens)](
         gathered,
         output,
         num_tokens,

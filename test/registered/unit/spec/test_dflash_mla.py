@@ -297,6 +297,10 @@ class TestDFlashMLA(CustomTestCase):
             Qwen3Config(**_export_fields(), markov_rank=4, markov_head_type="vanilla")
         )
         attn = model.layers[0].self_attn
+        torch.manual_seed(0)
+        with torch.no_grad():
+            for param in attn.parameters():
+                param.copy_(torch.randn_like(param) * 0.2 + (param == 1).float())
         attn.rotary_emb = copy.deepcopy(attn.rotary_emb)
         for module in (attn.rotary_emb, attn.kv_a_layernorm):
             module.forward = module.forward_native

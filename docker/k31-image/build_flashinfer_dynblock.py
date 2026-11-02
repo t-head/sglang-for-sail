@@ -89,10 +89,14 @@ def main() -> None:
             )
             built = Path(workspace) / target.name
             subprocess.run(
-                [sys.executable, "-c", _BUILD_ONE, generator, str(built)], env=env, check=True
+                [sys.executable, "-c", _BUILD_ONE, generator, str(built)],
+                env=env,
+                check=True,
             )
             shutil.copyfile(built, target)
-        (target.parent / MARKER).write_text(json.dumps({**marker, "arch": arch}, indent=1))
+        (target.parent / MARKER).write_text(
+            json.dumps({**marker, "arch": arch}, indent=1)
+        )
         return f"rebuilt {target} for {arch}"
 
     with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
