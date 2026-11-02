@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.runtime_context import get_memory, get_parallel
 
 
 class DevicePoolEntry:
@@ -453,6 +454,187 @@ def _build_dsa_device_pool_group(
         ),
     ]
     return DevicePoolGroup(entries, num_layers, page_size, rank_replicated=True)
+
+
+def _mha_device_pool_entry(
+    name: PoolName,
+    pool: Any,
+    layer_mapping: dict[int, int],
+    page_size: int,
+    indices_from_pool: PoolName | None = None,
+) -> DevicePoolEntry:
+    if pool.k_scale_buffer is not None or pool.native_k_scale_buffer is not None:
+        raise ValueError(
+            "The direct external linker does not support scaled KV caches yet."
+        )
+    num_layers = len(pool.k_buffer)
+    return DevicePoolEntry(
+        name=name,
+        indices_from_pool=indices_from_pool or name,
+        device_pool=pool,
+        components=[[*pool.k_buffer, *pool.v_buffer]],
+        layer_mapping={
+            layer: (index, num_layers + index) for layer, index in layer_mapping.items()
+        },
+        page_size=page_size,
+        rows_are_pages=False,
+    )
+
+
+def _mamba_device_pool_entry(req_to_token_pool: Any, start_layer: int) -> DevicePoolEntry:
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+        _stage_local_layer_mapping,
+    )
+
+    if get_memory().enable_unified_memory:
+        raise ValueError(
+            "The direct external linker does not support --enable-unified-memory "
+            "on hybrid Mamba models yet."
+        )
+    if (
+        req_to_token_pool.mamba_ckpt_pool is not None
+        or req_to_token_pool.short_conv_pool.enabled
+        or req_to_token_pool.ngram_pool.enabled
+    ):
+        raise ValueError(
+            "The direct external linker does not support int8 Mamba checkpoints "
+            "or Mamba side states yet."
+        )
+
+    mamba_pool = req_to_token_pool.mamba_pool
+    mamba_cache = mamba_pool.mamba_cache
+    layers = range(mamba_pool.num_mamba_layers)
+    components = [
+        [state[layer] for layer in layers]
+        for state in (mamba_cache.temporal, *mamba_cache.conv)
+        if state.numel() > 0
+    ]
+    return DevicePoolEntry(
+        name=PoolName.MAMBA,
+        indices_from_pool=PoolName.MAMBA,
+        device_pool=mamba_pool,
+        components=components,
+        layer_mapping=_stage_local_layer_mapping(
+            req_to_token_pool.mamba_map, start_layer
+        ),
+        page_size=1,
+        rows_are_pages=True,
+    )
+
+
+def _build_mamba_device_pool_group(
+    kvcache: Any, params: Any, page_size: int
+) -> DevicePoolGroup:
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+        _stage_local_layer_mapping,
+    )
+    from sglang.srt.mem_cache.memory_pool import (
+        DSATokenToKVPool,
+        HybridLinearKVPool,
+        MLATokenToKVPool,
+    )
+
+    full_kv_pool = kvcache.full_kv_pool
+    if (
+        type(kvcache) is not HybridLinearKVPool
+        or type(full_kv_pool) not in (MLATokenToKVPool, DSATokenToKVPool)
+        or params.mtp_draft_device_pools
+    ):
+        raise ValueError(
+            "The direct external linker supports FULL + MAMBA models only with a "
+            "plain MLA or DSA pool, without packed draft KV."
+        )
+    is_dsa = type(full_kv_pool) is DSATokenToKVPool
+    parallel = get_parallel()
+    dcp_size = parallel.attn_dcp_size
+    dcp_sharded = dcp_size > 1
+    dcp_mapper = (
+        partial(
+            maybe_dcp_kernel_indices,
+            dcp_size=dcp_size,
+            dcp_rank=parallel.attn_dcp_rank,
+        )
+        if dcp_sharded
+        else None
+    )
+
+    entries = [
+        DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=full_kv_pool,
+            components=[full_kv_pool.kv_buffer],
+            layer_mapping=_stage_local_layer_mapping(
+                kvcache.full_attention_layer_id_mapping, kvcache.start_layer
+            ),
+            page_size=page_size // dcp_size,
+            rows_are_pages=False,
+            pcp_replicated=is_dsa,
+            tp_replicated=True,
+            dcp_sharded=dcp_sharded,
+            index_mapper=dcp_mapper,
+        ),
+        _mamba_device_pool_entry(params.req_to_token_pool, kvcache.start_layer),
+    ]
+    if is_dsa:
+        buffers = full_kv_pool.index_k_with_scale_buffer
+        active_layers = [i for i, buffer in enumerate(buffers) if buffer.numel()]
+        active = {layer: i for i, layer in enumerate(active_layers)}
+        if active:
+            mapping = _stage_local_layer_mapping(
+                kvcache.full_attention_layer_id_mapping, kvcache.start_layer
+            )
+            entries.append(
+                DevicePoolEntry(
+                    name=PoolName.INDEXER,
+                    indices_from_pool=PoolName.KV,
+                    device_pool=full_kv_pool,
+                    components=[[buffers[i] for i in active]],
+                    layer_mapping={
+                        layer: active[i] for layer, i in mapping.items() if i in active
+                    },
+                    page_size=page_size // dcp_size,
+                    rows_are_pages=True,
+                    pcp_replicated=True,
+                    tp_replicated=True,
+                    dcp_sharded=dcp_sharded,
+                    index_mapper=dcp_mapper,
+                )
+            )
+    for draft_pool in params.sidecar_draft_device_pools:
+        draft_dcp_sharded = (
+            draft_pool.rows_are_dcp_collapsed()
+            if isinstance(draft_pool, MLATokenToKVPool)
+            else False
+        )
+        draft_page_size = page_size // dcp_size if draft_dcp_sharded else page_size
+        if draft_pool.page_size != draft_page_size:
+            raise ValueError("Draft KV page size must match the tree page size.")
+        layer_mapping = {layer: layer for layer in range(draft_pool.layer_num)}
+        if type(draft_pool) is MLATokenToKVPool:
+            entry = DevicePoolEntry(
+                name=PoolName.DRAFT,
+                indices_from_pool=PoolName.KV,
+                device_pool=draft_pool,
+                components=[draft_pool.kv_buffer],
+                layer_mapping=layer_mapping,
+                page_size=draft_page_size,
+                rows_are_pages=False,
+                tp_replicated=True,
+                dcp_sharded=draft_dcp_sharded,
+                index_mapper=dcp_mapper if draft_dcp_sharded else None,
+            )
+        else:
+            entry = _mha_device_pool_entry(
+                PoolName.DRAFT,
+                draft_pool,
+                layer_mapping,
+                page_size,
+                indices_from_pool=PoolName.KV,
+            )
+        entries.append(entry)
+    num_layers = max(layer for entry in entries for layer in entry.layer_mapping)
+    return DevicePoolGroup(entries, num_layers + 1, page_size)
 
 
 def resolve_hybrid_device_pool_group(

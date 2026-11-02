@@ -72,7 +72,7 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.dcp.layout import dsa_index_k_page_tokens
+from sglang.srt.layers.dcp.layout import dsa_index_k_page_tokens, dsa_shards_index_k
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     NextBatchPlan,
@@ -1668,6 +1668,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 device_page_size = self.token_to_kv_pool.page_size
                 return kv_to_page_indices(kv_indices_full, device_page_size)
 
+            def _dsa_pages_payload():
+                return kv_to_page_indices(
+                    self.req_to_token_pool.req_to_token[
+                        decode_req.req.kv.req_pool_idx, total_prefix_len:seq_len
+                    ],
+                    dsa_index_k_page_tokens(self.token_to_kv_pool.page_size),
+                )
+
             def _dsa_tail_payload():
                 return get_dsa_tail_state_indices(
                     self.token_to_kv_pool,
@@ -1708,7 +1716,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 StateType.QSA_PENDING: _qsa_pending_payload,
                 StateType.QSA_COMPRESSED: _full_kv_pages_payload,
                 StateType.SWA: _swa_payload,
-                StateType.DSA: _full_kv_pages_payload,
+                StateType.DSA: (
+                    _dsa_pages_payload
+                    if dsa_shards_index_k()
+                    else _full_kv_pages_payload
+                ),
                 StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
                 StateType.MINIMAX_DENSE_KV: _full_kv_pages_payload,

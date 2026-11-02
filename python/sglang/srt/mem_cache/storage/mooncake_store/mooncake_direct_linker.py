@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
+import time
 from queue import Empty, Queue
 
 import torch
@@ -559,6 +560,27 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load session cleanup failed")
+
+    @staticmethod
+    def _log_load_timing(request_transfers, requests, loaded, began, landed):
+        rate = sum(loaded) / max(landed - began, 1e-9) / 1e9
+        for transfers, (rid, queued_at), nbytes in zip(
+            request_transfers, requests, loaded
+        ):
+            pages = next((len(t.keys) for t in transfers if t.name == PoolName.KV), 0)
+            queued_at = began if queued_at is None else queued_at
+            logger.info(
+                "Mooncake linker load rid=%s pages=%d bytes=%d wait=%.0fms "
+                "xfer=%.0fms total=%.0fms batch_reqs=%d batch_rate=%.2fGB/s",
+                rid,
+                pages,
+                nbytes,
+                (began - queued_at) * 1e3,
+                (landed - began) * 1e3,
+                (landed - queued_at) * 1e3,
+                len(request_transfers),
+                rate,
+            )
 
     def offload(self, transfers: list[PoolTransfer]) -> bool:
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)

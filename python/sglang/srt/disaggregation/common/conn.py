@@ -1937,6 +1937,7 @@ class CommonKVSender(BaseKVSender):
         self._transfer_metric = KVTransferMetric()
         self._transfer_num_kv_indices = 0
         self._transfer_num_state_indices = 0
+        self._transfer_state_bytes = 0
         # inner state
         self.curr_idx = 0
         self.init_time: Optional[float] = None

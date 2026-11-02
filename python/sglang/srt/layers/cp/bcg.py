@@ -26,6 +26,7 @@ from sglang.srt.arg_groups.overrides import (
     resolved_view,
     resolving_view,
 )
+from sglang.srt.arg_groups.model_override_base import model_config_of
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
 from sglang.srt.layers.cp.padding import get_cp_padding_align_size
@@ -53,13 +54,39 @@ def supports_prefill_cp_bcg(server_args: ServerArgs) -> bool:
     cfg = resolving_view(server_args)
     resolved = resolved_view(server_args)
     prefill_attention_backend, _ = attention_backends_of(resolved_view(server_args))
+    is_kimi_k31 = "KimiK31ForConditionalGeneration" in model_config_of(
+        server_args
+    ).hf_config.architectures
+    kimi_ep = (
+        is_kimi_k31
+        and resolved.ep_size == cfg.tp_size == resolved.attn_cp_size
+        and resolved.moe_a2a_backend == "megamoe"
+        and cfg.moe_dp_size == 1
+    )
     return (
         cfg.enable_prefill_cp
-        and cfg.pp_size == 1
         and resolved.attn_cp_size == cfg.tp_size
         and (
-            (cfg.cp_strategy == "zigzag" and prefill_attention_backend == "trtllm_mha")
-            or (cfg.cp_strategy == "interleave" and prefill_attention_backend == "dsv4")
+            (
+                cfg.pp_size == 1
+                and (
+                    (
+                        cfg.cp_strategy == "zigzag"
+                        and prefill_attention_backend == "trtllm_mha"
+                    )
+                    or (
+                        cfg.cp_strategy == "interleave"
+                        and prefill_attention_backend == "dsv4"
+                    )
+                )
+            )
+            or (
+                is_kimi_k31
+                and cfg.cp_strategy == "interleave"
+                and prefill_attention_backend == "dsa"
+                and cfg.dp_size == 1
+                and (resolved.ep_size == 1 or kimi_ep)
+            )
         )
     )
 

@@ -65,6 +65,7 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.dcp.layout import dsa_shards_index_k
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
@@ -1578,6 +1579,13 @@ class SchedulerDisaggregationPrefillMixin:
                 ]
                 return _page_indices(kv_indices_full)
 
+            def _dsa_pages_payload():
+                return _page_indices(
+                    self.req_to_token_pool.req_to_token[
+                        req.kv.req_pool_idx, req.disagg_decode_prefix_len : seq_len
+                    ]
+                )
+
             def _dsa_tail_payload():
                 return get_dsa_tail_state_indices(
                     self.token_to_kv_pool_allocator.get_kvcache(),
@@ -1617,7 +1625,11 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.QSA_PENDING: _qsa_pending_payload,
                 StateType.QSA_COMPRESSED: _full_kv_pages_payload,
                 StateType.SWA: _swa_payload,
-                StateType.DSA: _full_kv_pages_payload,
+                StateType.DSA: (
+                    _dsa_pages_payload
+                    if dsa_shards_index_k()
+                    else _full_kv_pages_payload
+                ),
                 StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
                 StateType.MINIMAX_DENSE_KV: _full_kv_pages_payload,
