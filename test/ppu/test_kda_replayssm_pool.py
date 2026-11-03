@@ -71,3 +71,41 @@ def test_replayssm_pool_and_budget(enabled, kda, gdn, expected):
         )
     else:
         params.replayssm_ring_bytes_per_req.assert_not_called()
+
+
+@pytest.mark.parametrize("mode,role_switch", [("decode", False), ("prefill", True)])
+def test_pd_decode_extra_slots_keep_fixed_request_state(mode, role_switch):
+    config = module.KVCacheConfigurator.__new__(module.KVCacheConfigurator)
+    config.mambaish_config = NS(
+        mamba2_cache_params=NS(layers=[0, 1], mamba_cache_per_req=1024)
+    )
+    config.hybrid_gdn_config = config.hybrid_kda_config = None
+    config.pp_size = config.attn_dp_size = 1
+    config.extra_mamba_cache_bytes_per_req = 0
+    config.extra_mamba_cache_bytes_per_request_row = 128
+    config.spec_algorithm = NS(is_none=lambda: True)
+    config.allocate_intermediate_ssm = False
+    with (
+        get_context().override_server_args(
+            model_path="dummy",
+            max_mamba_cache_size=8,
+            max_running_requests=8,
+            disaggregation_mode=mode,
+            enable_pd_role_switch=role_switch,
+            disaggregation_decode_extra_slots=2,
+            enable_unified_memory=False,
+        ),
+        get_exec().mamba.override(enable_mamba_extra_buffer=False),
+        patch.object(
+            module.KVCacheConfigurator, "fused_entry_bytes", return_value=None
+        ),
+        patch.object(
+            module.KVCacheConfigurator, "_req_pool_pre_alloc_size", return_value=2
+        ),
+        patch.object(
+            module.KVCacheConfigurator, "_calculate_mamba_ratio", return_value=1
+        ),
+    ):
+        actual = config._handle_max_mamba_cache(1.0)
+    expected_bytes = 11 * (1024 + 128)
+    assert actual == 1.0 - expected_bytes / (1 << 30)
