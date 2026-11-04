@@ -6,6 +6,15 @@
 Preserves sigmoid probabilities from the selected logits, ordered normalization,
 and scale. This leaf uses one fixed launch configuration, not vLLM's optional
 driver-launch cache or autotuner. Public metadata validation owns buffer safety.
+
+One CTA per token row and one warp per CTA, so the kernel is a single serial
+latency chain: eight dependent reductions, each followed by a dependent reload
+of the winning logit. Decode rows are few, so nothing hides that chain -- it is
+what the duration is made of. Each round therefore reduces an int64 key that
+packs the score's order-preserving bit pattern above the inverted expert id, so
+one plain ``tl.max`` yields both the winner and its tie-broken index; the
+``return_indices`` reduction computes the same thing far slower. A single warp
+keeps every round inside a warp shuffle rather than a shared-memory round trip.
 """
 
 import torch
@@ -35,15 +44,24 @@ def _step5_router_topk_kernel(
     scores = tl.where(valid, probability + correction, -float("inf"))
     has_bad = tl.max((gating != gating).to(tl.int32), axis=0) > 0
 
+    # Order-preserving map from the score's bit pattern to an unsigned rank:
+    # non-negative floats keep their order with the sign bit set, negative ones
+    # are inverted. Adding 0.0 first folds -0.0 into +0.0, which compare equal
+    # but rank differently once packed. The inverted expert id occupies the low
+    # nine bits, so a tie resolves toward the smaller id exactly as the
+    # left-tie-break reduction did, and every real key stays non-negative.
+    scores = scores + 0.0
+    bits = scores.to(tl.int32, bitcast=True).to(tl.int64) & 0xFFFFFFFF
+    ordered = tl.where(bits >= 0x80000000, bits ^ 0xFFFFFFFF, bits | 0x80000000)
+    key = (ordered << 9) | (511 - expert).to(tl.int64)
+
     weights = tl.zeros((8,), dtype=tl.float32)
     indices = tl.zeros((8,), dtype=tl.int32)
     total = 0.0
     slot = tl.arange(0, 8)
     for k in tl.static_range(8):
-        score, index = tl.max(
-            scores, axis=0, return_indices=True, return_indices_tie_break_left=True
-        )
-        index = index.to(tl.int32)
+        best = tl.max(key, axis=0)
+        index = (511 - (best & 511)).to(tl.int32)
         # NaN rows are overwritten below, but still execute the reduction. A
         # masked padding winner must never read outside the logical logits row.
         selected_logit = tl.load(
@@ -57,7 +75,7 @@ def _step5_router_topk_kernel(
         weights = tl.where(slot == k, selected_probability, weights)
         indices = tl.where(slot == k, index, indices)
         total += selected_probability
-        scores = tl.where(expert == index, -float("inf"), scores)
+        key = tl.where(expert == index, -1, key)
 
     weights = weights / (total + 1e-20)
     weights = weights * 3.0
@@ -87,6 +105,6 @@ def _step5_router_topk(
         ids.stride(0),
         num_token_non_padded,
         HAS_PADDING=num_token_non_padded is not None,
-        num_warps=4,
+        num_warps=1,
         num_stages=2,
     )
