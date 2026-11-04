@@ -196,6 +196,32 @@ def _load_keys_tile(
     return tl.reshape(tl.permute(packed, (0, 2, 1)), (256, BLOCK_R))
 
 
+@triton.jit
+def _live_extent(
+    position,
+    row_valid,
+    request,
+    BLOCK_R: tl.constexpr,
+    REGIONS,
+    CLEAR_FUTURE: tl.constexpr,
+):
+    """Live region count per row and the last tile any row of the group needs.
+
+    A 1M graph capture has 4096 capacity tiles while a 60K request has about
+    235 live tiles, so both modes stop at live history. The portable FlashInfer
+    fallback (CLEAR_FUTURE) needs -inf past live to make a full-width top-k
+    replay safe; ``launch`` covers that part of every row with the flat
+    ``_wipe_scores`` pass instead of a per-tile full-width store.
+    """
+    live = tl.where(row_valid & (request > 0), tl.maximum(position // 8, 0), 0)
+    max_live = tl.max(live, axis=0)
+    last_tile = tl.minimum(tl.cdiv(max_live, BLOCK_R), tl.cdiv(REGIONS, BLOCK_R))
+    if not CLEAR_FUTURE:
+        # Selecting every historical region does not consume region_scores.
+        last_tile = tl.where(max_live <= 512, 0, last_tile)
+    return live, max_live, last_tile
+
+
 @triton.jit(
     do_not_specialize=("ROWS", "REGIONS"),
     do_not_specialize_on_alignment=("ROWS", "REGIONS"),
@@ -217,6 +243,7 @@ def _score_regions_ppu_opt(
     BLOCK_R: tl.constexpr,
     GRID_TILES: tl.constexpr,
     CLEAR_FUTURE: tl.constexpr,
+    EARLY_EXIT: tl.constexpr,
     WEIGHT_SCALE: tl.constexpr,
     GROUP_ROWS: tl.constexpr,
     HEAD_BLOCK: tl.constexpr,
@@ -225,7 +252,7 @@ def _score_regions_ppu_opt(
 ):
     """Score GROUP_ROWS rows together so they share one key-tile gather.
 
-    Three differences from the original ``_score_regions``:
+    Four differences from the original ``_score_regions``:
     1. key/query bytes go straight into the fp8 MMA instead of an element-wise
        software E4M3 decode (half of the instructions on the old path);
     2. M = GROUP_ROWS * HEAD_BLOCK is filled with adjacent rows of the same
@@ -233,7 +260,12 @@ def _score_regions_ppu_opt(
        drops to 1/GROUP_ROWS;
     3. a tile that lies entirely past live skips gather/MMA; under CLEAR_FUTURE
        its -inf columns are pre-filled by ``_wipe_scores`` instead of being
-       written full width by every tile.
+       written full width by every tile;
+    4. a CTA whose whole tile range lies past live returns before the query tile
+       is loaded, so the fixed per-CTA cost is skipped together with the work.
+       ``EARLY_EXIT`` enables that only when the launch can have an empty CTA;
+       otherwise the bound is computed below the query load where the gather's
+       latency hides it, and no CTA pays for a test that cannot fire.
 
     When the group spans several requests (a request boundary falls inside it)
     the kernel takes the per-row cold path. That path must store Out as soon as
@@ -262,6 +294,19 @@ def _score_regions_ppu_opt(
     mixed = (request != base_request) & (request != 0) & row_valid
     uniform = tl.sum(mixed.to(tl.int32), axis=0) == 0
 
+    if EARLY_EXIT:
+        live, max_live, last_tile = _live_extent(
+            position, row_valid, request, BLOCK_R, REGIONS, CLEAR_FUTURE
+        )
+        # Leave before the query tile is read: a CTA with no live tile writes
+        # nothing, yet that tile is GROUP_ROWS * HEAD_BLOCK * 256 bytes (8KB at
+        # group 8 / head block 4) plus its MMA operand staging. Whenever REGIONS
+        # over-provisions live -- a decode step whose context is far below
+        # capacity, or a replay with padded positions -- those CTA are the
+        # majority and their prologue is the whole kernel.
+        if first_tile >= last_tile:
+            return
+
     matrix_row = tl.arange(0, GROUP_ROWS * HEAD_BLOCK)
     channel = tl.arange(0, 256)
     head_index = tl.arange(0, HEAD_BLOCK)
@@ -284,18 +329,14 @@ def _score_regions_ppu_opt(
         ).to(tl.float32)
         * WEIGHT_SCALE
     )
+    if not EARLY_EXIT:
+        # Every CTA of this launch has work, so the bound must not gate the query
+        # load: computing it here lets the reduction overlap the gather latency,
+        # which is why the long-prefill configuration keeps this order.
+        live, max_live, last_tile = _live_extent(
+            position, row_valid, request, BLOCK_R, REGIONS, CLEAR_FUTURE
+        )
 
-    live = tl.where(row_valid & (request > 0), tl.maximum(position // 8, 0), 0)
-    max_live = tl.max(live, axis=0)
-    # A 1M graph capture has 4096 capacity tiles while a 60K request has about
-    # 235 live tiles, so both modes stop at live history. The portable
-    # FlashInfer fallback (CLEAR_FUTURE) needs -inf past live to make a
-    # full-width top-k replay safe; ``launch`` covers that part of every row
-    # with the flat `_wipe_scores` pass instead of a per-tile full-width store.
-    last_tile = tl.minimum(tl.cdiv(max_live, BLOCK_R), tl.cdiv(REGIONS, BLOCK_R))
-    if not CLEAR_FUTURE:
-        # Selecting every historical region does not consume region_scores.
-        last_tile = tl.where(max_live <= 512, 0, last_tile)
     for tile in range(first_tile, last_tile, GRID_TILES):
         regions = tile * BLOCK_R + tl.arange(0, BLOCK_R)
         in_range = regions < REGIONS
@@ -604,6 +645,20 @@ def _group_plan(rows, group_rows):
 _MAX_GRID_TILES = 128
 
 
+def _early_exit_worthwhile(rows: int, block_regions: int, grid_tiles: int) -> bool:
+    """Whether any CTA of this launch can end before its query tile.
+
+    Rows of one launch carry consecutive token positions, so the row count
+    lower-bounds how far live reaches: the last row sits at least ``rows - 1``
+    tokens past the first. When even that bound already covers every grid tile,
+    no CTA can exit and pulling the bound ahead of the query tile only makes the
+    gather wait for it. Shapes are fixed at graph capture, so this decision is
+    identical on every replay.
+    """
+    live_lower_bound = max(rows - 1, 0) // 8
+    return triton.cdiv(live_lower_bound, block_regions) < grid_tiles
+
+
 # region_scores comes from torch.empty and the portable selector runs top-k over
 # the whole row, so columns past live must be -inf. Keeping that sweep inside the
 # scoring kernel forces stores no wider than BLOCK_R elements: measured 425us out
@@ -743,6 +798,7 @@ def _launch_spans(
     heads = q.shape[1]
     block_regions = 8
     grid_tiles = min(triton.cdiv(regions, block_regions), _MAX_GRID_TILES)
+    early_exit = _early_exit_worthwhile(q.shape[0], block_regions, grid_tiles)
     _score_regions_ppu_opt[(starts.numel(), grid_tiles)](
         q,
         weights,
@@ -760,6 +816,7 @@ def _launch_spans(
         block_regions,
         grid_tiles,
         clear_future,
+        early_exit,
         weight_scale,
         span_rows,
         max(4, heads + (-heads % 4)),
@@ -831,6 +888,7 @@ def launch(
     num_warps = 2
     grid_tiles = min(triton.cdiv(regions, block_regions), _MAX_GRID_TILES)
     head_block = max(4, heads + (-heads % 4))
+    early_exit = _early_exit_worthwhile(rows, block_regions, grid_tiles)
     _score_regions_ppu_opt[(triton.cdiv(rows, group), grid_tiles)](
         q,
         weights,
@@ -850,6 +908,7 @@ def launch(
         block_regions,
         grid_tiles,
         clear_future,
+        early_exit,
         weight_scale,
         group,
         head_block,
