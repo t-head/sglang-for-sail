@@ -16,7 +16,7 @@ from sglang.srt.managers.mm_utils import (
     prepare_mm_inputs,
 )
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.step3_vl_10b import PerceptionEncoder
 from sglang.srt.models.step3p5 import Step3p5ForCausalLM
@@ -284,6 +284,7 @@ class Step3p7ForConditionalGeneration(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         get_embedding: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
@@ -293,6 +294,7 @@ class Step3p7ForConditionalGeneration(nn.Module):
                 Modality.IMAGE: self.get_image_feature,
             },
             positions=positions,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
         return hidden_states
 
