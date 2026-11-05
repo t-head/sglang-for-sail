@@ -417,6 +417,72 @@ def _assert_topk_values(window, indices, k):
     assert torch.equal(actual, expected)
 
 
+@pytest.mark.parametrize("path", ["paged", "ragged", "packed", "candidates"])
+@pytest.mark.parametrize("seq", [8192, 16384, 20480])
+@pytest.mark.parametrize("dist", ["narrow", "tiny", "two_values", "all_equal"])
+@torch.inference_mode()
+def test_topk_v2_overflowing_threshold_bin(path: str, seq: int, dist: str) -> None:
+    """An overflowing coarse bin must retain the exact top-k, including DCP score bits."""
+    torch.manual_seed(seq)
+    device = "cuda"
+    k, batch, start = 2048, 3, 3
+    values = torch.rand(batch, seq, device=device)
+    if dist == "narrow":
+        values = 1.0 + values * 0.02
+    elif dist == "tiny":
+        values = (0.5 + values) * 1e-30
+    elif dist == "two_values":
+        one = torch.ones((), device=device)
+        hi = one.nextafter(one + 1)
+        values = torch.where(values < 0.5, one, hi)
+    else:
+        values.fill_(0.5)
+
+    lengths = torch.full((batch,), seq, dtype=torch.int32, device=device)
+    out = torch.full((batch, k), -2, dtype=torch.int32, device=device)
+    if path == "paged":
+        topk_transform_paged_v2(values, lengths, None, out, PAGE_SIZE, _plan(lengths))
+    else:
+        width = (start + seq + 3) & ~3
+        scores = torch.full((batch, width), OUTSIDE_SCORE, device=device)
+        scores[:, start : start + seq] = values
+        starts = torch.full_like(lengths, start)
+        if path == "ragged":
+            topk_transform_ragged_v2(
+                scores, lengths, torch.zeros_like(lengths), out, row_starts=starts
+            )
+        elif path == "packed":
+            table = (
+                torch.arange(
+                    (seq + PAGE_SIZE - 1) // PAGE_SIZE, dtype=torch.int32, device=device
+                )
+                .expand(batch, -1)
+                .contiguous()
+            )
+            topk_transform_packed_v2(
+                scores, lengths, table, out, PAGE_SIZE, row_starts=starts
+            )
+        else:
+            world, rank = 8, 3
+            candidates = torch.full((batch, k, 2), -2, dtype=torch.int32, device=device)
+            topk_transform_candidates_v2(
+                scores,
+                lengths,
+                out_candidates=candidates,
+                world=world,
+                rank=rank,
+                row_starts=starts,
+                stable_ties=True,
+            )
+            positions = candidates[:, :, 1]
+            assert bool((positions % world == rank).all())
+            out = (positions - rank) // world
+            bits = values.gather(1, out.long()).view(torch.int32)
+            assert torch.equal(candidates[:, :, 0], bits)
+    for row in range(batch):
+        _assert_topk_values(values[row], out[row], k)
+
+
 @pytest.mark.parametrize("num_ties", [48, 96])
 @torch.inference_mode()
 def test_topk_v2_negative_infinity_ties(num_ties: int) -> None:
