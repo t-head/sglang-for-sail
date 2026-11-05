@@ -284,12 +284,14 @@ def _resolve_step5_model_layer_indices(
             == (swa[depth], swa[depth] + 1)
         )
     else:
+        # A pipeline stage owns a slice of the main layers, so its selected
+        # attention IDs must cover exactly that slice of the full partition.
+        owned = range(selection.start_layer, selection.end_layer)
+        selected = selection.full_attention_layer_ids + selection.swa_attention_layer_ids
         matches = (
-            selection.full_attention_layer_ids == full
-            and selection.swa_attention_layer_ids == swa
-            and sorted(full + swa) == list(range(model_config.num_hidden_layers))
-            and (selection.start_layer, selection.end_layer)
-            == (0, model_config.num_hidden_layers)
+            selection.full_attention_layer_ids == tuple(i for i in full if i in owned)
+            and selection.swa_attention_layer_ids == tuple(i for i in swa if i in owned)
+            and sorted(selected) == list(owned)
         )
     if not matches:
         raise ValueError("Step5 model selection does not match the resolved partition.")

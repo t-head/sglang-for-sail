@@ -471,12 +471,16 @@ class Step5PoolConfigurator(MemoryPoolConfigurator):
                 (16, 16, 16, 1, 1, 1, 1, 1),
                 (16, 16, 8, 1, 1, 1, 2, 1),
                 (16, 16, 4, 1, 1, 1, 4, 1),
+                (4, 1, 4, 2, 1, 1, 1, 1),
+                (4, 4, 4, 2, 1, 1, 1, 1),
+                (8, 8, 8, 2, 1, 1, 1, 1),
             )
             or actual != declared
         ):
             raise ValueError(
                 "runtime parallel topology must match TP4/EP1, TP4/EP4, TP8/EP8, "
-                "TP16/EP16 (CP1/CP2/CP4), or DP2/TP4/EP8 with PP1/CP1; got "
+                "TP16/EP16 (CP1/CP2/CP4), DP2/TP4/EP8 with PP1/CP1, or TP4/TP8 "
+                "with PP2; got "
                 f"(tp,ep,attn_tp,pp,dp,attn_dp,attn_cp,attn_dcp)={declared}"
             )
 
@@ -550,6 +554,7 @@ class Step5PoolConfigurator(MemoryPoolConfigurator):
             )
         ):
             raise ValueError("unsupported Step5 PD sizing mode")
+        layer_info = kvc.layer_info
         if (
             kvc.page_size != 64
             or schedule.page_size != kvc.page_size
@@ -560,13 +565,20 @@ class Step5PoolConfigurator(MemoryPoolConfigurator):
             )
             or kvc.sliding_window_size != 512
             or hf.sliding_window != kvc.sliding_window_size
-            or (kvc.layer_info.start_layer, kvc.layer_info.end_layer) != (0, 92)
-            or kvc.layer_info.num_effective_layers != 92
+            # Each pipeline stage owns a contiguous non-empty slice of the
+            # main layers; a single stage must cover all of them.
+            or not 0
+            <= layer_info.start_layer
+            < layer_info.end_layer
+            <= hf.num_hidden_layers
+            or layer_info.num_effective_layers
+            != layer_info.end_layer - layer_info.start_layer
             or hf.num_hidden_layers != 92
             or hf.num_nextn_predict_layers != 3
         ):
             raise ValueError(
-                "Step5 sizing requires explicit B, P64, W512 and all 92 layers"
+                "Step5 sizing requires explicit B, P64, W512 and a non-empty "
+                "main-layer stage"
             )
 
     @staticmethod
@@ -575,25 +587,27 @@ class Step5PoolConfigurator(MemoryPoolConfigurator):
 
         mc, ps = kvc.model_config, get_parallel()
         hf = mc.hf_text_config
+        # Per-stage geometry: each rank prices only the layers it allocates.
+        layer_info = kvc.layer_info
         full, swa = (
-            tuple(mc.full_attention_layer_ids),
-            tuple(mc.swa_attention_layer_ids),
+            tuple(layer_info.full_attention_layer_ids),
+            tuple(layer_info.swa_attention_layer_ids),
         )
         for layer_id in full + swa:
             _step5_integer("resolved layer ID", layer_id)
+        owned = list(range(layer_info.start_layer, layer_info.end_layer))
         if (
-            len(full) != 23
-            or len(swa) != 69
-            or len(set(full + swa)) != 92
-            or set(full + swa) != set(range(92))
+            sorted(full + swa) != owned
             or hf.layer_types_with_mtp is None
-            or len(hf.layer_types_with_mtp) != 95
+            or len(hf.layer_types_with_mtp)
+            != hf.num_hidden_layers + hf.num_nextn_predict_layers
             or any(hf.layer_types_with_mtp[i] != "full_attention" for i in full)
             or any(hf.layer_types_with_mtp[i] != "sliding_attention" for i in swa)
-            or hf.layer_types_with_mtp[92:] != ["sliding_attention"] * 3
+            or hf.layer_types_with_mtp[hf.num_hidden_layers :]
+            != ["sliding_attention"] * hf.num_nextn_predict_layers
         ):
             raise ValueError(
-                "invalid resolved target partition or three draft SWA layers"
+                "invalid resolved stage partition or draft SWA layers"
             )
         heads = mc.get_num_kv_heads(ps.attn_tp_size, ps.attn_dcp_size)
         for name, value in (

@@ -10,6 +10,7 @@ import logging
 import re
 import weakref
 from collections.abc import Iterable, Mapping
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal
@@ -57,7 +58,6 @@ from sglang.srt.layers.layer_boundary import (
     append_stages,
     declare_attn,
     declare_ffn,
-    layer_stack,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import GemmaRMSNorm
@@ -95,11 +95,12 @@ from sglang.srt.layers.step5_allreduce import (
     Step5BoundaryFusions,
     Step5DeferredMoE,
 )
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -118,7 +119,7 @@ from sglang.srt.runtime_context import (
     get_platform,
     get_stream,
 )
-from sglang.srt.utils import add_prefix, set_weight_attrs
+from sglang.srt.utils import add_prefix, make_pp_layers, set_weight_attrs
 
 
 class Step5MLP(nn.Module):
@@ -1509,50 +1510,59 @@ class Step5Model(nn.Module):
         )
         self.nvfp4_expert_layers = frozenset(self.nvfp4_expert_layouts)
         parallel = get_parallel()
+        self.pp_group = parallel.pp_group
         use_dp_attention_reduce = parallel.attn_dp_size > 1
         self.step5_layer_selection = resolve_step5_layer_selection(
-            config=config, draft_model_idx=None
+            config=config,
+            draft_model_idx=None,
+            pp_rank=parallel.pp_rank,
+            pp_size=parallel.pp_size,
         )
-        self.start_layer = self.step5_layer_selection.start_layer
-        self.end_layer = self.step5_layer_selection.end_layer
-        self.embed_tokens = VocabParallelEmbedding(
-            num_embeddings=config.vocab_size,
-            embedding_dim=config.hidden_size,
-            params_dtype=torch.bfloat16,
-            quant_config=None,
-            use_attn_tp_group=use_dp_attention_reduce,
-            prefix=add_prefix("embed_tokens", prefix),
-        )
-        with layer_stack(
-            previous_layers=[
-                lambda i=i: Step5DecoderLayer.stage_facts(config, i)
-                for i in range(self.start_layer - 1, -1, -1)
-            ],
-            next_layers=[
-                lambda i=i: Step5DecoderLayer.stage_facts(config, i)
-                for i in range(self.end_layer, config.num_hidden_layers)
-            ],
-        ):
-            self.layers = nn.ModuleList(
-                Step5DecoderLayer(
-                    profile=self.attention_profile,
-                    config=config,
-                    quant_config=step5_expert_quant_config(
-                        quant_config, layer_id, self.nvfp4_expert_layers
-                    ),
-                    layer_id=layer_id,
-                    tp_rank=parallel.attn_tp_rank,
-                    tp_size=parallel.attn_tp_size,
-                    use_dp_attention_reduce=use_dp_attention_reduce,
-                    prefix=add_prefix(f"layers.{layer_id}", prefix),
-                )
-                for layer_id in range(self.start_layer, self.end_layer)
+        if self.pp_group.is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                num_embeddings=config.vocab_size,
+                embedding_dim=config.hidden_size,
+                params_dtype=torch.bfloat16,
+                quant_config=None,
+                use_attn_tp_group=use_dp_attention_reduce,
+                prefix=add_prefix("embed_tokens", prefix),
             )
-        self.norm = GemmaRMSNorm(
-            hidden_size=config.hidden_size,
-            eps=config.rms_norm_eps,
-            weight_dtype=torch.float32,
+        else:
+            self.embed_tokens = PPMissingLayer()
+
+        def get_layer(idx: int, prefix: str) -> Step5DecoderLayer:
+            return Step5DecoderLayer(
+                profile=self.attention_profile,
+                config=config,
+                quant_config=step5_expert_quant_config(
+                    quant_config, idx, self.nvfp4_expert_layers
+                ),
+                layer_id=idx,
+                tp_rank=parallel.attn_tp_rank,
+                tp_size=parallel.attn_tp_size,
+                use_dp_attention_reduce=use_dp_attention_reduce,
+                prefix=prefix,
+            )
+
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
+            config.num_hidden_layers,
+            get_layer,
+            prefix=add_prefix("layers", prefix),
+            stage_facts=partial(Step5DecoderLayer.stage_facts, config),
         )
+        if (self.start_layer, self.end_layer) != (
+            self.step5_layer_selection.start_layer,
+            self.step5_layer_selection.end_layer,
+        ):
+            raise ValueError("Step5 model stage and layer selection disagree")
+        if self.pp_group.is_last_rank:
+            self.norm = GemmaRMSNorm(
+                hidden_size=config.hidden_size,
+                eps=config.rms_norm_eps,
+                weight_dtype=torch.float32,
+            )
+        else:
+            self.norm = PPMissingLayer(return_tuple=True)
 
     def get_input_embeddings(self) -> VocabParallelEmbedding:
         return self.embed_tokens
@@ -1563,17 +1573,27 @@ class Step5Model(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        hidden_states = (
-            self.embed_tokens(input_ids) if input_embeds is None else input_embeds
-        ).bfloat16()
-        residual_batch.start(forward_batch)
-        for layer in self.layers:
-            hidden_states = layer(
+        pp_proxy_tensors: PPProxyTensors | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | PPProxyTensors:
+        if self.pp_group.is_first_rank:
+            hidden_states = (
+                self.embed_tokens(input_ids) if input_embeds is None else input_embeds
+            ).bfloat16()
+            residual_batch.start(forward_batch)
+        else:
+            if pp_proxy_tensors is None:
+                raise ValueError("Step5 non-first pipeline stage requires proxy tensors")
+            hidden_states = self.layers[
+                self.start_layer
+            ].attn_boundary.from_pp(pp_proxy_tensors, forward_batch).bfloat16()
+        for layer_id in range(self.start_layer, self.end_layer):
+            hidden_states = self.layers[layer_id](
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+        if not self.pp_group.is_last_rank:
+            return residual_batch.to_pp(hidden_states, forward_batch)
         # Final norm and MTP capture consume the materialized BF16 residual sum.
         hidden_states, residual = residual_batch.stream_of(forward_batch).export(
             hidden_states
@@ -1613,6 +1633,7 @@ class Step5ForCausalLM(nn.Module):
         self.config = config
         self.checkpoint_path = get_model().model_path
         self.quant_config = quant_config
+        self.pp_group = get_parallel().pp_group
         self.model = Step5Model(
             config=config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
@@ -1621,14 +1642,17 @@ class Step5ForCausalLM(nn.Module):
         self.nvfp4_expert_layouts = self.model.nvfp4_expert_layouts
         self.tie_word_embeddings = False
         self.num_fused_shared_experts = 0
-        self.lm_head = ParallelLMHead(
-            num_embeddings=config.vocab_size,
-            embedding_dim=config.hidden_size,
-            params_dtype=torch.bfloat16,
-            quant_config=None,
-            prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_parallel().enable_dp_lm_head,
-        )
+        if self.pp_group.is_last_rank:
+            self.lm_head = ParallelLMHead(
+                num_embeddings=config.vocab_size,
+                embedding_dim=config.hidden_size,
+                params_dtype=torch.bfloat16,
+                quant_config=None,
+                prefix=add_prefix("lm_head", prefix),
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
+            )
+        else:
+            self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(
             config, valid_vocab_size=valid_vocab_size
         )
@@ -1793,6 +1817,13 @@ class Step5ForCausalLM(nn.Module):
             expected.update(sources or [name])
         seen, original_names = set(), set()
         checkpoint_depth = config.num_hidden_layers + config.num_nextn_predict_layers
+        # A pipeline stage owns neither the embedding table nor the final
+        # norm/head, so their checkpoint entries are not this rank's weights.
+        pp_absent_prefixes = ()
+        if not self.pp_group.is_first_rank:
+            pp_absent_prefixes += ("model.embed_tokens.",)
+        if not self.pp_group.is_last_rank:
+            pp_absent_prefixes += ("model.norm.", "lm_head.")
         weights = self._indexed_duplicate_weights(
             weights, expected, getattr(self, "checkpoint_path", None)
         )
@@ -1810,9 +1841,13 @@ class Step5ForCausalLM(nn.Module):
                     raise ValueError(f"Invalid Step5 checkpoint layer: {name}")
                 if config.num_hidden_layers <= int(index) < checkpoint_depth:
                     continue
+                if not self.start_layer <= int(index) < self.end_layer:
+                    continue
                 if local.startswith("share_expert."):
                     name = f"model.layers.{index}.moe.{local}"
             if name not in expected:
+                if name.startswith(pp_absent_prefixes):
+                    continue
                 raise ValueError(f"Unknown Step5 target weight: {name}")
             if name in seen:
                 raise ValueError(f"Duplicate Step5 target weight: {original_name}")
@@ -1934,7 +1969,8 @@ class Step5ForCausalLM(nn.Module):
             raise ValueError(
                 f"Step5 target is missing {len(missing)} weights: {sorted(missing)[:16]}"
             )
-        for layer in self.model.layers:
+        for layer_id in range(self.start_layer, self.end_layer):
+            layer = self.model.layers[layer_id]
             if layer.use_moe and layer.moe.use_nvfp4_experts:
                 step5_check_nvfp4_expert_scales(layer.moe.experts, layer.moe.prefix)
         return original_names
@@ -1946,10 +1982,18 @@ class Step5ForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor | None = None,
+        pp_proxy_tensors: PPProxyTensors | None = None,
     ):
-        hidden_states, hidden_states_before_norm = self.model(
-            input_ids, positions, forward_batch, input_embeds
+        output = self.model(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
+        if not self.pp_group.is_last_rank:
+            return output
+        hidden_states, hidden_states_before_norm = output
         return self.logits_processor(
             input_ids,
             hidden_states,
