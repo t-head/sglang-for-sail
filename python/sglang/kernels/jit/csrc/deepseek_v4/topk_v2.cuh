@@ -36,6 +36,7 @@ enum class TopKMode {
   INDICES,      ///< raw selected indices into `out`; `page_table` unused
   PAGE_TABLE,   ///< page-table-transformed indices into `out`
   DUAL_OUTPUT,  ///< page-table-transformed indices into `out` and raw indices into `raw_indices`
+  KPOOL,
 };
 
 using Register2 = impl::TopKRegister<2>;  // <= 8192, register-resident, 1 read
@@ -66,10 +67,17 @@ struct PageTransform {
   const int32_t* __restrict__ page_table;
   uint32_t page_bits;
   int32_t* __restrict__ raw_out;  // the row's raw output, written in DUAL_OUTPUT only
+  int32_t offset = 0;
+  uint32_t pool_bits = 0;
+  uint32_t tail_count = 0;
+  uint32_t out_cols = 0;
 
   SGL_DEVICE int32_t page_to_indices(uint32_t i) const {
     const uint32_t mask = (1u << page_bits) - 1u;
     return (page_table[i >> page_bits] << page_bits) | (i & mask);
+  }
+  SGL_DEVICE int32_t kpool_token(uint32_t i) const {
+    return page_table != nullptr ? page_to_indices(i) : static_cast<int32_t>(i) + offset;
   }
 };
 
@@ -142,10 +150,34 @@ SGL_DEVICE void for_each_item(uint32_t topk, const F& f) {
   }
 }
 
+template <typename F>
+SGL_DEVICE void
+kpool_expand(uint32_t num_pools, uint32_t topk, int32_t* out, const PageTransform& t, const F& selected) {
+  const auto pool_bits = t.pool_bits;
+  const uint32_t pool_mask = (1u << pool_bits) - 1u;
+  const uint32_t history = min(num_pools, topk) << pool_bits;
+  const uint32_t tail_end = history + t.tail_count;
+  const uint32_t tail_base = num_pools << pool_bits;
+  for (uint32_t col = threadIdx.x; col < t.out_cols; col += kBlockSize) {
+    int32_t value = -1;
+    if (col < history) {
+      const int32_t pool_id = selected(col >> pool_bits);
+      if (pool_id >= 0) value = t.kpool_token((static_cast<uint32_t>(pool_id) << pool_bits) | (col & pool_mask));
+    } else if (col < tail_end) {
+      value = t.kpool_token(tail_base + (col - history));
+    }
+    out[col] = value;
+  }
+}
+
 template <bool kPDL, TopKMode kMode>
 SGL_DEVICE void trivial_transform(const TopKProblem& problem, const PageTransform& transform) {
   device::PDLWaitPrimary<kPDL>();
   device::PDLTriggerSecondary<kPDL>();
+  if constexpr (kMode == TopKMode::KPOOL) {
+    return kpool_expand(
+        problem.seq_len, problem.topk, problem.out, transform, [](uint32_t r) { return static_cast<int32_t>(r); });
+  }
   for_each_item(problem.topk, [&](uint32_t tx, uint32_t) {
     if constexpr (kMode == TopKMode::INDICES) {
       problem.out[tx] = tx < problem.seq_len ? static_cast<int32_t>(tx) : -1;
@@ -162,6 +194,10 @@ template <TopKMode kMode>
 SGL_DEVICE void paged_transform(const TopKProblem& problem, int32_t* out, const PageTransform& transform) {
   static_assert(kMode != TopKMode::INDICES, "paged_transform requires page-table output");
   static_assert(kMaxTopK % kBlockSize == 0);
+  if constexpr (kMode == TopKMode::KPOOL) {
+    const auto staged = problem.out;
+    return kpool_expand(problem.seq_len, problem.topk, out, transform, [staged](uint32_t r) { return staged[r]; });
+  }
   constexpr uint32_t kNumElems = kMaxTopK / kBlockSize;
   int32_t indices[kNumElems];
   for_each_item(problem.topk, [&](uint32_t tx, uint32_t i) {
@@ -425,7 +461,6 @@ TOPK_KERNEL void topk_candidates_kernel(const __grid_constant__ TopKCandidatesPa
   for_each_item(topk, [&](uint32_t tx, uint32_t) { emit(tx, s_topk_indices[tx]); });
 }
 
-#ifdef USE_ROCM
 // Packed DSA extend layout.
 
 /**
@@ -892,8 +927,9 @@ struct TopKSplit : impl::TopKRadixBase<12> {
     // The full row's histogram and the full row's seq_len, so every rank picks
     // the same bin and the appends below agree on what "above" means.
     find_threshold(problem.topk, problem.seq_len, smem, [&](uint32_t threshold_bin) {
-      smem->v_hi = impl::coarse_bin_lower_bound<kHistBits>(threshold_bin + 1);
-      smem->v_lo = impl::coarse_bin_lower_bound<kHistBits>(threshold_bin + 0);
+      const auto [v_lo, v_hi] = impl::coarse_bin_bounds<kHistBits>(threshold_bin);
+      smem->v_hi = v_hi;
+      smem->v_lo = v_lo;
     });
 
     const auto topk = problem.topk;
@@ -920,7 +956,7 @@ struct TopKSplit : impl::TopKRadixBase<12> {
     const auto n_eq = min(smem->count_eq, kMaxNumTie);
     if (tx == 0) {
       smem->base_gt = atomicAdd(&ctr->count_gt, n_gt);
-      smem->base_eq = atomicAdd(&ctr->count_eq, n_eq);
+      smem->base_eq = atomicAdd(&ctr->count_eq, smem->count_eq);
     }
     __syncthreads();
     const auto base_gt = smem->base_gt;
@@ -960,12 +996,21 @@ struct TopKSplit : impl::TopKRadixBase<12> {
   /// into LDS first since handle_tie's ranking pass is all-to-all.
   SGL_DEVICE static void finish_ties(const TopKProblem& problem, const impl::TieValue* ties, Smem* smem) {
     const auto tx = threadIdx.x;
-    const auto above_count = smem->total_gt;
-    const auto tie_count = min(smem->total_eq, kMaxNumTie);
+    uint32_t above_count, tie_count;
+    if (smem->total_eq > kMaxNumTie) [[unlikely]] {
+      if (tx == 0) smem->count_gt = smem->total_gt;
+      __syncthreads();
+      refine_ties(problem, smem, smem->v_lo, smem->v_hi, smem->total_eq);
+      above_count = smem->count_gt;
+      tie_count = min(smem->count_eq, kMaxNumTie);
+    } else {
+      above_count = smem->total_gt;
+      tie_count = smem->total_eq;
+      for (uint32_t t = tx; t < tie_count; t += kBlockSize)
+        smem->tie_values[t] = ties[t];
+      __syncthreads();
+    }
     const auto remain_topk = above_count < problem.topk ? problem.topk - above_count : 0;
-    for (uint32_t t = tx; t < tie_count; t += kBlockSize)
-      smem->tie_values[t] = ties[t];
-    __syncthreads();
     handle_tie(smem->tie_values, problem, above_count, tie_count, remain_topk, &smem->tie_handle);
   }
 };
@@ -1494,7 +1539,6 @@ struct TopKKernel {
         .launch(topk_ragged_kpool_kernel<kUsePDL>, params);
   }
 
-#ifdef USE_ROCM  // see the packed kernel above
   /**
    * \brief Ragged top-k emitting distributed-merge candidates: `candidates`
    * [rows, topk, 2] int32 gets (fp32 score bits, `local * world + rank`) for
@@ -1643,7 +1687,6 @@ struct TopKKernel {
         .config({.use_pdl = kUsePDL})
         .launch(topk_packed_kernel<kUsePDL>, params);
   }
-#endif  // USE_ROCM
 };
 
 }  // namespace sglang

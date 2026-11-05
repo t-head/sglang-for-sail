@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.utils import is_sail
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -519,6 +520,14 @@ def _topk_transform_v2_ragged(
     construction), int32 non-negative lengths, and ``0 < topk <= 2048``.
     """
     from sglang.kernels.ops.attention.dsv4.topk import topk_transform_ragged_v2
+
+    if is_sail() and logits.dtype == torch.bfloat16:
+        num_rows, num_cols = logits.shape
+        logits_fp32 = logits.new_empty(
+            (num_rows, (num_cols + 3) // 4 * 4), dtype=torch.float32
+        )
+        logits_fp32[:, :num_cols].copy_(logits)
+        logits = logits_fp32[:, :num_cols]
 
     out = logits.new_empty((logits.shape[0], topk), dtype=torch.int32)
     topk_transform_ragged_v2(
