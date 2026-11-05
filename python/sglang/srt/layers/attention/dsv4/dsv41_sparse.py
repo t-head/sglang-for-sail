@@ -21,6 +21,10 @@ from sglang.kernels.ops.quantization.fp4_fake_quant import (
 from sglang.srt.layers.attention.dsv4.indexer_quant import use_dsv41_int8_indexer
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.speculative.ragged_verify import (
+    ragged_verify_token_rows,
+    resolve_ragged_verify_layout,
+)
 from sglang.srt.utils import add_prefix, is_gfx95_supported
 
 
@@ -76,6 +80,14 @@ def token_req_indices(forward_batch, *, num_tokens=None) -> torch.Tensor:
     if forward_batch.forward_mode.is_decode():
         return req
     if forward_batch.forward_mode.is_target_verify():
+        layout = resolve_ragged_verify_layout(forward_batch)
+        if layout is not None:
+            # Graph padding past qo_indptr[-1] maps to request-pool slot 0.
+            rows = ragged_verify_token_rows(
+                layout,
+                forward_batch.positions.shape[0] if num_tokens is None else num_tokens,
+            )
+            return torch.cat([req, req.new_zeros(1)])[rows]
         return torch.repeat_interleave(
             req, int(forward_batch.spec_info.draft_token_num), output_size=num_tokens
         )
