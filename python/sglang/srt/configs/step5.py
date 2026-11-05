@@ -433,18 +433,39 @@ def get_step5_mtp_layer_ids(
     return swa, full
 
 
+def _step5_stage_range(
+    num_hidden_layers: int, pp_rank: int, pp_size: int
+) -> tuple[int, int]:
+    """The main-layer range one pipeline stage owns."""
+    if (
+        type(pp_rank) is not int
+        or type(pp_size) is not int
+        or pp_size < 1
+        or not 0 <= pp_rank < pp_size
+    ):
+        raise ValueError("Step5 pipeline stage must be a valid (rank, size) pair.")
+    if pp_size == 1:
+        return 0, num_hidden_layers
+    # Imported here because the resolver runs after the process groups exist.
+    from sglang.srt.distributed.utils import get_pp_indices
+
+    return get_pp_indices(num_hidden_layers, pp_rank, pp_size)
+
+
 def resolve_step5_layer_selection(
     *,
     config: Step5Config,
     draft_model_idx: int | None,
+    pp_rank: int = 0,
+    pp_size: int = 1,
 ) -> Step5LayerSelection:
     """Resolve from the exact config and relative-index kwargs of the loader.
 
     This metadata boundary supports a declared SWA-only draft partition. It does
     not enable a speculative algorithm or qualify any draft execution depth.
+    A target runner owns only its own pipeline stage's slice of main layers; a
+    draft runner owns one unsplit MTP block.
     """
-    pass
-
     if not isinstance(config, Step5Config):
         raise TypeError("Step5 layer selection requires the registered Step5 config.")
     architecture = config.architectures[0]
@@ -454,6 +475,8 @@ def resolve_step5_layer_selection(
     if not config.is_hybrid_swa:
         raise ValueError("Step5 layer selection requires native hybrid SWA memory.")
     if draft:
+        if pp_size > 1:
+            raise ValueError("Step5 MTP layers cannot be split across PP stages.")
         swa, full = get_step5_mtp_layer_ids(config=config)
         if full:
             raise ValueError("Step5 draft FULL/DSA attention is not supported.")
@@ -474,14 +497,19 @@ def resolve_step5_layer_selection(
     # This is the same checkpoint-owned pattern consumed by the native hybrid
     # config adapter; it includes only main layers, even for a bundled MTP file.
     pattern = config.hybrid_layer_pattern
-    full = tuple(i for i, kind in enumerate(pattern) if kind == 0)
-    swa = tuple(i for i, kind in enumerate(pattern) if kind == 1)
-    if len(pattern) != config.num_hidden_layers or len(full) + len(swa) != len(pattern):
+    if len(pattern) != config.num_hidden_layers:
         raise ValueError("Step5 target pattern must cover every main layer once.")
+    start_layer, end_layer = _step5_stage_range(
+        config.num_hidden_layers, pp_rank, pp_size
+    )
+    full = tuple(i for i in range(start_layer, end_layer) if pattern[i] == 0)
+    swa = tuple(i for i in range(start_layer, end_layer) if pattern[i] == 1)
+    if len(full) + len(swa) != end_layer - start_layer:
+        raise ValueError("Step5 target pattern must cover every owned layer once.")
     return Step5LayerSelection(
         draft_model_idx=None,
-        start_layer=0,
-        end_layer=config.num_hidden_layers,
+        start_layer=start_layer,
+        end_layer=end_layer,
         full_attention_layer_ids=full,
         swa_attention_layer_ids=swa,
     )
