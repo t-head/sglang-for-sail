@@ -11,6 +11,10 @@
 
 static constexpr int kWarpSize = 32;
 static constexpr int DEFAULT_SHARED_MEM_THRESHOLD_KB = 48;  // Default shared memory quota in KB
+// Lower bound on the per-token absmax, same value as per_token_group_quant_8bit and the
+// CUDA reference. Without it a row whose absmax is a subnormal yields a subnormal scale,
+// 1/scale overflows to +inf and the row's zeros become fp8 NaN (0x7F).
+static constexpr float kAbsmaxFloor = 1e-10f;
 
 #if !defined(USE_ROCM) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
 template <typename Dtype, bool trans>
@@ -106,7 +110,7 @@ __global__ void per_token_quant_fp8_kernel(
     __syncwarp();
   }
 
-  float warp_max = warpReduceMax(max_value);
+  float warp_max = fmaxf(warpReduceMax(max_value), kAbsmaxFloor);
 
   // NOTE: one CTA has multiple warps (each warp handles one token), so `scale`
   // must be per-warp/per-thread (register) instead of a single shared variable.
@@ -115,7 +119,7 @@ __global__ void per_token_quant_fp8_kernel(
   if (lane_id == 0) {
     token_scale[0] = scale;
   }
-  const float scale_inv = (scale == 0.f) ? 0.f : 1.0f / scale;
+  const float scale_inv = 1.0f / scale;
 
   //
   // Pass-2: Quantize and write back
@@ -376,11 +380,11 @@ __global__ void per_token_quant_fp8_persistent_kernel(
     }
 #endif
 
-    const float scale = warp_max_result / FP8_E4M3_MAX;
+    const float scale = fmaxf(warp_max_result, kAbsmaxFloor) / FP8_E4M3_MAX;
     if (lane_id == 0) {
       output_s[token_id] = scale;
     }
-    const float scale_inv = (scale == 0.f) ? 0.f : 1.0f / scale;
+    const float scale_inv = 1.0f / scale;
 
     //
     // Pass-2: re-read smem, quantize and write back (mirrors the original
@@ -516,12 +520,12 @@ __global__ void per_token_quant_fp8_small_batch_kernel(
 
   __shared__ float scale;
   if (tid == 0) {
-    scale = max_value / FP8_E4M3_MAX;
+    scale = fmaxf(max_value, kAbsmaxFloor) / FP8_E4M3_MAX;
     output_s[token_idx] = scale;
   }
   __syncthreads();
 
-  const float scale_inv = (scale == 0.f) ? 0.f : 1.0f / scale;
+  const float scale_inv = 1.0f / scale;
 
   // Quantize using vectorized loads
   for (int32_t i = tid; i < num_vec_elems; i += block_dim) {

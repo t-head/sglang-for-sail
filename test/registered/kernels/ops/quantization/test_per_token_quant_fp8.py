@@ -60,6 +60,35 @@ def test_per_token_quant_fp8_zero_rows_are_bit_exact(dtype, dispatch):
     _assert_bitwise_equal(actual_output, expected_output)
 
 
+# The kernel computes the floor in float32, so compare against the same rounding.
+_ABSMAX_FLOOR = (torch.tensor(1e-10, dtype=torch.float32) / 448.0).item()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dispatch", ["cta", "warp"])
+@pytest.mark.parametrize("use_jit", [False, True])
+def test_per_token_quant_fp8_subnormal_rows_stay_finite(dtype, dispatch, use_jit):
+    """A row whose absmax is a subnormal must not emit fp8 NaN (0x7F).
+
+    Without an absmax floor the scale is a subnormal, 1/scale overflows to +inf and
+    every zero element of that row becomes 0 * inf = NaN. float16 cannot reach the
+    triggering range, so only bfloat16/float32 are covered here.
+    """
+    num_tokens = 1 if dispatch == "cta" else _warp_dispatch_num_tokens()
+    subnormal = torch.finfo(dtype).smallest_normal / 2
+    input = torch.zeros((num_tokens, 512), dtype=dtype, device="cuda")
+    input[0, 0] = subnormal
+    input[-1, 0] = subnormal / 2
+
+    output, scale = _run_impl(input, use_jit=use_jit)
+
+    assert torch.isfinite(scale).all()
+    assert torch.isfinite(1.0 / scale).all()
+    assert scale.min().item() >= _ABSMAX_FLOOR
+    assert (output.view(torch.uint8) == 0x7F).sum().item() == 0
+    assert torch.all(output[0].view(torch.uint8) == 0)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("dispatch", ["cta", "warp"])
 def test_per_token_quant_fp8_midpoints_are_bit_exact(dtype, dispatch):

@@ -14,6 +14,10 @@ namespace sglang {
 
 constexpr uint32_t kPerTokenQuantWarpSize = 32;
 constexpr uint32_t kPerTokenQuantTokensPerCTA = 8;
+// Lower bound on the per-token absmax, same value as per_token_group_quant_8bit and the
+// CUDA reference. Without it a row whose absmax is a subnormal yields a subnormal scale,
+// 1/scale overflows to +inf and the row's zeros become fp8 NaN (0x7F).
+constexpr float kPerTokenQuantAbsmaxFloor = 1e-10f;
 
 /** \brief Quantize one token per warp for large token batches. */
 template <typename T, int kVecSize>
@@ -48,11 +52,12 @@ __global__ void per_token_quant_fp8_warp_kernel(
     }
   }
 
-  const float scale = warp::reduce_max(max_value) / math::FP8_E4M3_MAX;
+  const float scale =
+      math::max(warp::reduce_max(max_value), kPerTokenQuantAbsmaxFloor) / math::FP8_E4M3_MAX;
   if (lane_id == 0) {
     output_s[token_id] = scale;
   }
-  const float scale_inv = scale == 0.0f ? 0.0f : 1.0f / scale;
+  const float scale_inv = 1.0f / scale;
 
   for (uint32_t i = lane_id; i < num_vecs; i += kPerTokenQuantWarpSize) {
     input_vec_t input_vec;
@@ -95,7 +100,8 @@ __global__ void per_token_quant_fp8_cta_kernel(
   cta::reduce_max(max_value, reduction_smem);
   __syncthreads();
   if (threadIdx.x == 0) {
-    scale_smem = reduction_smem[0] / math::FP8_E4M3_MAX;
+    scale_smem =
+        math::max(reduction_smem[0], kPerTokenQuantAbsmaxFloor) / math::FP8_E4M3_MAX;
     output_s[token_id] = scale_smem;
   }
   __syncthreads();
