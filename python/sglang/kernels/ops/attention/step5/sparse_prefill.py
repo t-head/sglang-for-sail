@@ -7,6 +7,11 @@ import math
 import torch
 
 from sglang.kernels.ops.attention.step5 import options as step5_options
+from sglang.kernels.ops.attention.step5.prefill_ppu import (
+    can_use_step5_prefill_ppu,
+    step5_sparse_prefill_ppu,
+)
+from sglang.srt.environ import envs
 
 
 @functools.cache
@@ -221,7 +226,36 @@ def step5_sparse_prefill_selected(
 
     Union contents depend on this layer's selection. All scratch is allocated
     before layer execution by the caller; no indexer/cache ownership is retained.
+
+    When the SAIL JIT prefill kernel is available and ``SGLANG_SAIL_STEP5_ATTN_CUDA``
+    stays on, the whole chunk runs in that one launch instead: every row walks its
+    own selection, so the union is skipped and only the two int32 planes are
+    filled. The kernel covers the eight- and sixteen-head layouts on PPU parts
+    and leaves everything else on the portable schedule.
     """
+    if (
+        query_positions is not None
+        and lse is not None
+        and packed.shape == physical_regions.shape
+        and packed.shape[0] == q.shape[0]
+        and envs.SGLANG_SAIL_STEP5_ATTN_CUDA.get()
+        and can_use_step5_prefill_ppu(q, k)
+    ):
+        step5_sparse_prefill_ppu(
+            q,
+            k,
+            v,
+            packed=packed,
+            physical_regions=physical_regions,
+            logical_starts=logical_starts,
+            live_regions=counts,
+            positions=query_positions,
+            out=out,
+            lse=lse,
+            scale=scale,
+        )
+        return
+
     from sglang.kernels.ops.attention.step5.prefill_metadata import (
         step5_build_prefill_union,
     )

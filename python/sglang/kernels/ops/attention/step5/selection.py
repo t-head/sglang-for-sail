@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Step5 region selection using the existing FlashInfer deterministic top-k."""
+"""Step5 region selection over FlashInfer top-k or the SAIL AOT radix selector."""
 
 import torch
+
+from sglang.kernels.ops.attention.step5.selection_ppu import (
+    can_use_step5_selection_ppu,
+)
 
 
 def can_use_step5_selection_cute(scores: torch.Tensor) -> bool:
@@ -20,6 +24,7 @@ def step5_select_regions(
     region_ids: torch.Tensor,
     counts: torch.Tensor,
     use_cute: bool | None = None,
+    ppu_workspace=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select <=512 historical regions, sort IDs, then append current exactly once.
 
@@ -27,10 +32,16 @@ def step5_select_regions(
     orders by bit pattern, so a -0.0 would rank below a +0.0 and beat the smaller
     region id. Only the first positions//8 columns are ranked, and scores are read
     as given, so the future tail may hold stale values. Width covers positions//8.
-    Slot zero is padding. Output IDs are logical, ascending, int32 [T,513], padded
-    with -1; counts are int32 [T]. Caller must keep outputs disjoint from inputs
-    and each other. Warm FlashInfer outside capture and use its shared device
-    scratch on the sequential forward stream.
+    Slot zero is padding. Output IDs are logical, int32 [T,513], padded with -1;
+    counts are int32 [T]. The FlashInfer path returns them ascending; the PPU
+    radix path returns the same set in an unspecified slot order, because its
+    staging pass hands out output slots with atomics. Its caller appends the
+    current region and packs addresses without relying on that order. Both fast
+    paths only run once the width exceeds the 512 history slots; narrower tiles
+    keep every history region, so ranking them would be pure overhead. Caller
+    must keep outputs disjoint from inputs and each other. Warm FlashInfer
+    outside capture and use its shared device scratch on the sequential forward
+    stream.
     """
     if scores.device.type != "cuda" or torch.version.hip is not None:
         raise ValueError("Step5 selection requires NVIDIA CUDA")
@@ -89,7 +100,23 @@ def step5_select_regions(
         )
     selected_k = 0
     indices = region_ids
-    if width > 512:
+    # A tile that fits in the 512 history slots keeps all of them, so ranking it
+    # would only add work; the FlashInfer branch below uses the same threshold.
+    ppu_selected = (
+        ppu_workspace is not None
+        and width > 512
+        and can_use_step5_selection_ppu(scores)
+    )
+    if ppu_selected:
+        from sglang.kernels.ops.attention.step5.selection_ppu import (
+            step5_select_regions_ppu,
+        )
+
+        indices = step5_select_regions_ppu(
+            scores, positions=positions, workspace=ppu_workspace
+        )
+        selected_k = 513
+    elif width > 512:
         import flashinfer
 
         from sglang.kernels.ops.attention.step5.selection_triton import (

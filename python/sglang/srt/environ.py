@@ -706,6 +706,14 @@ class Envs:
     # MMA and group rows that share a request onto one key-tile gather. Set
     # false to fall back to the portable per-row/per-group Triton schedule.
     SGLANG_STEP5_SCORING_REGION_OPT = EnvBool(True)
+    # PPU region-selection fast path: rank the history with the SAIL JIT radix
+    # selector instead of FlashInfer ragged top-k. Set false to fall back.
+    SGLANG_SAIL_STEP5_SELECTION_RADIX = EnvBool(True)
+    # PPU attention fast path: run the Step5 sparse decode and prefill attention
+    # on the SAIL JIT kernels instead of the portable Triton fallback (the CuTe
+    # kernels never run on PPU parts). Set false to force Triton for A/B
+    # comparisons; shapes the JIT kernels do not cover fall back on their own.
+    SGLANG_SAIL_STEP5_ATTN_CUDA = EnvBool(True)
     # Once decode passes the sliding window, drop the SWA part of the prefill's
     # tree lock; its SWA KV becomes evictable rather than freed.
     SGLANG_OPT_RELEASE_PREFILL_SWA = EnvBoolWithAlias(

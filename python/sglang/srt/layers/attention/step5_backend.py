@@ -7,6 +7,11 @@ import copy
 import numpy as np
 import torch
 
+from sglang.kernels.ops.attention.step5.decode_ppu import (
+    STEP5_PPU_DECODE_REGIONS,
+    allocate_step5_ppu_decode_workspace,
+    can_allocate_step5_ppu_decode,
+)
 from sglang.kernels.ops.attention.step5.fp8_kv import (
     step5_fp8_kv_dequant_pages,
     step5_fp8_kv_remap_pages,
@@ -108,6 +113,19 @@ def _allocate_attention_buffers(
                 (groups, (region_bins + 31) // 32), dtype=torch.int32, device=device
             ),
         )
+    # Decode scratch for the SAIL AOT paged kernel; absent on devices and head
+    # layouts that keep the portable schedule.
+    ppu_decode = None
+    if decode and can_allocate_step5_ppu_decode(
+        heads=heads, kv_heads=1, device=device
+    ):
+        ppu_decode = allocate_step5_ppu_decode_workspace(
+            rows=rows,
+            heads=heads,
+            kv_heads=1,
+            regions=STEP5_PPU_DECODE_REGIONS,
+            device=device,
+        )
     return dict(
         lse=(
             None
@@ -117,6 +135,7 @@ def _allocate_attention_buffers(
         partial=partial,
         partial_lse=partial_lse,
         prefill=prefill,
+        ppu_decode=ppu_decode,
     )
 
 
@@ -992,6 +1011,14 @@ class Step5AttentionBackend(AttentionBackend):
             and head_gate.shape == (4, 16)
             and head_gate.is_contiguous()
         )
+        # Interleave-CP decode keeps the portable schedule: its local shard owns
+        # neither the full-batch positions nor this metadata's scratch.
+        decode_positions = (
+            None
+            if cp_local is not None
+            else metadata.indexer_metadata.query_positions
+        )
+        decode_ppu = None if cp_local is not None else metadata.ppu_decode
         if metadata.decode:
             step5_sparse_decode_selected(
                 q,
@@ -1013,6 +1040,8 @@ class Step5AttentionBackend(AttentionBackend):
                 partial_lse=metadata.partial_lse,
                 **({"head_gate": head_gate} if fuse_head_gate else {}),
                 **kv_scales,
+                query_positions=decode_positions,
+                ppu_workspace=decode_ppu,
             )
         else:
             workspace = metadata.prefill

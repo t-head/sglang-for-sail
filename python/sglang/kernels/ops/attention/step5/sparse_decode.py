@@ -6,6 +6,8 @@ import math
 
 import torch
 
+from sglang.srt.environ import envs
+
 
 def _can_use_sparse_decode_cute(device: torch.device) -> bool:
     """CuTe DSL sparse decode needs sm90/sm100; other devices use the Triton path."""
@@ -441,13 +443,49 @@ def step5_sparse_decode_selected(
     head_gate=None,
     k_scale=None,
     v_scale=None,
+    query_positions=None,
+    ppu_workspace=None,
 ):
     """Execute a precomputed split schedule and merge selected-region attention.
 
     Consumes packed regions, causal lengths and caller-owned scratch only. The
     caller prepares the schedule once before layer execution. No request state,
     ForwardBatch, speculative mode or indexer metadata is consulted here.
+
+    When the SAIL JIT paged kernel is available and ``SGLANG_SAIL_STEP5_ATTN_CUDA``
+    stays on, the whole batch runs in that one launch instead: it needs the
+    absolute query positions and its own scratch, and it cannot fuse a head gate
+    or read FP8 KV, so those features keep the portable schedule.
     """
+    if (
+        query_positions is not None
+        and ppu_workspace is not None
+        and lse is not None
+        and packed.ndim == 2
+        and packed.shape[1] == ppu_workspace.physical_regions.shape[2]
+        and head_gate is None
+        and k_scale is None
+        and v_scale is None
+        and envs.SGLANG_SAIL_STEP5_ATTN_CUDA.get()
+    ):
+        from sglang.kernels.ops.attention.step5.decode_ppu import (
+            can_use_step5_decode_ppu,
+            step5_sparse_decode_ppu,
+        )
+
+        if can_use_step5_decode_ppu(q, k):
+            step5_sparse_decode_ppu(
+                q,
+                k,
+                v,
+                packed=packed,
+                query_positions=query_positions,
+                out=out,
+                lse=lse,
+                scale=scale,
+                workspace=ppu_workspace,
+            )
+            return
     rows = q.shape[0]
     dynamic = dynamic_splits
     work = work_rows
