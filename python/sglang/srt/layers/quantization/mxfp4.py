@@ -640,37 +640,42 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # MoE runner, so it needs the same unpadded checkpoint layout and
         # DeepGEMM scale preparation even when the runner is flashinfer_mxfp4.
         self.use_mega_moe = get_moe_a2a_backend().is_megamoe()
-        valu_enabled = envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16.get()
-        mma_enabled = envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16_MMA.get()
-        self._validate_ppu_mxfp4_w4a16(
-            valu_enabled,
-            mma_enabled,
-        )
-        self.use_deepgemm_mxfp4_w4a16_valu = (
-            _is_sail and self.use_deep_gemm and valu_enabled
-        )
-        self.use_deepgemm_mxfp4_w4a16_mma = (
-            _is_sail and self.use_deep_gemm and mma_enabled
-        )
-        self.use_deepgemm_mxfp4_w4a8 = (
-            _is_sail and envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A8.get()
-        )
-        if self.use_deepgemm_mxfp4_w4a8:
-            if not self.use_deep_gemm:
-                raise ValueError(
-                    "PPU MXFP4 W4A8 requires --moe-runner-backend deep_gemm."
-                )
-            if valu_enabled or mma_enabled:
-                raise ValueError("PPU MXFP4 W4A8 and W4A16 are mutually exclusive.")
-            moe_a2a_backend = get_moe_a2a_backend()
-            if get_device_sm() != 89 or not (
-                moe_a2a_backend.is_none() or moe_a2a_backend.is_deepep()
-            ):
-                raise ValueError(
-                    "PPU MXFP4 W4A8 requires M890 and none/deepep MoE a2a."
-                )
-            if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-                raise RuntimeError("PPU MXFP4 W4A8 requires DeepGEMM.")
+        if _is_sail and self.use_mega_moe:
+            self.use_deepgemm_mxfp4_w4a16_valu = False
+            self.use_deepgemm_mxfp4_w4a16_mma = False
+            self.use_deepgemm_mxfp4_w4a8 = False
+        else:
+            valu_enabled = envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16.get()
+            mma_enabled = envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16_MMA.get()
+            self._validate_ppu_mxfp4_w4a16(
+                valu_enabled,
+                mma_enabled,
+            )
+            self.use_deepgemm_mxfp4_w4a16_valu = (
+                _is_sail and self.use_deep_gemm and valu_enabled
+            )
+            self.use_deepgemm_mxfp4_w4a16_mma = (
+                _is_sail and self.use_deep_gemm and mma_enabled
+            )
+            self.use_deepgemm_mxfp4_w4a8 = (
+                _is_sail and envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A8.get()
+            )
+            if self.use_deepgemm_mxfp4_w4a8:
+                if not self.use_deep_gemm:
+                    raise ValueError(
+                        "PPU MXFP4 W4A8 requires --moe-runner-backend deep_gemm."
+                    )
+                if valu_enabled or mma_enabled:
+                    raise ValueError("PPU MXFP4 W4A8 and W4A16 are mutually exclusive.")
+                moe_a2a_backend = get_moe_a2a_backend()
+                if get_device_sm() != 89 or not (
+                    moe_a2a_backend.is_none() or moe_a2a_backend.is_deepep()
+                ):
+                    raise ValueError(
+                        "PPU MXFP4 W4A8 requires M890 and none/deepep MoE a2a."
+                    )
+                if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+                    raise RuntimeError("PPU MXFP4 W4A8 requires DeepGEMM.")
         self.flashinfer_mxfp4_moe_precision = (
             get_exec().moe.flashinfer_mxfp4_moe_precision
         )
@@ -1112,10 +1117,28 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         return
                     if self.with_bias:
                         raise ValueError("PPU MegaMoE does not support expert bias")
-                    from deep_gemm import transform_weights_for_mega_moe
+                    import deep_gemm
+
+                    w4a8_enabled = envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A8.get()
+                    w4a16_enabled = (
+                        envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16.get()
+                        or envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16_MMA.get()
+                    )
+                    if w4a8_enabled and w4a16_enabled:
+                        raise ValueError(
+                            "PPU MegaMoE W4A8 and W4A16 are mutually exclusive."
+                        )
+                    mma_type = "mxf4xmxf4"
+                    transform = deep_gemm.transform_weights_for_mega_moe
+                    if w4a8_enabled:
+                        mma_type = "fp8xfp4"
+                        transform = deep_gemm.transform_weights_for_w4a8_mega_moe
+                    elif w4a16_enabled:
+                        mma_type = "bf16xfp4"
+                        transform = deep_gemm.transform_weights_for_w4a16_mega_moe
 
                     # PPU MegaMoE consumes raw uint8 scales, before preprocessing.
-                    l1_pair, l2_pair = transform_weights_for_mega_moe(
+                    l1_pair, l2_pair = transform(
                         (
                             layer.w13_weight.data,
                             torch.stack(list(layer.w13_weight_scale)),
@@ -1131,7 +1154,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     layer.w13_weight_scale.data = l1_pair[1]
                     layer.w2_weight.data = l2_pair[0]
                     layer.w2_weight_scale.data = l2_pair[1]
-                    layer._mega_moe_mma_type = "mxf4xmxf4"
+                    layer._mega_moe_mma_type = mma_type
                     layer._mega_moe_weights_built = True
                     layer._mxfp4_backend = "deep_gemm"
                     torch.cuda.empty_cache()
