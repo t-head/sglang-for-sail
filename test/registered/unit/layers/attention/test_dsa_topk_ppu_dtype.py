@@ -1,8 +1,8 @@
-"""CPU checks for PPU prefill logits entering the FP32 ragged TopK kernel."""
+"""CPU checks for PPU BF16 prefill dispatch to the DeepSelect wheel adapter."""
 
 import sys
 from types import ModuleType
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -32,14 +32,7 @@ def test_ragged_topk_preserves_scores_and_platform_boundary(width, dtype, ppu):
     ).to(torch.int32)
 
     def kernel(scores, seq_lens, *, out_offsets, out_indices, row_starts):
-        if ppu and dtype == torch.bfloat16:
-            assert scores.dtype == torch.float32
-            assert scores.shape == logits.shape
-            assert scores.stride(1) == 1
-            assert scores.stride(0) % 4 == 0
-            assert torch.equal(scores, before.float())
-        else:
-            assert scores is logits
+        assert scores is logits
         assert seq_lens is lengths
         assert out_offsets is offsets
         assert row_starts is starts
@@ -51,8 +44,13 @@ def test_ragged_topk_preserves_scores_and_platform_boundary(width, dtype, ppu):
     module_name = "sglang.kernels.ops.attention.dsv4.topk"
     kernel_module = ModuleType(module_name)
     kernel_module.topk_transform_ragged_v2 = kernel
+    native_name = "sglang.kernels.ops.attention.dsa.deep_select"
+    native_module = ModuleType(native_name)
+    native_module.topk_transform_ragged = Mock(return_value=expected)
     with (
-        patch.dict(sys.modules, {module_name: kernel_module}),
+        patch.dict(
+            sys.modules, {module_name: kernel_module, native_name: native_module}
+        ),
         patch.object(dsa_topk_backend, "is_sail", return_value=ppu),
     ):
         out = dsa_topk_backend._topk_transform_v2_ragged(
@@ -62,6 +60,12 @@ def test_ragged_topk_preserves_scores_and_platform_boundary(width, dtype, ppu):
     assert out.dtype == torch.int32
     assert torch.equal(out, expected)
     assert torch.equal(logits, before)
+    if ppu and dtype == torch.bfloat16:
+        native_module.topk_transform_ragged.assert_called_once_with(
+            logits, lengths, topk, offsets, starts
+        )
+    else:
+        native_module.topk_transform_ragged.assert_not_called()
 
 
 def test_ppu_ragged_topk_reported_shape():
@@ -73,19 +77,20 @@ def test_ppu_ragged_topk_reported_shape():
     columns = torch.arange(topk, dtype=torch.int32).expand(rows, -1)
     expected = torch.where(columns < lengths[:, None], columns + offsets[:, None], -1)
 
-    def kernel(scores, seq_lens, *, out_offsets, out_indices, row_starts):
+    def kernel(scores, seq_lens, requested_topk, out_offsets, row_starts):
         assert scores.shape == (356, 356)
-        assert scores.dtype == torch.float32
-        assert scores.stride(0) % 4 == 0
-        assert torch.equal(scores, logits.float())
+        assert scores is logits
+        assert scores.dtype == torch.bfloat16
+        assert scores.stride() == (512, 1)
+        assert requested_topk == topk
         assert seq_lens is lengths
         assert out_offsets is offsets
         assert row_starts is starts
-        out_indices.copy_(expected)
+        return expected
 
-    module_name = "sglang.kernels.ops.attention.dsv4.topk"
+    module_name = "sglang.kernels.ops.attention.dsa.deep_select"
     kernel_module = ModuleType(module_name)
-    kernel_module.topk_transform_ragged_v2 = kernel
+    kernel_module.topk_transform_ragged = kernel
     with (
         patch.dict(sys.modules, {module_name: kernel_module}),
         patch.object(dsa_topk_backend, "is_sail", return_value=True),
