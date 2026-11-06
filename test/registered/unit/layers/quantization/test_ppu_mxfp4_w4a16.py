@@ -439,6 +439,7 @@ class TestPpuMxfp4W4A16(unittest.TestCase):
 
     def test_ppu_valu_weight_creation_keeps_legacy_padding(self):
         method = mxfp4.Mxfp4MoEMethod.__new__(mxfp4.Mxfp4MoEMethod)
+        method.use_mega_moe = False
         method.use_marlin = False
         method.use_deepgemm_mxfp4_w4a16_valu = True
         method.use_deepgemm_mxfp4_w4a16_mma = False
@@ -468,6 +469,7 @@ class TestPpuMxfp4W4A16(unittest.TestCase):
 
     def test_ppu_mma_weight_creation_uses_direct_layout_without_bias(self):
         method = mxfp4.Mxfp4MoEMethod.__new__(mxfp4.Mxfp4MoEMethod)
+        method.use_mega_moe = False
         method.use_marlin = False
         method.use_deepgemm_mxfp4_w4a16_valu = False
         method.use_deepgemm_mxfp4_w4a16_mma = True
@@ -495,6 +497,7 @@ class TestPpuMxfp4W4A16(unittest.TestCase):
 
     def test_ppu_mma_rejects_expert_bias(self):
         method = mxfp4.Mxfp4MoEMethod.__new__(mxfp4.Mxfp4MoEMethod)
+        method.use_mega_moe = False
         method.use_marlin = False
         method.use_deepgemm_mxfp4_w4a16_valu = False
         method.use_deepgemm_mxfp4_w4a16_mma = True

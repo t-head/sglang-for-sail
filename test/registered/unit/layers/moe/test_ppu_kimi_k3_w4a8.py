@@ -232,6 +232,7 @@ def test_w4a8_opt_in_does_not_change_other_platforms():
 @pytest.mark.parametrize("activation", ["silu", "situ"])
 def test_w4a8_weight_creation_accepts_activation(activation):
     method = mxfp4.Mxfp4MoEMethod.__new__(mxfp4.Mxfp4MoEMethod)
+    method.use_mega_moe = False
     method.use_marlin = False
     method.use_deep_gemm = True
     method.use_deepgemm_mxfp4_w4a8 = True
