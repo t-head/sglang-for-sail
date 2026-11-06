@@ -86,6 +86,8 @@ class Step5SelectionWorkspace(msgspec.Struct, frozen=True, kw_only=True):
     # (start, end, rows) spans cut from the per-request packed lengths; indexing
     # the score tile per span beats the divisibility-based row grouping.
     score_groups: tuple[torch.Tensor, torch.Tensor, int] | None = None
+    # SAIL AOT radix selector scratch; None keeps the portable selection path.
+    ppu_selector: object | None = None
 
 
 class Step5IndexerMetadata(msgspec.Struct, frozen=True, kw_only=True):
@@ -168,6 +170,8 @@ class Step5AttentionMetadata(msgspec.Struct, frozen=True, kw_only=True):
     partial: torch.Tensor | None
     partial_lse: torch.Tensor | None
     prefill: Step5PrefillWorkspace | None
+    # SAIL AOT paged decode scratch; None keeps the portable decode schedule.
+    ppu_decode: object | None = None
     # Interleave-CP local metadata: a full Step5AttentionMetadata describing
     # the padded local q shard; kernels read it via this handle while the
     # full-batch fields above keep the gathered packed layout.

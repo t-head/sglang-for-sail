@@ -47,10 +47,19 @@ REGION_TOKENS = tl.constexpr(8)
 # 256 made every K/V tile load and MMA 33% wider than the row it carries.
 BLOCK_D1 = 128
 BLOCK_D2 = 64
-# MMA minimum along the query-head axis, and 16 windows of 8 tokens along the
-# selected-token axis.
+# MMA minimum along the query-head axis, and the token-axis tile windows 16
+# (full) or 8 (half) regions of 8 tokens, picked per launch grid below.
 BLOCK_M = 16
-BLOCK_N = 128
+# Full tile: the deepest per-CTA prefetch while the whole grid still fits one
+# wave of resident CTAs (rows <= 40 on the targeted PPU parts: 20 CUs x the
+# 2-block shared-memory limit).
+BLOCK_N_FULL = 128
+# Half tile: halves the K/V staging (108.5KB -> 57.3KB) so 4 blocks stay
+# resident per CU once the grid spills past one wave. Measured on
+# PPU-ZW810E: 1.13x at 256 rows, 1.24x at 48-64 rows, single-wave shapes
+# keep the full-tile behavior.
+BLOCK_N_HALF = 64
+BLOCK_N_SWITCH_ROWS = 48
 
 
 @triton.jit
@@ -186,7 +195,9 @@ def launch(
     Single-pass decode with no split-KV partitioning or merge, so ``out`` is the
     final BF16 attention of shape ``[rows, heads, 192]`` and ``lse`` the FP32
     natural log-sum-exp ``[rows, heads]``. ``heads``, the packed width and the
-    head-dim split are compile-time specialization keys.
+    head-dim split are compile-time specialization keys; so is the token-axis
+    tile, which stays at the full width while the grid fits one wave of
+    resident CTAs and halves beyond it to keep four blocks per CU.
     """
     if k.dtype != torch.bfloat16:
         raise ValueError("Step5 Triton sparse decode supports only BF16 K/V")
@@ -195,6 +206,7 @@ def launch(
         return
     if head_dim != BLOCK_D1 + BLOCK_D2:
         raise NotImplementedError("Step5 Triton sparse decode requires head_dim=192")
+    block_n = BLOCK_N_HALF if rows >= BLOCK_N_SWITCH_ROWS else BLOCK_N_FULL
     _sparse_decode[(rows, triton.cdiv(heads, BLOCK_M))](
         q,
         k,
@@ -215,7 +227,7 @@ def launch(
         BLOCK_D2,
         packed_regions.shape[1],
         BLOCK_M,
-        BLOCK_N,
+        block_n,
         num_warps=4,
         num_stages=2,
     )

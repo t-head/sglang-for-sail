@@ -18,6 +18,8 @@ SWA_FA4_NUM_SPLITS = 1
 SWA_FA4_TILE_N = 0
 # Fuse SWA QK-norm/RoPE with the paged KV-cache store.
 SWA_FUSED_QKNORM_STORE = True
+# Same fusion for DSA layers, whose full-pool store is also a plain row scatter.
+DSA_FUSED_QKNORM_STORE = True
 # Shift paged KV origin to the SWA window (cache_leftpad + reduced
 # seqused_k) so tile_n=128 decode drops the unused first n-block.
 SWA_FA4_WINDOW_ALIGN = True

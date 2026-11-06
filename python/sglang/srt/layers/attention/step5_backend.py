@@ -7,6 +7,12 @@ import copy
 import numpy as np
 import torch
 
+from sglang.kernels.ops.attention.step5.decode_ppu import (
+    STEP5_PPU_DECODE_REGIONS,
+    allocate_step5_decode_native_partial,
+    allocate_step5_ppu_decode_workspace,
+    can_allocate_step5_ppu_decode,
+)
 from sglang.kernels.ops.attention.step5.fp8_kv import (
     step5_fp8_kv_dequant_pages,
     step5_fp8_kv_remap_pages,
@@ -67,6 +73,14 @@ def _allocate_attention_buffers(
             (work, heads, head_dim), dtype=torch.float32, device=device
         )
         partial_lse = torch.empty((work, heads), dtype=torch.float32, device=device)
+    elif decode:
+        # The native build merges its splits on device, so its scratch is a
+        # four-dimensional block sized by the split capacity rather than by the
+        # scheduled work rows. A refused build leaves both entries None and the
+        # paged decode workspace below takes over.
+        partial, partial_lse = allocate_step5_decode_native_partial(
+            rows, heads, head_dim, device
+        )
     if not decode:
         capacity = min(16 * 513, region_bins)
         sm100_buffers = {}
@@ -109,6 +123,22 @@ def _allocate_attention_buffers(
                 (groups, (region_bins + 31) // 32), dtype=torch.int32, device=device
             ),
         )
+    # Decode scratch for the SAIL paged kernel; absent on devices and head
+    # layouts that keep the portable schedule, and skipped when the native
+    # kernel already took the partial block above.
+    ppu_decode = None
+    if (
+        decode
+        and partial is None
+        and can_allocate_step5_ppu_decode(heads=heads, kv_heads=1, device=device)
+    ):
+        ppu_decode = allocate_step5_ppu_decode_workspace(
+            rows=rows,
+            heads=heads,
+            kv_heads=1,
+            regions=STEP5_PPU_DECODE_REGIONS,
+            device=device,
+        )
     return dict(
         lse=(
             None
@@ -118,6 +148,7 @@ def _allocate_attention_buffers(
         partial=partial,
         partial_lse=partial_lse,
         prefill=prefill,
+        ppu_decode=ppu_decode,
     )
 
 
@@ -871,6 +902,17 @@ class Step5AttentionBackend(AttentionBackend):
         fn = getattr(self.swa_backend, "swa_kv_write_target", None)
         return fn(layer, forward_batch) if fn is not None else None
 
+    def full_kv_write_target(self, layer, forward_batch):
+        """Fused QK-norm KV store for a DSA (full-pool) layer, or None.
+
+        ``_forward_dsa`` writes K/V through ``set_kv_buffer`` at
+        ``out_cache_loc``; that is the same plain row scatter the SWA side
+        absorbs, so the model can hand the target to ``step5_qknorm_rope`` and
+        skip the standalone store.
+        """
+        fn = getattr(self.swa_backend, "full_kv_write_target", None)
+        return fn(layer, forward_batch) if fn is not None else None
+
     def forward_decode(
         self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs
     ):
@@ -993,6 +1035,14 @@ class Step5AttentionBackend(AttentionBackend):
             and head_gate.shape == (4, 16)
             and head_gate.is_contiguous()
         )
+        # Interleave-CP decode keeps the portable schedule: its local shard owns
+        # neither the full-batch positions nor this metadata's scratch.
+        decode_positions = (
+            None
+            if cp_local is not None
+            else metadata.indexer_metadata.query_positions
+        )
+        decode_ppu = None if cp_local is not None else metadata.ppu_decode
         if metadata.decode:
             step5_sparse_decode_selected(
                 q,
@@ -1014,6 +1064,8 @@ class Step5AttentionBackend(AttentionBackend):
                 partial_lse=metadata.partial_lse,
                 **({"head_gate": head_gate} if fuse_head_gate else {}),
                 **kv_scales,
+                query_positions=decode_positions,
+                ppu_workspace=decode_ppu,
             )
         else:
             workspace = metadata.prefill

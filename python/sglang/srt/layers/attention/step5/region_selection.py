@@ -18,13 +18,16 @@ from sglang.kernels.ops.attention.step5.selection import (
     can_use_step5_selection_cute,
     step5_select_regions,
 )
+from sglang.kernels.ops.attention.step5.selection_ppu import (
+    allocate_step5_ppu_selector_workspace,
+    can_use_step5_selection_ppu,
+)
 from sglang.kernels.ops.attention.step5.selection_deepselect import (
     STEP5_HISTORY_REGIONS,
     can_use_step5_selection_deepselect,
     deepselect_score_width,
     step5_select_regions_deepselect,
 )
-from sglang.kernels.ops.attention.step5.sparse_metadata import step5_pack_decode_regions
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.step5.metadata import (
     STEP5_SCORE_WORKSPACE_ELEMENTS,
@@ -153,6 +156,22 @@ def allocate_selection_workspace(
         ):
             prepare_scoring(scoring_workspace, req_to_token, row_to_req, positions)
             scoring_metadata_ready = True
+    # Region ids arrive ranked rather than ascending on the PPU radix path, so
+    # only allocate its scratch when that path will actually run. Tiles that fit
+    # in the 512 history slots keep every region, so the selector would be pure
+    # overhead there.
+    ppu_selector = None
+    if (
+        capacity
+        and score_width > 512
+        and not use_cute
+        and not use_deepselect
+        and envs.SGLANG_SAIL_STEP5_SELECTION_RADIX.get()
+        and can_use_step5_selection_ppu(region_scores)
+    ):
+        ppu_selector = allocate_step5_ppu_selector_workspace(
+            rows=capacity, width=score_width, device=device
+        )
     return Step5SelectionWorkspace(
         packed=torch.empty((rows, 513), dtype=torch.int64, device=device),
         counts=torch.empty(rows, dtype=torch.int32, device=device),
@@ -182,6 +201,7 @@ def allocate_selection_workspace(
             (start, min(start + capacity, rows))
             for start in range(0, rows, capacity or 1)
         ),
+        ppu_selector=ppu_selector,
     )
 
 
@@ -298,6 +318,8 @@ def select_step5_regions(
             )
         else:
             tile_ids = ids[: end - start]
+            # Packing is part of this launch: the kernel reads the IDs it just
+            # wrote, so the separate step5_pack_decode_regions pass is gone.
             step5_select_regions(
                 tile_scores,
                 positions=positions[start:end],
@@ -305,14 +327,9 @@ def select_step5_regions(
                 region_ids=tile_ids,
                 use_cute=workspace.use_cute,
                 counts=counts[start:end],
-            )
-            step5_pack_decode_regions(
-                tile_ids,
-                counts[start:end],
+                ppu_workspace=workspace.ppu_selector,
                 req_to_token=req_to_token,
-                row_to_req=row_to_req[start:end],
-                positions=positions[start:end],
-                packed_regions=packed[start:end],
+                packed=packed[start:end],
                 causal_lengths=lengths[start:end],
             )
     return packed, counts, lengths

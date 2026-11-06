@@ -7,10 +7,11 @@ row with the zero-centered GemmaRMSNorm (``weight + 1``), materializes BF16 --
 matching the CuTe smem round -- then applies the half-split NeoX RoPE straight
 from the model's merged ``[cos | sin]`` table.
 
-Q and K are two separate launches so the norm weight tensor and the output
-offsets stay compile-time constants. V and the head gate are plain copies, and
-the optional SWA paged KV-cache scatter is fused into the K launch (``loc < 0``
-rows are skipped). RoPE and tail columns are assembled in registers and written
+Q heads and the single K/V lane share one launch, ``grid = (tokens, heads +
+1)``: lane ``heads`` carries K, the V copy, the head gate and the optional paged
+KV-cache scatter (``loc < 0`` rows are skipped), while lanes ``[0, heads)`` are
+standard Q heads. A separate K launch would repeat the whole grid prologue for
+16 rows of work. RoPE and tail columns are assembled in registers and written
 with a single masked store per row, so the rotated ``[0, 2*rd)`` segment and the
 passthrough ``[2*rd, 192)`` tail never race on overlapping addresses.
 """
@@ -58,36 +59,14 @@ def _norm_rope_row(
 
 
 @triton.jit
-def _qknorm_rope_q(
+def _qknorm_rope(
     QKV,
     QW,
-    COS,
-    SIN,
-    POS,
-    Q,
-    ROW_WIDTH: tl.constexpr,
-    HEADS: tl.constexpr,
-    RD: tl.constexpr,
-    EPS: tl.constexpr,
-):
-    token = tl.program_id(0).to(tl.int64)
-    head = tl.program_id(1).to(tl.int64)
-    pos = tl.load(POS + token).to(tl.int64)
-    out = _norm_rope_row(
-        QKV, QW, COS, SIN, token * ROW_WIDTH + head * 192, pos, RD, EPS
-    )
-    channel = tl.arange(0, 256)
-    q_off = token * (HEADS * 192) + head * 192
-    tl.store(Q + q_off + channel, out, mask=channel < 192)
-
-
-@triton.jit
-def _qknorm_rope_kv(
-    QKV,
     KW,
     COS,
     SIN,
     POS,
+    Q,
     K,
     V,
     GATE,
@@ -102,31 +81,44 @@ def _qknorm_rope_kv(
     STORE_CACHE: tl.constexpr,
 ):
     token = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1).to(tl.int64)
+    pos = tl.load(POS + token).to(tl.int64)
     channel = tl.arange(0, 256)
     mask = channel < 192
-    pos = tl.load(POS + token).to(tl.int64)
-    # K head: norm + RoPE, written to the [T,192] K output and (optionally) cache.
-    k_out = _norm_rope_row(
-        QKV, KW, COS, SIN, token * ROW_WIDTH + HEADS * 192, pos, RD, EPS
-    )
-    tl.store(K + token * 192 + channel, k_out, mask=mask)
-    # V head: plain copy, no norm and no RoPE.
-    v_raw = tl.load(
-        QKV + token * ROW_WIDTH + (HEADS + 1) * 192 + channel, mask=mask, other=0.0
-    )
-    tl.store(V + token * 192 + channel, v_raw, mask=mask)
-    if GATED:
-        g = tl.arange(0, 16)
-        gmask = g < HEADS
-        gate_val = tl.load(
-            QKV + token * ROW_WIDTH + (HEADS + 2) * 192 + g, mask=gmask, other=0.0
+    if head < HEADS:
+        out = _norm_rope_row(
+            QKV, QW, COS, SIN, token * ROW_WIDTH + head * 192, pos, RD, EPS
         )
-        tl.store(GATE + token * HEADS + g, gate_val, mask=gmask)
-    if STORE_CACHE:
-        loc = tl.load(LOC + token).to(tl.int64)
-        if loc >= 0:
-            tl.store(KCACHE + loc * 192 + channel, k_out, mask=mask)
-            tl.store(VCACHE + loc * 192 + channel, v_raw, mask=mask)
+        tl.store(Q + token * (HEADS * 192) + head * 192 + channel, out, mask=mask)
+    else:
+        # K head: norm + RoPE, written to the [T,192] K output and (optionally)
+        # cache. The gate and cache pointers are placeholders unless their
+        # constexpr guards hold, so only the specialization touches them.
+        k_out = _norm_rope_row(
+            QKV, KW, COS, SIN, token * ROW_WIDTH + HEADS * 192, pos, RD, EPS
+        )
+        tl.store(K + token * 192 + channel, k_out, mask=mask)
+        # V head: plain copy, no norm and no RoPE.
+        v_raw = tl.load(
+            QKV + token * ROW_WIDTH + (HEADS + 1) * 192 + channel,
+            mask=mask,
+            other=0.0,
+        )
+        tl.store(V + token * 192 + channel, v_raw, mask=mask)
+        if GATED:
+            g = tl.arange(0, 16)
+            gmask = g < HEADS
+            gate_val = tl.load(
+                QKV + token * ROW_WIDTH + (HEADS + 2) * 192 + g,
+                mask=gmask,
+                other=0.0,
+            )
+            tl.store(GATE + token * HEADS + g, gate_val, mask=gmask)
+        if STORE_CACHE:
+            loc = tl.load(LOC + token).to(tl.int64)
+            if loc >= 0:
+                tl.store(KCACHE + loc * 192 + channel, k_out, mask=mask)
+                tl.store(VCACHE + loc * 192 + channel, v_raw, mask=mask)
 
 
 def launch(
@@ -149,7 +141,7 @@ def launch(
     store_cache: bool,
     eps: float,
 ) -> None:
-    """Run the Q launch then the fused K/V/gate/cache launch, in place.
+    """Run the Q heads and the K/V/gate/cache lane in one launch, in place.
 
     Argument order mirrors the CuTe compiled callable so ``_qknorm_rope`` can
     pick a backend without reshaping its call site. ``cos``/``sin`` are the
@@ -161,26 +153,14 @@ def launch(
     tokens = qkv.shape[0]
     row_width = qkv.shape[1]
     rd = cos.shape[1]
-    _qknorm_rope_q[(tokens, heads)](
+    _qknorm_rope[(tokens, heads + 1)](
         qkv,
         q_weight,
-        cos,
-        sin,
-        positions,
-        q,
-        row_width,
-        heads,
-        rd,
-        eps,
-        num_warps=4,
-        enable_fp_fusion=False,
-    )
-    _qknorm_rope_kv[(tokens,)](
-        qkv,
         k_weight,
         cos,
         sin,
         positions,
+        q,
         k,
         v,
         gate if gated else qkv,
