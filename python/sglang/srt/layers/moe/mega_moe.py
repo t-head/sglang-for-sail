@@ -150,16 +150,29 @@ def _get_mega_moe_symm_buffer(
         )
         buf = _MEGA_MOE_SYMM_BUFFER.get(key)
         if buf is None:
-            buf = deep_gemm.get_symm_buffer_for_mega_moe(
+            factory = deep_gemm.get_symm_buffer_for_mega_moe
+            factory_kwargs = {
+                "num_shared_experts": num_shared_experts,
+                "mma_type": mma_type,
+            }
+            if _is_sail:
+                if mma_type == "fp8xfp4":
+                    factory = deep_gemm.get_symm_buffer_for_w4a8_mega_moe
+                    factory_kwargs = {}
+                elif mma_type == "bf16xfp4":
+                    factory = deep_gemm.get_symm_buffer_for_w4a16_mega_moe
+                    factory_kwargs = {}
+                elif mma_type == "mxf4xmxf4":
+                    factory_kwargs["mma_type"] = "fp4xfp4"
+            buf = factory(
                 group,
                 num_experts,
                 num_max_tokens_per_rank,
                 num_topk,
                 hidden,
                 intermediate_hidden,
-                num_shared_experts=num_shared_experts,
-                mma_type=mma_type,
                 activation=activation,
+                **factory_kwargs,
             )
             _MEGA_MOE_SYMM_BUFFER[key] = buf
     return buf
@@ -370,11 +383,12 @@ def run_mega_routed_experts(
         mma_type=mma_type,
     )
 
+    topk_ids_dtype = torch.int64 if _is_sail else torch.int32
     if num_tokens > 0:
-        topk_ids_in = topk_ids.to(torch.int32)
+        topk_ids_in = topk_ids.to(topk_ids_dtype)
         topk_weights_in = topk_weights.to(torch.float32)
     else:
-        topk_ids_in = hidden_states.new_empty((0, top_k), dtype=torch.int32)
+        topk_ids_in = hidden_states.new_empty((0, top_k), dtype=topk_ids_dtype)
         topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
 
     if not _is_sail and _device_sm == 90:
@@ -394,7 +408,17 @@ def run_mega_routed_experts(
         topk_weights_in = topk_weights_in * routed_scaling_factor
 
     mega_kwargs = {"recipe": (1, 1, 32)}
-    if mma_type == "nvfp4xnvfp4":
+    if _is_sail:
+        deep_gemm.mega_moe_pre_dispatch(
+            hidden_states.contiguous(),
+            topk_ids_in.contiguous(),
+            topk_weights_in.contiguous(),
+            buf,
+            num_tokens=num_tokens,
+        )
+        if mma_type != "mxf4xmxf4":
+            mega_kwargs = {}
+    elif mma_type == "nvfp4xnvfp4":
         # Per-token outer scales go to buf.x_scales; the kernel folds them with
         # the per-expert alphas in the L1 / L2 epilogues.
         deep_gemm.mega_moe_pre_dispatch(
@@ -461,26 +485,31 @@ def run_mega_routed_experts(
             shared_block_m=shared_block_m,
         )
 
-    # Allocate at least one row so y has a non-null CUDA data_ptr;
+    # Allocate at least one CUDA row so y has a non-null data_ptr;
     # the DeepGEMM tvm-ffi binding rejects nullptr in convert_to_torch_tensor().
     y = torch.empty(
-        (max(num_tokens, 1), hidden_size),
+        (num_tokens if _is_sail else max(num_tokens, 1), hidden_size),
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
     with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
-        mega_moe_kernel = (
-            deep_gemm.fp4_fp4_mega_moe
-            if _is_sail and mma_type == "mxf4xmxf4"
-            else deep_gemm.fp8_fp4_mega_moe
-        )
+        if _is_sail:
+            mega_moe_kernel = {
+                "mxf4xmxf4": deep_gemm.fp4_fp4_mega_moe,
+                "fp8xfp4": deep_gemm.fp8_fp4_mega_moe,
+                "bf16xfp4": deep_gemm.bf16_fp4_mega_moe,
+            }[mma_type]
+        else:
+            mega_moe_kernel = deep_gemm.fp8_fp4_mega_moe
+            mega_kwargs.update(
+                shared_l1_weights=shared_l1_weights,
+                shared_l2_weights=shared_l2_weights,
+            )
         mega_moe_kernel(
             y,
             experts.mega_l1_weights,
             experts.mega_l2_weights,
             buf,
-            shared_l1_weights=shared_l1_weights,
-            shared_l2_weights=shared_l2_weights,
             activation="swiglu",
             activation_clamp=activation_clamp,
             fast_math=True,
