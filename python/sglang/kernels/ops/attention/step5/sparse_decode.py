@@ -6,12 +6,16 @@ import math
 
 import torch
 
+from sglang.kernels.jit.utils.common import is_sail_runtime
+from sglang.srt.environ import envs
+
 
 def _can_use_sparse_decode_cute(device: torch.device) -> bool:
     """CuTe DSL sparse decode needs sm90/sm100; other devices use the Triton path."""
     return (
         device.type == "cuda"
         and torch.version.hip is None
+        and not is_sail_runtime()
         and torch.cuda.get_device_capability(device)[0] in (9, 10)
     )
 
@@ -441,13 +445,57 @@ def step5_sparse_decode_selected(
     head_gate=None,
     k_scale=None,
     v_scale=None,
+    query_positions=None,
+    ppu_workspace=None,
 ):
     """Execute a precomputed split schedule and merge selected-region attention.
 
     Consumes packed regions, causal lengths and caller-owned scratch only. The
     caller prepares the schedule once before layer execution. No request state,
     ForwardBatch, speculative mode or indexer metadata is consulted here.
+
+    When the SAIL JIT paged kernel is available and ``SGLANG_SAIL_STEP5_ATTN_CUDA``
+    stays on, the whole batch runs in that one launch instead: it cannot fuse a
+    head gate or read FP8 KV, so those features keep the portable schedule.
+    ``decode_ppu`` picks between its two builds there; the native one merges its
+    splits on device and needs no query positions, so it is recognised by the
+    four-dimensional partial block its caller allocated.
     """
+    if (
+        lse is not None
+        and packed.ndim == 2
+        and (
+            ppu_workspace is None
+            or packed.shape[1] == ppu_workspace.physical_regions.shape[2]
+        )
+        and head_gate is None
+        and k_scale is None
+        and v_scale is None
+        and envs.SGLANG_SAIL_STEP5_ATTN_CUDA.get()
+    ):
+        from sglang.kernels.ops.attention.step5.decode_ppu import (
+            can_use_step5_decode_ppu,
+            step5_sparse_decode_ppu,
+        )
+
+        if can_use_step5_decode_ppu(q, k):
+            step5_sparse_decode_ppu(
+                q,
+                k,
+                v,
+                packed=packed,
+                query_positions=query_positions,
+                out=out,
+                lse=lse,
+                scale=scale,
+                workspace=ppu_workspace,
+                counts=counts,
+                causal_lengths=causal_lengths,
+                valid_rows=valid_rows,
+                partial=partial,
+                partial_lse=partial_lse,
+            )
+            return
     rows = q.shape[0]
     dynamic = dynamic_splits
     work = work_rows

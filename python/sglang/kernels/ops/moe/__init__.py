@@ -287,6 +287,14 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="moe.local_expert_lookup",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.local_expert_map:local_expert_lookup",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
         op="moe.mask_topk_ids",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.moe.dsv4:mask_topk_ids",

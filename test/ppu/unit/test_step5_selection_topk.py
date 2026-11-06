@@ -41,6 +41,9 @@ from sglang.kernels.ops.attention.step5.selection_triton import (
     canonicalize_zero,
     launch as pack_regions,
 )
+from sglang.kernels.ops.attention.step5.sparse_metadata import (
+    step5_pack_decode_regions,
+)
 
 DEV = "cuda"
 TOPK = 512
@@ -224,7 +227,9 @@ def run_producer_zero_contract():
     q = torch.zeros((rows, heads, 256), dtype=torch.bfloat16, device=DEV)
     weights = torch.full((rows, heads), -1.0, dtype=torch.float32, device=DEV)
     keys = torch.zeros((1, 8, 1, 256), dtype=torch.uint8, device=DEV)
-    req_to_token = torch.zeros((2, 8192), dtype=torch.int32, device=DEV)
+    # Requests are 1..rows, so the pool view needs a row per request plus the
+    # padding slot; a 2-row fixture read past the tensor once rows reached 4.
+    req_to_token = torch.zeros((rows + 1, 8192), dtype=torch.int32, device=DEV)
     scores = torch.empty((rows, width), dtype=torch.float32, device=DEV)
     step5_paged_scores(
         q,
@@ -252,6 +257,135 @@ def run_producer_zero_contract():
         assert int(got[r, TOPK]) == live, "the current region follows the live ids"
         assert int(got_counts[r]) == TOPK + 1
     print("PASS producer +0.0 contract")
+
+
+def run_write_extent_bound():
+    """A score width off the tile grid must not spill -inf into the next row.
+
+    The write extent is clamped by the tile *count*, so a width of 1000 leaves
+    24 lanes of the last tile (992..1023) past the row's own columns; without
+    an in_range intersect they land on the next row's leading columns. A row
+    that writes nothing -- under 512 live regions the row extent is zero -- is
+    the detector: its whole row must keep the sentinel.
+    """
+    sentinel = 1234.5
+    rows, width = 8, 1000
+    live = [width, 100, width, 100, width, 100, width, 100]
+    cases = {
+        "grouped hot path": [1, 1, 1, 1, 1, 1, 1, 1],
+        # A request boundary inside the group drives the per-row cold path.
+        "mixed cold path": [1, 2, 1, 1, 1, 1, 1, 1],
+    }
+    q = torch.zeros((rows, 4, 256), dtype=torch.bfloat16, device=DEV)
+    weights = torch.ones((rows, 4), dtype=torch.float32, device=DEV)
+    keys = torch.zeros((1, 8, 1, 256), dtype=torch.uint8, device=DEV)
+    req_to_token = torch.zeros((3, 8 * width), dtype=torch.int32, device=DEV)
+    positions = torch.tensor([n * 8 for n in live], dtype=torch.int32, device=DEV)
+    for tag, row_to_req in cases.items():
+        out = torch.full((rows, width), sentinel, dtype=torch.float32, device=DEV)
+        step5_paged_scores(
+            q,
+            weights,
+            compressed_index_keys=keys,
+            req_to_token=req_to_token,
+            row_to_req=torch.tensor(row_to_req, dtype=torch.int32, device=DEV),
+            positions=positions,
+            out=out,
+            clear_future=False,
+            group_rows=4,
+        )
+        torch.cuda.synchronize()
+        for r, n in enumerate(live):
+            if n < width:
+                assert (out[r] == sentinel).all(), (
+                    f"{tag}: row {r} (live={n}) was written; the previous row's "
+                    "tile padding spilled into its leading columns"
+                )
+            else:
+                assert (out[r] == 0).all(), (
+                    f"{tag}: row {r} must score a zero query as exactly 0"
+                )
+        print(f"PASS write extent bound ({tag}, width={width})")
+
+
+def _req_to_token(rows, context):
+    """Aligned [rows+1, context] pool view; request slot 0 stays padding."""
+    base = torch.arange(rows + 1, dtype=torch.int32, device=DEV).mul_(8 * context)
+    cols = torch.arange(context, dtype=torch.int32, device=DEV)
+    return (base.unsqueeze(1) + cols.unsqueeze(0)).contiguous()
+
+
+def run_fused_packing_equivalence():
+    """Folding the pack into selection must match the separate pass bit for bit.
+
+    ``step5_pack_decode_regions`` re-read the IDs selection had just written, so
+    the only thing to prove is that the fused ``lane <= count`` predicate plus
+    the slot-512 tail cover exactly what ``lane < count`` plus the 1024-lane
+    sweep over the whole width covered before.
+    """
+    for tag, width, live in (
+        ("single-tile", 512, [0, 1, 300, 512]),
+        ("ragged", 4096, [0, 1, 511, 512, 513, 700]),
+    ):
+        rows = len(live)
+        scores = _scores(rows, width, live, seed=3)
+        positions, row_to_req, _, _ = _metadata(rows, live)
+        row_to_req[0] = 0  # a padding row selects nothing
+        req_to_token = _req_to_token(rows, 8 * width)
+        for packed_width in (513, 514, 516):
+            ids_split = torch.empty((rows, 513), dtype=torch.int32, device=DEV)
+            counts_split = torch.empty(rows, dtype=torch.int32, device=DEV)
+            packed_split = torch.full(
+                (rows, packed_width), -5, dtype=torch.int64, device=DEV
+            )
+            lengths_split = torch.full((rows,), -5, dtype=torch.int32, device=DEV)
+            step5_select_regions(
+                scores,
+                positions=positions,
+                row_to_req=row_to_req,
+                region_ids=ids_split,
+                counts=counts_split,
+                use_cute=False,
+            )
+            step5_pack_decode_regions(
+                ids_split,
+                counts_split,
+                req_to_token=req_to_token,
+                row_to_req=row_to_req,
+                positions=positions,
+                packed_regions=packed_split,
+                causal_lengths=lengths_split,
+            )
+
+            ids_fused = torch.empty((rows, 513), dtype=torch.int32, device=DEV)
+            counts_fused = torch.empty(rows, dtype=torch.int32, device=DEV)
+            packed_fused = torch.full(
+                (rows, packed_width), -5, dtype=torch.int64, device=DEV
+            )
+            lengths_fused = torch.full((rows,), -5, dtype=torch.int32, device=DEV)
+            step5_select_regions(
+                scores,
+                positions=positions,
+                row_to_req=row_to_req,
+                region_ids=ids_fused,
+                counts=counts_fused,
+                use_cute=False,
+                req_to_token=req_to_token,
+                packed=packed_fused,
+                causal_lengths=lengths_fused,
+            )
+            torch.cuda.synchronize()
+
+            assert torch.equal(ids_split, ids_fused), f"{tag}/{packed_width}: ids"
+            assert torch.equal(counts_split, counts_fused), f"{tag}/{packed_width}: counts"
+            assert torch.equal(packed_split, packed_fused), (
+                f"{tag}/{packed_width}: fused pack differs from the separate pass"
+            )
+            assert torch.equal(lengths_split, lengths_fused), (
+                f"{tag}/{packed_width}: causal lengths differ"
+            )
+            assert (packed_fused >= -1).all(), "tail slots must be -1, not uninitialised"
+        print(f"PASS fused packing equivalence {tag} (width={width})")
 
 
 def _bench(fn, iters=20, reps=5):
@@ -370,7 +504,9 @@ def main():
     run_short_context_padding()
     run_live_prefix_isolation()
     run_width_narrowing()
+    run_fused_packing_equivalence()
     run_producer_zero_contract()
+    run_write_extent_bound()
     print("ALL PASS")
     if "--bench" in sys.argv:
         report_cost()
