@@ -4006,7 +4006,7 @@ class TestKimiK31DcpOverrides(CustomTestCase):
     DCP-1 or same-DCP PD prefill over Mooncake."""
 
     @staticmethod
-    def _overrides(**fields):
+    def _overrides(sail=False, **fields):
         from sglang.srt.arg_groups.model_overrides import kimi_k3 as kimi_k3_module
 
         cfg = SimpleNamespace(
@@ -4025,7 +4025,14 @@ class TestKimiK31DcpOverrides(CustomTestCase):
         )
         for name, value in fields.items():
             setattr(cfg, name, value)
-        return kimi_k3_module._kimi_k31_dcp_overrides(cfg)
+        with (
+            patch(
+                "sglang.srt.speculative.draft_worker_common.DFLASH_MLA_ONLY_DRAFT_BACKENDS",
+                ("flashmla",) if sail else ("cutedsl_mla", "trtllm_mla"),
+            ),
+            patch("sglang.srt.utils.is_sail", return_value=sail),
+        ):
+            return kimi_k3_module._kimi_k31_dcp_overrides(cfg)
 
     def test_dflash_defaults_to_cutedsl_mla_draft_and_decode_verify(self):
         overrides = self._overrides(speculative_algorithm="DFLASH")
@@ -4034,8 +4041,57 @@ class TestKimiK31DcpOverrides(CustomTestCase):
         )
         self.assertEqual(overrides["speculative_attention_mode"], "decode")
 
+    def test_ppu_dflash_defaults_to_flashmla_draft(self):
+        overrides = self._overrides(
+            sail=True,
+            speculative_algorithm="DFLASH",
+            tp_size=16,
+            dcp_comm_backend="ag_rs",
+        )
+        self.assertEqual(overrides["speculative_draft_attention_backend"], "flashmla")
+        self.assertEqual(overrides["speculative_attention_mode"], "decode")
+
+    def test_ppu_dflash_preserves_explicit_flashmla_draft(self):
+        overrides = self._overrides(
+            sail=True,
+            speculative_algorithm="DFLASH",
+            tp_size=16,
+            dcp_comm_backend="ag_rs",
+            speculative_draft_attention_backend="flashmla",
+        )
+        self.assertEqual(overrides["speculative_draft_attention_backend"], "flashmla")
+        self.assertEqual(overrides["speculative_attention_mode"], "decode")
+
+    def test_flashmla_dflash_draft_remains_ppu_only(self):
+        with self.assertRaisesRegex(ValueError, "cutedsl_mla"):
+            self._overrides(
+                speculative_algorithm="DFLASH",
+                speculative_draft_attention_backend="flashmla",
+            )
+
+    def test_ppu_dflash_rejects_unsupported_draft_backends(self):
+        for backend in ("cutedsl_mla", "flashinfer", "triton", "trtllm_mla"):
+            with self.subTest(backend=backend):
+                with self.assertRaisesRegex(ValueError, "flashmla"):
+                    self._overrides(
+                        sail=True,
+                        speculative_algorithm="DFLASH",
+                        speculative_draft_attention_backend=backend,
+                    )
+
+    def test_dflash_accepts_all_mla_only_backends(self):
+        for backend in ("cutedsl_mla", "trtllm_mla"):
+            with self.subTest(backend=backend):
+                overrides = self._overrides(
+                    speculative_algorithm="DFLASH",
+                    speculative_draft_attention_backend=backend,
+                )
+                self.assertEqual(
+                    overrides["speculative_draft_attention_backend"], "cutedsl_mla"
+                )
+
     def test_dflash_rejects_other_draft_backends(self):
-        for backend in ("flashinfer", "triton", "trtllm_mla"):
+        for backend in ("flashinfer", "triton"):
             with self.subTest(backend=backend):
                 with self.assertRaisesRegex(ValueError, "cutedsl_mla"):
                     self._overrides(
