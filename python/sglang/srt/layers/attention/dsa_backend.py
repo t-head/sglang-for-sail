@@ -489,6 +489,8 @@ def _validate_dcp_backend(
         raise ValueError(
             "DSA with --dcp-size > 1 needs the v2 top-k (SGLANG_OPT_USE_TOPK_V2)."
         )
+    if _is_sail and prefill_impl == "flashmla_sparse" and decode_impl == "flashmla_kv":
+        return
     if prefill_impl != decode_impl or decode_impl not in ("flashmla_kv", "trtllm"):
         raise ValueError(
             "DSA with --dcp-size > 1 needs --dsa-prefill-backend and "
@@ -2023,12 +2025,21 @@ class DeepseekSparseAttnBackend(
             # CUDA graph captures the schedule tensor's shape and data pointer.
             # Reserve schedule capacity for the largest context this graph can
             # replay; per-replay code refreshes the valid prefix in-place.
-            paged_mqa_ctx_lens_2d = torch.full_like(
-                paged_mqa_ctx_lens_2d, self.req_to_token.shape[1]
-            )
-            paged_mqa_schedule_metadata = self._build_paged_mqa_schedule_metadata(
-                paged_mqa_ctx_lens_2d
-            )
+            if self.attn_dcp_size > 1:
+                # Keep the actual shard lengths for the indexer and local top-k.
+                capacity_ctx_lens_2d = torch.full_like(
+                    paged_mqa_ctx_lens_2d, self.req_to_token.shape[1]
+                )
+                paged_mqa_schedule_metadata = self._build_paged_mqa_schedule_metadata(
+                    capacity_ctx_lens_2d
+                )
+            else:
+                paged_mqa_ctx_lens_2d = torch.full_like(
+                    paged_mqa_ctx_lens_2d, self.req_to_token.shape[1]
+                )
+                paged_mqa_schedule_metadata = self._build_paged_mqa_schedule_metadata(
+                    paged_mqa_ctx_lens_2d
+                )
 
         metadata = DSAMetadata(
             page_size=self.physical_page_size,
@@ -2732,6 +2743,17 @@ class DeepseekSparseAttnBackend(
                         self.forward_metadata.page_table_1_flattened
                     )
                     assert page_table_1_flattened is not None
+                    if (
+                        _is_sail
+                        and self.attn_dcp_size > 1
+                        and dsa_impl == "flashmla_sparse"
+                    ):
+                        # DCP gather packs KV in request/token order, not pool slots.
+                        page_table_1_flattened = torch.arange(
+                            page_table_1_flattened.numel(),
+                            dtype=page_table_1_flattened.dtype,
+                            device=page_table_1_flattened.device,
+                        )
                     kv_cache = dequantize_k_cache_paged(
                         kv_cache, page_table_1_flattened
                     )
