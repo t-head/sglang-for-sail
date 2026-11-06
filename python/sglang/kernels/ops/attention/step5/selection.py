@@ -25,6 +25,9 @@ def step5_select_regions(
     counts: torch.Tensor,
     use_cute: bool | None = None,
     ppu_workspace=None,
+    req_to_token: torch.Tensor | None = None,
+    packed: torch.Tensor | None = None,
+    causal_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select <=512 historical regions, sort IDs, then append current exactly once.
 
@@ -32,16 +35,21 @@ def step5_select_regions(
     orders by bit pattern, so a -0.0 would rank below a +0.0 and beat the smaller
     region id. Only the first positions//8 columns are ranked, and scores are read
     as given, so the future tail may hold stale values. Width covers positions//8.
-    Slot zero is padding. Output IDs are logical, int32 [T,513], padded with -1;
-    counts are int32 [T]. The FlashInfer path returns them ascending; the PPU
-    radix path returns the same set in an unspecified slot order, because its
-    staging pass hands out output slots with atomics. Its caller appends the
-    current region and packs addresses without relying on that order. Both fast
-    paths only run once the width exceeds the 512 history slots; narrower tiles
-    keep every history region, so ranking them would be pure overhead. Caller
-    must keep outputs disjoint from inputs and each other. Warm FlashInfer
-    outside capture and use its shared device scratch on the sequential forward
-    stream.
+    Slot zero is padding. Output IDs are logical, int32 [T,513], padded with
+    -1; counts are int32 [T]. The FlashInfer path returns them ascending; the
+    PPU radix path returns the same set in an unspecified slot order, because
+    its staging pass hands out output slots with atomics. The append and the
+    address fold below do not rely on that order. Both fast paths only run once
+    the width exceeds the 512 history slots; narrower tiles keep every history
+    region, so ranking them would be pure overhead. Caller must keep outputs
+    disjoint from inputs and each other. Warm FlashInfer outside capture and
+    use its shared device scratch on the sequential forward stream.
+
+    ``packed``/``causal_lengths`` opt into the sparse-attention ABI in the same
+    launch: the logical-to-physical fold that ``step5_pack_decode_regions`` used
+    to perform reads the IDs this kernel has just written, so folding them here
+    saves a whole launch per layer. Both must be supplied together with
+    ``req_to_token``.
     """
     if scores.device.type != "cuda" or torch.version.hip is not None:
         raise ValueError("Step5 selection requires NVIDIA CUDA")
@@ -74,6 +82,35 @@ def step5_select_regions(
             or not dtype_ok
         ):
             raise ValueError(f"Step5 selection invalid {name} metadata")
+    if (packed is None) != (causal_lengths is None):
+        raise ValueError(
+            "Step5 selection packed output needs both packed and causal_lengths"
+        )
+    if packed is not None:
+        if req_to_token is None:
+            raise ValueError("Step5 selection packed output needs req_to_token")
+        if (
+            packed.device != scores.device
+            or packed.dtype != torch.int64
+            or packed.ndim != 2
+            or packed.shape[0] != rows
+            or packed.shape[1] not in (513, 514, 516)
+            or not packed.is_contiguous()
+            or causal_lengths.device != scores.device
+            or causal_lengths.dtype != torch.int32
+            or tuple(causal_lengths.shape) != (rows,)
+            or not causal_lengths.is_contiguous()
+        ):
+            raise ValueError(
+                "Step5 selection packed output requires int64 [T,513/514/516] "
+                "and contiguous int32 [T] causal lengths"
+            )
+        if (
+            req_to_token.device != scores.device
+            or req_to_token.ndim != 2
+            or req_to_token.stride(1) != 1
+        ):
+            raise ValueError("Step5 selection req_to_token requires CUDA integer [R,C]")
     if rows == 0:
         return region_ids, counts
     for out, others in (
@@ -96,7 +133,13 @@ def step5_select_regions(
         )
 
         return step5_select_regions_cute(
-            scores, positions, row_to_req, region_ids, counts
+            scores,
+            positions,
+            row_to_req,
+            region_ids,
+            counts,
+            req_to_token=req_to_token,
+            causal_lengths=causal_lengths,
         )
     selected_k = 0
     indices = region_ids
@@ -139,5 +182,15 @@ def step5_select_regions(
         selected_k = 512
     from sglang.kernels.ops.attention.step5.selection_triton import launch
 
-    launch(indices, positions, row_to_req, region_ids, counts, selected_k=selected_k)
+    launch(
+        indices,
+        positions,
+        row_to_req,
+        region_ids,
+        counts,
+        selected_k=selected_k,
+        req_to_token=req_to_token,
+        packed=packed,
+        causal_lengths=causal_lengths,
+    )
     return region_ids, counts

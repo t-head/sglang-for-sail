@@ -889,6 +889,17 @@ class Step5AttentionBackend(AttentionBackend):
         fn = getattr(self.swa_backend, "swa_kv_write_target", None)
         return fn(layer, forward_batch) if fn is not None else None
 
+    def full_kv_write_target(self, layer, forward_batch):
+        """Fused QK-norm KV store for a DSA (full-pool) layer, or None.
+
+        ``_forward_dsa`` writes K/V through ``set_kv_buffer`` at
+        ``out_cache_loc``; that is the same plain row scatter the SWA side
+        absorbs, so the model can hand the target to ``step5_qknorm_rope`` and
+        skip the standalone store.
+        """
+        fn = getattr(self.swa_backend, "full_kv_write_target", None)
+        return fn(layer, forward_batch) if fn is not None else None
+
     def forward_decode(
         self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs
     ):

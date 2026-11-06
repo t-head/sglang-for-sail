@@ -620,23 +620,15 @@ class FlashAttentionBackend(AttentionBackend):
             return float(scale) == 1.0
         return False
 
-    def swa_kv_write_target(
-        self, layer: RadixAttention, forward_batch: ForwardBatch
-    ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """Physical K/V rows and loc for a fused QK-norm store, or None.
+    def _row_scatter_kv_target(self, layer: RadixAttention, forward_batch, loc):
+        """(k rows, v rows, loc) when this layer's paged write is a row scatter.
 
-        Returns ``(k_cache[slots, 192], v_cache[slots, 192], loc)`` when this
-        layer's paged write is a plain row scatter that ``step5_qknorm_rope`` can
-        absorb. Callers must skip ``set_kv_buffer`` when the return is not None.
-
-        A SWA sub-pool is written at the forward's pre-translated window loc; a
-        batch without one is written at its own ``out_cache_loc``. Both are the
-        locs ``KVWriteLoc.for_layer`` hands ``set_kv_buffer``, on every FA
-        version: the windows only change what attention reads.
+        Every rejection is a correctness gate rather than a heuristic: a
+        quantized pool, a split KV head, a loc still needing translation, or a
+        non-identity descale all change what the stored bytes must be, and the
+        fused QK-norm store writes the K/V it has just computed.
         """
         if self.kv_cache_is_mxfp8 or self.attn_cp_size > 1 or self.fa_skip_kv_cache:
-            return None
-        if layer.sliding_window_size is None or layer.sliding_window_size <= -1:
             return None
         # One 192-wide row per slot: a second KV head would fold two heads into
         # one row, so the row view below would scatter the wrong bytes.
@@ -654,16 +646,6 @@ class FlashAttentionBackend(AttentionBackend):
             and self._is_identity_kv_scale(layer.v_scale)
         ):
             return None
-        if self.use_sliding_window_kv_pool:
-            metadata = self.forward_metadata
-            loc = metadata.swa_out_cache_loc if metadata is not None else None
-        else:
-            # The same loc ``KVWriteLoc.for_layer`` hands ``set_kv_buffer``.
-            loc = (
-                forward_batch.encoder_out_cache_loc
-                if layer.is_cross_attention
-                else forward_batch.out_cache_loc
-            )
         if loc is None or loc.ndim != 1 or loc.numel() == 0:
             return None
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -685,6 +667,50 @@ class FlashAttentionBackend(AttentionBackend):
         ):
             return None
         return k_rows, v_rows, loc
+
+    def swa_kv_write_target(
+        self, layer: RadixAttention, forward_batch: ForwardBatch
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Physical K/V rows and loc for a fused QK-norm store, or None.
+
+        Returns ``(k_cache[slots, 192], v_cache[slots, 192], loc)`` when this
+        layer's paged write is a plain row scatter that ``step5_qknorm_rope`` can
+        absorb. Callers must skip ``set_kv_buffer`` when the return is not None.
+
+        A SWA sub-pool is written at the forward's pre-translated window loc; a
+        batch without one is written at its own ``out_cache_loc``. Both are the
+        locs ``KVWriteLoc.for_layer`` hands ``set_kv_buffer``, on every FA
+        version: the windows only change what attention reads.
+        """
+        if layer.sliding_window_size is None or layer.sliding_window_size <= -1:
+            return None
+        if self.use_sliding_window_kv_pool:
+            metadata = self.forward_metadata
+            loc = metadata.swa_out_cache_loc if metadata is not None else None
+        else:
+            loc = (
+                forward_batch.encoder_out_cache_loc
+                if layer.is_cross_attention
+                else forward_batch.out_cache_loc
+            )
+        return self._row_scatter_kv_target(layer, forward_batch, loc)
+
+    def full_kv_write_target(
+        self, layer: RadixAttention, forward_batch: ForwardBatch
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Same fused store for a FULL-pool layer, which has no sliding window.
+
+        Step5 DSA layers keep their K/V in the full sub-pool at
+        ``out_cache_loc``, so the standalone ``set_kv_buffer`` they would issue
+        is the same row scatter ``swa_kv_write_target`` absorbs. Interleave CP
+        gathers rows before writing them, which the shared guard (``attn_cp_size
+        > 1``) already turns into a fallback.
+        """
+        if layer.is_cross_attention:
+            return None
+        return self._row_scatter_kv_target(
+            layer, forward_batch, forward_batch.out_cache_loc
+        )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         # Single-CG has no Python between steps, so one capturable kernel updates

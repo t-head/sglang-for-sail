@@ -28,7 +28,6 @@ from sglang.kernels.ops.attention.step5.selection_deepselect import (
     deepselect_score_width,
     step5_select_regions_deepselect,
 )
-from sglang.kernels.ops.attention.step5.sparse_metadata import step5_pack_decode_regions
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.step5.metadata import (
     STEP5_SCORE_WORKSPACE_ELEMENTS,
@@ -319,6 +318,8 @@ def select_step5_regions(
             )
         else:
             tile_ids = ids[: end - start]
+            # Packing is part of this launch: the kernel reads the IDs it just
+            # wrote, so the separate step5_pack_decode_regions pass is gone.
             step5_select_regions(
                 tile_scores,
                 positions=positions[start:end],
@@ -327,14 +328,8 @@ def select_step5_regions(
                 use_cute=workspace.use_cute,
                 counts=counts[start:end],
                 ppu_workspace=workspace.ppu_selector,
-            )
-            step5_pack_decode_regions(
-                tile_ids,
-                counts[start:end],
                 req_to_token=req_to_token,
-                row_to_req=row_to_req[start:end],
-                positions=positions[start:end],
-                packed_regions=packed[start:end],
+                packed=packed[start:end],
                 causal_lengths=lengths[start:end],
             )
     return packed, counts, lengths

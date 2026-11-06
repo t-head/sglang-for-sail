@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.moe.local_expert_map import local_expert_lookup
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -32,6 +33,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import (
     get_bool_env_var,
     get_device,
+    is_cuda,
     is_hip,
 )
 
@@ -131,6 +133,23 @@ class StandardDispatcher(BaseDispatcher):
         self.local_expert_mapping = None
         self._local_expert_lookup = None
         self.expert_mask_gpu = None
+
+    def _remap_local_expert_ids(self, topk_ids: torch.Tensor) -> torch.Tensor:
+        # ``table[topk_ids]`` asks ATen to promote the int32 index to int64
+        # first, which is a second launch for a 32-element gather. The fused
+        # lookup does both in one, and only the CUDA path is gated so HIP keeps
+        # its eager behaviour.
+        table = self._local_expert_lookup
+        if (
+            is_cuda()
+            and not _is_hip
+            and topk_ids.dtype == torch.int32
+            and table.dtype == torch.int32
+            and topk_ids.is_contiguous()
+            and table.is_contiguous()
+        ):
+            return local_expert_lookup(topk_ids, table)
+        return table[topk_ids]
 
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
@@ -233,7 +252,7 @@ class StandardDispatcher(BaseDispatcher):
                 )
             elif not self.use_aiter_moe_runner:
                 if TopKOutputChecker.format_is_standard(topk_output):
-                    topk_ids_local = self._local_expert_lookup[topk_output.topk_ids]
+                    topk_ids_local = self._remap_local_expert_ids(topk_output.topk_ids)
                     # Drop dp-attention MAX_LEN pad rows from the dispatch:
                     # pad rows carry stale hidden through the router and
                     # their expert outputs are discarded downstream — pure

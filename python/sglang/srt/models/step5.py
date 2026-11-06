@@ -1081,17 +1081,24 @@ class Step5Attention(nn.Module):
         )
         kv_write = None
         # Idle dummy rows must not write KV, including through fused store.
-        if (
-            not self.is_dsa
-            and not idle
-            # Both qknorm backends reproduce the fused store; the attention
-            # backend only offers a target where its own paged write is a plain
-            # row scatter at a loc it can name up front.
-            and self._fused_qknorm
-            # TODO(yhyang201): frozen SGLANG_OPT_STEP5_SWA_FUSED_QKNORM_STORE; prune dead paths.
-            and step5_options.SWA_FUSED_QKNORM_STORE
-        ):
-            candidate = backend.swa_kv_write_target(self.attn, forward_batch)
+        # Both qknorm backends reproduce the fused store; the attention backend
+        # only offers a target where its own paged write is a plain row scatter
+        # at a loc it can name up front.
+        if not idle and self._fused_qknorm:
+            if self.is_dsa:
+                # TODO(yhyang201): frozen SGLANG_OPT_STEP5_DSA_FUSED_QKNORM_STORE; prune dead paths.
+                candidate = (
+                    backend.full_kv_write_target(self.attn, forward_batch)
+                    if step5_options.DSA_FUSED_QKNORM_STORE
+                    else None
+                )
+            else:
+                # TODO(yhyang201): frozen SGLANG_OPT_STEP5_SWA_FUSED_QKNORM_STORE; prune dead paths.
+                candidate = (
+                    backend.swa_kv_write_target(self.attn, forward_batch)
+                    if step5_options.SWA_FUSED_QKNORM_STORE
+                    else None
+                )
             if (
                 candidate is not None
                 and candidate[2].shape == (qkv.shape[0],)
