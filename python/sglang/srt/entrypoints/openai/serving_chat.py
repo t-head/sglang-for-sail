@@ -52,6 +52,7 @@ from sglang.srt.entrypoints.openai.parallel_prompt_encode import (
     parallel_prompt_encode,
 )
 from sglang.srt.entrypoints.openai.protocol import (
+    AllowedToolChoice,
     ChatCompletionMessageContentTextPart,
     ChatCompletionMessageContentVideoPart,
     ChatCompletionMessageGenericParam,
@@ -101,6 +102,7 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
+from sglang.srt.function_call.kimik3_detector import KimiK3Detector
 from sglang.srt.function_call.utils import (
     check_tool_parameters_schema,
     get_json_schema_constraint,
@@ -750,6 +752,17 @@ class OpenAIServingChat(OpenAIServingBase):
                 or (request.tool_choice == "none" and request._tool_choice_explicit)
             ):
                 template_kwargs.setdefault("tool_choice", request.tool_choice)
+            elif (
+                isinstance(request.tool_choice, AllowedToolChoice)
+                and not request.tool_choice.allowed_tools.tools
+            ):
+                # The text-only grammar can still admit malformed tool markers.
+                template_kwargs.setdefault("tool_choice", "none")
+            elif (
+                isinstance(request.tool_choice, AllowedToolChoice)
+                and request.tool_choice.allowed_tools.mode == "required"
+            ):
+                template_kwargs.setdefault("tool_choice", "required")
             if request.response_format is not None:
                 template_kwargs.setdefault(
                     "response_format",
@@ -1185,6 +1198,22 @@ class OpenAIServingChat(OpenAIServingBase):
         if not request.messages:
             return "Messages cannot be empty."
 
+        # History contains complete calls, unlike streaming response deltas
+        # whose shared FunctionResponse model allows the name to be absent.
+        for message_index, message in enumerate(request.messages):
+            if (
+                not isinstance(message, ChatCompletionMessageGenericParam)
+                or message.role != "assistant"
+            ):
+                continue
+            for tool_index, tool_call in enumerate(message.tool_calls or []):
+                name = tool_call.function.name
+                if name is None or not name.strip():
+                    return (
+                        f"messages[{message_index}].tool_calls[{tool_index}]"
+                        ".function.name must be a non-empty string."
+                    )
+
         if (
             request.chat_template_kwargs
             and "chat_template" in request.chat_template_kwargs
@@ -1227,7 +1256,7 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             return "Tools cannot be empty if tool choice is set to required."
 
-        if request.tool_choice is not None and not isinstance(request.tool_choice, str):
+        if isinstance(request.tool_choice, ToolChoice):
             if not effective_tools:
                 return "Tools cannot be empty if tool choice is set to a specific tool."
             tool_name = request.tool_choice.function.name
@@ -1236,6 +1265,19 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             if not tool_exists:
                 return f"Tool '{tool_name}' not found in tools list."
+
+        if isinstance(request.tool_choice, AllowedToolChoice):
+            if self.tool_call_parser != "kimi_k3":
+                return "allowed_tools requires the Kimi K3 tool parser."
+            allowed_tools = request.tool_choice.allowed_tools
+            declared_names = {
+                tool.function.name
+                for tool in effective_tools
+                if tool.type == "function"
+            }
+            for tool in allowed_tools.tools:
+                if tool.function.name not in declared_names:
+                    return f"allowed_tools references undeclared function {tool.function.name!r}."
 
         if has_message_tools:
             names = [tool.function.name for tool in effective_tools]
@@ -1592,9 +1634,14 @@ class OpenAIServingChat(OpenAIServingBase):
         tools = None
         tool_call_stop = None
         required_parsed_natively = glm_constraint
-        if effective_tools and request.tool_choice != "none":
+        kimi_k3_tool_grammar = (
+            self.chat_encoding_spec == "kimi_k3" and self.tool_call_parser == "kimi_k3"
+        )
+        if (
+            effective_tools or isinstance(request.tool_choice, AllowedToolChoice)
+        ) and request.tool_choice != "none":
             request.skip_special_tokens = False
-            if not isinstance(request.tool_choice, str):
+            if isinstance(request.tool_choice, ToolChoice):
                 tools = [
                     item.model_dump()
                     for item in request.tools or []
@@ -1639,10 +1686,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if (
                 tool_call_constraint is None
                 and not required_parsed_natively
-                and not (
-                    self.chat_encoding_spec == "kimi_k3"
-                    and self.tool_call_parser == "kimi_k3"
-                )
+                and not kimi_k3_tool_grammar
                 and (
                     request.tool_choice == "required"
                     or isinstance(request.tool_choice, ToolChoice)
@@ -1654,6 +1698,15 @@ class OpenAIServingChat(OpenAIServingBase):
                     parallel_tool_calls=request.parallel_tool_calls,
                 )
                 tool_call_constraint = ("json_schema", json_schema)
+        elif effective_tools and kimi_k3_tool_grammar:
+            tool_call_constraint = (
+                "structural_tag",
+                KimiK3Detector().get_structural_tag(
+                    effective_tools,
+                    tool_choice="none",
+                    thinking_mode=xgrammar_reasoning,
+                ),
+            )
 
         # When input_ids are provided, skip template tokenization entirely;
         # only stop tokens and tool_call_constraint are needed.
@@ -3104,7 +3157,7 @@ class OpenAIServingChat(OpenAIServingBase):
         text: str,
         tools: list[Any],
         finish_reason: dict[str, Any],
-        tool_choice: str | ToolChoice | None = None,
+        tool_choice: str | ToolChoice | AllowedToolChoice | None = None,
         history_tool_calls_cnt: int = 0,
     ) -> ToolCallProcessingResult:
         """Process tool calls in the response"""

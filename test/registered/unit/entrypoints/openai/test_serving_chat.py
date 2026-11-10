@@ -22,15 +22,19 @@ from pathlib import Path
 from typing import Optional
 from unittest.mock import Mock, patch
 
+import xgrammar as xgr
 from fastapi import Request
 from transformers.utils.chat_template_utils import _compile_jinja_template
+from fastapi.responses import StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
+from xgrammar.testing import _is_grammar_accept_string
 
 from sglang.srt.entrypoints.openai.chat_encoding import (
     resolve_dsv4_reasoning_effort_profile,
 )
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
+    ChatCompletionResponse,
     MessageProcessingResult,
     Tool,
     ToolChoice,
@@ -42,7 +46,9 @@ from sglang.srt.entrypoints.openai.serving_chat import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
-from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.function_call.kimik3_format import THINK_CLOSE, TOOLS_CLOSE, TOOLS_OPEN
+from sglang.srt.function_call.kimik3_structural_tag import get_kimik3_structural_tag
 from sglang.srt.function_call.utils import check_tool_parameters_schema
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.jinja_template_utils import (
@@ -1481,6 +1487,41 @@ class ServingChatTestCase(CustomTestCase):
         result = self.chat._process_messages(request, is_multimodal=False)
 
         self.assertIsNone(result.stop)
+
+    def test_kimi_k3_tool_choice_none_forbids_tools_section(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.chat.tool_call_parser = "kimi_k3"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Weather in Paris?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+            tool_choice="none",
+        )
+
+        result = self.chat._process_messages(request, is_multimodal=False)
+
+        constraint_type, tag = result.tool_call_constraint
+        self.assertEqual(constraint_type, "structural_tag")
+        self.assertIn(
+            tag.model_dump_json(),
+            {
+                get_kimik3_structural_tag(
+                    [], tool_choice="none", thinking_mode=m
+                ).model_dump_json()
+                for m in (False, True)
+            },
+        )
 
     def test_dsv_tool_choice_none_omits_tools_from_prompt(self):
         self.template_manager.chat_template_name = None
@@ -5129,6 +5170,603 @@ class ServingChatTestCase(CustomTestCase):
         """Default _encode_messages returns None (use standard encoding)."""
         result = self.chat._encode_messages([], Mock(), False)
         self.assertIsNone(result)
+
+
+class TestAllowedToolsServing(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.tm = _MockTokenizerManager()
+        self.tm.server_args.tool_call_parser = "kimi_k3"
+        self.tm.model_config.get_default_sampling_params.return_value = {}
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.template_manager = _MockTemplateManager()
+        self.template_manager.chat_template_name = None
+        self.chat = OpenAIServingChat(self.tm, self.template_manager)
+        self.raw_request = Request({"type": "http", "headers": []})
+        self.internal_request = None
+
+    def _request(self, mode="auto", names=("A", "B"), **kwargs):
+        return ChatCompletionRequest(
+            messages=[{"role": "user", "content": "Choose a tool."}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {"name": name, "parameters": {"type": "object"}},
+                }
+                for name in ("A", "B", "C")
+            ],
+            tool_choice={
+                "type": "allowed_tools",
+                "allowed_tools": {
+                    "mode": mode,
+                    "tools": [
+                        {"type": "function", "function": {"name": name}}
+                        for name in names
+                    ],
+                },
+            },
+            **kwargs,
+        )
+
+    def _complete(self, request, text="No tool needed.", *, finish_type="stop"):
+        self.internal_request = None
+
+        async def generate(internal_request, raw_request):
+            self.internal_request = internal_request
+            chunks = range(1, len(text) + 1) if request.stream else [len(text)]
+            for end in chunks:
+                results = [_spec_result(index) for index in range(request.n)]
+                for result in results:
+                    result["text"] = text[:end]
+                    result["meta_info"]["finish_reason"] = (
+                        {"type": finish_type} if end == len(text) else None
+                    )
+                    if request.stream:
+                        yield result
+                if not request.stream:
+                    yield results
+
+        async def complete():
+            self.tm.generate_request = generate
+            response = await self.chat.handle_request(request, self.raw_request)
+            if isinstance(response, StreamingResponse):
+                return [
+                    json.loads(chunk.removeprefix("data: "))
+                    async for chunk in response.body_iterator
+                    if chunk.startswith("data: ") and "[DONE]" not in chunk
+                ]
+            return response
+
+        return asyncio.run(complete())
+
+    def test_allowed_subset_keeps_all_declarations_and_installs_constraint(self):
+        for names in (("A", "B"), ("B",), ()):
+            with self.subTest(names=names):
+                response = self._complete(self._request(names=names))
+                self.assertEqual(response.choices[0].message.content, "No tool needed.")
+                self.assertIsNone(response.choices[0].message.tool_calls)
+                rendered_tools = self.tm.tokenizer.apply_chat_template.call_args.kwargs[
+                    "tools"
+                ]
+                self.assertEqual(
+                    [tool["function"]["name"] for tool in rendered_tools],
+                    ["A", "B", "C"],
+                )
+                self.assertNotIn("strict", rendered_tools[0]["function"])
+                self.assertTrue(self.internal_request.sampling_params["structural_tag"])
+
+    def test_allowed_tools_k3_template_hints_preserve_choice_and_grammar(self):
+        """Required/empty allowlists need matching tool-use hints;
+        otherwise K3 can emit XML or malformed tool markers as plain text.
+        """
+        call = (
+            TOOLS_OPEN
+            + '<|open|>call tool="B" index="1"<|sep|><|close|>call<|sep|>'
+            + TOOLS_CLOSE
+        )
+        fields = {"tool_choice", "tools", "chat_template_kwargs"}
+        for mode, names, template_choice in (
+            ("auto", (), "none"),
+            ("required", (), "none"),
+            ("auto", ("B",), None),
+            ("required", ("B",), "required"),
+            ("auto", ("A", "B"), None),
+            ("required", ("A", "B"), "required"),
+        ):
+            for stream in (False, True):
+                for template_kwargs, expected_hint in (
+                    ({"thinking": False}, template_choice),
+                    ({"thinking": False, "tool_choice": "auto"}, "auto"),
+                ):
+                    with self.subTest(
+                        mode=mode, stream=stream, names=names, kwargs=template_kwargs
+                    ):
+                        request = self._request(
+                            mode=mode,
+                            names=names,
+                            stream=stream,
+                            chat_template_kwargs=template_kwargs,
+                        )
+                        original_choice = request.tool_choice
+                        original_fields = request.model_dump(include=fields)
+                        original_tools = [
+                            tool.model_dump(exclude_unset=True)
+                            for tool in request.tools
+                        ]
+                        text = call if names else "No tool needed."
+                        result = self._complete(request, text)
+                        if stream:
+                            self.assertFalse(any("error" in event for event in result))
+                        else:
+                            self.assertIsInstance(result, ChatCompletionResponse)
+                        rendered = self.tm.tokenizer.apply_chat_template.call_args
+                        self.assertEqual(
+                            rendered.kwargs.get("tool_choice"), expected_hint
+                        )
+                        self.assertEqual(rendered.kwargs["tools"], original_tools)
+                        self.assertIs(request.tool_choice, original_choice)
+                        self.assertEqual(
+                            request.model_dump(include=fields), original_fields
+                        )
+                        grammar = xgr.Grammar.from_structural_tag(
+                            self.internal_request.sampling_params["structural_tag"]
+                        )
+                        self.assertTrue(_is_grammar_accept_string(grammar, text))
+                        self.assertFalse(
+                            _is_grammar_accept_string(
+                                grammar, call.replace('tool="B"', 'tool="C"')
+                            )
+                        )
+
+    def test_auto_stream_can_reply_without_calls_even_with_an_empty_allowlist(self):
+        for names in (("A",), ()):
+            with self.subTest(names=names):
+                response = self._complete(self._request(names=names, stream=True))
+                deltas = [
+                    choice["delta"]
+                    for event in response
+                    for choice in event.get("choices", [])
+                ]
+                self.assertEqual(
+                    "".join(delta.get("content") or "" for delta in deltas),
+                    "No tool needed.",
+                )
+                self.assertFalse(any(delta.get("tool_calls") for delta in deltas))
+                self.assertFalse(any("error" in event for event in response))
+
+    def test_native_calls_work_with_streaming_reasoning_and_text_response_format(self):
+        self.tm.server_args.reasoning_parser = "kimi_k3"
+        self.chat = OpenAIServingChat(self.tm, self.template_manager)
+        calls = (
+            TOOLS_OPEN
+            + '<|open|>call tool="B" index="1"<|sep|><|close|>call<|sep|>'
+            + TOOLS_CLOSE
+        )
+        for stream in (False, True):
+            for mode in ("auto", "required"):
+                for thinking in (False, True):
+                    with self.subTest(stream=stream, mode=mode, thinking=thinking):
+                        response = self._complete(
+                            self._request(
+                                mode=mode,
+                                stream=stream,
+                                chat_template_kwargs={"thinking": thinking},
+                                response_format={"type": "text"},
+                            ),
+                            ("Thinking." + THINK_CLOSE if thinking else "") + calls,
+                        )
+                        if stream:
+                            messages = [
+                                choice["delta"]
+                                for event in response
+                                for choice in event.get("choices", [])
+                            ]
+                            names = [
+                                call["function"]["name"]
+                                for message in messages
+                                for call in message.get("tool_calls", [])
+                            ]
+                            reasoning = "".join(
+                                message.get("reasoning_content") or ""
+                                for message in messages
+                            )
+                            self.assertFalse(
+                                any("error" in event for event in response)
+                            )
+                        else:
+                            message = response.choices[0].message
+                            names = [call.function.name for call in message.tool_calls]
+                            reasoning = message.reasoning_content or ""
+                        self.assertEqual(names, ["B"])
+                        self.assertEqual(reasoning, "Thinking." if thinking else "")
+                        self.assertEqual(
+                            self.internal_request.require_reasoning, thinking
+                        )
+
+    def test_non_strict_response_schema_is_not_an_active_constraint(self):
+        response = self._complete(
+            self._request(
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "answer",
+                        "schema": {"type": "object"},
+                        "strict": False,
+                    },
+                }
+            )
+        )
+        self.assertIsNone(response.choices[0].message.tool_calls)
+        self.assertNotIn("json_schema", self.internal_request.sampling_params)
+        self.assertTrue(self.internal_request.sampling_params["structural_tag"])
+
+    def test_message_declarations_remain_in_place_and_all_schemas_are_validated(self):
+        request = self._request(names=("B",))
+        request.tools[2].function.parameters = {
+            "type": "object",
+            "properties": {"n": {"type": "int"}},
+        }
+        request = ChatCompletionRequest.model_validate(
+            {
+                **request.model_dump(),
+                "tools": [request.tools[0].model_dump(exclude_unset=True)],
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "Tools",
+                        "tools": [
+                            tool.model_dump(exclude_unset=True)
+                            for tool in request.tools[1:]
+                        ],
+                    },
+                    {"role": "user", "content": "Hello"},
+                ],
+            }
+        )
+        self._complete(request)
+        rendered = self.tm.tokenizer.apply_chat_template.call_args
+        self.assertEqual(
+            [t["function"]["name"] for t in rendered.kwargs["tools"]], ["A"]
+        )
+        message_tools = rendered.args[0][0]["tools"]
+        self.assertEqual([t["function"]["name"] for t in message_tools], ["B", "C"])
+        self.assertEqual(
+            message_tools[1]["function"]["parameters"]["properties"]["n"]["type"],
+            "integer",
+        )
+        request.messages[0].tools[1].function.parameters = {"type": "invalid_type"}
+        response = self._complete(request)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("schema", json.loads(response.body)["message"])
+        self.assertIsNone(self.internal_request)
+
+    def test_constraint_construction_failure_uses_existing_fallback(self):
+        for mode in ("auto", "required"):
+            for stream in (False, True):
+                with self.subTest(mode=mode, stream=stream):
+                    request = self._request(mode=mode, stream=stream)
+                    request.tools[0].function.strict = True
+                    request.tools[0].function.parameters = {"type": "array"}
+                    response = self._complete(request)
+                    if stream:
+                        self.assertFalse(any("error" in event for event in response))
+                    else:
+                        self.assertIsInstance(response, ChatCompletionResponse)
+                        self.assertEqual(
+                            response.choices[0].message.content, "No tool needed."
+                        )
+                    self.assertIsNotNone(self.internal_request)
+                    self.assertIsNone(
+                        self.internal_request.sampling_params.get("structural_tag")
+                    )
+                    self.assertIsNone(
+                        self.internal_request.sampling_params.get("json_schema")
+                    )
+
+    def test_empty_allowlist_without_declarations_still_constrains_generation(self):
+        for mode, tools in (
+            ("auto", None),
+            ("auto", []),
+            ("required", None),
+            ("required", []),
+        ):
+            for stream in (False, True):
+                with self.subTest(mode=mode, tools=tools, stream=stream):
+                    request = self._request(mode=mode, names=(), stream=stream)
+                    request.tools = tools
+                    response = self._complete(request)
+                    if stream:
+                        self.assertFalse(any("error" in event for event in response))
+                        deltas = [
+                            choice["delta"]
+                            for event in response
+                            for choice in event.get("choices", [])
+                        ]
+                        text = "".join(delta.get("content") or "" for delta in deltas)
+                        self.assertFalse(
+                            any(delta.get("tool_calls") for delta in deltas)
+                        )
+                    else:
+                        text = response.choices[0].message.content
+                        self.assertIsNone(response.choices[0].message.tool_calls)
+                    self.assertEqual(text, "No tool needed.")
+                    grammar = xgr.Grammar.from_structural_tag(
+                        self.internal_request.sampling_params["structural_tag"]
+                    )
+                    self.assertTrue(_is_grammar_accept_string(grammar, text))
+                    self.assertFalse(
+                        _is_grammar_accept_string(
+                            grammar,
+                            TOOLS_OPEN
+                            + '<|open|>call tool="A" index="1"<|sep|><|close|>call<|sep|>'
+                            + TOOLS_CLOSE,
+                        )
+                    )
+
+    def test_output_constraints_conflict_with_both_allowed_tools_modes(self):
+        constraints = [
+            {"response_format": {"type": "json_object"}},
+            {
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": "answer", "schema": {"type": "object"}},
+                }
+            },
+            {
+                "response_format": {
+                    "type": "structural_tag",
+                    "format": {"type": "any_text"},
+                }
+            },
+            {"regex": "[a-z]+"},
+            {"ebnf": 'root ::= "answer"'},
+        ]
+        for stream in (False, True):
+            for mode in ("auto", "required"):
+                for constraint in constraints:
+                    with self.subTest(stream=stream, mode=mode, constraint=constraint):
+                        response = self._complete(
+                            self._request(mode=mode, stream=stream, **constraint)
+                        )
+                        self.assertEqual(response.status_code, 400)
+                        self.assertIn(
+                            "cannot be combined", json.loads(response.body)["message"]
+                        )
+                        self.assertIsNone(self.internal_request)
+
+    def test_invalid_allowlist_is_rejected_before_generation(self):
+        for stream in (False, True):
+            for has_declarations in (False, True):
+                for mode, names in (
+                    ("auto", ("A", "missing")),
+                    ("required", ("A", "missing")),
+                ):
+                    with self.subTest(
+                        stream=stream,
+                        has_declarations=has_declarations,
+                        mode=mode,
+                        names=names,
+                    ):
+                        request = self._request(mode=mode, names=names, stream=stream)
+                        if not has_declarations:
+                            request.tools = None
+                        response = self._complete(request)
+                        self.assertEqual(response.status_code, 400)
+                        self.assertIn(
+                            "allowed_tools", json.loads(response.body)["message"]
+                        )
+                        self.assertIsNone(self.internal_request)
+
+    def test_allowed_tools_preserves_existing_output_parsing(self):
+        """Grammar selection must not add rejection to the native parser's output."""
+        text = (
+            TOOLS_OPEN + '<|open|>call tool="A" index="1"<|sep|>'
+            '<|open|>argument key="body" type="string"<|sep|>'
+            "<|close|>call<|sep|>"
+            '<|open|>call tool="C" index="2"<|sep|><|close|>call<|sep|>'
+            "<|close|>argument<|sep|><|close|>call<|sep|>" + TOOLS_CLOSE
+        )
+        for mode in ("auto", "required"):
+            for stream in (False, True):
+                with self.subTest(mode=mode, stream=stream):
+                    outputs = []
+                    for allowed in (False, True):
+                        request = self._request(mode=mode, stream=stream)
+                        if not allowed:
+                            request.tool_choice = mode
+                        response = self._complete(request, text)
+                        if stream:
+                            self.assertFalse(
+                                any("error" in event for event in response)
+                            )
+                            outputs.append(
+                                [
+                                    call["function"]
+                                    for event in response
+                                    for choice in event.get("choices", [])
+                                    for call in choice.get("delta", {}).get(
+                                        "tool_calls", []
+                                    )
+                                ]
+                            )
+                        else:
+                            self.assertIsInstance(response, ChatCompletionResponse)
+                            outputs.append(
+                                [
+                                    call.function.model_dump()
+                                    for call in response.choices[0].message.tool_calls
+                                    or []
+                                ]
+                            )
+                    self.assertEqual(outputs[0], outputs[1])
+                    grammar = xgr.Grammar.from_structural_tag(
+                        self.internal_request.sampling_params["structural_tag"]
+                    )
+                    self.assertTrue(_is_grammar_accept_string(grammar, text))
+
+    def test_parallel_limit_is_per_choice_and_preserves_legal_calls(self):
+        for stream in (False, True):
+            for parallel in (False, True):
+                with self.subTest(stream=stream, parallel=parallel):
+                    names = ["A", "B"] if parallel else ["B"]
+                    text = (
+                        TOOLS_OPEN
+                        + "".join(
+                            f'<|open|>call tool="{name}" index="1"<|sep|>'
+                            "<|close|>call<|sep|>"
+                            for name in names
+                        )
+                        + TOOLS_CLOSE
+                    )
+                    response = self._complete(
+                        self._request(stream=stream, n=2, parallel_tool_calls=parallel),
+                        text,
+                    )
+                    if stream:
+                        self.assertFalse(any("error" in event for event in response))
+                        calls_by_choice = {0: [], 1: []}
+                        for event in response:
+                            for choice in event.get("choices", []):
+                                calls_by_choice[choice["index"]].extend(
+                                    call["function"]["name"]
+                                    for call in choice.get("delta", {}).get(
+                                        "tool_calls", []
+                                    )
+                                )
+                    else:
+                        calls_by_choice = {
+                            choice.index: [
+                                call.function.name for call in choice.message.tool_calls
+                            ]
+                            for choice in response.choices
+                        }
+                    self.assertEqual(calls_by_choice, {0: names, 1: names})
+
+    def test_required_preserves_incomplete_output_on_both_pd_workers(self):
+        """Incomplete PD output must retain its finish reason on both workers."""
+        for mode in ("prefill", "decode"):
+            publish(
+                ServerArgs(model_path="dummy", disaggregation_mode=mode),
+                role="tokenizer",
+            )
+            self.chat = OpenAIServingChat(self.tm, self.template_manager)
+            for stream in (False, True):
+                with self.subTest(mode=mode, stream=stream):
+                    response = self._complete(
+                        self._request(
+                            mode="required",
+                            stream=stream,
+                            max_completion_tokens=512,
+                            bootstrap_host="127.0.0.1",
+                            bootstrap_room=1,
+                        ),
+                        "<|open|>",
+                        finish_type="length",
+                    )
+                    self.assertTrue(
+                        self.internal_request.sampling_params["structural_tag"]
+                    )
+                    if stream:
+                        self.assertFalse(any("error" in event for event in response))
+                        finishes = [
+                            choice["finish_reason"]
+                            for event in response
+                            for choice in event.get("choices", [])
+                            if choice.get("finish_reason") is not None
+                        ]
+                        self.assertEqual(finishes, ["length"])
+                    else:
+                        self.assertIsInstance(response, ChatCompletionResponse)
+                        self.assertEqual(response.choices[0].finish_reason, "length")
+                        self.assertIsNone(response.choices[0].message.tool_calls)
+
+    def test_required_preserves_length_truncation_before_a_call(self):
+        """A truncated grammar-valid prefix must not become a validation error."""
+        prefix = TOOLS_OPEN + '<|open|>call tool="B" index="1"<|sep|>'
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                response = self._complete(
+                    self._request(mode="required", stream=stream),
+                    prefix,
+                    finish_type="length",
+                )
+                compiler = xgr.GrammarCompiler(
+                    xgr.TokenizerInfo([bytes([i]) for i in range(256)])
+                )
+                matcher = xgr.GrammarMatcher(
+                    compiler.compile_structural_tag(
+                        self.internal_request.sampling_params["structural_tag"]
+                    )
+                )
+                self.assertTrue(matcher.accept_string(prefix))
+                self.assertFalse(matcher.is_completed())
+                if stream:
+                    self.assertFalse(any("error" in event for event in response))
+                    choices = [
+                        choice
+                        for event in response
+                        for choice in event.get("choices", [])
+                    ]
+                    self.assertEqual(choices[-1]["finish_reason"], "length")
+                    self.assertFalse(
+                        any(
+                            choice.get("delta", {}).get("tool_calls")
+                            for choice in choices
+                        )
+                    )
+                else:
+                    self.assertIsInstance(response, ChatCompletionResponse)
+                    self.assertEqual(response.choices[0].finish_reason, "length")
+                    self.assertIsNone(response.choices[0].message.tool_calls)
+
+    def test_k3_parser_installs_grammar_without_native_encoder(self):
+        """A generic chat template must not disable the selected K3 tool grammar."""
+        self.chat.chat_encoding_spec = None
+        call = (
+            TOOLS_OPEN
+            + '<|open|>call tool="B" index="1"<|sep|><|close|>call<|sep|>'
+            + TOOLS_CLOSE
+        )
+        for mode in ("auto", "required"):
+            for stream in (False, True):
+                with self.subTest(mode=mode, stream=stream):
+                    response = self._complete(
+                        self._request(mode=mode, names=("B",), stream=stream), call
+                    )
+                    if stream:
+                        self.assertFalse(any("error" in event for event in response))
+                    else:
+                        self.assertIsInstance(response, ChatCompletionResponse)
+                    grammar = xgr.Grammar.from_structural_tag(
+                        self.internal_request.sampling_params["structural_tag"]
+                    )
+                    self.assertTrue(_is_grammar_accept_string(grammar, call))
+                    self.assertFalse(
+                        _is_grammar_accept_string(
+                            grammar, call.replace('tool="B"', 'tool="C"')
+                        )
+                    )
+                    self.assertEqual(
+                        _is_grammar_accept_string(grammar, "No tool needed."),
+                        mode == "auto",
+                    )
+
+    def test_unsupported_parser_is_rejected_before_generation(self):
+        for encoder, parser in (
+            ("kimi_k3", None),
+            ("kimi_k3", "hermes"),
+            ("kimi_k3", "kimi_k2"),
+        ):
+            with self.subTest(encoder=encoder, parser=parser):
+                self.chat.chat_encoding_spec = encoder
+                self.chat.tool_call_parser = parser
+                response = self._complete(self._request())
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("allowed_tools", json.loads(response.body)["message"])
+                self.assertIsNone(self.internal_request)
 
 
 class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):

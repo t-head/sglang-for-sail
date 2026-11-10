@@ -423,15 +423,19 @@ class ToolChoiceObjectFormTestCase(CustomTestCase):
         import openai.types.responses as ort
 
         named = {"type": "function", "name": "get_weather"}
-        # Object forms other than a named function cannot be forced through the
-        # tool-call parser, so the response must echo the "auto" we actually
-        # run -- which also keeps it inside the SDK's ToolChoice union that the
-        # typed event below validates against.
+        # Unsupported built-in choices still echo the effective "auto" mode.
         for tool_choice, expected in (
             ("auto", "auto"),
             ("required", "required"),
             ("none", "none"),
             (named, named),
+            *[
+                (
+                    {"type": "allowed_tools", "mode": mode, "tools": [named]},
+                    {"type": "allowed_tools", "mode": mode, "tools": [named]},
+                )
+                for mode in ("auto", "required")
+            ],
             ({"type": "function", "function": {"name": "get_weather"}}, named),
             ({"type": "web_search"}, "auto"),
             ({"type": "mcp", "server_label": "s"}, "auto"),
@@ -445,6 +449,29 @@ class ToolChoiceObjectFormTestCase(CustomTestCase):
             ort.ResponseCreatedEvent(
                 type="response.created", sequence_number=0, response=resp.model_dump()
             )
+
+    def test_allowed_tools_rejects_invalid_or_chat_shaped_choices(self):
+        choices = [
+            {"type": "allowed_tools", "mode": "none", "tools": []},
+            {"type": "allowed_tools", "tools": []},
+            {"type": "allowed_tools", "mode": "auto"},
+            {
+                "type": "allowed_tools",
+                "allowed_tools": {"mode": "auto", "tools": []},
+            },
+            *[
+                {"type": "allowed_tools", "mode": "auto", "tools": [tool]}
+                for tool in (
+                    {"type": "function", "function": {"name": "lookup"}},
+                    {"type": "function"},
+                    {"type": "custom", "name": "lookup"},
+                    {"type": "web_search"},
+                )
+            ],
+        ]
+        for choice in choices:
+            with self.subTest(choice=choice), self.assertRaises(ValueError):
+                ResponsesRequest(input="hi", tool_choice=choice)
 
 
 if __name__ == "__main__":

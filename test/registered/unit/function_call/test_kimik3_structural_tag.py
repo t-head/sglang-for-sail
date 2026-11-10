@@ -1,11 +1,15 @@
 import json
 import sys
+from unittest.mock import Mock
 
 import pytest
 import xgrammar as xgr
 from xgrammar.testing import _is_grammar_accept_string
 
+from sglang.srt.constrained.base_grammar_backend import InvalidGrammarObject
+from sglang.srt.constrained.xgrammar_backend import XGrammarGrammarBackend
 from sglang.srt.entrypoints.openai.protocol import (
+    AllowedToolChoice,
     ChatCompletionRequest,
     Function,
     Tool,
@@ -18,6 +22,7 @@ from sglang.srt.function_call.kimik3_detector import KimiK3Detector
 from sglang.srt.function_call.kimik3_format import (
     ARGUMENT_CLOSE,
     CALL_CLOSE,
+    MESSAGE_CLOSE,
     RESPONSE_CLOSE,
     THINK_CLOSE,
     TOOLS_CLOSE,
@@ -29,7 +34,7 @@ from sglang.srt.function_call.kimik3_structural_tag import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 _CLOSE_TOKEN = "<|close|>"
 _CLOSE_TOKEN_ID = 256
@@ -76,6 +81,20 @@ def _tool(name="weather", strict=True):
                 "additionalProperties": False,
             },
         ),
+    )
+
+
+def _allowed_choice(mode="auto", names=("weather",)):
+    return AllowedToolChoice.model_validate(
+        {
+            "type": "allowed_tools",
+            "allowed_tools": {
+                "mode": mode,
+                "tools": [
+                    {"type": "function", "function": {"name": name}} for name in names
+                ],
+            },
+        }
     )
 
 
@@ -239,6 +258,48 @@ def test_required_without_an_open_response_channel_is_unchanged():
     assert not _accepts(grammar, response)
 
 
+def test_required_rejects_message_close_before_tools():
+    grammar = _grammar([_tool()], tool_choice="required")
+    response = "<|open|>response<|sep|>Hi there!<|close|>response<|sep|>"
+
+    assert not _accepts(grammar, response + MESSAGE_CLOSE)
+    assert not _accepts(
+        grammar, response + MESSAGE_CLOSE + _tools_section(_valid_weather_call())
+    )
+    assert _accepts(
+        grammar, response + _tools_section(_valid_weather_call()) + MESSAGE_CLOSE
+    )
+    assert not _accepts(grammar, response + "<|close|>messagemessage<|sep|>")
+    for near_miss in (
+        "<|close|>Message<|sep|>",
+        "<|close|>_message<|sep|>",
+        TOOLS_CLOSE,
+    ):
+        assert not _accepts(grammar, response + near_miss)
+    assert not _accepts(grammar, "<|open|>response<|sep|>Hi" + TOOLS_CLOSE)
+
+
+def test_tool_choice_none_rejects_tools_section():
+    grammar = _grammar([_tool()], tool_choice="none")
+    plain = "<|open|>response<|sep|>Sunny.<|close|>response<|sep|>" + MESSAGE_CLOSE
+
+    assert _accepts(grammar, plain)
+    assert not _accepts(grammar, _tools_section(_valid_weather_call()) + MESSAGE_CLOSE)
+    assert not _accepts(grammar, "<|open|>tools<|close|>message<|sep|>")
+    assert not _accepts(grammar, "<|sep|><|close|>tools<|sep|>" + MESSAGE_CLOSE)
+    assert not _accepts(grammar, "")
+    for blank in ("", " ", "\n\n"):
+        empty = f"<|open|>response<|sep|>{blank}<|close|>response<|sep|>"
+        assert not _accepts(grammar, empty + MESSAGE_CLOSE)
+    for text in ("é", "👋 hi", "<b>bold</b>", "x"):
+        response = f"<|open|>response<|sep|>{text}<|close|>response<|sep|>"
+        assert _accepts(grammar, response)
+    assert not _accepts(grammar, "<|open|>response<|sep|>x<|close|>Message<|sep|>")
+    assert _accepts(
+        grammar, "<|open|>response<|sep|>- **a** é\n<b><|close|>response<|sep|>"
+    )
+
+
 def test_auto_allows_plain_response_or_multiple_tool_calls():
     grammar = _grammar([_tool(), _tool("forecast")])
     plain = (
@@ -273,6 +334,120 @@ def test_named_tool_choice_forces_only_the_selected_tool():
 
     assert _accepts(grammar, _tools_section(forecast_call))
     assert not _accepts(grammar, _tools_section(_valid_weather_call()))
+
+
+@pytest.mark.parametrize("mode", ["auto", "required"])
+def test_allowed_tools_constrains_names_without_making_parameters_strict(mode):
+    tools = [_tool(name, strict=False) for name in ("weather", "forecast", "search")]
+    request = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "Weather?"}],
+        tools=tools,
+        tool_choice={
+            "type": "allowed_tools",
+            "allowed_tools": {
+                "mode": mode,
+                "tools": [
+                    {"type": "function", "function": {"name": name}}
+                    for name in ("weather", "forecast")
+                ],
+            },
+        },
+    )
+    with envs.SGLANG_TOOL_STRICT_LEVEL.override(ToolStrictLevel.OFF):
+        constraint = FunctionCallParser(
+            tools=tools, tool_call_parser="kimi_k3"
+        ).get_structure_constraint(request.tool_choice)
+    assert constraint is not None
+    assert constraint[0] == "structural_tag"
+    grammar = xgr.Grammar.from_structural_tag(constraint[1])
+    loose_args = _argument("unknown", "string", "not in the schema")
+    assert _accepts(grammar, _tools_section(_call("weather", 1, loose_args)))
+    assert _accepts(
+        grammar,
+        _tools_section(_call("weather", 1), _call("forecast", 2)),
+    )
+    assert not _accepts(grammar, _tools_section(_call("search", 1)))
+    assert not _accepts(
+        grammar,
+        _tools_section(_call("weather", 1), _call("search", 2)),
+    )
+    assert _accepts(grammar, "No tool needed.") == (mode == "auto")
+    assert all(not tool.function.strict for tool in tools)
+
+
+@pytest.mark.parametrize("mode", ["auto", "required"])
+@pytest.mark.parametrize("thinking_mode", [False, True])
+def test_empty_allowed_tools_only_accepts_text(mode, thinking_mode):
+    parser = FunctionCallParser(tools=[_tool()], tool_call_parser="kimi_k3")
+    constraint = parser.get_structure_constraint(
+        _allowed_choice(mode=mode, names=()), thinking_mode=thinking_mode
+    )
+    grammar = xgr.Grammar.from_structural_tag(constraint[1])
+    prefix = "Thinking." + THINK_CLOSE if thinking_mode else ""
+    assert _accepts(grammar, prefix + "No tool needed.")
+    assert not _accepts(grammar, prefix + _tools_section(_valid_weather_call()))
+    assert not _accepts(grammar, prefix + _valid_weather_call())
+
+
+@pytest.mark.parametrize("mode", ["auto", "required"])
+@pytest.mark.parametrize("parallel", [False, True])
+def test_allowed_tools_token_matching_preserves_parallel_and_strict(mode, parallel):
+    tools = [_tool(), _tool("search")]
+    with envs.SGLANG_TOOL_STRICT_LEVEL.override(ToolStrictLevel.OFF):
+        constraint = FunctionCallParser(
+            tools=tools, tool_call_parser="kimi_k3"
+        ).get_structure_constraint(
+            _allowed_choice(mode=mode), parallel_tool_calls=parallel, thinking_mode=True
+        )
+    tag = constraint[1]
+    prefix = "Thinking." + THINK_CLOSE
+    assert _token_accepts(tag, prefix + _tools_section(_valid_weather_call()))
+    assert not _token_accepts(tag, prefix + _tools_section(_call("weather", 1)))
+    assert (
+        _token_accepts(
+            tag, prefix + _tools_section(_valid_weather_call(), _valid_weather_call(2))
+        )
+        == parallel
+    )
+    matcher = xgr.GrammarMatcher(_TOKEN_COMPILER.compile_structural_tag(tag))
+    assert matcher.accept_string(prefix + TOOLS_OPEN + '<|open|>call tool="')
+    assert not matcher.accept_token(ord("s"))
+
+
+def test_allowed_tools_honors_parameter_strict_level_without_mutating_declarations():
+    tools = [_tool(strict=False)]
+    with envs.SGLANG_TOOL_STRICT_LEVEL.override(ToolStrictLevel.PARAMETER):
+        constraint = FunctionCallParser(
+            tools=tools, tool_call_parser="kimi_k3"
+        ).get_structure_constraint(_allowed_choice())
+    assert _token_accepts(constraint[1], _tools_section(_valid_weather_call()))
+    assert not _token_accepts(constraint[1], _tools_section(_call("weather", 1)))
+    assert not tools[0].function.strict
+
+
+def test_allowed_tools_compile_failure_is_an_invalid_grammar_not_unconstrained():
+    tool = _tool()
+    tool.function.parameters = {
+        "type": "object",
+        "properties": {"value": {"$ref": "#/$defs/missing"}},
+        "required": ["value"],
+    }
+    constraint = FunctionCallParser(
+        tools=[tool], tool_call_parser="kimi_k3"
+    ).get_structure_constraint(_allowed_choice())
+    request = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "Hello"}], tool_choice=_allowed_choice()
+    )
+    params = request.to_sampling_params([], {}, constraint)
+    backend = XGrammarGrammarBackend(
+        tokenizer=Mock(init_xgrammar=lambda: (_TOKENIZER_INFO, None)), vocab_size=257
+    )
+    try:
+        result = backend.dispatch_structural_tag(params["structural_tag"])
+        assert isinstance(result, InvalidGrammarObject)
+        assert "missing" in result.error_message
+    finally:
+        backend.executor.shutdown(wait=True)
 
 
 def test_function_call_parser_uses_native_tag_for_named_tool_choice():
@@ -1084,6 +1259,29 @@ def test_reasoning_prefix_is_owned_by_exactly_one_layer():
     assert _accepts(wrapped_by_xgrammar, output)
     assert not _accepts(post_reasoning_only, output)
     assert _accepts(post_reasoning_only, _tools_section(_valid_weather_call()))
+
+
+def test_output_may_start_inside_the_prefilled_response():
+    # Without thinking the prompt ends with the response open marker.
+    call = _tools_section(_valid_weather_call())
+    required = _grammar([_tool()], tool_choice="required")
+    assert _accepts(
+        required, "Hi there!<|close|>response<|sep|>" + call + MESSAGE_CLOSE
+    )
+    assert not _accepts(required, "Hi there!<|close|>response<|sep|>" + MESSAGE_CLOSE)
+    assert not _accepts(
+        required, "Hi<|close|>response<|sep|>" + MESSAGE_CLOSE + call + MESSAGE_CLOSE
+    )
+
+    none = _grammar([_tool()], tool_choice="none")
+    assert _accepts(none, "Sunny.<|close|>response<|sep|>" + MESSAGE_CLOSE)
+    assert not _accepts(none, "<|close|>response<|sep|>" + MESSAGE_CLOSE)
+    assert not _accepts(none, "Sunny.<|close|>response<|sep|>" + call)
+
+
+def test_single_call_auto_admits_the_turn_close():
+    grammar = _grammar([_tool()], parallel_tool_calls=False)
+    assert _accepts(grammar, _tools_section(_valid_weather_call()) + MESSAGE_CLOSE)
 
 
 if __name__ == "__main__":

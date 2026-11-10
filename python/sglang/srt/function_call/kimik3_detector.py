@@ -5,7 +5,7 @@ from typing import List, Literal, Optional, Union
 
 from xgrammar import StructuralTag
 
-from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
+from sglang.srt.entrypoints.openai.protocol import AllowedToolChoice, Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -111,7 +111,9 @@ class KimiK3Detector(BaseFormatDetector):
     def get_structural_tag(
         self,
         tools: Union[List[Tool], None] = None,
-        tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
+        tool_choice: Union[
+            ToolChoice, AllowedToolChoice, Literal["auto", "required", "none"]
+        ] = "auto",
         thinking_mode: bool = False,
         parallel_tool_calls: bool = True,
         response_channel_open: bool = False,

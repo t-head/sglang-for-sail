@@ -38,6 +38,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     UsageInfo,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
@@ -917,6 +918,41 @@ class TestThinkingParam(unittest.TestCase):
     def test_unknown_type_rejected(self):
         with self.assertRaises(ValidationError):
             self._request(thinking={"type": "sometimes"})
+
+
+class TestAllowedTools(CustomTestCase):
+    def test_chat_completions_nested_tool_choice_round_trip(self):
+        for mode in ("auto", "required"):
+            with self.subTest(mode=mode):
+                choice = {
+                    "type": "allowed_tools",
+                    "allowed_tools": {
+                        "mode": mode,
+                        "tools": [{"type": "function", "function": {"name": "A"}}],
+                    },
+                }
+                request = ChatCompletionRequest(
+                    messages=[{"role": "user", "content": "Hello"}],
+                    tool_choice=choice,
+                )
+                self.assertEqual(request.model_dump()["tool_choice"], choice)
+
+    def test_allowed_tools_rejects_responses_shape_and_unsupported_modes(self):
+        for choice in (
+            {"type": "allowed_tools", "mode": "auto", "tools": []},
+            {"type": "allowed_tools", "allowed_tools": {"mode": "none", "tools": []}},
+            {
+                "type": "allowed_tools",
+                "allowed_tools": {
+                    "mode": "auto",
+                    "tools": [{"type": "custom", "name": "A"}],
+                },
+            },
+        ):
+            with self.subTest(choice=choice), self.assertRaises(ValidationError):
+                ChatCompletionRequest(
+                    messages=[{"role": "user", "content": "Hello"}], tool_choice=choice
+                )
 
 
 if __name__ == "__main__":
