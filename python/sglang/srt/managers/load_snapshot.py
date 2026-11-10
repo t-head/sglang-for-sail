@@ -75,7 +75,7 @@ def should_use_zmq() -> bool:
     ) or envs.SGLANG_LOAD_SNAPSHOT_USE_ZMQ.get()
 
 
-_LOAD_AWARE_METHODS = frozenset({"total_requests", "total_tokens"})
+_LOAD_AWARE_METHODS = frozenset({"total_requests", "total_tokens", "context_bucket"})
 
 
 def _tokenizer_load_snapshot_owner_caller() -> str:
@@ -183,7 +183,7 @@ class QueueMetrics(msgspec.Struct, array_like=True):
 
 
 # LoadSnapshot's nested sub-struct fields; every other struct field is a flat
-# scalar returned under "core".
+# value returned under "core".
 _SECTION_FIELDS = frozenset(
     {"memory", "speculative", "lora", "disaggregation", "queues"}
 )
@@ -202,6 +202,11 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     # num_total_tokens minus tokens still awaiting a KV transfer (equal to it
     # outside disaggregated decode).
     num_active_tokens: int = 0
+    # Full current sequence lengths of running and queued requests, independent
+    # of prefix-cache sharing and KV allocation state. Only context_bucket
+    # balancing collects these fields.
+    context_length_histogram: Optional[list[int]] = None
+    num_context_tokens: int = 0
     num_prealloc_ready_tokens: int = 0
     max_total_num_tokens: int = 0
     max_running_requests: int = 0
@@ -254,7 +259,7 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
         return load
 
 
-# Flat scalar fields returned under "core": every struct field but the sections.
+# Fields returned under "core": every struct field but the sections.
 _CORE_KEYS = tuple(
     f for f in LoadSnapshot.__struct_fields__ if f not in _SECTION_FIELDS
 )

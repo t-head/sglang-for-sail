@@ -1160,7 +1160,7 @@ class TestKV4Compatibility(unittest.TestCase):
             handle_kv4_compatibility(args)
 
 
-class TestLoadBalanceMethod(unittest.TestCase):
+class TestLoadBalanceMethod(CustomTestCase):
     def _load_balance_args(self, **kwargs):
         server_args = ServerArgs(model_path="dummy", **kwargs)
         handle_pd_disaggregation(server_args)
@@ -1182,6 +1182,65 @@ class TestLoadBalanceMethod(unittest.TestCase):
 
     def test_pd_decode_defaults_to_round_robin(self):
         server_args = self._load_balance_args(disaggregation_mode="decode")
+        self.assertEqual(
+            resolution_result(server_args, "load_balance_method"), "round_robin"
+        )
+
+    def test_context_bucket_accepts_fixed_dp_topology(self):
+        for max_ep_size in (None, 8):
+            with self.subTest(max_ep_size=max_ep_size):
+                server_args = self._load_balance_args(
+                    disaggregation_mode="decode",
+                    load_balance_method="context_bucket",
+                    dp_size=8,
+                    max_ep_size=max_ep_size,
+                )
+                self.assertEqual(
+                    resolution_result(server_args, "load_balance_method"),
+                    "context_bucket",
+                )
+
+    def test_context_bucket_rejects_elastic_topology(self):
+        for topology in (
+            {"elastic_ep_backend": "mooncake"},
+            {"max_ep_size": 16},
+        ):
+            with self.subTest(topology=topology):
+                with self.assertRaisesRegex(ValueError, "fixed DP topology"):
+                    self._load_balance_args(
+                        disaggregation_mode="decode",
+                        load_balance_method="context_bucket",
+                        dp_size=8,
+                        **topology,
+                    )
+
+    def test_context_bucket_rejects_non_decode_modes(self):
+        for mode in ("null", "prefill"):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(ValueError, "disaggregation-mode decode"):
+                    self._load_balance_args(
+                        disaggregation_mode=mode,
+                        load_balance_method="context_bucket",
+                        dp_size=8,
+                    )
+
+    def test_context_bucket_rejects_pipeline_parallelism(self):
+        with self.assertRaisesRegex(ValueError, "pp-size 1"):
+            self._load_balance_args(
+                disaggregation_mode="decode",
+                load_balance_method="context_bucket",
+                dp_size=8,
+                pp_size=2,
+            )
+
+    def test_round_robin_is_not_rejected_by_context_bucket_topology_guard(self):
+        server_args = self._load_balance_args(
+            disaggregation_mode="decode",
+            load_balance_method="round_robin",
+            dp_size=8,
+            max_ep_size=16,
+            elastic_ep_backend="mooncake",
+        )
         self.assertEqual(
             resolution_result(server_args, "load_balance_method"), "round_robin"
         )

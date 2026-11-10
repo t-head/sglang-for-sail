@@ -91,13 +91,17 @@ class Parallel(msgspec.Struct):
     load_balance_method: A[
         str,
         Arg(
-            help="The load balancing strategy for data parallelism.",
+            help="The load balancing strategy for data parallelism. "
+            "context_bucket balances context-length distributions among DP "
+            "ranks with similar outstanding request counts "
+            "(disaggregated decode, PP=1, fixed DP topology only).",
             choices=[
                 "auto",
                 "round_robin",
                 "follow_bootstrap_room",
                 "total_requests",
                 "total_tokens",
+                "context_bucket",
             ],
         ),
     ] = "auto"

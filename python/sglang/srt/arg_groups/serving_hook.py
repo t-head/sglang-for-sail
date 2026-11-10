@@ -17,7 +17,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import get_platform, num_dp_ranks_of
 from sglang.srt.sampling.watermarking.config import load_watermark_config
 from sglang.srt.utils.common import (
     configure_media_url_security,
@@ -211,6 +211,20 @@ def handle_load_balance_method(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.disaggregation_mode not in ("null", "prefill", "decode"):
         raise ValueError(f"Invalid disaggregation_mode={cfg.disaggregation_mode!r}")
+
+    if cfg.load_balance_method == "context_bucket":
+        if cfg.disaggregation_mode != "decode" or cfg.pp_size != 1:
+            raise ValueError(
+                "context_bucket requires --disaggregation-mode decode and "
+                "--pp-size 1; other modes have incomplete context load snapshots."
+            )
+        if cfg.elastic_ep_backend is not None or (
+            cfg.max_ep_size is not None and cfg.max_ep_size > num_dp_ranks_of(cfg)
+        ):
+            raise ValueError(
+                "context_bucket requires a fixed DP topology; elastic EP and "
+                "DP expansion are not supported by its load snapshot budget."
+            )
 
     if cfg.load_balance_method == "auto":
         # Default behavior:

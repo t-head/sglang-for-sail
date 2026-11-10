@@ -3,9 +3,12 @@
 The e2e counterpart, over the real scheduler load-report path, is
 test/registered/disaggregation/test_disaggregation_dp_attention.py.
 
+`total_tokens` is exercised end-to-end there; its tie-break on
+`total_requests` transitively covers that state.
+
 Fragility: scheduler tests bypass `DataParallelController.__init__` via
 `__new__` and inject only the attrs the schedulers read (`workers`, `status`,
-`_active_workers`, `round_robin_counter`, `dp_budget`). Update `_make_controller`
+`_active_workers`, `round_robin_counter`, `dp_budget`, `context_bucket_budget`). Update `_make_controller`
 if a scheduler starts reading another attr. `maybe_external_dp_rank_routing`
 is exercised as the real method, no mock. The refresh-throttle tests inject
 `load_snapshot_reader` and `_last_refresh_time` on top of those.
@@ -25,6 +28,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.context_bucket import ContextBucketBudget
 from sglang.srt.managers.data_parallel_controller import (
     DataParallelController,
     DPBudget,
@@ -57,15 +61,17 @@ def _make_controller(num_dp_ranks: int) -> DataParallelController:
     ctl.round_robin_counter = 0
     ctl.health_round_robin_counter = 0
     ctl.dp_budget = DPBudget(num_dp_ranks=num_dp_ranks)
+    ctl.context_bucket_budget = ContextBucketBudget(num_dp_ranks=num_dp_ranks)
     return ctl
 
 
 def _req(
     routed_dp_rank=None,
     bootstrap_room=None,
-    input_ids=None,
+    input_ids=(),
     rid="USER",
     time_stats=None,
+    input_embeds=None,
 ):
     """Req stand-in; SimpleNamespace avoids pinning to the Req dataclass schema."""
     return SimpleNamespace(
@@ -73,7 +79,8 @@ def _req(
         rid=rid,
         routed_dp_rank=routed_dp_rank,
         bootstrap_room=bootstrap_room,
-        input_ids=input_ids or [],
+        input_ids=input_ids,
+        input_embeds=input_embeds,
     )
 
 
@@ -537,6 +544,126 @@ class TestRefreshLoadBudgetThrottle(CustomTestCase):
             after_burst,
             "a stale-timestamp snapshot must not wipe the speculative state",
         )
+
+
+class TestContextBucketScheduler(CustomTestCase):
+    def test_input_embeds_without_input_ids_routes_and_reserves_the_decode_bucket(self):
+        for routed_dp_rank in (None, 1):
+            with self.subTest(routed_dp_rank=routed_dp_rank):
+                ctl = _make_controller(num_dp_ranks=2)
+                ctl.context_bucket_budget.update_budget(
+                    [
+                        _load(
+                            dp_rank=rank,
+                            timestamp=1.0,
+                            context_length_histogram=[0] * 9,
+                        )
+                        for rank in range(2)
+                    ]
+                )
+                req = _req(
+                    routed_dp_rank=routed_dp_rank,
+                    input_ids=None,
+                    input_embeds=[[0.0]] * 8192,
+                )
+                self.assertIsNone(req.input_ids)
+                ctl.context_bucket_scheduler(req)
+                target = 0 if routed_dp_rank is None else routed_dp_rank
+                ctl.workers[target].send_pyobj.assert_called_once()
+                self.assertEqual(ctl.context_bucket_budget.context_tokens[target], 8193)
+                self.assertEqual(
+                    ctl.context_bucket_budget.context_histograms[target],
+                    [0, 1] + [0] * 7,
+                )
+                self.assertEqual(sum(ctl.context_bucket_budget.total_requests), 1)
+
+    def test_input_embeds_length_takes_precedence_like_the_scheduler(self):
+        ctl = _make_controller(num_dp_ranks=2)
+        ctl.context_bucket_scheduler(_req(input_ids=[1], input_embeds=[[0.0]] * 16))
+        self.assertEqual(ctl.context_bucket_budget.context_tokens, [17, 0])
+
+    def test_token_ids_include_the_prefill_handoff_token(self):
+        for routed_dp_rank in (None, 1):
+            with self.subTest(routed_dp_rank=routed_dp_rank):
+                ctl = _make_controller(num_dp_ranks=2)
+                ctl.context_bucket_budget.update_budget(
+                    [
+                        _load(
+                            dp_rank=rank,
+                            timestamp=1.0,
+                            context_length_histogram=[0] * 9,
+                        )
+                        for rank in range(2)
+                    ]
+                )
+                ctl.context_bucket_scheduler(
+                    _req(routed_dp_rank=routed_dp_rank, input_ids=range(32768))
+                )
+                target = 0 if routed_dp_rank is None else routed_dp_rank
+                self.assertEqual(
+                    ctl.context_bucket_budget.context_tokens[target], 32769
+                )
+                self.assertEqual(
+                    ctl.context_bucket_budget.context_histograms[target],
+                    [0, 0, 0, 1] + [0] * 5,
+                )
+
+    def test_automatic_routing_filters_inactive_unhealthy_and_missing_workers(self):
+        ctl = _make_controller(num_dp_ranks=4)
+        ctl._active_workers = [1, 2, 3]
+        ctl.status[1] = False
+        ctl.workers[2] = None
+        ctl.context_bucket_scheduler(_req(input_ids=[1] * 16))
+        ctl.workers[0].send_pyobj.assert_not_called()
+        ctl.workers[1].send_pyobj.assert_not_called()
+        ctl.workers[3].send_pyobj.assert_called_once()
+        self.assertEqual(ctl.context_bucket_budget.total_requests, [0, 0, 0, 1])
+        self.assertEqual(ctl.context_bucket_budget.context_tokens, [0, 0, 0, 17])
+
+    def test_no_available_workers_raises_without_sending(self):
+        ctl = _make_controller(num_dp_ranks=2)
+        ctl.status = [False, False]
+        with self.assertRaises(RuntimeError):
+            ctl.context_bucket_scheduler(_req())
+        for worker in ctl.workers:
+            worker.send_pyobj.assert_not_called()
+        self.assertEqual(ctl.context_bucket_budget.total_requests, [0, 0])
+
+    def test_external_rank_is_preserved_and_reserved_for_the_next_dispatch(self):
+        ctl = _make_controller(num_dp_ranks=2)
+        ctl.context_bucket_scheduler(_req(routed_dp_rank=0, input_ids=[1] * 16))
+        ctl.workers[0].send_pyobj.assert_called_once()
+        self.assertEqual(ctl.context_bucket_budget.total_requests, [1, 0])
+        self.assertEqual(ctl.context_bucket_budget.context_tokens, [17, 0])
+        ctl.context_bucket_scheduler(_req(input_ids=[1]))
+        ctl.workers[1].send_pyobj.assert_called_once()
+
+    def test_external_rank_keeps_existing_binding_semantics(self):
+        ctl = _make_controller(num_dp_ranks=2)
+        # An explicit PD binding keeps using the existing direct-route path;
+        # automatic placement's status filter must not silently reroute it.
+        ctl.status[1] = False
+        ctl.context_bucket_scheduler(_req(routed_dp_rank=1, input_ids=[1]))
+        ctl.workers[1].send_pyobj.assert_called_once()
+        ctl.workers[0].send_pyobj.assert_not_called()
+        self.assertEqual(ctl.context_bucket_budget.total_requests, [0, 1])
+
+    def test_invalid_external_rank_is_not_reserved_or_automatically_rerouted(self):
+        for rank in (-1, 2):
+            with self.subTest(rank=rank):
+                ctl = _make_controller(num_dp_ranks=2)
+                with self.assertRaises(ValueError):
+                    ctl.context_bucket_scheduler(_req(routed_dp_rank=rank))
+                for worker in ctl.workers:
+                    worker.send_pyobj.assert_not_called()
+                self.assertEqual(ctl.context_bucket_budget.total_requests, [0, 0])
+
+    def test_failed_external_send_does_not_create_a_reservation(self):
+        ctl = _make_controller(num_dp_ranks=2)
+        ctl.workers[1].send_pyobj.side_effect = RuntimeError("socket closed")
+        with self.assertRaisesRegex(RuntimeError, "socket closed"):
+            ctl.context_bucket_scheduler(_req(routed_dp_rank=1, input_ids=[1]))
+        self.assertEqual(ctl.context_bucket_budget.total_requests, [0, 0])
 
 
 if __name__ == "__main__":
