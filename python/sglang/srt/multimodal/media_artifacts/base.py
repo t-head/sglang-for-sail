@@ -24,6 +24,7 @@ media, a prompt-specific ``MultimodalDataItem``, or a ViT embedding-cache entry.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional, Protocol, runtime_checkable
@@ -43,6 +44,8 @@ from sglang.srt.multimodal.cache import (
     snapshot_media,
 )
 from sglang.srt.utils import load_image
+
+logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -104,6 +107,12 @@ class MediaArtifactCacheMixin:
 
     artifact_modality: Optional[Modality] = None
     artifact_option_defaults: Mapping[str, Any] = {"detail": "auto"}
+    # Whether recomputing an evicted artifact must reproduce its feature hash.
+    # True turns a mismatch into an error, which catches identity bugs. A
+    # processor that picks its preprocessing backend per request (GPU and CPU
+    # agree only to ~5e-3) sets this False: a metadata-only entry left by a GPU
+    # run can be refilled by a CPU run, and that is a cache refresh, not a bug.
+    artifact_feature_hash_is_backend_stable: bool = True
 
     def artifact_preprocess_kwargs(
         self, source: Any, modality: Modality
@@ -525,9 +534,15 @@ class MediaArtifactCacheMixin:
                     previous is not None
                     and previous.feature_hash != artifact.feature_hash
                 ):
-                    raise ValueError(
-                        "Cached media artifact feature hash changed for identical "
-                        f"identity {missed.key}"
+                    if self.artifact_feature_hash_is_backend_stable:
+                        raise ValueError(
+                            "Cached media artifact feature hash changed for "
+                            f"identical identity {missed.key}"
+                        )
+                    logger.debug(
+                        "Media artifact %s refreshed with a new feature hash "
+                        "(preprocessing backend changed)",
+                        missed.key,
                     )
                 cache_value = artifact.cache_value()
                 self.validate_artifact(cache_value, entry)

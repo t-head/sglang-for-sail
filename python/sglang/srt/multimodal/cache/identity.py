@@ -72,11 +72,13 @@ class MediaSnapshot:
 
 
 def _snapshot_pil(image: Image.Image) -> MediaSnapshot:
+    from sglang.srt.utils.common import CORRUPT_IMAGE_EXCEPTIONS, corrupt_image_message
+
     try:
         snapshot = image.copy()
         snapshot.load()
-    except OSError as e:
-        raise ValueError(f"Could not decode image: {e}") from e
+    except CORRUPT_IMAGE_EXCEPTIONS as e:
+        raise ValueError(corrupt_image_message(e)) from e
     payload = snapshot.tobytes()
     palette = snapshot.palette.tobytes() if snapshot.palette is not None else b""
     palette_mode = (

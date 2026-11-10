@@ -111,7 +111,10 @@ from sglang.srt.managers.io_struct import (
     unwrap_from_pickle,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
-from sglang.srt.managers.mm_utils import wrap_shm_features
+from sglang.srt.managers.mm_utils import (
+    drop_mm_features_for_decode,
+    wrap_shm_features,
+)
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.positional_embeds_transport import PositionalEmbedsTransport
 from sglang.srt.managers.schedule_batch import (
@@ -186,6 +189,7 @@ from sglang.srt.utils.cudacore_pyspy_dump_utils import (
     pyspy_dump_schedulers,
     trigger_cuda_user_coredump,
 )
+from sglang.srt.utils.event_loop_lag import EventLoopLagMonitor
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -873,6 +877,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_disaggregation(self, *, start_pd_bootstrap_service: bool = True):
         # PD Disaggregation
         self.disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
+        self._drop_decode_mm_features = (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and envs.SGLANG_DISAGG_DECODE_DROP_MM_FEATURES.get()
+        )
+        if self._drop_decode_mm_features:
+            logger.info(
+                "PD decode: dropping multimodal feature tensors before dispatch "
+                "(SGLANG_DISAGG_DECODE_DROP_MM_FEATURES=1)."
+            )
         # Keep a reference so the bootstrap server is not garbage-collected.
         self.bootstrap_server = (
             start_disagg_service() if start_pd_bootstrap_service else None
@@ -1354,11 +1367,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                                 hex_hash,
                             )
             if (
-                envs.SGLANG_MM_PRECOMPUTE_HASH.get()
+                (envs.SGLANG_MM_PRECOMPUTE_HASH.get() or self._drop_decode_mm_features)
                 and mm_inputs
                 and mm_inputs.mm_items
             ):
                 await self.mm_processor.hash_executor.set_pad_values(mm_inputs.mm_items)
+            if self._drop_decode_mm_features and mm_inputs and mm_inputs.mm_items:
+                drop_mm_features_for_decode(mm_inputs.mm_items)
         else:
             mm_inputs = None
 
@@ -2552,6 +2567,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
+
+        loop_lag_ms = envs.SGLANG_LOG_EVENT_LOOP_LAG_MS.get()
+        if loop_lag_ms > 0:
+            EventLoopLagMonitor(loop, loop_lag_ms / 1000, "TokenizerManager").start()
 
     async def handle_loop(self):
         """The event loop that handles requests"""

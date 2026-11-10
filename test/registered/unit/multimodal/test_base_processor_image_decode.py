@@ -16,9 +16,11 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 import asyncio
 import concurrent.futures
 import io
+import struct
 import sys
 import types
 import unittest
+import zlib
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -57,6 +59,30 @@ def _jpeg_bytes(size=(8, 8)) -> bytes:
     buf = io.BytesIO()
     Image.fromarray(arr, "RGB").save(buf, format="JPEG", quality=90, subsampling=2)
     return buf.getvalue()
+
+
+def _png_with_broken_chunk(size=64) -> bytes:
+    """A PNG whose second IDAT chunk has a damaged type, as seen in production.
+
+    The header is valid, so ``Image.open`` succeeds; the decoder needs the
+    second chunk and PIL raises SyntaxError("broken PNG file (chunk ...)").
+    """
+
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        crc = zlib.crc32(kind + payload) & 0xFFFFFFFF
+        return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", crc)
+
+    rows = np.random.RandomState(0).randint(0, 256, (size, size * 3), dtype=np.uint8)
+    pixels = zlib.compress(b"".join(b"\x00" + row.tobytes() for row in rows))
+    half = len(pixels) // 2
+    header = struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", pixels[:half])
+        + chunk(b"\x00IEN", pixels[half:])
+        + chunk(b"IEND", b"")
+    )
 
 
 def _is_decoded(img: Image.Image) -> bool:
@@ -119,6 +145,35 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
     def test_invalid_image_bytes_are_a_client_error(self):
         with self.assertRaisesRegex(ValueError, "cannot identify image file"):
             _StubProcessor._load_single_item(b"not an image", Modality.IMAGE)
+
+    def test_broken_png_chunk_is_a_client_error(self):
+        """A valid header with a damaged chunk mid-stream must be a 400.
+
+        PIL opens it fine and only fails in ``load()``, with SyntaxError
+        ("broken PNG file") rather than OSError, which used to escape the
+        decode guard and reach the generic 500 handler.
+        """
+        data = _png_with_broken_chunk()
+        with self.assertRaisesRegex(
+            ValueError, r"^Could not decode image: image is corrupted or truncated$"
+        ) as ctx:
+            common.load_image(data, gpu_image_decode=False)
+        self.assertIsInstance(ctx.exception.__cause__, SyntaxError)
+        with self.assertRaisesRegex(ValueError, r"corrupted or truncated"):
+            _StubProcessor._load_single_item(data, Modality.IMAGE)
+
+    def test_oversized_image_is_a_client_error(self):
+        with patch.object(
+            common.Image,
+            "open",
+            side_effect=Image.DecompressionBombError(
+                "Image size exceeds the decompression bomb limit"
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ValueError, r"^image too large, exceeds upper limit\.$"
+            ):
+                common.load_image(b"oversized image", gpu_image_decode=False)
 
     def test_unexpected_loader_bug_remains_a_server_error(self):
         with patch(

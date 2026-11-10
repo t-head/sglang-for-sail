@@ -8,15 +8,24 @@ images onto the checkpoint-configured background
 at load time.
 """
 
+import asyncio
 import functools
+import io
+import logging
 import math
 import re
-from typing import Dict, List, Optional, Union
+import threading
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, replace
+from http import HTTPStatus
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import numpy as np
 import torch
+from fastapi import HTTPException
 from PIL import Image
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -26,7 +35,7 @@ from sglang.srt.models.kimi_k3 import (
     KimiK3ForConditionalGeneration,
     KimiK31ForConditionalGeneration,
 )
-from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
+from sglang.srt.multimodal.cache import resolve_multimodal_item_hash, snapshot_media
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     DEFERRED_PREPROCESSING_KEY,
     KimiK3DeferredPreprocessing,
@@ -36,6 +45,7 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
 )
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     to_chw_uint8,
+    to_hwc_uint8,
 )
 from sglang.srt.multimodal.media_artifacts import (
     MediaArtifactCacheMixin,
@@ -63,7 +73,137 @@ from sglang.srt.multimodal.processors.kimi_k25 import (
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
-from sglang.srt.utils import is_cuda
+from sglang.srt.runtime_context import get_serving
+from sglang.srt.utils import is_cuda, load_image
+from sglang.srt.utils.common import CORRUPT_VIDEO_MESSAGE, is_corrupt_video_error
+
+logger = logging.getLogger(__name__)
+
+IMAGE_PREPROCESS_MODES = ("auto", "cpu", "gpu")
+
+
+def _resolve_image_preprocess_mode() -> str:
+    """Read and validate ``SGLANG_K3_IMAGE_PREPROCESS_MODE``.
+
+    An unrecognized value fails here, at processor construction, rather than
+    silently falling back to one of the arms -- a typo in the launch command
+    would otherwise look exactly like the mode working.
+    """
+    mode = (envs.SGLANG_K3_IMAGE_PREPROCESS_MODE.get() or "auto").strip().lower()
+    if mode not in IMAGE_PREPROCESS_MODES:
+        raise ValueError(
+            "SGLANG_K3_IMAGE_PREPROCESS_MODE must be one of "
+            f"{', '.join(IMAGE_PREPROCESS_MODES)}; got {mode!r}"
+        )
+    return mode
+
+
+@dataclass(frozen=True)
+class _K3EncodedImage:
+    """Raw image bytes plus header geometry, not yet decoded.
+
+    Under the "auto" GPU budget the decode backend is part of the decision:
+    nvJPEG decodes straight into GPU memory, so a request routed to the CPU
+    must never reach it. This carries a cache miss from snapshot to the point
+    where the whole batch's backend is chosen.
+    """
+
+    data: bytes
+    width: int
+    height: int
+    channels: int
+
+
+def _probe_encoded_image(data: bytes) -> Optional[_K3EncodedImage]:
+    """Read width/height/alpha from the image header without decoding pixels.
+
+    Returns None for anything PIL cannot identify, so the caller falls back to
+    the regular decode path and keeps its error semantics unchanged.
+    """
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            width, height = image.size
+            has_alpha = image.mode != "RGB" and (
+                "A" in image.getbands() or "transparency" in image.info
+            )
+    except Exception:
+        return None
+    return _K3EncodedImage(data, int(width), int(height), 4 if has_alpha else 3)
+
+
+def _image_geometry(image) -> tuple[int, int, int]:
+    """(width, height, channels) for an encoded, PIL, or CHW tensor image."""
+    if isinstance(image, _K3EncodedImage):
+        return image.width, image.height, image.channels
+    width, height = _get_image_dimensions(image)
+    if isinstance(image, torch.Tensor):
+        channels = 3 if image.dim() == 2 or image.shape[0] == 1 else image.shape[0]
+        return int(width), int(height), int(channels)
+    has_alpha = image.mode != "RGB" and (
+        "A" in image.getbands() or "transparency" in image.info
+    )
+    return int(width), int(height), 4 if has_alpha else 3
+
+
+def _estimate_gpu_preprocess_bytes(images, config) -> int:
+    """Rough peak GPU bytes for preprocessing ``images`` on the GPU path.
+
+    Per image: the decoded uint8 source and its copy in the same-size
+    ``torch.cat`` batch (2 * C * W * H), plus the fp32 resized image, its
+    patchified copy and the final concat (3 * 3 * padded * 4 bytes). The fp32
+    resize scratch is capped at 1 GiB by ``_resize_bicubic_chunked`` and is
+    ignored. This sits on the high side of what was measured: 40x 8192x8192
+    held 15 GiB when it OOMed, against ~32 GiB estimated here.
+    """
+    total = 0
+    for image in images:
+        width, height, channels = _image_geometry(image)
+        resize = navit_resize_config(
+            width,
+            height,
+            config.patch_size,
+            config.merge_kernel_size,
+            config.in_patch_limit,
+            config.patch_limit_on_one_side,
+            config.fixed_output_tokens,
+        )
+        padded = (resize["new_width"] + resize["pad_width"]) * (
+            resize["new_height"] + resize["pad_height"]
+        )
+        total += 2 * channels * width * height + 3 * 3 * padded * 4
+    return total
+
+
+def _decode_encoded_image(image, gpu_image_decode):
+    """Decode an ``_K3EncodedImage`` with an explicit backend; pass others through."""
+    if not isinstance(image, _K3EncodedImage):
+        return image
+    decoded, _ = load_image(image.data, gpu_image_decode)
+    if isinstance(decoded, Image.Image):
+        decoded.load()
+    return decoded
+
+
+def _apply_k3_video_config_overrides(media_proc_cfg: dict) -> dict:
+    """Let env vars override the checkpoint's own video sampling config.
+
+    ``media_proc_cfg`` ships entirely from the checkpoint's
+    ``trust_remote_code`` processor -- not from sglang, and not necessarily
+    from any specific file sglang controls -- so there is normally no way to
+    tune it short of locating and editing that checkpoint-side source. Each
+    override is applied independently and only when its env var is set.
+    """
+    media_proc_cfg = dict(media_proc_cfg)
+    overrides = {
+        "sample_fps": envs.SGLANG_K3_VIDEO_SAMPLE_FPS.get(),
+        "max_num_frames_each_video": envs.SGLANG_K3_VIDEO_MAX_NUM_FRAMES.get(),
+        "in_patch_limit_video": envs.SGLANG_K3_VIDEO_IN_PATCH_LIMIT.get(),
+    }
+    applied = {key: value for key, value in overrides.items() if value is not None}
+    if applied:
+        media_proc_cfg.update(applied)
+        logger.info("Kimi-K3 video media_proc_cfg overridden via env vars: %s", applied)
+    return media_proc_cfg
 
 
 def _encode_k3_special_tokens(tokenizer, text: str) -> list[int]:
@@ -73,6 +213,125 @@ def _encode_k3_special_tokens(tokenizer, text: str) -> list[int]:
     except TypeError:
         # Keep the helper usable with lightweight tokenizer stubs in CPU tests.
         return list(tokenizer.encode(text))
+
+
+@dataclass(frozen=True)
+class _KimiK3VisualItem:
+    """One MoonViT input grid derived from an image or a video chunk."""
+
+    media_type: Literal["image", "video"]
+    frames: tuple[Any, ...]
+    source_index: int
+    in_patch_limit: int
+    timestamp_text: str = ""
+
+    @property
+    def size(self) -> tuple[int, int]:
+        return _get_image_dimensions(self.frames[0])
+
+
+def _format_k3_timestamp(timestamp: float, mode: str) -> str:
+    total_seconds = max(0, int(timestamp))
+    milliseconds = int((max(0.0, timestamp) % 1) * 1000)
+    hours = (total_seconds // 3600) % 24
+    minutes = (total_seconds // 60) % 60
+    seconds = total_seconds % 60
+    if mode == "hh:mm:ss.fff":
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
+    if mode == "mm:ss.fff":
+        return f"{(total_seconds // 60) % 60:02d}:{seconds:02d}.{milliseconds:03d}"
+    if mode == "mm:ss":
+        return f"{(total_seconds // 60) % 60:02d}:{seconds:02d}"
+    raise ValueError(f"Invalid Kimi-K3 timestamp mode: {mode}")
+
+
+def _video_frame_to_chw(frame):
+    if isinstance(frame, np.ndarray):
+        frame = torch.from_numpy(frame)
+    if isinstance(frame, torch.Tensor):
+        if frame.ndim != 3:
+            raise ValueError(f"Expected a 3D video frame, got shape {frame.shape}.")
+        if frame.shape[-1] in (1, 3, 4) and frame.shape[0] not in (1, 3, 4):
+            frame = frame.permute(2, 0, 1)
+        return frame.contiguous()
+    if isinstance(frame, Image.Image):
+        return frame
+    raise TypeError(f"Unsupported Kimi-K3 video frame type: {type(frame)}")
+
+
+def _split_k3_video(
+    video,
+    media_proc_cfg: dict,
+    source_index: int,
+) -> list[_KimiK3VisualItem]:
+    total_frames = len(video)
+    if total_frames <= 0:
+        raise ValueError("Kimi-K3 video input must contain at least one frame.")
+
+    avg_fps = float(getattr(video, "avg_fps", 0) or 0)
+    if avg_fps <= 0:
+        raise ValueError("Kimi-K3 video input must report a positive frame rate.")
+
+    sample_fps = min(float(media_proc_cfg.get("sample_fps", 8.0)), avg_fps)
+    sampled_nframes = max(round(total_frames * sample_fps / avg_fps), 1)
+    max_frames = media_proc_cfg.get("max_num_frames_each_video")
+    if max_frames is not None:
+        sampled_nframes = min(sampled_nframes, max(1, int(max_frames)))
+    sampled_nframes = min(sampled_nframes, total_frames)
+
+    frame_indices = (
+        np.linspace(0, total_frames - 1, sampled_nframes).round().astype(int).tolist()
+    )
+    try:
+        if hasattr(video, "get_frames_as_tensor"):
+            # This function runs one video per thread on the shared IO pool, so
+            # the decoder's own inner thread pool would multiply against that
+            # outer concurrency -- see SGLANG_K3_VIDEO_DECODE_THREADS (default 1).
+            decoded_frames = video.get_frames_as_tensor(
+                frame_indices, num_threads=envs.SGLANG_K3_VIDEO_DECODE_THREADS.get()
+            )
+        elif hasattr(video, "get_frames_at"):
+            decoded_frames = video.get_frames_at(frame_indices)
+        else:
+            decoded_frames = [video[index] for index in frame_indices]
+    except RuntimeError as e:
+        # A damaged packet is a bad upload (400), not a server fault. The
+        # header opened fine, so load_video's own mapping never saw it.
+        if is_corrupt_video_error(e):
+            raise ValueError(CORRUPT_VIDEO_MESSAGE) from e
+        raise
+    frames = [_video_frame_to_chw(frame) for frame in decoded_frames]
+
+    temporal_merge = int(media_proc_cfg.get("temporal_merge_kernel_size", 4))
+    if temporal_merge < 1 or temporal_merge > 4:
+        raise ValueError("Kimi-K3 temporal_merge_kernel_size must be between 1 and 4.")
+
+    per_frame_limit = int(
+        media_proc_cfg.get("in_patch_limit_each_frame")
+        or media_proc_cfg["in_patch_limit"]
+    )
+    total_patch_limit = media_proc_cfg.get("in_patch_limit_video")
+    if total_patch_limit is not None:
+        per_frame_limit = min(
+            per_frame_limit,
+            max(1, round(int(total_patch_limit) / sampled_nframes)),
+        )
+
+    timestamp_mode = media_proc_cfg.get("timestamp_mode", "hh:mm:ss.fff")
+    chunks = []
+    for start in range(0, sampled_nframes, temporal_merge):
+        chunks.append(
+            _KimiK3VisualItem(
+                media_type="video",
+                frames=tuple(frames[start : start + temporal_merge]),
+                source_index=source_index,
+                in_patch_limit=per_frame_limit,
+                timestamp_text=_format_k3_timestamp(
+                    frame_indices[start] / avg_fps, timestamp_mode
+                ),
+            )
+        )
+    return chunks
 
 
 def _expand_k3_image_prompt_token_ids(
@@ -96,30 +355,104 @@ def _expand_k3_image_prompt_token_ids(
         input_ids = input_ids.detach().flatten().cpu().numpy()
     input_ids = np.asarray(input_ids, dtype=np.int64)
 
-    placeholder_count = np.count_nonzero(input_ids == image_token_id)
+    if input_ids.ndim != 1:
+        raise ValueError("Expected a flat K3 prompt token sequence.")
+
+    placeholder_positions = np.flatnonzero(input_ids == image_token_id)
+    placeholder_count = len(placeholder_positions)
     if placeholder_count != len(image_token_counts):
         raise ValueError(
             f"Expected {len(image_token_counts)} image placeholder token(s), "
             f"found {placeholder_count}."
         )
 
+    # Splice whole segments instead of a per-token Python loop: this runs on the
+    # tokenizer event loop and long prompts (~1M tokens) blocked it for ~0.1 s.
+    segments = []
+    segment_start = 0
+    for image_index, position in enumerate(placeholder_positions):
+        segments.append(input_ids[segment_start:position])
+        width, height = image_sizes[image_index]
+        segments.append(
+            _as_int64_array(
+                _encode_k3_special_tokens(
+                    tokenizer,
+                    f"<|media_begin|>image {width}x{height}<|media_content|>",
+                )
+            )
+        )
+        segments.append(
+            np.full(
+                max(image_token_counts[image_index], 0),
+                image_token_id,
+                dtype=np.int64,
+            )
+        )
+        segments.append(
+            _as_int64_array(_encode_k3_special_tokens(tokenizer, "<|media_end|>"))
+        )
+        segment_start = position + 1
+    segments.append(input_ids[segment_start:])
+
+    return torch.from_numpy(np.concatenate(segments)).unsqueeze(0)
+
+
+def _as_int64_array(token_ids: list[int]) -> np.ndarray:
+    return np.asarray(token_ids, dtype=np.int64).reshape(-1)
+
+
+def _expand_k3_visual_prompt_token_ids(
+    input_ids: Union[List[int], torch.Tensor],
+    image_token_id: int,
+    visual_items: list[_KimiK3VisualItem],
+    resize_configs: list[dict],
+    tokenizer,
+) -> torch.Tensor:
+    """Replace each source-media placeholder with its MoonViT grid(s)."""
+    if len(visual_items) != len(resize_configs):
+        raise ValueError("Expected one resize config for each Kimi-K3 visual item.")
+
+    if isinstance(input_ids, torch.Tensor):
+        input_ids = input_ids.detach().flatten().cpu().numpy()
+    input_ids = np.asarray(input_ids, dtype=np.int64)
+
+    groups: list[list[tuple[_KimiK3VisualItem, dict]]] = []
+    for item, config in zip(visual_items, resize_configs):
+        if item.source_index == len(groups):
+            groups.append([])
+        elif item.source_index != len(groups) - 1:
+            raise ValueError("Kimi-K3 visual items are not ordered by source media.")
+        groups[item.source_index].append((item, config))
+
+    placeholder_count = int(np.count_nonzero(input_ids == image_token_id))
+    if placeholder_count != len(groups):
+        raise ValueError(
+            f"Expected {len(groups)} visual placeholder token(s), "
+            f"found {placeholder_count}."
+        )
+
     output = []
-    image_index = 0
+    source_index = 0
     for token_id in input_ids:
         if token_id != image_token_id:
             output.append(int(token_id))
             continue
 
-        width, height = image_sizes[image_index]
-        output.extend(
-            _encode_k3_special_tokens(
-                tokenizer,
-                f"<|media_begin|>image {width}x{height}<|media_content|>",
-            )
-        )
-        output.extend([image_token_id] * image_token_counts[image_index])
-        output.extend(_encode_k3_special_tokens(tokenizer, "<|media_end|>"))
-        image_index += 1
+        group = groups[source_index]
+        if group[0][0].media_type == "image" and len(group) != 1:
+            raise ValueError("A Kimi-K3 image source must produce exactly one grid.")
+        for item, config in group:
+            if item.media_type == "image":
+                width, height = item.size
+                media_prefix = f"<|media_begin|>image {width}x{height}<|media_content|>"
+            else:
+                media_prefix = (
+                    f"{item.timestamp_text}<|media_begin|>video<|media_content|>"
+                )
+            output.extend(_encode_k3_special_tokens(tokenizer, media_prefix))
+            output.extend([image_token_id] * int(config["num_tokens"]))
+            output.extend(_encode_k3_special_tokens(tokenizer, "<|media_end|>"))
+        source_index += 1
 
     return torch.tensor(output, dtype=torch.long).unsqueeze(0)
 
@@ -165,6 +498,84 @@ def _k3_to_cuda_chw(image: Union[torch.Tensor, Image.Image]) -> torch.Tensor:
     return image
 
 
+def _gpu_preprocess_k3_visual_items(
+    visual_items: list[_KimiK3VisualItem],
+    resize_configs: list[dict],
+    image_scale: torch.Tensor,
+    image_bias: torch.Tensor,
+    patch_size: int,
+    transparent_bg_config: Optional[dict],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Preprocess image/video frames and restore each item's temporal grid.
+
+    Video frames are intentionally processed one temporal chunk at a time.
+    ``_gpu_preprocess_images`` keeps a batched result alive until it returns,
+    and its final concat needs another contiguous allocation. Running it over
+    all frames of a long video therefore briefly holds roughly two copies of
+    the full pre-patch tensor. The output below is allocated once and filled
+    from each small chunk so the peak scales with four frames, not with the
+    whole video.
+    """
+    if len(visual_items) != len(resize_configs):
+        raise ValueError("Expected one resize config for each Kimi-K3 visual item.")
+
+    if not visual_items:
+        device = image_scale.device
+        return (
+            torch.empty(0, 3, patch_size, patch_size, device=device),
+            torch.empty(0, 3, dtype=torch.int64),
+        )
+
+    # Each frame contributes one (t=1, h, w) grid. Compute the final row
+    # count up front so no second full-size torch.cat allocation is needed.
+    total_rows = sum(
+        len(item.frames)
+        * math.prod(_grid_thw_from_resize_config(config, patch_size))
+        for item, config in zip(visual_items, resize_configs)
+    )
+    pixel_values = None
+    pixel_offset = 0
+    grids = []
+    for item, config in zip(visual_items, resize_configs):
+        item_pixel_values, item_grids = _gpu_preprocess_images(
+            list(item.frames),
+            [config] * len(item.frames),
+            image_scale,
+            image_bias,
+            patch_size,
+            to_chw=_k3_to_cuda_chw,
+            post_resize=lambda x: _fill_transparent_bg(x, transparent_bg_config),
+        )
+        if len(item_grids) == 0 or not torch.all(item_grids[:, 0] == 1):
+            raise ValueError("Expected one spatial MoonViT grid per video frame.")
+        if not torch.all(item_grids[:, 1:] == item_grids[0, 1:]):
+            raise ValueError("Kimi-K3 video frames must share one spatial grid.")
+
+        if pixel_values is None:
+            pixel_values = torch.empty(
+                (total_rows, *item_pixel_values.shape[1:]),
+                dtype=item_pixel_values.dtype,
+                device=item_pixel_values.device,
+            )
+        elif pixel_values.shape[1:] != item_pixel_values.shape[1:]:
+            raise ValueError("Kimi-K3 visual items produced incompatible patch shapes.")
+
+        next_offset = pixel_offset + item_pixel_values.shape[0]
+        if next_offset > total_rows:
+            raise ValueError("Kimi-K3 visual preprocessing produced too many patches.")
+        pixel_values[pixel_offset:next_offset].copy_(item_pixel_values)
+        del item_pixel_values
+        pixel_offset = next_offset
+        grids.append((len(item.frames), *item_grids[0, 1:].tolist()))
+
+    if pixel_values is None or pixel_offset != total_rows:
+        raise ValueError(
+            "Kimi-K3 visual preprocessing produced an unexpected patch count: "
+            f"{pixel_offset} != {total_rows}"
+        )
+    return pixel_values, torch.tensor(grids, dtype=torch.int64)
+
+
 class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
     def __init__(self, hf_processor, image_token, image_token_id, config):
         self.preprocess_config = config
@@ -181,9 +592,114 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
             image_std=config.image_std,
         )
         self._transparent_bg_config = config.transparent_bg_config
+        self._image_preprocess_mode = _resolve_image_preprocess_mode()
+        self._log_preprocess_backend = envs.SGLANG_K3_IMAGE_PREPROCESS_LOG.get()
+        self._oom_fallback = envs.SGLANG_K3_IMAGE_PREPROCESS_OOM_FALLBACK.get()
+
+    def _can_retry_on_cpu(self, images) -> bool:
+        """Whether a GPU OOM on ``images`` may be redone on the CPU.
+
+        Visual items (the video path) have no CPU implementation, so their
+        OOM is re-raised instead of turning into a confusing CPU-side error.
+        """
+        return self._oom_fallback and not any(
+            isinstance(image, _KimiK3VisualItem) for image in images
+        )
+
+    def _after_gpu_oom(self, images) -> list:
+        """Free the failed attempt's GPU memory; return CPU-acceptable images.
+
+        Runs after the ``except`` block has exited, so the OOM traceback --
+        whose frames still reference the partial batch tensors -- is gone and
+        ``empty_cache`` can actually return that memory to the driver, where
+        the scheduler on the same GPU needs it. Decoded CUDA tensors (nvJPEG
+        output) are copied to the host, since the CPU processor takes PIL.
+        """
+        torch.cuda.empty_cache()
+        logger.warning(
+            "Kimi-K3 preprocess: CUDA OOM on the GPU path for %d image(s); "
+            "redoing them on the CPU. Lower "
+            "SGLANG_K3_IMAGE_PREPROCESS_GPU_BUDGET_MB if this repeats.",
+            len(images),
+        )
+        return [
+            (
+                Image.fromarray(to_hwc_uint8(image).numpy())
+                if isinstance(image, torch.Tensor)
+                else image
+            )
+            for image in images
+        ]
+
+    @staticmethod
+    def _has_video(images) -> bool:
+        return any(
+            isinstance(image, _KimiK3VisualItem) and image.media_type == "video"
+            for image in images or ()
+        )
+
+    def _use_gpu(self, images, use_gpu: Optional[bool] = None) -> bool:
+        """Whether this call preprocesses on the GPU.
+
+        ``use_gpu`` is the per-request decision "auto" mode made from its GPU
+        budget; None means "follow SGLANG_K3_IMAGE_PREPROCESS_MODE".
+
+        Either way it only governs images. Video has no CPU preprocessing path
+        at all (``_cpu_call`` goes through the checkpoint's image processor),
+        so a video item keeps the GPU even when the CPU was chosen --
+        otherwise that choice would turn every video request into the
+        ``RuntimeError`` below instead of a slower request.
+        """
+        if not images or not torch.cuda.is_available():
+            return False
+        if use_gpu is None:
+            use_gpu = self._image_preprocess_mode != "cpu"
+        if use_gpu:
+            return True
+        if self._has_video(images):
+            if self._log_preprocess_backend:
+                logger.info(
+                    "Kimi-K3 preprocess: CPU selected (mode=%s) but request "
+                    "carries video; using GPU (video has no CPU preprocessing "
+                    "path)",
+                    self._image_preprocess_mode,
+                )
+            return True
+        return False
+
+    def _log_backend(self, backend: str, images, resize_configs=None) -> None:
+        if not self._log_preprocess_backend:
+            return
+        total_tokens = (
+            sum(config["num_tokens"] for config in resize_configs)
+            if resize_configs
+            else None
+        )
+        logger.info(
+            "Kimi-K3 preprocess: backend=%s mode=%s items=%d visual_tokens=%s",
+            backend,
+            self._image_preprocess_mode,
+            len(images or ()),
+            "n/a" if total_tokens is None else total_tokens,
+        )
 
     def preprocess_fingerprint_payload(self):
         return self.preprocess_config
+
+    def _normalize_visual_items(self, images) -> list[_KimiK3VisualItem]:
+        return [
+            (
+                image
+                if isinstance(image, _KimiK3VisualItem)
+                else _KimiK3VisualItem(
+                    media_type="image",
+                    frames=(image,),
+                    source_index=index,
+                    in_patch_limit=self._in_patch_limit,
+                )
+            )
+            for index, image in enumerate(images or [])
+        ]
 
     def _prepare_input_ids(
         self, input_text, resize_configs, original_input_ids, image_sizes
@@ -204,12 +720,81 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
     def __call__(self, text=None, images=None, **kwargs):
         images = images or kwargs.pop("images", None)
         original_input_ids = kwargs.pop("sglang_original_input_ids", None)
-        if images and torch.cuda.is_available():
-            return self._gpu_call(text, images, original_input_ids)
+        use_gpu = kwargs.pop("sglang_use_gpu", None)
+        if self._use_gpu(images, use_gpu):
+            try:
+                return self._gpu_call(text, images, original_input_ids)
+            except torch.OutOfMemoryError:
+                if not self._can_retry_on_cpu(images):
+                    raise
+            # Outside the except block: see _after_gpu_oom.
+            images = self._after_gpu_oom(images)
+        if images and self._has_video(images):
+            raise RuntimeError("Kimi-K3 video preprocessing requires CUDA.")
         return self._cpu_call(text, images, original_input_ids, **kwargs)
 
     def _gpu_call(self, text, images, original_input_ids=None):
         input_text = text[0] if isinstance(text, list) else text
+
+        if any(isinstance(image, _KimiK3VisualItem) for image in images):
+            visual_items = self._normalize_visual_items(images)
+            resize_configs = []
+            for item in visual_items:
+                width, height = item.size
+                resize_configs.append(
+                    navit_resize_config(
+                        width,
+                        height,
+                        self._patch_size,
+                        self._merge_kernel_size,
+                        item.in_patch_limit,
+                        self._patch_limit_on_one_side,
+                        self._fixed_output_tokens,
+                    )
+                )
+
+            self._log_backend("gpu", visual_items, resize_configs)
+            if any(item.media_type == "video" for item in visual_items):
+                video_tokens = sum(
+                    config["num_tokens"]
+                    for item, config in zip(visual_items, resize_configs)
+                    if item.media_type == "video"
+                )
+                logger.info(
+                    "Kimi-K3 video preprocessing: %d video chunk(s), "
+                    "%d visual token(s) from video, %d total visual token(s) "
+                    "across %d item(s)",
+                    sum(1 for item in visual_items if item.media_type == "video"),
+                    video_tokens,
+                    sum(config["num_tokens"] for config in resize_configs),
+                    len(visual_items),
+                )
+
+            if original_input_ids is None:
+                original_input_ids = _encode_k3_special_tokens(
+                    self._hf_processor.tokenizer, input_text
+                )
+            input_ids = _expand_k3_visual_prompt_token_ids(
+                original_input_ids,
+                self._image_token_id,
+                visual_items,
+                resize_configs,
+                self._hf_processor.tokenizer,
+            )
+            image_scale, image_bias = self._get_gpu_norm_tensors()
+            pixel_values, grid_thws = _gpu_preprocess_k3_visual_items(
+                visual_items,
+                resize_configs,
+                image_scale,
+                image_bias,
+                self._patch_size,
+                self._transparent_bg_config,
+            )
+            return {
+                "input_ids": input_ids,
+                "pixel_values": pixel_values,
+                "image_grid_thw": grid_thws,
+            }
 
         resize_configs = []
         image_sizes = []
@@ -232,6 +817,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
             input_text, resize_configs, original_input_ids, image_sizes
         )
 
+        self._log_backend("gpu", images, resize_configs)
         image_scale, image_bias = self._get_gpu_norm_tensors()
         # Shared source-compatible batched pipeline (same as K2.5): RGBA
         # inputs land in their own source-shape groups, and the
@@ -266,6 +852,9 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
             )
             for image in images
         ]
+        self._log_backend(
+            "cpu", images, [{"num_tokens": count} for count in image_token_counts]
+        )
         expanded_text = _expand_k3_image_prompt_text(
             input_text,
             self._image_token,
@@ -314,7 +903,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
         )
         return input_ids, resize_configs, deferred_preprocessing
 
-    def prepare_image_features(self, images):
+    def prepare_image_features(self, images, use_gpu: Optional[bool] = None):
         """Prepare prompt-independent, per-image features in one processor call."""
         image_sizes = [_get_image_dimensions(image) for image in images]
         resize_configs = [
@@ -330,20 +919,30 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
             for width, height in image_sizes
         ]
 
-        if images and torch.cuda.is_available():
+        pixel_values = None
+        if self._use_gpu(images, use_gpu):
+            self._log_backend("gpu", images, resize_configs)
             image_scale, image_bias = self._get_gpu_norm_tensors()
-            pixel_values, grid_thws = _gpu_preprocess_images(
-                images,
-                resize_configs,
-                image_scale,
-                image_bias,
-                self._patch_size,
-                to_chw=_k3_to_cuda_chw,
-                post_resize=lambda x: _fill_transparent_bg(
-                    x, self._transparent_bg_config
-                ),
-            )
-        else:
+            try:
+                pixel_values, grid_thws = _gpu_preprocess_images(
+                    images,
+                    resize_configs,
+                    image_scale,
+                    image_bias,
+                    self._patch_size,
+                    to_chw=_k3_to_cuda_chw,
+                    post_resize=lambda x: _fill_transparent_bg(
+                        x, self._transparent_bg_config
+                    ),
+                )
+            except torch.OutOfMemoryError:
+                if not self._can_retry_on_cpu(images):
+                    raise
+            if pixel_values is None:
+                # Outside the except block: see _after_gpu_oom.
+                images = self._after_gpu_oom(images)
+        if pixel_values is None:
+            # `_cpu_call` logs the backend itself.
             # The checkpoint CPU processor couples prompt composition with media
             # preprocessing. A synthetic prompt keeps that API but is discarded;
             # image features and grids are independent of its text.
@@ -402,13 +1001,302 @@ class KimiK3ImageProcessor(
             image_token_id=mm_tokens.image_token_id,
             config=preprocess_config,
         )
+        self._image_preprocess_mode = _resolve_image_preprocess_mode()
+        # `_load_single_item` is a classmethod and reads `cls.gpu_image_decode`,
+        # so an instance attribute would not reach the decode path. Assign on
+        # the class instead of hardcoding the value at class-definition time,
+        # which would freeze whatever the environment held at import. The mode
+        # is process-global, so every instance resolves the same value.
+        type(self).gpu_image_decode = (
+            False if self._image_preprocess_mode == "cpu" else "nvjpeg_fancy"
+        )
+
         super().__init__(hf_config, server_args, processor, *args, **kwargs)
         self.mm_tokens = mm_tokens
+        self.media_proc_cfg = _apply_k3_video_config_overrides(
+            dict(_processor.media_processor.media_proc_cfg)
+        )
+
+        # "auto" GPU budget, shared by every request this tokenizer worker is
+        # preprocessing. Workers in other tokenizer processes share the same
+        # GPU, so each gets an equal slice. None = no budget (always GPU).
+        budget_mb = envs.SGLANG_K3_IMAGE_PREPROCESS_GPU_BUDGET_MB.get()
+        worker_num = max(int(get_serving().tokenizer_worker_num), 1)
+        self._gpu_preprocess_budget_bytes = (
+            budget_mb * 1024 * 1024 // worker_num
+            if self._image_preprocess_mode == "auto" and budget_mb > 0
+            else None
+        )
+        self._gpu_preprocess_inflight_bytes = 0
+        # Reserved from processor worker threads and the event loop alike.
+        self._gpu_preprocess_lock = threading.Lock()
+        self._log_preprocess_backend = envs.SGLANG_K3_IMAGE_PREPROCESS_LOG.get()
+        if self._gpu_preprocess_budget_bytes is not None:
+            # GPU and CPU features for one image differ slightly, and a request
+            # may now land on either; see artifact_feature_hash_is_backend_stable.
+            self.artifact_feature_hash_is_backend_stable = False
+
+        logger.info(
+            "Kimi-K3 image preprocessing mode=%s (jpeg_decode=%s, "
+            "gpu_budget=%s, feature_transport=%s, processor_workers=%d, "
+            "io_workers=%d, preprocess_cache=%s). Video always preprocesses "
+            "on the GPU.",
+            self._image_preprocess_mode,
+            "pil-cpu" if self.gpu_image_decode is False else self.gpu_image_decode,
+            (
+                "off"
+                if self._gpu_preprocess_budget_bytes is None
+                else f"{self._gpu_preprocess_budget_bytes / 2**20:.0f}MiB"
+            ),
+            self.mm_feature_transport,
+            self.mm_processor_worker_num,
+            self.mm_io_worker_num,
+            "on" if self.mm_preprocess_cache.enabled else "off",
+        )
+        max_inflight_frames = envs.SGLANG_K3_VIDEO_MAX_INFLIGHT_FRAMES.get()
+        self._video_gpu_frame_budget = (
+            max_inflight_frames if max_inflight_frames > 0 else None
+        )
+        self._video_gpu_inflight_frames = 0
+        self._video_gpu_condition = asyncio.Condition()
+        max_queue_depth = envs.SGLANG_K3_VIDEO_MAX_QUEUE_DEPTH.get()
+        self._video_gpu_queue_depth_limit = (
+            max_queue_depth if max_queue_depth > 0 else None
+        )
+        self._video_gpu_queue_depth = 0
+
+    @asynccontextmanager
+    async def _video_gpu_preprocess_slot(self, sampled_frames: int):
+        """Block until enough of the global video-frame budget is free.
+
+        ``SGLANG_K3_VIDEO_MAX_SAMPLED_FRAMES`` bounds one request's own
+        preprocessing cost, but nothing else here bounds how many of those
+        per-request peaks land on the GPU at the same time -- two or more
+        requests that are each individually within budget can still add up
+        past available memory. This closes that gap one level up: weighted
+        by sampled frame count rather than by request count, so a request
+        with a small video waits less than one with a big video -- there
+        is no fixed number of concurrency "slots", just a shared frame
+        budget. A request whose own frame count already exceeds the budget
+        is let through alone (once no other video request is in flight)
+        rather than blocked forever. A no-op for non-video requests
+        (``sampled_frames <= 0``; images are cheap enough not to need this)
+        or when the budget is disabled.
+
+        ``SGLANG_K3_VIDEO_MAX_QUEUE_DEPTH`` bounds how many requests may be
+        waiting at this gate at once, on top of the frame budget itself. A
+        sustained burst of video requests each individually within
+        ``SGLANG_K3_VIDEO_MAX_SAMPLED_FRAMES`` still pays its own decode
+        cost (on the IO thread pool, before this gate is ever reached)
+        regardless of how long the queue here already is -- an unbounded
+        queue means an unbounded amount of already-decoded frame tensors
+        sitting in host memory behind it. A request that would push the
+        queue past this depth is rejected with 400 (Bad Request) before it
+        joins the queue, instead of queueing indefinitely; the current
+        queue depth (not counting this rejected request) is logged at INFO
+        level whenever a request has to queue.
+        """
+        if sampled_frames <= 0 or self._video_gpu_frame_budget is None:
+            yield
+            return
+        debug = envs.SGLANG_K3_VIDEO_DEBUG_LOG.get()
+        budget = self._video_gpu_frame_budget
+        queue_depth_limit = self._video_gpu_queue_depth_limit
+        async with self._video_gpu_condition:
+            must_queue = (
+                self._video_gpu_inflight_frames > 0
+                and self._video_gpu_inflight_frames + sampled_frames > budget
+            )
+            if must_queue:
+                if (
+                    queue_depth_limit is not None
+                    and self._video_gpu_queue_depth >= queue_depth_limit
+                ):
+                    raise HTTPException(
+                        status_code=HTTPStatus.BAD_REQUEST,
+                        detail="Internal video format error",
+                    )
+                self._video_gpu_queue_depth += 1
+                logger.info(
+                    "Kimi-K3 video GPU-preprocess: queueing for %d frames of "
+                    "budget (%d/%d in use); %d request(s) now queued",
+                    sampled_frames,
+                    self._video_gpu_inflight_frames,
+                    budget,
+                    self._video_gpu_queue_depth,
+                )
+            if debug:
+                logger.info(
+                    "Kimi-K3 video GPU-preprocess: waiting for %d frames of "
+                    "budget (%d/%d in use)",
+                    sampled_frames,
+                    self._video_gpu_inflight_frames,
+                    budget,
+                )
+            try:
+                while (
+                    self._video_gpu_inflight_frames > 0
+                    and self._video_gpu_inflight_frames + sampled_frames > budget
+                ):
+                    await self._video_gpu_condition.wait()
+            finally:
+                if must_queue:
+                    self._video_gpu_queue_depth -= 1
+            self._video_gpu_inflight_frames += sampled_frames
+            if debug:
+                logger.info(
+                    "Kimi-K3 video GPU-preprocess: acquired %d frames of "
+                    "budget (%d/%d in use)",
+                    sampled_frames,
+                    self._video_gpu_inflight_frames,
+                    budget,
+                )
+        try:
+            yield
+        finally:
+            async with self._video_gpu_condition:
+                self._video_gpu_inflight_frames -= sampled_frames
+                if debug:
+                    logger.info(
+                        "Kimi-K3 video GPU-preprocess: released %d frames of "
+                        "budget (%d/%d in use)",
+                        sampled_frames,
+                        self._video_gpu_inflight_frames,
+                        budget,
+                    )
+                self._video_gpu_condition.notify_all()
+
+    @staticmethod
+    def _resolve_visual_modalities(request_obj, image_count, video_count):
+        modalities = []
+        for modality in request_obj.modalities or []:
+            if isinstance(modality, list):
+                modalities.extend(modality)
+            else:
+                modalities.append(modality)
+
+        if not modalities:
+            return ["image"] * image_count + ["video"] * video_count
+        if (
+            any(modality not in ("image", "video") for modality in modalities)
+            or modalities.count("image") != image_count
+            or modalities.count("video") != video_count
+        ):
+            raise ValueError(
+                "Kimi-K3 media order does not match the supplied image/video data."
+            )
+        return modalities
+
+    def _reserve_gpu_preprocess(self, images) -> tuple[Optional[bool], int]:
+        """Pick this batch's backend under the "auto" GPU budget.
+
+        Returns ``(use_gpu, reserved_bytes)``. ``use_gpu`` is None when no
+        budget is active, meaning "follow the static mode" exactly as before.
+        A batch goes to the GPU only if its estimate fits next to everything
+        already in flight; it never waits. A batch carrying an already-decoded
+        tensor keeps the GPU, since the CPU processor never received tensors
+        before this switch existed. The caller must release ``reserved_bytes``.
+        """
+        if self._gpu_preprocess_budget_bytes is None or not images:
+            return None, 0
+        if any(isinstance(image, torch.Tensor) for image in images):
+            return True, 0
+        budget = self._gpu_preprocess_budget_bytes
+        estimate = _estimate_gpu_preprocess_bytes(
+            images, self._processor.preprocess_config
+        )
+        with self._gpu_preprocess_lock:
+            inflight = self._gpu_preprocess_inflight_bytes
+            use_gpu = inflight + estimate <= budget
+            if use_gpu:
+                self._gpu_preprocess_inflight_bytes += estimate
+        if self._log_preprocess_backend:
+            logger.info(
+                "Kimi-K3 preprocess budget: backend=%s items=%d "
+                "estimate=%.0fMiB inflight=%.0fMiB budget=%.0fMiB",
+                "gpu" if use_gpu else "cpu",
+                len(images),
+                estimate / 2**20,
+                inflight / 2**20,
+                budget / 2**20,
+            )
+        return use_gpu, estimate if use_gpu else 0
+
+    def _release_gpu_preprocess(self, reserved_bytes: int) -> None:
+        if reserved_bytes:
+            with self._gpu_preprocess_lock:
+                self._gpu_preprocess_inflight_bytes -= reserved_bytes
+
+    async def _decode_images_for_backend(self, images, use_gpu: Optional[bool]):
+        """Decode any ``_K3EncodedImage`` on the IO pool with the chosen backend."""
+        if not any(isinstance(image, _K3EncodedImage) for image in images):
+            return list(images)
+        gpu_image_decode = self.gpu_image_decode if use_gpu is not False else False
+        loop = asyncio.get_running_loop()
+        return list(
+            await asyncio.gather(
+                *(
+                    loop.run_in_executor(
+                        self.io_executor,
+                        _decode_encoded_image,
+                        image,
+                        gpu_image_decode,
+                    )
+                    for image in images
+                )
+            )
+        )
+
+    def decode_media_snapshot(self, snapshot, modality):
+        """Leave raw image bytes undecoded while the "auto" budget is active.
+
+        The batch's backend is chosen in ``_run_preprocess_and_build_artifact_batch``
+        from header geometry, and only then decoded -- nvJPEG would otherwise
+        put the pixels on the GPU before the request could be sent to the CPU.
+        Headers PIL cannot read take the regular decode path unchanged.
+        """
+        if (
+            self._gpu_preprocess_budget_bytes is not None
+            and modality == Modality.IMAGE
+            and isinstance(snapshot.data, (bytes, bytearray))
+        ):
+            encoded = _probe_encoded_image(bytes(snapshot.data))
+            if encoded is not None:
+                return encoded
+        return super().decode_media_snapshot(snapshot, modality)
+
+    async def _run_preprocess_and_build_artifact_batch(self, entries):
+        use_gpu, reserved = self._reserve_gpu_preprocess(
+            [entry.media for entry in entries]
+        )
+        try:
+            decoded = await self._decode_images_for_backend(
+                [entry.media for entry in entries], use_gpu
+            )
+            entries = [
+                replace(entry, media=media) for entry, media in zip(entries, decoded)
+            ]
+            if self.mm_processor_executor is None:
+                return self.prepare_artifact_batch(entries, use_gpu=use_gpu)
+            return await self.mm_processor_executor.run(
+                self.prepare_artifact_batch, entries, use_gpu=use_gpu
+            )
+        finally:
+            self._release_gpu_preprocess(reserved)
 
     def _should_defer_gpu_preprocessing(self, images) -> bool:
         """
         when raw_bytes <= processed_bytes, preprocess first would introduce larger payload, so deferring gpu preprocessing would benefit
         """
+        # Both explicit modes opt out of deferral, for opposite reasons.
+        # Under "cpu" this gate would otherwise win first -- its own
+        # precondition is `mm_feature_transport == "cpu"`, which is exactly
+        # the transport a CPU run uses -- and hand the work to the vision-DP
+        # owner rank's GPU, so the request would still preprocess on a GPU,
+        # just in the model process. Under "gpu" deferral is simply not the
+        # eager-GPU baseline being measured.
+        if self._image_preprocess_mode != "auto":
+            return False
         if (
             not images
             or self.mm_feature_transport != "cpu"
@@ -531,11 +1419,15 @@ class KimiK3ImageProcessor(
         entries: list[MediaArtifactInput],
         *,
         processor=None,
+        use_gpu: Optional[bool] = None,
     ) -> list[KimiK3ImagePreprocessArtifact]:
         """Preprocess raw cache misses into reusable per-image cache items.
 
         Each entry is a confirmed cache miss. It is either processed now or
         stored with the metadata needed for deferred GPU preprocessing.
+        ``use_gpu`` is the "auto" budget's decision for this batch (None:
+        follow the static mode). When it chose the CPU nothing is deferred,
+        since deferral would only move the GPU work to the model process.
         """
         processor = processor or self._processor
         artifacts: list[Optional[KimiK3ImagePreprocessArtifact]] = [None] * len(entries)
@@ -546,7 +1438,7 @@ class KimiK3ImageProcessor(
         config = processor.preprocess_config
         for index, entry in enumerate(entries):
             image = entry.media
-            if not self._should_defer_gpu_preprocessing([image]):
+            if use_gpu is False or not self._should_defer_gpu_preprocessing([image]):
                 eager_entry_indices.append(index)
                 eager_images.append(image)
                 continue
@@ -582,7 +1474,7 @@ class KimiK3ImageProcessor(
         # 2. preprocess CPU eager inputs as one batch
         if eager_images:
             features, sizes, configs, grids = processor.prepare_image_features(
-                eager_images
+                eager_images, use_gpu=use_gpu
             )
             for index, feature, size, resize_config, grid in zip(
                 eager_entry_indices, features, sizes, configs, grids
@@ -660,15 +1552,91 @@ class KimiK3ImageProcessor(
             im_token_id=self.mm_tokens.image_token_id,
         )
 
+    async def _stage_raw_images(self, image_data) -> Optional[list]:
+        """Fetch each raw image once and read its header, without decoding.
+
+        Returns one ``_K3EncodedImage`` (or already-decoded PIL/tensor) per
+        input, or None when any input is not plain raw media; the caller then
+        keeps the previous path untouched. URLs are downloaded here exactly
+        once, and the bytes are reused for the real decode.
+        """
+        if not image_data or any(self._is_preprocessed_input(i) for i in image_data):
+            return None
+        loop = asyncio.get_running_loop()
+        try:
+            snapshots = await asyncio.gather(
+                *(
+                    loop.run_in_executor(self.io_executor, snapshot_media, item)
+                    for item in image_data
+                )
+            )
+        except Exception:
+            # Let the regular loader raise its usual, client-facing error.
+            return None
+        staged = []
+        for snapshot in snapshots:
+            data = snapshot.data
+            if isinstance(data, (bytes, bytearray)):
+                encoded = _probe_encoded_image(bytes(data))
+                if encoded is None:
+                    return None
+                staged.append(encoded)
+            elif isinstance(data, (Image.Image, torch.Tensor)):
+                staged.append(data)
+            else:
+                return None
+        return staged
+
     async def _process_mm_data_uncached(
         self, image_data, input_text, request_obj, **kwargs
     ):
+        """Uncached path; under the "auto" budget, pick the backend first."""
+        video_data = request_obj.video_data
+        staged = (
+            await self._stage_raw_images(list(image_data or []))
+            if self._gpu_preprocess_budget_bytes is not None and not video_data
+            else None
+        )
+        if staged is None:
+            return await self._process_mm_data_uncached_impl(
+                image_data, input_text, request_obj, **kwargs
+            )
+
+        use_gpu, reserved = self._reserve_gpu_preprocess(staged)
+        try:
+            if use_gpu:
+                # The loader decodes raw bytes with nvJPEG as before.
+                image_data = [
+                    i.data if isinstance(i, _K3EncodedImage) else i for i in staged
+                ]
+            else:
+                image_data = await self._decode_images_for_backend(staged, False)
+            return await self._process_mm_data_uncached_impl(
+                image_data, input_text, request_obj, use_gpu=use_gpu, **kwargs
+            )
+        finally:
+            self._release_gpu_preprocess(reserved)
+
+    async def _process_mm_data_uncached_impl(
+        self, image_data, input_text, request_obj, use_gpu=None, **kwargs
+    ):
         """Compatibility path for precomputed inputs and lightweight test stubs."""
+        image_data = list(image_data or [])
+        video_data = list(request_obj.video_data or [])
         expected_image_count = len(image_data or [])
         placeholder_count = self.count_image_placeholders(
             input_text, self.mm_tokens.image_token_id
         )
-        if placeholder_count is not None:
+        if video_data:
+            base_output = await self.fast_load_mm_data(
+                prompt=input_text,
+                image_data=image_data,
+                video_data=video_data,
+                multimodal_tokens=self.mm_tokens,
+                discard_alpha_channel=False,
+                input_ids=input_text if placeholder_count is not None else None,
+            )
+        elif placeholder_count is not None:
             base_output = await self.fast_load_mm_data(
                 prompt=input_text,
                 image_data=image_data,
@@ -683,18 +1651,122 @@ class KimiK3ImageProcessor(
                 multimodal_tokens=self.mm_tokens,
                 discard_alpha_channel=False,
             )
-        if len(base_output.images) != expected_image_count:
+        loaded_images = list(base_output.images or [])
+        loaded_videos = list(base_output.videos or [])
+        if len(loaded_images) != expected_image_count or len(loaded_videos) != len(
+            video_data
+        ):
             raise ValueError(
-                "Kimi image placeholders must map one-to-one to image data: "
-                f"expected {expected_image_count}, loaded {len(base_output.images)}"
+                "Kimi visual placeholders must map one-to-one to source media: "
+                f"expected {expected_image_count} image(s) and {len(video_data)} "
+                f"video(s), loaded {len(loaded_images)} image(s) and "
+                f"{len(loaded_videos)} video(s)"
             )
-        if self._should_defer_gpu_preprocessing(base_output.images):
+
+        # Read by _video_gpu_preprocess_slot below regardless of whether
+        # this request has any video (stays 0 for image-only requests, in
+        # which case that slot is a no-op).
+        total_sampled_frames = 0
+        if video_data:
+            modalities = self._resolve_visual_modalities(
+                request_obj, expected_image_count, len(video_data)
+            )
+            image_iter = iter(loaded_images)
+            video_iter = iter(loaded_videos)
+            visual_items = []
+            for source_index, modality in enumerate(modalities):
+                if modality == "image":
+                    visual_items.append(
+                        _KimiK3VisualItem(
+                            media_type="image",
+                            frames=(next(image_iter),),
+                            source_index=source_index,
+                            in_patch_limit=int(self.media_proc_cfg["in_patch_limit"]),
+                        )
+                    )
+                    continue
+
+                video = next(video_iter)
+                try:
+                    # _split_k3_video decodes pixel frames synchronously
+                    # (video.get_frames_as_tensor/get_frames_at can take
+                    # seconds for a long video) with no internal await --
+                    # running it inline on the event loop thread would
+                    # starve every other coroutine on this worker for that
+                    # whole time, including the health-check endpoint's own
+                    # internal generate call (confirmed in production: a
+                    # sustained batch of concurrent long-video requests made
+                    # /health time out under its 5s HTTP timeout for three
+                    # consecutive 30s-interval probes, which is exactly this
+                    # gate's failure_threshold, and the router's circuit
+                    # breaker took the otherwise-healthy prefill worker out
+                    # of rotation). Reuse the existing IO thread pool (the
+                    # same one video loading already runs on) instead of
+                    # spinning up a dedicated executor.
+                    chunks = await asyncio.get_running_loop().run_in_executor(
+                        self.io_executor,
+                        _split_k3_video,
+                        video,
+                        self.media_proc_cfg,
+                        source_index,
+                    )
+                    total_frames = len(video)
+                    avg_fps = float(getattr(video, "avg_fps", 0) or 0)
+                    sampled_frames = sum(len(item.frames) for item in chunks)
+                    total_sampled_frames += sampled_frames
+                    logger.info(
+                        "Kimi-K3 video request rid=%s source_index=%d "
+                        "duration=%.1fs source_frames=%d avg_fps=%.2f "
+                        "sampled_frames=%d chunks=%d total_sampled_frames=%d",
+                        request_obj.rid,
+                        source_index,
+                        total_frames / avg_fps if avg_fps > 0 else float("nan"),
+                        total_frames,
+                        avg_fps,
+                        sampled_frames,
+                        len(chunks),
+                        total_sampled_frames,
+                    )
+                    max_sampled_frames = envs.SGLANG_K3_VIDEO_MAX_SAMPLED_FRAMES.get()
+                    if 0 < max_sampled_frames < total_sampled_frames:
+                        raise HTTPException(
+                            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                            detail=(
+                                "Kimi-K3 video request rejected: "
+                                f"{source_index + 1} video(s) in this request "
+                                f"sampled {total_sampled_frames} frames total, "
+                                "exceeding this server's "
+                                "SGLANG_K3_VIDEO_MAX_SAMPLED_FRAMES="
+                                f"{max_sampled_frames} safety limit -- this is "
+                                "checked cumulatively across every video in the "
+                                "request, not per video. This backend cannot "
+                                "process this request right now -- retry "
+                                "against a different backend, or send fewer/"
+                                "shorter videos per request."
+                            ),
+                        )
+                    visual_items.extend(chunks)
+                finally:
+                    close = getattr(video, "close", None)
+                    if close is not None:
+                        close()
+
+            # K3 uses the image placeholder id for every MoonViT grid. The T
+            # dimension distinguishes temporal video chunks from still images.
+            base_output.images = visual_items
+            base_output.videos = []
+
+        if use_gpu is not False and self._should_defer_gpu_preprocessing(
+            base_output.images
+        ):
             return self._build_deferred_output(base_output)
-        mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
-            base_output,
-            self.mm_tokens,
-            sglang_original_input_ids=base_output.input_ids,
-        )
+        async with self._video_gpu_preprocess_slot(total_sampled_frames):
+            mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
+                base_output,
+                self.mm_tokens,
+                sglang_original_input_ids=base_output.input_ids,
+                sglang_use_gpu=use_gpu,
+            )
         if self.keep_mm_features_on_device:
             for item in mm_items:
                 item.model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY] = (
@@ -714,24 +1786,45 @@ class KimiK3ImageProcessor(
         *args,
         **kwargs,
     ):
-        if request_obj.video_data or kwargs.get("audio_data"):
-            raise ValueError("Kimi-K3 supports image input only")
+        audio_data = kwargs.get("audio_data") or request_obj.audio_data
+        if audio_data:
+            raise ValueError(
+                "Kimi-K3 supports image and video input (without audio track) only"
+            )
 
+        image_data = list(image_data or [])
+        video_data = list(request_obj.video_data or [])
         expected_image_count = len(image_data or [])
+        expected_media_count = expected_image_count + len(video_data)
         placeholder_count = self.count_image_placeholders(
             input_text, self.mm_tokens.image_token_id
         )
         if placeholder_count is not None:
-            if placeholder_count != expected_image_count:
+            if placeholder_count != expected_media_count:
                 raise ValueError(
-                    "Kimi image placeholders must map one-to-one to image data: "
-                    f"expected {expected_image_count}, found {placeholder_count} token(s)"
+                    "Kimi visual placeholders must map one-to-one to source media: "
+                    f"expected {expected_media_count}, found {placeholder_count} "
+                    "token(s)"
                 )
+        elif video_data:
+            placeholder_count = input_text.count(self.mm_tokens.image_token)
+            if placeholder_count != expected_media_count:
+                raise ValueError(
+                    "Kimi visual placeholders must map one-to-one to source media: "
+                    f"expected {expected_media_count}, found {placeholder_count}."
+                )
+
+        if video_data:
+            self._resolve_visual_modalities(
+                request_obj, expected_image_count, len(video_data)
+            )
         if (
-            any(self._is_preprocessed_input(item) for item in image_data)
+            video_data
+            or any(self._is_preprocessed_input(item) for item in image_data)
             or not self.mm_preprocess_cache.enabled
         ):
-            # 1. keep preprocessed inputs and cache-off requests on the legacy path
+            # 1. keep video, preprocessed inputs, and cache-off requests on the
+            # uncached path. Image artifacts remain image-only.
             return await self._process_mm_data_uncached(
                 image_data, input_text, request_obj, **kwargs
             )

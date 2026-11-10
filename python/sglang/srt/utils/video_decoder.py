@@ -1,7 +1,9 @@
 """Unified video decoder: torchcodec preferred, decord as fallback."""
 
+import json
 import logging
 import os
+from typing import Optional
 
 import numpy as np
 
@@ -59,21 +61,45 @@ class VideoDecoderWrapper:
         self._source_bytes = source if isinstance(source, bytes) else None
         self._source_path = source if isinstance(source, str) else None
         self._tmp_path = None
-        if _BACKEND == "torchcodec":
+        self._backend = _BACKEND
+        if self._backend == "torchcodec":
             kwargs = {"dimension_order": "NHWC"}
             if device == "cuda" and _try_cuda_backend():
                 kwargs["device"] = "cuda"
             self._tc_kwargs = kwargs
             try:
-                self._decoder = VideoDecoder(source, **kwargs)
-            except RuntimeError:
-                if "device" in kwargs:
-                    logger.warning("CUDA video decoding failed, falling back to CPU.")
-                    kwargs.pop("device")
-                    self._tc_kwargs = kwargs
+                try:
                     self._decoder = VideoDecoder(source, **kwargs)
-                else:
+                except RuntimeError:
+                    if "device" in kwargs:
+                        logger.warning(
+                            "CUDA video decoding failed, falling back to CPU."
+                        )
+                        kwargs.pop("device")
+                        self._tc_kwargs = kwargs
+                        self._decoder = VideoDecoder(source, **kwargs)
+                    else:
+                        raise
+            except json.JSONDecodeError as error:
+                from sglang.srt.utils.video_metadata_fallback import (
+                    SequentialVideoDecoder,
+                    is_nonfinite_fps_json_error,
+                )
+
+                if not is_nonfinite_fps_json_error(error):
                     raise
+                self._decoder = SequentialVideoDecoder(source)
+                self._backend = "pyav"
+                logger.warning(
+                    "Video metadata fallback: non-finite TorchCodec FPS; "
+                    "using bounded sequential PyAV decode "
+                    "(frames=%d, sampling_fps=%s, size=%dx%d). "
+                    "Original timing is not repaired.",
+                    len(self._decoder),
+                    self._decoder.avg_fps,
+                    self._decoder.width,
+                    self._decoder.height,
+                )
         else:
             from decord import VideoReader, cpu
 
@@ -95,61 +121,83 @@ class VideoDecoderWrapper:
 
     def __getitem__(self, idx):
         """Return one NHWC uint8 frame (numpy on CPU, tensor on CUDA)."""
-        if _BACKEND == "torchcodec":
+        if self._backend == "torchcodec":
             frame = self._decoder[idx]
             data = frame.data if hasattr(frame, "data") else frame
             return data if data.is_cuda else data.numpy()
+        elif self._backend == "pyav":
+            return self._decoder[idx]
         else:
             frame = self._decoder[idx]
             return frame.asnumpy() if hasattr(frame, "asnumpy") else np.array(frame)
 
     @property
     def avg_fps(self) -> float:
-        if _BACKEND == "torchcodec":
+        if self._backend == "torchcodec":
             return self._decoder.metadata.average_fps
+        elif self._backend == "pyav":
+            return self._decoder.avg_fps
         else:
             return self._decoder.get_avg_fps()
 
     @property
     def frame_shape(self) -> tuple[int, int]:
-        if _BACKEND == "torchcodec":
+        if self._backend == "torchcodec":
             metadata = self._decoder.metadata
             height = getattr(metadata, "height", None)
             width = getattr(metadata, "width", None)
             if height and width:
                 return int(height), int(width)
+        elif self._backend == "pyav":
+            return int(self._decoder.height), int(self._decoder.width)
         shape = self[0].shape
         return int(shape[-3]), int(shape[-2])
 
     def get_frames_at(self, indices: list):
         """Return NHWC uint8 frames (numpy on CPU, tensor on CUDA)."""
-        if _BACKEND == "torchcodec":
+        if self._backend == "torchcodec":
             batch = self._decoder.get_frames_at(indices)
             return batch.data if batch.data.is_cuda else batch.data.numpy()
+        elif self._backend == "pyav":
+            return self._decoder.get_frames_at(indices)
         else:
             return self._decoder.get_batch(indices).asnumpy()
 
-    def get_frames_as_tensor(self, indices: list):
-        """Return frames at given indices as a torch tensor (NHWC, uint8, pinned memory)."""
+    def get_frames_as_tensor(self, indices: list, num_threads: Optional[int] = None):
+        """Return frames at given indices as a torch tensor (NHWC, uint8, pinned memory).
+
+        num_threads overrides the instance's num_decode_threads for this call
+        only. Pass 1 when the caller is *itself* already running one decode per
+        thread on its own pool: this decoder's inner pool would then multiply
+        against that outer concurrency (outer_workers x inner_threads decoders
+        alive at once, each with its own ffmpeg threads and each entering
+        OpenMP regions during colour conversion), which is how a decode fleet
+        exhausts the process/thread limit. None keeps the instance's setting.
+        """
         import torch
 
+        effective_threads = (
+            self._num_decode_threads if num_threads is None else num_threads
+        )
         if (
-            _BACKEND == "torchcodec"
-            and self._num_decode_threads != 1
+            self._backend == "torchcodec"
+            and effective_threads != 1
             and len(indices) > 1
         ):
-            num_threads = self._num_decode_threads
-            if num_threads <= 0:
-                num_threads = min(os.cpu_count() or 8, 16)
-            num_threads = min(num_threads, len(indices))
-            if num_threads > 1:
-                return self._parallel_decode(indices, num_threads)
+            resolved_threads = effective_threads
+            if resolved_threads <= 0:
+                resolved_threads = min(os.cpu_count() or 8, 16)
+            resolved_threads = min(resolved_threads, len(indices))
+            if resolved_threads > 1:
+                return self._parallel_decode(indices, resolved_threads)
 
-        if _BACKEND == "torchcodec":
+        if self._backend == "torchcodec":
             batch = self._decoder.get_frames_at(indices)
             if _is_cpu_engine():
                 return batch.data
             return batch.data if batch.data.is_cuda else batch.data.pin_memory()
+        elif self._backend == "pyav":
+            return torch.from_numpy(self._decoder.get_frames_at(indices)).pin_memory()
         else:
             arr = self._decoder.get_batch(indices).asnumpy()
             output = torch.from_numpy(arr)
@@ -204,6 +252,10 @@ class VideoDecoderWrapper:
         return None
 
     def close(self):
+        if getattr(self, "_backend", None) == "pyav" and getattr(
+            self, "_decoder", None
+        ) is not None:
+            self._decoder.close()
         self._decoder = None
         self._source = None
         self._source_bytes = None

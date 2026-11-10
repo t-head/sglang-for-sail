@@ -376,6 +376,9 @@ class Envs:
     # (queueing excluded) takes at least this many ms; either delays the next
     # token of every stream on that worker. <= 0 disables.
     SGLANG_LOG_SLOW_PREPROCESSING_MS = EnvInt(200)
+    # WARNING (with the blocking call's stack) when a tokenizer worker's event
+    # loop stops running callbacks for at least this many ms. <= 0 disables.
+    SGLANG_LOG_EVENT_LOOP_LAG_MS = EnvInt(0)
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
     # Request-log fields (any nesting depth) logged as their length plus a hash
     # at --log-requests-level 1 and 2: grammar constraints such as a tool-call
@@ -1613,6 +1616,10 @@ class Envs:
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
     # Currently supported by the Kimi-K2.5 image processor only.
     SGLANG_FORCE_CPU_IMAGE_PREPROCESSING = EnvBool(False)
+    # PD decode only: drop multimodal feature tensors in the tokenizer before
+    # dispatch. Decode gets prompt KV from prefill and never runs the encoder,
+    # so it only needs item metadata (offsets, hash/pad_value, grid info).
+    SGLANG_DISAGG_DECODE_DROP_MM_FEATURES = EnvBool(False)
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
@@ -2041,6 +2048,137 @@ class Envs:
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
+    # Hard cap on sampled frames for a Kimi-K3 request's video_url content, as
+    # a safety net independent of the checkpoint's own sample_fps /
+    # max_num_frames_each_video preprocessor config: summed across every
+    # video in the request (NOT checked per-video -- two videos each under
+    # the cap can still add up over it, which is exactly the shape of a real
+    # incident this was missed on the first pass), a request that would
+    # sample more than this many frames total is rejected with 503 (Service
+    # Unavailable) before any GPU preprocessing, instead of risking an OOM
+    # deep in the model forward pass on an oversized prefill batch. 503 (not
+    # 400) so a router/gateway sees this as "this backend can't take it
+    # right now" and can retry elsewhere, rather than a client-side error.
+    # Set to 0 (or any value <= 0) to disable the cap.
+    SGLANG_K3_VIDEO_MAX_SAMPLED_FRAMES = EnvInt(256)
+    # Global cap on total sampled frames across all Kimi-K3 video requests
+    # currently in GPU preprocessing (bicubic resize -> patchify -> concat)
+    # on this worker, at the same time. SGLANG_K3_VIDEO_MAX_SAMPLED_FRAMES
+    # bounds one request's own preprocessing cost, but nothing else bounds
+    # how many of those per-request peaks land on the GPU simultaneously --
+    # two or more requests that are each individually within budget can
+    # still add up past available memory (the same shape of gap that
+    # motivated checking SGLANG_K3_VIDEO_MAX_SAMPLED_FRAMES cumulatively
+    # across videos within one request, just one level up: across
+    # concurrent requests on the same worker). This is a byte-count-free
+    # proxy for GPU memory pressure -- weighted by sampled frame count
+    # rather than by request count, so a request queues for exactly as
+    # long as its own frame weight needs the other requests to finish, not
+    # a fixed number of concurrency "slots". Excess requests block until
+    # enough frame budget frees up; this never rejects a request that
+    # already passed SGLANG_K3_VIDEO_MAX_SAMPLED_FRAMES on its own. Set to
+    # 0 (or any value <= 0) to disable (unbounded concurrency).
+    SGLANG_K3_VIDEO_MAX_INFLIGHT_FRAMES = EnvInt(256)
+    # Cap on how many Kimi-K3 video requests may be queued at once waiting
+    # for SGLANG_K3_VIDEO_MAX_INFLIGHT_FRAMES's GPU-preprocess frame budget
+    # to free up, on this worker. The current queue depth (requests waiting
+    # at this gate, not counting the ones already admitted) is logged at
+    # INFO level on every video request that reaches the gate. Frame
+    # decoding itself (the CPU/IO-thread-pool step that runs before this
+    # gate) is not bounded by this cap -- a request that arrives once the
+    # queue is already at this depth has already paid its own decode cost
+    # by the time it gets here, but rejecting it with 400 (Bad Request)
+    # before it joins the wait queue stops that queue, and the decoded
+    # frame tensors already resident in host memory behind it, from growing
+    # without bound under a sustained burst of video requests. Set to 0 (or
+    # any value <= 0) to disable (unbounded queueing, the previous
+    # behavior).
+    SGLANG_K3_VIDEO_MAX_QUEUE_DEPTH = EnvInt(8)
+    # When true, log Kimi-K3 video GPU-preprocessing slot acquire/release
+    # events (current in-flight count) at INFO level, on top of the
+    # always-on per-request duration/frame-count/token-count logs. Off by
+    # default because slot events fire far more often than one line per
+    # video; turn on to confirm the concurrency cap above is actually taking
+    # effect under real traffic.
+    SGLANG_K3_VIDEO_DEBUG_LOG = EnvBool(False)
+    # Override individual keys of the checkpoint-provided video media_proc_cfg
+    # (sample_fps / max_num_frames_each_video / in_patch_limit_video) without
+    # locating or editing the checkpoint's own trust_remote_code processor
+    # file -- media_proc_cfg ships entirely from that checkpoint-side code,
+    # not from sglang or any file sglang controls, so there is normally no
+    # way to tune it short of finding and editing that file. Unset (None)
+    # leaves the checkpoint's own value alone; each is applied independently.
+    SGLANG_K3_VIDEO_SAMPLE_FPS = EnvFloat(None)
+    SGLANG_K3_VIDEO_MAX_NUM_FRAMES = EnvInt(None)
+    SGLANG_K3_VIDEO_IN_PATCH_LIMIT = EnvInt(None)
+    # Threads VideoDecoderWrapper may use *within* one Kimi-K3 video's frame
+    # decode. Defaults to 1 because _split_k3_video already runs one video per
+    # thread on the shared multimodal IO pool (mm_io_worker_num, 16 by
+    # default), so the decoder's own inner pool multiplies against that:
+    # io_workers x inner_threads live VideoDecoder instances, each with its own
+    # ffmpeg threads, and each entering an OpenMP region per colour-conversion
+    # copy. libgomp aborts the *process* when pthread_create returns EAGAIN
+    # (gomp_fatal -> exit() off the main thread, while other threads still hold
+    # torch/CUDA state -> SIGSEGV), so the product has to stay bounded. Inner
+    # parallelism only helps when the outer pool is idle -- a single video in
+    # flight -- and that is exactly the case that was never the bottleneck.
+    # Raise it (or 0 for min(cpu_count, 16)) only alongside a lowered
+    # --mm-io-worker-num and a pinned OMP_NUM_THREADS.
+    SGLANG_K3_VIDEO_DECODE_THREADS = EnvInt(1)
+    # Where Kimi-K3 *image* preprocessing (bicubic resize -> transparent-bg
+    # composite -> normalize+patchify) runs. Video is unaffected: it has no
+    # CPU preprocessing path and always uses the GPU.
+    #   "auto" - pick per request. A request goes to the GPU path (eager in
+    #            the tokenizer process, or deferred to the vision-DP owner
+    #            rank when `_should_defer_gpu_preprocessing` says so) only if
+    #            its estimated GPU preprocessing peak fits in
+    #            SGLANG_K3_IMAGE_PREPROCESS_GPU_BUDGET_MB together with every
+    #            request already preprocessing on the GPU; otherwise it takes
+    #            the "cpu" path below. With the budget disabled this is the
+    #            previous unconditional GPU behavior.
+    #   "cpu"  - run the checkpoint's own HF processor on the CPU, and decode
+    #            JPEG with PIL instead of nvJPEG. No image preprocessing
+    #            allocates on any GPU, which removes the tokenizer-process
+    #            allocation behind request-level "CUDA out of memory" on
+    #            large multi-image requests. Costs host CPU and raises TTFT;
+    #            numerically this is the checkpoint's exact reference path,
+    #            not an approximation of it (the GPU bicubic resize tracks
+    #            PIL to ~5e-3, and nvJPEG needs fancy_upsampling to match
+    #            PIL's chroma upsampling at all).
+    #   "gpu"  - always preprocess eagerly on the GPU in the tokenizer
+    #            process, never defer. Only useful as an A/B baseline against
+    #            "cpu"; this is the configuration that OOMs.
+    # Changing this changes `gpu_image_decode`, which is part of the
+    # preprocess-artifact fingerprint, so cached artifacts from another mode
+    # are never reused across a restart.
+    SGLANG_K3_IMAGE_PREPROCESS_MODE = EnvStr("auto")
+    # GPU memory budget, in MiB, that "auto" mode lets image preprocessing use
+    # on the tokenizer's GPU at one time, summed over every request currently
+    # preprocessing there (concurrent processor workers each hold one). A
+    # request whose estimate does not fit next to the ones in flight is
+    # preprocessed on the CPU instead; nothing waits. The estimate comes from
+    # image headers, before decode, because nvJPEG decode itself lands on the
+    # GPU. Split evenly across --tokenizer-worker-num, which all share one GPU.
+    # The default leaves room under the ~10 GiB a B300 prefill rank has free
+    # beside the scheduler at --mem-fraction-static 0.85: 10x 8192x8192 (est.
+    # ~8 GiB) did not OOM there, 40x 8192x8192 did. Each decision is logged
+    # with its estimate when SGLANG_K3_IMAGE_PREPROCESS_LOG is on, which is
+    # the data to tune this from. Set to 0 (or any value <= 0) to disable,
+    # restoring the previous always-GPU "auto".
+    SGLANG_K3_IMAGE_PREPROCESS_GPU_BUDGET_MB = EnvInt(6144)
+    # Safety net under the budget above, for when the estimate is wrong: if
+    # Kimi-K3 *image* preprocessing on the tokenizer's GPU raises CUDA OOM,
+    # release the cached allocations and redo that request on the CPU instead
+    # of failing it with 500. Logged at WARNING every time it fires -- each one
+    # means the budget is set too high. Video still raises (no CPU path). Off
+    # only to reproduce the raw OOM, e.g. as the mode=gpu A/B baseline.
+    SGLANG_K3_IMAGE_PREPROCESS_OOM_FALLBACK = EnvBool(True)
+    # Log one line per processor call naming the backend that actually ran
+    # (plus image count and resolved visual-token total), to confirm the mode
+    # above is taking effect under real traffic. One line per call is roughly
+    # one line per request, matching the always-on video logs; turn it off to
+    # silence it entirely.
+    SGLANG_K3_IMAGE_PREPROCESS_LOG = EnvBool(True)
 
     # ===================================================================
     # Symmetric memory
