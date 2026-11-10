@@ -124,6 +124,18 @@ class OpenAIServingBase(ABC):
                 # Only set timing fields if adapted_request supports them
                 adapted_request.received_time = received_time
 
+            if (
+                raw_request is not None
+                and isinstance(adapted_request, GenerateReqInput)
+                and adapted_request.cache_ttl_seconds is not None
+                and isinstance(adapted_request.cache_user_id, str)
+                and adapted_request.cache_user_id.strip()
+            ):
+                # API conversion may run in a child process. Publish its user
+                # identity on the parent's trusted request state so the manager
+                # can distinguish it from fields in a raw /generate body.
+                raw_request.state.cache_identity = adapted_request.cache_user_id
+
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:
                 return await self._handle_streaming_request(

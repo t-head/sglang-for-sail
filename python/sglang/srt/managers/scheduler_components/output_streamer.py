@@ -347,6 +347,7 @@ class _GenerationStreamAccumulator:
     reasoning_tokens: list = field(default_factory=list)
     completion_tokens: list = field(default_factory=list)
     cached_tokens: list = field(default_factory=list)
+    cache_input_metadata: list = field(default_factory=list)
     cached_tokens_details: list = field(
         default_factory=list
     )  # Detailed breakdown by cache source
@@ -476,6 +477,23 @@ class _GenerationStreamAccumulator:
         # reasoning usage only within the same prefix as completion usage.
         self.reasoning_tokens.append(min(req.reasoning_tokens, len(output_ids_)))
         self.cached_tokens.append(req.cached_tokens)
+        cache_input_metadata = None
+        finish_reason = self.finished_reasons[-1]
+        if (
+            not self.rust_server_mode
+            and len(output_ids_) > 0
+            and (
+                finish_reason is None
+                or finish_reason.get("type") not in ("abort", "error")
+            )
+            and not getattr(req, "cache_input_metadata_sent", False)
+        ):
+            cache_input_metadata = getattr(req, "cache_input_metadata", None)
+            if cache_input_metadata is not None:
+                req.cache_input_metadata_sent = True
+                # The admitted payload owns this one-time snapshot until sent.
+                req.cache_input_metadata = None
+        self.cache_input_metadata.append(cache_input_metadata)
         # Index-aligned with the batch items so mixed batches resolve per-item
         # on the tokenizer side; None for non-beam items and aborted groups.
         beam_output = (
@@ -729,6 +747,11 @@ class _GenerationStreamAccumulator:
             reasoning_tokens=self.reasoning_tokens,
             completion_tokens=self.completion_tokens,
             cached_tokens=self.cached_tokens,
+            cache_input_metadata=(
+                self.cache_input_metadata
+                if any(item is not None for item in self.cache_input_metadata)
+                else None
+            ),
             cached_tokens_details=self.cached_tokens_details,
             image_tokens=self.image_tokens,
             audio_tokens=self.audio_tokens,

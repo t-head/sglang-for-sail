@@ -28,6 +28,20 @@ use tokio_util::sync::CancellationToken;
 /// back. Arbitrary value; it holds the useful prefix of every observed case.
 const MAX_UPSTREAM_ERROR_BODY_BYTES: usize = 2048;
 
+/// Preserve the worker's cache accounting without exposing other upstream headers.
+fn cache_write_response_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut forwarded = HeaderMap::new();
+    for name in [
+        "msh-usage-cache-write-tokens-5m",
+        "msh-usage-cache-write-tokens-1h",
+    ] {
+        if let Some(value) = headers.get(name) {
+            forwarded.insert(HeaderName::from_static(name), value.clone());
+        }
+    }
+    forwarded
+}
+
 /// Truncate an upstream error body to [`MAX_UPSTREAM_ERROR_BODY_BYTES`].
 ///
 /// The result is deliberately not valid JSON when it truncates: the marker
@@ -271,6 +285,11 @@ impl Proxy {
             Self::classify_reqwest_error_for(worker_url.clone(), e, path)
         })?;
         let status = resp.status();
+        let cache_headers = if status.is_success() {
+            cache_write_response_headers(resp.headers())
+        } else {
+            HeaderMap::new()
+        };
         // Defer breaker recording until after the body completes — a
         // worker that returns 2xx headers and then drops mid-body is
         // still failing the request, and crediting it as healthy lets
@@ -319,6 +338,7 @@ impl Proxy {
             HeaderName::from_static("content-type"),
             HeaderValue::from_static("application/json"),
         );
+        out.headers_mut().extend(cache_headers);
         Ok(out)
     }
 
@@ -448,6 +468,7 @@ impl Proxy {
             );
             return Ok(out);
         }
+        let cache_headers = cache_write_response_headers(resp.headers());
         // Breaker recording is deferred to the pump's completion hook so
         // an upstream that returns 2xx headers and then drops mid-stream
         // is recorded as a failure.
@@ -487,6 +508,7 @@ impl Proxy {
             HeaderValue::from_str(&content_type)
                 .unwrap_or_else(|_| HeaderValue::from_static("application/json")),
         );
+        out.headers_mut().extend(cache_headers);
         Ok(out)
     }
 }

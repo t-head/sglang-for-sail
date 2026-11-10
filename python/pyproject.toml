@@ -159,6 +159,10 @@ http2 = [
   "granian>=2.6.0",
 ]
 
+cache-accounting = [
+  "redis>=6.4",
+]
+
 fastokens = [
   "fastokens>=0.3.2",
 ]

@@ -61,6 +61,17 @@ from sglang.srt.beam_search.output import (
     build_beam_search_out,
     try_build_beam_search_out_dict,
 )
+from sglang.srt.cache_accounting import (
+    CACHE_BLOCK_SIZE,
+    CacheAccountingError,
+    CacheMediaSpan,
+    CacheUsage,
+    PageCachePlan,
+    RedisPageCacheStore,
+    build_page_cache_plan,
+)
+from sglang.srt.cache_accounting.metrics import CacheAccountingMetrics
+from sglang.srt.cache_accounting.multimodal import prepare_media_digests
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
@@ -281,6 +292,15 @@ class ReqState:
 
     # For performance metrics
     time_stats: APIServerReqTimeStats
+    cache_plan: Optional[PageCachePlan] = None
+    # MM plans need the Scheduler's final expansion, not tokenizer placeholders.
+    cache_plan_context: Optional[tuple[str, str, int]] = None
+    cache_physical_ttl_seconds: Optional[int] = None
+    cache_metrics_parent: Optional[ReqState] = None
+    cache_task: Optional[asyncio.Task] = None
+    cache_usage: Optional[CacheUsage] = None
+    cache_finished_event: Optional[asyncio.Event] = None
+    cache_renewal_task: Optional[asyncio.Task] = None
     last_completion_tokens: int = 1
     ttft_observed: bool = False
 
@@ -561,6 +581,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Init running status
         self.init_running_status()
+        self._init_cache_accounting()
 
         # Init logging and dumping
         self.init_request_logging_and_dumping()
@@ -1071,12 +1092,465 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "top_logprobs_num must contain one value per input in a batch."
                 )
 
+    def _init_cache_accounting(self) -> None:
+        cfg = get_serving()
+        role = get_disagg().disaggregation_mode
+        self._cache_store = None
+        self._cache_metrics = None
+        self._cache_tasks: set[asyncio.Task] = set()
+        self._cache_renewal_tasks: dict[asyncio.Task, asyncio.Event] = {}
+        self._cache_accounting_closing = False
+        if not cfg.enable_cache_accounting:
+            return
+        if role == "prefill":
+            action = "skip_prefill"
+        else:
+            if self.enable_metrics:
+                self._cache_metrics = CacheAccountingMetrics(
+                    role="standalone" if role == "null" else role
+                )
+            self._cache_store = RedisPageCacheStore(
+                cfg.cache_redis_url,
+                timeout_seconds=cfg.cache_timeout,
+                username=os.environ.get("SGLANG_CACHE_REDIS_USERNAME"),
+                password=os.environ.get("SGLANG_CACHE_REDIS_PASSWORD"),
+                metrics=self._cache_metrics,
+                cluster=getattr(cfg, "cache_redis_cluster", False),
+            )
+            action = "account"
+        logger.info(
+            "Cache accounting startup enabled=%s role=%s action=%s block_size=%d "
+            "metrics_enabled=%s redis_mode=%s",
+            cfg.enable_cache_accounting,
+            "standalone" if role == "null" else role,
+            action,
+            CACHE_BLOCK_SIZE,
+            self._cache_metrics is not None,
+            "cluster" if getattr(cfg, "cache_redis_cluster", False) else "standalone",
+        )
+
+    def _validate_cache_request(self, obj: GenerateReqInput) -> None:
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            obj.cache_ttl_seconds = None
+            obj.cache_user_id = None
+            return
+        if obj.cache_ttl_seconds is None:
+            return
+        if not get_serving().enable_cache_accounting:
+            raise ValueError("Cache accounting is not enabled on this server")
+        if obj.cache_ttl_seconds not in (300, 3600):
+            raise ValueError("cache_ttl_seconds must be 300 or 3600")
+        if obj.cache_mode not in ("implicit", "explicit"):
+            raise ValueError("cache_mode must be implicit or explicit")
+        if not isinstance(obj.cache_user_id, str) or not obj.cache_user_id.strip():
+            # Requests without an identity use physical cache usage and never
+            # access Redis, including shapes unsupported by the Redis plan.
+            obj.cache_user_id = None
+            return
+        params = obj.sampling_params or {}
+        if isinstance(params, dict):
+            params = {
+                **(getattr(self, "preferred_sampling_params", None) or {}),
+                **params,
+            }
+        if (
+            not isinstance(params, dict)
+            or params.get("n", 1) != 1
+            or (params.get("beam_width") or 1) != 1
+            or params.get("use_beam_search", False)
+            or params.get("max_new_tokens") == 0
+            or isinstance(obj.text, list)
+            or (obj.input_ids and isinstance(obj.input_ids[0], list))
+            or obj.input_embeds is not None
+            or obj.session_params is not None
+            or obj.positional_embed_overrides is not None
+            or obj.lora_path is not None
+            or obj.lora_id is not None
+            or not self.is_generation
+        ):
+            if not obj.cache_required:
+                # Optional accounting: serve the request without cache usage
+                # instead of rejecting shapes the accountant cannot price.
+                logger.debug(
+                    "Cache accounting skipped rid=%s role=%s reason=unsupported_request",
+                    obj.rid,
+                    self.disaggregation_mode.value,
+                )
+                obj.cache_ttl_seconds = None
+                obj.cache_user_id = None
+                return
+            raise ValueError(
+                "Cache accounting currently supports a single "
+                "generation without sessions, adapters, embeddings, or beam search"
+            )
+
+    async def _prepare_cache_plan(
+        self, obj: GenerateReqInput, input_ids: Optional[List[int]]
+    ) -> None:
+        if obj.cache_ttl_seconds is None:
+            return
+        self._validate_cache_request(obj)
+        if obj.cache_ttl_seconds is None:
+            return
+        if obj.cache_user_id is None:
+            self.rid_to_state[
+                obj.rid
+            ].cache_physical_ttl_seconds = obj.cache_ttl_seconds
+            return
+        cfg = get_serving()
+        # Accounting uses 256-token blocks independently of GPU KV page size.
+        # Keep all namespace inputs fixed before Scheduler dispatch.
+        namespace = json.dumps(
+            {
+                "deployment": cfg.cache_namespace,
+                "model": self.model_path,
+                "weights": self.config_value("weight_version"),
+                "tokenizer": cfg.tokenizer_path,
+                "tokenizer_template": getattr(self.tokenizer, "chat_template", None),
+                "chat_template": cfg.chat_template,
+                "hf_chat_template_name": cfg.hf_chat_template_name,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if obj.contains_mm_input():
+            self.rid_to_state[obj.rid].cache_plan_context = (
+                obj.cache_user_id,
+                namespace,
+                obj.cache_ttl_seconds,
+            )
+            return
+        if input_ids is None:
+            raise ValueError("Cache accounting requires final input token IDs")
+        state = self.rid_to_state[obj.rid]
+        # Long text hashing must not run inline on the tokenizer event loop.
+        # Resolve config above and publish the completed plan on this thread.
+        plan = await asyncio.to_thread(
+            build_page_cache_plan,
+            input_ids=input_ids,
+            cache_user_id=obj.cache_user_id,
+            namespace=namespace,
+            page_size=CACHE_BLOCK_SIZE,
+            ttl_seconds=obj.cache_ttl_seconds,
+            mode=obj.cache_mode,
+        )
+        state.cache_plan = plan
+
+    def _start_cache_accounting(
+        self,
+        state: ReqState,
+        prompt_tokens: int,
+        completion_tokens: int,
+        finish_reason: Any,
+        cached_tokens: int = 0,
+        cache_input_metadata: Optional[dict] = None,
+    ) -> None:
+        if getattr(self, "_cache_accounting_closing", False):
+            return
+        plan = state.cache_plan
+        context = getattr(state, "cache_plan_context", None)
+        physical_ttl = getattr(state, "cache_physical_ttl_seconds", None)
+        physical_finished_without_output = (
+            plan is None
+            and physical_ttl is not None
+            and completion_tokens == 0
+            and isinstance(finish_reason, dict)
+            and finish_reason.get("type") in ("stop", "length")
+        )
+        if (
+            (plan is None and context is None and physical_ttl is None)
+            or state.cache_task is not None
+            or (completion_tokens <= 0 and not physical_finished_without_output)
+            or (
+                isinstance(finish_reason, dict)
+                and finish_reason.get("type") in ("abort", "error")
+            )
+        ):
+            return
+
+        rid = state.obj.rid
+        role = (
+            "standalone"
+            if self.disaggregation_mode == DisaggregationMode.NULL
+            else self.disaggregation_mode.value
+        )
+        ttl_seconds = (
+            plan.ttl_seconds
+            if plan is not None
+            else context[2]
+            if context is not None
+            else physical_ttl
+        )
+        block_size = plan.page_size if plan is not None else CACHE_BLOCK_SIZE
+        metrics_parent = getattr(state, "cache_metrics_parent", None)
+        finished_event = asyncio.Event()
+        state.cache_finished_event = finished_event
+
+        async def account_once():
+            nonlocal cache_input_metadata
+            started = time.perf_counter()
+            active_plan = plan
+            media_unavailable = False
+            if context is not None:
+                try:
+                    if not isinstance(cache_input_metadata, dict):
+                        raise ValueError("Missing final multimodal input metadata")
+                    spans = [
+                        CacheMediaSpan(*span)
+                        for span in cache_input_metadata["media_spans"]
+                    ]
+                    if not spans:
+                        raise ValueError("Missing multimodal content identities")
+                    active_plan = await asyncio.to_thread(
+                        build_page_cache_plan,
+                        input_ids=cache_input_metadata["input_ids"],
+                        cache_user_id=context[0],
+                        namespace=context[1],
+                        page_size=CACHE_BLOCK_SIZE,
+                        ttl_seconds=ttl_seconds,
+                        media_spans=spans,
+                        mode=getattr(state.obj, "cache_mode", "implicit"),
+                    )
+                    if active_plan.prompt_tokens != prompt_tokens:
+                        raise ValueError("Final multimodal input length differs")
+                    state.cache_plan = active_plan
+                except (ValueError, TypeError, KeyError, OverflowError) as exc:
+                    active_plan = None
+                    media_unavailable = True
+                    logger.warning(
+                        "Cache accounting multimodal fallback rid=%s role=%s ttl=%d "
+                        "reason=invalid_input_metadata error_type=%s",
+                        rid,
+                        role,
+                        ttl_seconds,
+                        type(exc).__name__,
+                    )
+                finally:
+                    # The expanded input crosses IPC only once; retain just keys.
+                    cache_input_metadata = None
+                    state.cache_plan_context = None
+            if active_plan is None:
+                usage = CacheUsage(
+                    ttl_seconds=ttl_seconds,
+                    read_tokens=max(0, min(prompt_tokens, cached_tokens)),
+                )
+                source = (
+                    "multimodal_unavailable"
+                    if media_unavailable
+                    else "missing_identity"
+                )
+            else:
+                if prompt_tokens != active_plan.prompt_tokens:
+                    raise CacheAccountingError(
+                        "Cache prompt-token count differs from final input IDs"
+                    )
+                source = "redis" if active_plan.page_keys else "no_complete_block"
+                # A terminal-only output can finish before this task runs. In
+                # that case the initial EVAL already sets the TTL after finish.
+                finished_before_account = finished_event.is_set()
+                try:
+                    usage = await self._cache_store.account(active_plan, rid=rid)
+                except CacheAccountingError as exc:
+                    # Freeze the engine's actual prefix hit from this output. A
+                    # failed Redis operation cannot confirm any cache creation.
+                    usage = CacheUsage(
+                        ttl_seconds=ttl_seconds,
+                        read_tokens=max(0, min(prompt_tokens, cached_tokens)),
+                    )
+                    source = "physical"
+                    logger.warning(
+                        "Cache accounting Redis fallback rid=%s role=%s ttl=%d "
+                        "error_type=%s",
+                        rid,
+                        role,
+                        ttl_seconds,
+                        type(
+                            exc.__cause__ if exc.__cause__ is not None else exc
+                        ).__name__,
+                    )
+                if source == "redis" and not finished_before_account:
+                    # A hit inherits the first writer's TTL. Renew that confirmed
+                    # generation rather than the requesting caller's preference.
+                    renewal_plan = dataclasses.replace(
+                        active_plan, ttl_seconds=usage.ttl_seconds
+                    )
+                    if active_plan.mode == "explicit":
+                        renewal_plan = dataclasses.replace(
+                            renewal_plan,
+                            page_keys=active_plan.page_keys[
+                                : usage.read_tokens // active_plan.page_size
+                            ],
+                            prompt_tokens=usage.read_tokens,
+                        )
+                    self._start_cache_renewal(
+                        state, renewal_plan, generation=usage.generation
+                    )
+            observe_usage = metrics_parent is None or metrics_parent.cache_usage is None
+            if metrics_parent is not None and metrics_parent.cache_usage is None:
+                # Parallel samples share one input; the first successful sample
+                # owns its metric observation while each sample keeps its usage.
+                metrics_parent.cache_usage = usage
+            if self._cache_metrics is not None and observe_usage:
+                self._cache_metrics.observe_usage(usage.ttl_seconds, usage, source)
+            logger.info(
+                "Cache accounting complete rid=%s role=%s ttl=%d block_size=%d "
+                "prompt=%d read=%d write=%d source=%s "
+                "elapsed_ms=%.3f",
+                rid,
+                role,
+                usage.ttl_seconds,
+                block_size,
+                prompt_tokens,
+                usage.read_tokens,
+                usage.write_tokens,
+                source,
+                (time.perf_counter() - started) * 1000,
+            )
+            return usage
+
+        task = asyncio.create_task(account_once())
+        state.cache_task = task
+        # Do not await Redis in the shared batch-output receiver. Each response
+        # waits for its own decision before exposing any usage to its client.
+        tasks = getattr(self, "_cache_tasks", None)
+        if tasks is not None:
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+        task.add_done_callback(
+            lambda done: done.exception() if not done.cancelled() else None
+        )
+
+    def _start_cache_renewal(
+        self, state: ReqState, plan: PageCachePlan, *, generation: str | None
+    ) -> None:
+        finished_event = getattr(state, "cache_finished_event", None)
+        if (
+            not plan.page_keys
+            or generation is None
+            or finished_event is None
+            or getattr(state, "cache_renewal_task", None) is not None
+        ):
+            return
+
+        async def renew_on_finish() -> None:
+            await finished_event.wait()
+            try:
+                await self._cache_store.renew(
+                    plan, generation=generation, rid=state.obj.rid
+                )
+            except Exception as exc:
+                # Maintenance cannot revise the read/write decision already
+                # returned in HTTP headers or usage.
+                logger.warning(
+                    "Cache accounting renewal failed rid=%s ttl=%d phase=finish "
+                    "error_type=%s",
+                    state.obj.rid,
+                    plan.ttl_seconds,
+                    type(exc).__name__,
+                )
+            else:
+                logger.info(
+                    "Cache accounting TTL renewal complete rid=%s ttl=%d phase=finish",
+                    state.obj.rid,
+                    plan.ttl_seconds,
+                )
+
+        task = asyncio.create_task(renew_on_finish())
+        state.cache_renewal_task = task
+        tasks = getattr(self, "_cache_renewal_tasks", None)
+        if tasks is None:
+            tasks = self._cache_renewal_tasks = {}
+        tasks[task] = finished_event
+        task.add_done_callback(lambda done: tasks.pop(done, None))
+        task.add_done_callback(
+            lambda done: done.exception() if not done.cancelled() else None
+        )
+
+    def _finish_cache_accounting(self, state: ReqState) -> None:
+        # The output owner signals completion even if the HTTP consumer left.
+        finished_event = getattr(state, "cache_finished_event", None)
+        if finished_event is not None:
+            finished_event.set()
+
+    async def _attach_cache_usage(self, state: ReqState, out: dict) -> None:
+        if state.cache_task is None:
+            return
+        if state.cache_usage is None:
+            state.cache_usage = await asyncio.shield(state.cache_task)
+        finished_event = getattr(state, "cache_finished_event", None)
+        renewal_task = getattr(state, "cache_renewal_task", None)
+        if finished_event is not None and finished_event.is_set() and renewal_task:
+            await asyncio.shield(renewal_task)
+        out["meta_info"]["cache_usage"] = state.cache_usage.to_dict()
+
+    async def close_cache_accounting(self) -> None:
+        if self._cache_store is not None:
+            self._cache_accounting_closing = True
+            if self._cache_tasks:
+                # In-flight confirmations may still register a final renewal.
+                await asyncio.gather(*tuple(self._cache_tasks), return_exceptions=True)
+            renewals = getattr(self, "_cache_renewal_tasks", {})
+            renewal_tasks = tuple(renewals)
+            # Let a terminal response finish its bounded Redis renewal. Cancelling
+            # it would also interrupt a response awaiting that task via shield.
+            # Signal active maintainers too, so forced shutdown never waits for
+            # another engine output.
+            for finished_event in tuple(renewals.values()):
+                finished_event.set()
+            if renewal_tasks:
+                await asyncio.gather(*renewal_tasks, return_exceptions=True)
+            await self._cache_store.aclose()
+
+    async def _prepare_cache_media_digests(self, obj, mm_inputs) -> None:
+        if (
+            not isinstance(obj, GenerateReqInput)
+            or obj.cache_ttl_seconds is None
+            or obj.cache_user_id is None
+            or mm_inputs is None
+        ):
+            return
+        try:
+            # Hash real processor payloads before transport/release, off the
+            # event loop. The Scheduler only attaches final token positions.
+            await asyncio.to_thread(prepare_media_digests, mm_inputs)
+        except Exception as exc:
+            logger.warning(
+                "Cache accounting multimodal identity unavailable rid=%s error_type=%s",
+                obj.rid,
+                type(exc).__name__,
+            )
+
+    def _resolve_cache_identity(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        request: Optional[fastapi.Request],
+    ) -> None:
+        if not isinstance(obj, GenerateReqInput) or obj.cache_ttl_seconds is None:
+            return
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            obj.cache_ttl_seconds = None
+            obj.cache_user_id = None
+            return
+        if request is None:
+            return
+        # API adapters set cache_identity only after validating their public
+        # identity fields. Native /generate bodies cannot populate request.state.
+        state = request.state
+        identity = getattr(state, "cache_identity", None)
+        if not isinstance(identity, str) or not identity.strip():
+            identity = None
+        obj.cache_user_id = identity
+
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
+
+        self._resolve_cache_identity(obj, request)
+        if isinstance(obj, GenerateReqInput):
+            self._validate_cache_request(obj)
 
         # Reject the entire raw batch before expansion or dispatch of any member.
         self.validate_request_params(obj)
@@ -1453,12 +1927,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 and mm_inputs.mm_items
             ):
                 await self.mm_processor.hash_executor.set_pad_values(mm_inputs.mm_items)
+            # Digest media for cache accounting before decode drops the features.
+            await self._prepare_cache_media_digests(obj, mm_inputs)
             if self._drop_decode_mm_features and mm_inputs and mm_inputs.mm_items:
                 drop_mm_features_for_decode(mm_inputs.mm_items)
         else:
             mm_inputs = None
 
         self._validate_one_request(obj, input_ids)
+        if isinstance(obj, GenerateReqInput):
+            await self._prepare_cache_plan(obj, input_ids)
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
@@ -1774,6 +2252,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             tokenized_obj = TokenizedGenerateReqInput(
                 input_text=input_text,
+                return_cache_input=(
+                    self.rid_to_state[obj.rid].cache_plan_context is not None
+                ),
                 input_ids=input_ids_arr,
                 mm_inputs=mm_inputs,
                 sampling_params=sampling_params,
@@ -1898,6 +2379,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         tokenized_objs = []
         for i, req in enumerate(requests):
             self._validate_one_request(obj[i], input_ids_list[i])
+            if isinstance(req, GenerateReqInput):
+                await self._prepare_cache_plan(req, input_ids_list[i])
             token_type_ids = (
                 token_type_ids_list[i] if token_type_ids_list is not None else None
             )
@@ -2190,6 +2673,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         for key, values in state.customized_info_accumulated.items():
                             meta_info.setdefault(key, list(values))
 
+            try:
+                await self._attach_cache_usage(state, out)
+            except CacheAccountingError as exc:
+                raise fastapi.HTTPException(
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    detail="Cache accounting is temporarily unavailable",
+                ) from exc
+
             # Resolve deferred text for non-incremental streaming.
             # _handle_batch_output sets "text": None on intermediate chunks
             # to avoid O(n) string rebuild per step (O(n^2) total).
@@ -2333,6 +2824,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
+                # This is an internal warmup, not one of the user's samples.
+                tmp_obj.cache_ttl_seconds = None
+                tmp_obj.cache_user_id = None
+                tmp_obj.cache_required = False
                 self._init_req_state(tmp_obj)
                 request_states[tmp_obj.rid] = self.rid_to_state[tmp_obj.rid]
                 await self._send_one_request(tokenized_obj)
@@ -2363,6 +2858,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     self._init_req_state(tmp_obj)
                     state = self.rid_to_state[tmp_obj.rid]
                     request_states[tmp_obj.rid] = state
+                    if state.cache_physical_ttl_seconds is not None:
+                        state.cache_metrics_parent = request_states[objs[i].rid]
                     tokenized_obj.time_stats = state.time_stats
                     if tmp_obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_objs[i].input_ids)
@@ -2741,6 +3238,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
 
             if not isinstance(recv_obj, BatchEmbeddingOutput):
+                self._start_cache_accounting(
+                    state,
+                    recv_obj.prompt_tokens[i],
+                    recv_obj.completion_tokens[i],
+                    recv_obj.finished_reasons[i],
+                    cached_tokens=recv_obj.cached_tokens[i],
+                    cache_input_metadata=(
+                        recv_obj.cache_input_metadata[i]
+                        if recv_obj.cache_input_metadata is not None
+                        else None
+                    ),
+                )
                 meta_info.update(
                     {
                         "reasoning_tokens": recv_obj.reasoning_tokens[i],
@@ -2931,6 +3440,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.time_stats.set_last_time(ts=first_output_time)
 
             if state.finished:
+                self._finish_cache_accounting(state)
                 span_attrs = (
                     self.convert_to_span_attrs(state, recv_obj, i)
                     if state.time_stats.trace_ctx.tracing_enable
@@ -3729,6 +4239,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 break
 
+        await self.close_cache_accounting()
         # Stop the watchdog: child exits are expected during shutdown, not crashes.
         if self._subprocess_watchdog is not None:
             self._subprocess_watchdog.stop()
@@ -3781,6 +4292,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
             return
         state.finished = True
+        self._finish_cache_accounting(state)
         state.time_stats.set_finished_time()
 
         abort_message = recv_obj.abort_message or "Abort in waiting queue"
@@ -4028,6 +4540,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         for rid, sub_obj, bootstrap_room in items:
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
+            if isinstance(obj, GenerateReqInput) and obj.cache_ttl_seconds is not None:
+                # __getitem__ does not carry cache options. Preserve them on
+                # cached subobjects so parallel-sample clones keep the mode.
+                sub_obj.cache_ttl_seconds = obj.cache_ttl_seconds
+                sub_obj.cache_mode = obj.cache_mode
+                sub_obj.cache_user_id = obj.cache_user_id
+                sub_obj.cache_required = obj.cache_required
+                if (
+                    not isinstance(sub_obj.cache_user_id, str)
+                    or not sub_obj.cache_user_id.strip()
+                ):
+                    state.cache_physical_ttl_seconds = obj.cache_ttl_seconds
             if self.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)

@@ -15,8 +15,8 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, AsyncIterator, Optional, 
 import jinja2
 import openai.types.responses as openai_responses_types
 import orjson
-from fastapi import Request
-from fastapi.responses import ORJSONResponse
+from fastapi import HTTPException, Request
+from fastapi.responses import ORJSONResponse, StreamingResponse
 from openai.types.responses import (
     ResponseOutputText,
     ResponseReasoningItem,
@@ -61,11 +61,12 @@ from sglang.srt.entrypoints.harmony_utils import (
     render_for_completion,
 )
 from sglang.srt.entrypoints.openai.protocol import (
+    CacheUsage,
     ChatCompletionMessageParam,
     ChatCompletionRequest,
     Function,
     MessageProcessingResult,
-    PromptTokenUsageInfo,
+    PromptTokensDetails,
     RequestResponseMetadata,
     ResponseOutputMessage,
     ResponsesRequest,
@@ -86,6 +87,7 @@ from sglang.srt.entrypoints.openai.responses_adapters import (
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
+from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
@@ -295,7 +297,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         self,
         request: ResponsesRequest,
         raw_request: Optional[Request] = None,
-    ) -> Union[AsyncGenerator[str, None], ResponsesResponse, ORJSONResponse]:
+    ) -> Union[
+        AsyncGenerator[str, None], ResponsesResponse, ORJSONResponse, StreamingResponse
+    ]:
         # Validate model
         if not self.tokenizer_manager:
             return self.create_error_response("Model not loaded")
@@ -431,6 +435,34 @@ class OpenAIServingResponses(OpenAIServingChat):
             logger.exception("Error in preprocessing prompt inputs")
             return self.create_error_response(f"{e} {e.__cause__}")
 
+        try:
+            cache_params = self._cache_request_params(request)
+        except ValueError as e:
+            return self.create_error_response(str(e))
+        if cache_params:
+            fallback_reason = None
+            if self.use_harmony and self._has_response_tool(
+                request, "web_search", "web_search_preview", "code_interpreter"
+            ):
+                # Later built-in turns can write after HTTP headers have gone
+                # out. Keep all rounds on physical usage with no Redis writes.
+                fallback_reason = "builtin_tools"
+            elif request.background and not request.stream:
+                # The queued acknowledgement precedes any engine usage.
+                fallback_reason = "background"
+            if fallback_reason is not None:
+                cache_params["cache_user_id"] = None
+                cache_params["cache_required"] = False
+                logger.info(
+                    "Cache accounting Responses fallback rid=%s reason=%s",
+                    request.request_id,
+                    fallback_reason,
+                )
+        if raw_request is not None:
+            # Responses does not pass through OpenAIServingBase.handle_request.
+            raw_request.state.cache_identity = cache_params.get("cache_user_id")
+        cache_context: Optional[dict[str, Any]] = {} if cache_params else None
+
         request_metadata = RequestResponseMetadata(request_id=request.request_id)
         if raw_request:
             raw_request.state.request_metadata = request_metadata
@@ -539,6 +571,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     adapted_request = GenerateReqInput(
                         **prompt_kwargs,
                         **logprob_kwargs,
+                        **cache_params,
                         image_data=(
                             processed_messages.image_data
                             if processed_messages
@@ -586,6 +619,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         context,
                         raw_request=raw_request,
                         priority=request.priority,
+                        cache_context=cache_context,
                     )
                     generators.append(generator)
             except ValueError as e:
@@ -629,6 +663,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         request_metadata,
                         created_time,
                         require_reasoning=require_reasoning,
+                        cache_context=cache_context,
                     ),
                     name=f"create_{response.id}",
                 )
@@ -641,26 +676,90 @@ class OpenAIServingResponses(OpenAIServingChat):
                 return response
 
             if request.stream:
+                if cache_params:
+                    try:
+                        first_result = await anext(result_generator)
+                    except HTTPException as e:
+                        await result_generator.aclose()
+                        return self.create_error_response(
+                            str(e.detail), status_code=e.status_code
+                        )
+                    except ValueError as e:
+                        await result_generator.aclose()
+                        return self.create_error_response(str(e))
+                    except StopAsyncIteration:
+                        await result_generator.aclose()
+                        return self.create_error_response(
+                            "The engine returned no output.",
+                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                        )
+                    except BaseException:
+                        await result_generator.aclose()
+                        raise
+
+                    async def replay_first_result():
+                        try:
+                            yield first_result
+                            async for item in result_generator:
+                                yield item
+                        finally:
+                            await result_generator.aclose()
+
+                    stream_results = replay_first_result()
+                else:
+                    stream_results = result_generator
                 if self.use_harmony:
-                    return self.responses_stream_generator(
+                    stream = self.responses_stream_generator(
                         request,
                         sampling_params,
-                        result_generator,
+                        stream_results,
                         context,
                         model_name,
                         tokenizer,
                         request_metadata,
                         require_reasoning=require_reasoning,
+                        cache_context=cache_context,
                     )
-                return self.responses_stream_generator_non_harmony(
-                    request,
-                    sampling_params,
-                    result_generator,
-                    model_name,
-                    tokenizer,
-                    request_metadata,
-                    require_reasoning=require_reasoning,
-                )
+                else:
+                    stream = self.responses_stream_generator_non_harmony(
+                        request,
+                        sampling_params,
+                        stream_results,
+                        model_name,
+                        tokenizer,
+                        request_metadata,
+                        require_reasoning=require_reasoning,
+                        cache_context=cache_context,
+                    )
+                if not cache_params:
+                    return stream
+
+                async def close_stream():
+                    try:
+                        async for event in stream:
+                            yield event
+                    finally:
+                        await stream.aclose()
+                        await stream_results.aclose()
+                        await result_generator.aclose()
+
+                headers = {"Cache-Control": "no-cache", "Connection": "keep-alive"}
+                if cache_context.get("usage") is not None:
+                    headers.update(cache_context["usage"].response_headers())
+                try:
+                    return StreamingResponse(
+                        close_stream(),
+                        media_type="text/event-stream",
+                        headers=headers,
+                        background=self.tokenizer_manager.create_abort_task(
+                            adapted_request
+                        ),
+                    )
+                except BaseException:
+                    await stream.aclose()
+                    await stream_results.aclose()
+                    await result_generator.aclose()
+                    raise
             try:
                 result: Union[
                     ORJSONResponse, ResponsesResponse
@@ -673,8 +772,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                     tokenizer,
                     request_metadata,
                     require_reasoning=require_reasoning,
+                    cache_context=cache_context,
                 )
                 return result
+            except HTTPException as e:
+                return self.create_error_response(
+                    str(e.detail), status_code=e.status_code
+                )
             except Exception as e:
                 return self.create_error_response(str(e))
         return self.create_error_response("Unknown error")
@@ -697,6 +801,8 @@ class OpenAIServingResponses(OpenAIServingChat):
             messages=messages,
             stream=request.stream,
             tools=chat_tools or None,
+            # Must render like the NV decode fleets' prod builds: a tool-less
+            # request passes "none", which the K3 encoder renders.
             tool_choice=(
                 self._chat_tool_choice(tool_choice)
                 if chat_tools or is_allowed_tools
@@ -771,6 +877,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         *,
         require_reasoning: bool,
         output_items: Optional[list] = None,
+        cache_context: Optional[dict[str, Any]] = None,
     ) -> Union[ResponsesResponse, ORJSONResponse]:
         if created_time is None:
             created_time = int(time.time())
@@ -862,16 +969,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                 num_cached_tokens = 0
                 num_reasoning_tokens = 0
 
-        usage = UsageInfo(
-            prompt_tokens=num_prompt_tokens,
-            completion_tokens=num_generated_tokens,
-            total_tokens=num_prompt_tokens + num_generated_tokens,
-            reasoning_tokens=num_reasoning_tokens,
+        usage = self._response_usage(
+            num_prompt_tokens,
+            num_generated_tokens,
+            num_cached_tokens,
+            num_reasoning_tokens,
+            cache_context=cache_context,
         )
-        if self.enable_prompt_tokens_details and num_cached_tokens:
-            usage.prompt_tokens_details = PromptTokenUsageInfo(
-                cached_tokens=num_cached_tokens
-            )
         request_metadata.final_usage_info = usage
 
         response = ResponsesResponse.from_request(
@@ -906,6 +1010,37 @@ class OpenAIServingResponses(OpenAIServingChat):
                         ]
 
         return response
+
+    def _response_usage(
+        self,
+        prompt_tokens: int,
+        completion_tokens: int,
+        cached_tokens: int,
+        reasoning_tokens: int,
+        *,
+        total_tokens: Optional[int] = None,
+        cache_context: Optional[dict[str, Any]] = None,
+    ) -> UsageInfo:
+        counters = cache_context or {}
+        cache_usage = counters.get("usage")
+        if cache_usage is not None:
+            return UsageProcessor.calculate_token_usage(
+                prompt_tokens=counters.get("prompt_tokens", prompt_tokens),
+                completion_tokens=counters.get("completion_tokens", completion_tokens),
+                reasoning_tokens=counters.get("reasoning_tokens", reasoning_tokens),
+                cache_usage=cache_usage,
+            )
+        return UsageInfo(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens or (prompt_tokens + completion_tokens),
+            reasoning_tokens=reasoning_tokens,
+            prompt_tokens_details=(
+                PromptTokensDetails(cached_tokens=cached_tokens)
+                if self.enable_prompt_tokens_details and cached_tokens
+                else None
+            ),
+        )
 
     @staticmethod
     def _wants_reasoning_summary(request: ResponsesRequest) -> bool:
@@ -1215,21 +1350,28 @@ class OpenAIServingResponses(OpenAIServingChat):
         chat_tools = []
         for tool in request.tools:
             if tool.type == "function":
-                description, parameters = tool.description, tool.parameters
+                # K3 renders tools with exclude_unset=True. Preserve omitted
+                # fields so equivalent Chat and Responses tools share a prefix.
+                function_fields = tool.model_dump(
+                    include={"name", "description", "parameters", "strict"},
+                    exclude_unset=True,
+                )
             elif tool.type == "custom" and tool.name:
-                description = custom_tool_description(tool.description, tool.format)
-                parameters = custom_tool_parameters()
+                function_fields = {
+                    "name": tool.name,
+                    "description": custom_tool_description(
+                        tool.description, tool.format
+                    ),
+                    "parameters": custom_tool_parameters(),
+                }
+                if "strict" in tool.model_fields_set:
+                    function_fields["strict"] = tool.strict
             else:
                 continue
             chat_tools.append(
                 Tool(
                     type="function",
-                    function=Function(
-                        name=tool.name,
-                        description=description,
-                        parameters=parameters,
-                        strict=tool.strict,
-                    ),
+                    function=Function(**function_fields),
                 )
             )
         return chat_tools
@@ -1300,7 +1442,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         }
 
     @classmethod
-    def _normalize_response_message_for_chat(cls, message: Any) -> Any:
+    def _normalize_response_message_for_chat(
+        cls, message: Any, *, label_developer_instructions: bool = True
+    ) -> Any:
         """Convert one Responses-API input item to a chat-completions message."""
         if hasattr(message, "model_dump"):
             message = message.model_dump(exclude_none=True)
@@ -1308,13 +1452,17 @@ class OpenAIServingResponses(OpenAIServingChat):
             return message
 
         # Most chat templates only recognize system/user/assistant/tool; collapse
-        # ``developer`` to ``system`` at the boundary, labelled so the instruction
-        # tier survives the collapse.
+        # ``developer`` to ``system`` at the boundary. K3 treats both roles
+        # identically; an extra label would change its cached prefix.
         if message.get("role") == "developer":
             message = {
                 **message,
                 "role": "system",
-                "content": label_developer_content(message.get("content")),
+                "content": (
+                    label_developer_content(message.get("content"))
+                    if label_developer_instructions
+                    else message.get("content")
+                ),
             }
 
         msg_type = message.get("type")
@@ -1482,7 +1630,10 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
 
         for input_item in self._response_input_history(request):
-            normalized = self._normalize_response_message_for_chat(input_item)
+            normalized = self._normalize_response_message_for_chat(
+                input_item,
+                label_developer_instructions=self.chat_encoding_spec != "kimi_k3",
+            )
             if normalized is not None:
                 messages.append(normalized)
 
@@ -1583,6 +1734,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         created_time: Optional[int] = None,
         *,
         require_reasoning: bool,
+        cache_context: Optional[dict[str, Any]] = None,
     ):
         try:
             # Update the status to "in_progress"
@@ -1601,6 +1753,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 request_metadata,
                 created_time,
                 require_reasoning=require_reasoning,
+                cache_context=cache_context,
             )
         except Exception as e:
             logger.exception("Background request failed for %s", request.request_id)
@@ -1694,6 +1847,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         created_time: Optional[int] = None,
         *,
         require_reasoning: bool,
+        cache_context: Optional[dict[str, Any]] = None,
     ) -> AsyncGenerator[str, None]:
         created_time = created_time or int(time.time())
         sequence_number = 0
@@ -1868,6 +2022,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             output=[],
             status="in_progress",
             usage=None,
+            cache_usage=(cache_context or {}).get("usage"),
         ).model_dump()
         initial_response["tools"] = []
         yield _send_event("response.created", response=initial_response)
@@ -1907,6 +2062,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             created_time=created_time,
             require_reasoning=require_reasoning,
             output_items=emitted_items,
+            cache_context=cache_context,
         )
         response_dict = final_response.model_dump()
         response_dict["tools"] = []
@@ -1923,6 +2079,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         created_time: Optional[int] = None,
         *,
         require_reasoning: bool,
+        cache_context: Optional[dict[str, Any]] = None,
     ) -> AsyncGenerator[str, None]:
         pending: list[dict] = []
         can_call_tools = (
@@ -1938,6 +2095,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             request_metadata,
             created_time,
             require_reasoning=require_reasoning,
+            cache_context=cache_context,
         ):
             if not can_call_tools:
                 yield event
@@ -1978,6 +2136,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         created_time: Optional[int] = None,
         *,
         require_reasoning: bool,
+        cache_context: Optional[dict[str, Any]] = None,
     ) -> AsyncGenerator[str, None]:
         """Stream a /v1/responses response as typed OpenAI SSE events for
         non-harmony models. Each engine chunk is run through the reasoning
@@ -1987,6 +2146,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         created_time = created_time or int(time.time())
         sequence_number = 0
+        response_cache_options = None
 
         def _send_event(event):
             nonlocal sequence_number
@@ -1995,6 +2155,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             sequence_number += 1
             event_type = getattr(event, "type", "unknown")
             payload = event.model_dump()
+            if isinstance(payload.get("response"), dict):
+                if response_cache_options is not None:
+                    payload["response"]["prompt_cache_options"] = response_cache_options
+                else:
+                    payload["response"].pop("prompt_cache_options", None)
             if isinstance(getattr(event, "item", None), ResponseOutputMessage):
                 payload["item"] = event.item.model_dump()
             return f"event: {event_type}\ndata: {orjson.dumps(payload).decode()}\n\n"
@@ -2015,8 +2180,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                 output=[],
                 status="in_progress",
                 usage=None,
+                cache_usage=(cache_context or {}).get("usage"),
             ).model_dump()
         )
+        response_cache_options = initial_response.get("prompt_cache_options")
         yield _send_event(
             openai_responses_types.ResponseCreatedEvent(
                 type="response.created",
@@ -2659,6 +2826,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     output=[],
                     status="failed",
                     usage=None,
+                    cache_usage=(cache_context or {}).get("usage"),
                 ).model_dump()
             )
             failed["error"] = {"code": "server_error", "message": str(e)}
@@ -2681,16 +2849,14 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         final_output_items = list(emitted_items)
 
-        usage = UsageInfo(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=total_tokens_meta or (prompt_tokens + completion_tokens),
-            reasoning_tokens=reasoning_tokens_meta,
+        usage = self._response_usage(
+            prompt_tokens,
+            completion_tokens,
+            cached_tokens,
+            reasoning_tokens_meta,
+            total_tokens=total_tokens_meta,
+            cache_context=cache_context,
         )
-        if self.enable_prompt_tokens_details and cached_tokens:
-            usage.prompt_tokens_details = PromptTokenUsageInfo(
-                cached_tokens=cached_tokens
-            )
         request_metadata.final_usage_info = usage
 
         final_response = ResponsesResponse.from_request(
@@ -2728,21 +2894,54 @@ class OpenAIServingResponses(OpenAIServingChat):
         context: ConversationContext,
         raw_request: Optional[Request] = None,
         priority: Optional[int] = None,
+        cache_context: Optional[dict[str, Any]] = None,
         **kwargs,
     ) -> AsyncGenerator[Any, None]:
         """Generate with builtin tool support for harmony-based models."""
         orig_priority = priority or 0
+        completed_counts = (
+            dict.fromkeys(
+                ("prompt_tokens", "completion_tokens", "reasoning_tokens"), 0
+            )
+            if cache_context is not None
+            else None
+        )
+        completed_usage = None
 
         while True:
             # Generate using SGLang's tokenizer manager
             generator = self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
             )
-
-            async for res in generator:
-                context.append_output(res)
-                # NOTE(woosuk): The stop condition is handled by the engine.
-                yield context
+            turn_counts = (
+                dict.fromkeys(completed_counts, 0) if completed_counts else None
+            )
+            turn_usage = None
+            try:
+                async for res in generator:
+                    if cache_context is not None and isinstance(res, dict):
+                        meta = res.get("meta_info") or {}
+                        for name in turn_counts:
+                            if meta.get(name) is not None:
+                                turn_counts[name] = meta[name]
+                                cache_context[name] = (
+                                    completed_counts[name] + turn_counts[name]
+                                )
+                        if turn_usage is None and meta.get("cache_usage") is not None:
+                            turn_usage = CacheUsage.model_validate(meta["cache_usage"])
+                            cache_context["usage"] = UsageProcessor._cache_total(
+                                (completed_usage, turn_usage)
+                            )
+                    context.append_output(res)
+                    # NOTE(woosuk): The stop condition is handled by the engine.
+                    yield context
+            finally:
+                await generator.aclose()
+            if turn_counts is not None:
+                for name in completed_counts:
+                    completed_counts[name] += turn_counts[name]
+                if turn_usage is not None:
+                    completed_usage = cache_context["usage"]
 
             if not context.need_builtin_tool_call():
                 # The model did not ask for a tool call, so we're done.
@@ -2771,6 +2970,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                 session_id=adapted_request.session_id,
                 extra_key=adapted_request.extra_key,
                 cache_salt=adapted_request.cache_salt,
+                cache_user_id=adapted_request.cache_user_id,
+                cache_ttl_seconds=adapted_request.cache_ttl_seconds,
+                cache_mode=adapted_request.cache_mode,
+                cache_required=adapted_request.cache_required,
                 return_logprob=adapted_request.return_logprob,
                 logprob_start_len=adapted_request.logprob_start_len,
                 top_logprobs_num=adapted_request.top_logprobs_num,

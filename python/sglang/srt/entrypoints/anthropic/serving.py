@@ -749,6 +749,8 @@ class AnthropicServing:
                     chat_request, raw_request
                 )
             )
+            # Keep Anthropic on its original physical-cache usage path.
+            adapted_request.cache_ttl_seconds = None
             adapted_request.received_time = received_time
 
             # Get response from OpenAI handler
@@ -808,9 +810,17 @@ class AnthropicServing:
                     chat_request, raw_request
                 )
             )
+            # Keep Anthropic on its original physical-cache usage path.
+            adapted_request.cache_ttl_seconds = None
             adapted_request.received_time = received_time
         except asyncio.CancelledError:
             raise
+        except ValueError as e:
+            return self._error_response(
+                status_code=400,
+                error_type="invalid_request_error",
+                message=str(e),
+            )
         except Exception as e:
             logger.exception("Error converting streaming request: %s", e)
             return self._error_response(

@@ -68,6 +68,7 @@ try:
 except ImportError:
     initialize_mamba_selective_state_update_backend = None
 from sglang.srt.beam_search.coordinator import BeamCoordinator
+from sglang.srt.cache_accounting.multimodal import freeze_cache_input_metadata
 from sglang.srt.configs.model_config import (
     ModelConfig,
     ModelImpl,
@@ -3284,6 +3285,13 @@ class Scheduler(
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
+
+        if recv_req.return_cache_input:
+            # Freeze only after media expansion and any input truncation. This
+            # contains no identity, TTL, feature tensors, or Redis operations.
+            req.cache_input_metadata = freeze_cache_input_metadata(
+                req.origin_input_ids, req.multimodal_inputs
+            )
 
         if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
             # When return_logprob is False, logprob_start_len should be ignored

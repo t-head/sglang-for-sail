@@ -181,6 +181,14 @@ class GenerateReqInput:
     # Stable identity shared by requests in the same session. Unlike
     # session_params, this does not alter or reconstruct the prompt.
     session_id: Optional[str] = field(default=None, kw_only=True)
+    # Internal cache accounting context: the digest of a gateway cache_user_id,
+    # never the raw user identity or an interface authentication credential.
+    cache_user_id: Optional[str] = field(default=None, kw_only=True)
+    cache_ttl_seconds: Optional[int] = field(default=None, kw_only=True)
+    cache_mode: str = field(default="implicit", kw_only=True)
+    # True when the client explicitly asked for accounting; unsupported
+    # request shapes are then rejected instead of silently skipped.
+    cache_required: bool = field(default=False, kw_only=True)
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
     # The token ids for text.
@@ -1173,6 +1181,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Shape of output_token_sampling_logprobs for each output token. This is a
     # defaulted tail field so older IPC senders decode as selected mode.
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
+    # Internal opt-in for one scheduler-finalized MM accounting input snapshot.
+    # Identity and TTL remain in TokenizerManager, outside scheduler IPC.
+    return_cache_input: bool = False
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
@@ -1718,6 +1729,9 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
 
+    # Internal, RID-aligned, first-success-only accounting input metadata.
+    cache_input_metadata: Optional[List[Optional[dict]]] = None
+
 
 class BatchStrOutput(BaseBatchReq, kw_only=True):
     # The finish reason
@@ -1808,6 +1822,9 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+
+    # Passed through unchanged from BatchTokenIDOutput; never public usage.
+    cache_input_metadata: Optional[List[Optional[dict]]] = None
 
 
 class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):

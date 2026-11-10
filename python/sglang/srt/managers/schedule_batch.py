@@ -1058,6 +1058,9 @@ class Req(ReqDllmMixin):
         self.rid = rid
         self.cache_request_handle = CacheRequestHandle(rid=rid, attempt_id=0)
         self.origin_input_ids = origin_input_ids
+        # Internal accounting input is frozen after MM expansion and sent once.
+        self.cache_input_metadata: Optional[dict] = None
+        self.cache_input_metadata_sent = False
         self.origin_input_ids_unpadded = (
             origin_input_ids_unpadded
             if origin_input_ids_unpadded

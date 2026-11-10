@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from sglang.srt.arg_groups.choices import BUILT_IN_SAMPLING_BACKENDS
 from sglang.srt.arg_groups.overrides import (
@@ -105,6 +107,39 @@ def check_watermark_server_args(server_args: Any) -> None:
         raise ValueError("--enable-watermark is not supported with SGLANG_RUST_SERVER")
 
 
+def validate_cache_accounting(cfg: Any) -> None:
+    if not cfg.enable_cache_accounting or cfg.disaggregation_mode == "prefill":
+        return
+    if envs.SGLANG_RUST_SERVER.get():
+        raise ValueError(
+            "--enable-cache-accounting is not supported with SGLANG_RUST_SERVER"
+        )
+    parsed = urlparse(cfg.cache_redis_url or "")
+    if parsed.scheme not in ("redis", "rediss") or not parsed.hostname:
+        raise ValueError("Cache accounting requires a redis:// or rediss:// URL")
+    if (
+        parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            "--cache-redis-url must not contain credentials, query "
+            "parameters, or fragments; use SGLANG_CACHE_REDIS_USERNAME "
+            "and SGLANG_CACHE_REDIS_PASSWORD for authentication"
+        )
+    if getattr(cfg, "cache_redis_cluster", False) and parsed.path not in (
+        "",
+        "/",
+        "/0",
+    ):
+        raise ValueError("Redis Cluster cache accounting only supports database 0")
+    if not cfg.cache_namespace or not cfg.cache_namespace.strip():
+        raise ValueError("Cache accounting requires --cache-namespace")
+    if not math.isfinite(cfg.cache_timeout) or cfg.cache_timeout <= 0:
+        raise ValueError("--cache-timeout must be finite and positive")
+
+
 def validate_response_store(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if cfg.enable_response_store and cfg.disaggregation_mode != "null":
@@ -177,6 +212,8 @@ def check_server_args(server_args: Any):
     cfg = resolving_view(server_args)
 
     validate_request_limits(cfg.max_parallel_samples, cfg.max_batch_outputs)
+
+    validate_cache_accounting(cfg)
 
     # Check parallel size constraints
     if cfg.ep_join_mode != "scale":
