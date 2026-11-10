@@ -1094,7 +1094,7 @@ class TestChunkedPagedDecode(CustomTestCase):
         with (
             patch.object(mod, "get_deep_gemm_decode_data", return_value=data),
             patch.object(mod, "deep_gemm_fp4_paged_mqa_logits", deep_gemm),
-            patch.object(mod, "topk_transform_paged_from_metadata", topk),
+            patch.object(mod, "topk_transform_paged", topk),
             patch.object(
                 mod,
                 "candidate_row_lens",
@@ -1125,7 +1125,20 @@ class TestChunkedPagedDecode(CustomTestCase):
         ):
             table = backend.publish_decode(inputs)
 
-        self._assert_chunked_calls(deep_gemm, topk)
+        self.assertEqual(deep_gemm.call_count, len(self.chunks))
+        for call, plan in zip(deep_gemm.call_args_list, self.plans):
+            self.assertIs(call.args[5], plan)
+        self.assertEqual(len(topk.call_args_list), len(self.chunks))
+        for call, rows in zip(topk.call_args_list, self.chunks):
+            # V1 receives real per-chunk views, not metadata/rows keyword args.
+            self.assertEqual(call.args[0].shape[0], rows.stop - rows.start)
+            self.assertEqual(
+                call.args[3].data_ptr(), inputs.out_page_indices[rows].data_ptr()
+            )
+            torch.testing.assert_close(
+                call.args[1],
+                inputs.paged_metadata.compressed_seq_lens[rows].reshape(-1),
+            )
         self.assertEqual(table.blocks.shape, (self.num_rows, backend.topk_blocks))
         self.assertEqual(table.phys_blocks.shape, table.blocks.shape)
         self.assertEqual(table.valid_lens.shape, (self.num_rows,))
