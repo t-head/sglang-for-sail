@@ -102,6 +102,27 @@ class CudaRTLibrary:
             cudaError_t,
             [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, cudaMemcpyKind],
         ),
+        # cudaError_t cudaMemcpy2DAsync ( void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height, cudaMemcpyKind kind, cudaStream_t stream ) # noqa
+        Function(
+            "cudaMemcpy2DAsync",
+            cudaError_t,
+            [
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                ctypes.c_size_t,
+                ctypes.c_size_t,
+                cudaMemcpyKind,
+                ctypes.c_void_p,
+            ],
+        ),
+        # cudaError_t cudaStreamIsCapturing ( cudaStream_t stream, cudaStreamCaptureStatus* pCaptureStatus ) # noqa
+        Function(
+            "cudaStreamIsCapturing",
+            cudaError_t,
+            [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)],
+        ),
         # cudaError_t cudaIpcGetMemHandle ( cudaIpcMemHandle_t* handle, void* devPtr ) # noqa
         Function(
             "cudaIpcGetMemHandle",

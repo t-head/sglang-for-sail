@@ -2904,6 +2904,7 @@ def initialize_model_parallel(
                 shared_group_ranks,
                 get_world_group().local_rank,
                 backend,
+                use_pynccl=True,
                 use_custom_allreduce=False,
                 use_torch_symm_mem_allreduce=False,
                 group_name="shared_experts_tp",

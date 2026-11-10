@@ -286,6 +286,109 @@ def test_parallel_group_construction_tp8_attn_cp2(custom_allreduce_enabled):
             parallel_state.destroy_model_parallel()
 
 
+@pytest.mark.parametrize("enable_symm_mem", [False, True])
+@pytest.mark.parametrize(
+    ("shared_size", "expected"),
+    [
+        (2, [[0, 1], [2, 3], [4, 5], [6, 7]]),
+        (4, [[0, 1, 2, 3], [4, 5, 6, 7]]),
+    ],
+)
+def test_shared_experts_tp_groups_stay_within_attention_tp(
+    shared_size, expected, enable_symm_mem
+):
+    """Independent SharedTP partitions a TP8 attention group contiguously."""
+    world_size = 8
+    with (
+        patch.object(parallel_state, "_WORLD", None),
+        patch.object(parallel_state, "_TP", None),
+        patch.object(parallel_state, "_ATTN_CP", None),
+        patch.object(parallel_state, "_ATTN_TP", None),
+        patch.object(parallel_state, "_SHARED_EXPERTS_TP", None),
+        patch.object(parallel_state, "_PP", None),
+        patch.object(parallel_state, "_SELF_PP", None),
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_world_size", return_value=world_size),
+        patch("torch.distributed.get_rank", return_value=0),
+        patch("torch.distributed.get_backend", return_value="nccl"),
+    ):
+        created_groups = {}
+        created_kwargs = {}
+
+        def mock_init_model_parallel_group(group_ranks, local_rank, backend, **kwargs):
+            created_groups[kwargs.get("group_name", "unknown")] = group_ranks
+            created_kwargs[kwargs.get("group_name", "unknown")] = kwargs
+            group = Mock()
+            group.device_group = Mock()
+            group.local_rank = 0
+            return group
+
+        world = Mock(device_group=Mock(), local_rank=0)
+        with (
+            patch.object(
+                parallel_state,
+                "init_model_parallel_group",
+                side_effect=mock_init_model_parallel_group,
+            ),
+            patch.object(parallel_state, "get_world_group", return_value=world),
+        ):
+            publish_build_topology(
+                tp_size=8,
+                pp_size=1,
+                shared_experts_tp_size=shared_size,
+            )
+            parallel_state.initialize_model_parallel(enable_symm_mem=enable_symm_mem)
+
+        assert created_groups["shared_experts_tp"] == expected
+        # Shared AG/RS always use pynccl (lower CPU cost than c10d), with or
+        # without symm mem; their buffers stay off the symmetric pool.
+        assert created_kwargs["shared_experts_tp"]["use_pynccl"] is True
+        parallel_state.destroy_model_parallel()
+
+
+def test_shared_experts_tp_size_one_is_replicated():
+    """--shared-experts-tp-size 1 passes arg validation and means replicated
+    shared experts. Size 1 must build no group."""
+    world_size = 8
+    with (
+        patch.object(parallel_state, "_WORLD", None),
+        patch.object(parallel_state, "_TP", None),
+        patch.object(parallel_state, "_ATTN_CP", None),
+        patch.object(parallel_state, "_ATTN_TP", None),
+        patch.object(parallel_state, "_SHARED_EXPERTS_TP", None),
+        patch.object(parallel_state, "_PP", None),
+        patch.object(parallel_state, "_SELF_PP", None),
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_world_size", return_value=world_size),
+        patch("torch.distributed.get_rank", return_value=0),
+        patch("torch.distributed.get_backend", return_value="nccl"),
+    ):
+        created_groups = {}
+
+        def mock_init_model_parallel_group(group_ranks, local_rank, backend, **kwargs):
+            created_groups[kwargs.get("group_name", "unknown")] = group_ranks
+            group = Mock()
+            group.device_group = Mock()
+            group.local_rank = 0
+            return group
+
+        world = Mock(device_group=Mock(), local_rank=0)
+        with (
+            patch.object(
+                parallel_state,
+                "init_model_parallel_group",
+                side_effect=mock_init_model_parallel_group,
+            ),
+            patch.object(parallel_state, "get_world_group", return_value=world),
+        ):
+            publish_build_topology(tp_size=8, pp_size=1, shared_experts_tp_size=1)
+            parallel_state.initialize_model_parallel()
+
+        assert "shared_experts_tp" not in created_groups
+        assert parallel_state._SHARED_EXPERTS_TP is None
+        parallel_state.destroy_model_parallel()
+
+
 def test_parallel_group_construction_tp8_moe_ep4_cp2():
     """
     Test parallel group construction for 8 GPU configuration with:
