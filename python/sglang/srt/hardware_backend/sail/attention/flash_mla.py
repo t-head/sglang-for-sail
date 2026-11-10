@@ -127,9 +127,9 @@ def flash_mla_with_kvcache(
             f"SAIL FlashMLA does not support explicit KV layout {kv_format!r}."
         )
 
-    if not use_legacy or heads_per_group:
+    if heads_per_group:
         raise NotImplementedError(
-            "SAIL FlashMLA requires the legacy KV layout without token packing."
+            "SAIL FlashMLA does not support token packing (heads_per_group)."
         )
 
     if softmax_scale is None:
@@ -204,9 +204,6 @@ def flash_mla_sparse_fwd(
     """
     if _import_error is not None:
         raise _IMPORT_ERROR from _import_error
-
-    if not use_legacy:
-        raise NotImplementedError("SAIL FlashMLA requires the legacy KV layout.")
 
     return _flashmla.flash_mla_sparse_fwd(
         q,
