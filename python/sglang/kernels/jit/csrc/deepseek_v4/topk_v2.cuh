@@ -52,6 +52,7 @@ enum class TopKMode {
 
 using Register2 = impl::TopKRegister<2>;  // <= 8192, register-resident, 1 read
 using Register4 = impl::TopKRegister<4>;  // <= 16384, register-resident, 1 read
+using CandidateBlocks = impl::TopKCandidate<4>;
 using Streaming = impl::TopKStreaming;
 
 constexpr uint32_t kBlockSize = impl::TopKConfig::kBlockSize;
@@ -450,6 +451,46 @@ TOPK_KERNEL void topk_ragged_kpool_kernel(const __grid_constant__ TopKRaggedKpoo
 /// row's top-k as (fp32 score bits, global position) int32 pairs, where local
 /// position l on rank `dcp_rank` is global position `l * dcp_size + dcp_rank`.
 /// With `page_bits` b > 0, pages of 2^b tokens interleave across ranks instead.
+struct TopKCandidateParams {
+  const float* __restrict__ scores;
+  const int32_t* __restrict__ seq_lens;
+  const int32_t* __restrict__ blocks;  // [rows, blocks_stride] columns, -1 padded
+  const int32_t* __restrict__ out_offsets;
+  int32_t* __restrict__ topk_indices;
+  int64_t score_stride;
+  uint32_t blocks_stride;
+  uint32_t topk;
+};
+
+template <bool kPDL>
+TOPK_KERNEL void topk_candidate_kernel(const __grid_constant__ TopKCandidateParams params) {
+  device::enable_smem_spilling();
+  const auto bx = blockIdx.x;
+  const auto seq_len = static_cast<uint32_t>(params.seq_lens[bx]);
+  const auto topk = params.topk;
+  const auto out = params.topk_indices + bx * static_cast<int64_t>(topk);
+  const auto bias = params.out_offsets[bx];
+
+  if (seq_len <= topk) {
+    device::PDLWaitPrimary<kPDL>();
+    for_each_item(topk, [&](uint32_t tx, uint32_t) { out[tx] = tx < seq_len ? static_cast<int32_t>(tx) + bias : -1; });
+    return;
+  }
+
+  constexpr uint32_t kBlockPositions = CandidateBlocks::kBlockPositions;
+  const auto num_blocks = (seq_len + kBlockPositions - 1) / kBlockPositions;
+  const auto kept = min(num_blocks, params.blocks_stride);
+  const auto problem = TopKProblem{
+      .in = params.scores + bx * params.score_stride,
+      .out = out,
+      .topk = topk,
+      .seq_len = seq_len,
+      .bias = bias,
+  };
+  __shared__ impl::MaxSmem<CandidateBlocks::Smem> smem;
+  CandidateBlocks::forward<kPDL>(problem, params.blocks + bx * params.blocks_stride, kept, &smem);
+}
+
 struct TopKCandidatesParams {
   float* __restrict__ scores;  // NOTE: may write, as for the ragged layout
   const int32_t* __restrict__ seq_lens;
@@ -1957,6 +1998,65 @@ struct TopKKernel {
    * every selected local position, `(0, -1)` padded. `scores` is written in
    * place as for `transform_ragged`.
    */
+  static void transform_candidate_blocks(
+      const tvm::ffi::TensorView scores,
+      const tvm::ffi::TensorView seq_lens,
+      const tvm::ffi::TensorView blocks,
+      const tvm::ffi::TensorView out_offsets,
+      const tvm::ffi::TensorView topk_indices) {
+    using namespace host;
+    auto B = SymbolicSize{"batch_size"};
+    auto L = SymbolicSize{"max_seq_len"};
+    auto S = SymbolicSize{"score_stride"};
+    auto C = SymbolicSize{"num_blocks"};
+    auto K = SymbolicSize{"topk"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLGPU>();
+
+    TensorMatcher({B, L})  // score
+        .with_strides({S, 1})
+        .with_dtype<float>()
+        .with_device(device_)
+        .verify(scores);
+    TensorMatcher({B})  // seq_lens
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(seq_lens);
+    TensorMatcher({B, C})  // blocks
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(blocks);
+    TensorMatcher({B})  // out_offsets
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(out_offsets);
+    TensorMatcher({B, K})  // topk_indices
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(topk_indices);
+
+    RuntimeCheck(S.unwrap() % 4 == 0, "score_stride must be a multiple of 4 (16-byte vectorized load)");
+    RuntimeCheck(
+        static_cast<uint64_t>(C.unwrap()) <= CandidateBlocks::kMaxBlocks,
+        "num_blocks exceeds the candidate kernel's block window");
+    const auto topk = static_cast<uint32_t>(K.unwrap());
+    RuntimeCheck(topk > 0 && topk <= kMaxTopK, "topk must be in (0, 2048]");
+
+    const auto params = TopKCandidateParams{
+        .scores = static_cast<const float*>(scores.data_ptr()),
+        .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
+        .blocks = static_cast<const int32_t*>(blocks.data_ptr()),
+        .out_offsets = static_cast<const int32_t*>(out_offsets.data_ptr()),
+        .topk_indices = static_cast<int32_t*>(topk_indices.data_ptr()),
+        .score_stride = S.unwrap(),
+        .blocks_stride = static_cast<uint32_t>(C.unwrap()),
+        .topk = topk,
+    };
+    LaunchKernel(static_cast<uint32_t>(B.unwrap()), kBlockSize, device_.unwrap())
+        .config({.use_pdl = kUsePDL})
+        .launch(topk_candidate_kernel<kUsePDL>, params);
+  }
+
   static void transform_candidates(
       const tvm::ffi::TensorView scores,
       const tvm::ffi::TensorView seq_lens,

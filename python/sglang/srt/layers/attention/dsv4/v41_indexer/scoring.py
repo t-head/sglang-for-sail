@@ -360,14 +360,43 @@ def dense_prefill_topk(
     kv: Tuple[torch.Tensor, torch.Tensor],
     *,
     out: torch.Tensor,
+    two_level: bool = False,
 ) -> None:
-    """Request-local compressed positions of the data's query rows into
-    ``out``, one ``out`` row per scored row, ``-1`` padded, unordered."""
-    lens = data.compress_lens
+    """Request-local compressed positions into ``out``, ``-1`` padded, unordered.
+
+    ``two_level`` selects through the candidate structure -- block maxima, then
+    only the kept blocks -- instead of a full-width top-k. That is exact here
+    because nothing is published: the block window is ``k + 1`` (one slot reserves the newest block), so the
+    second level reads ``(k + 1) * 8`` of the row's columns instead of all of them.
+    """
+    from sglang.kernels.ops.attention.dsv4 import topk_transform_candidates
+
     # Score columns are request-relative, so a zero offset emits request-local positions.
-    zero_offsets = torch.zeros_like(lens)
+    zero_offsets = torch.zeros_like(data.request_starts)
+    two_level = two_level and 0 < out.shape[1] < 2048
+    if two_level:
+        from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+            candidate_block_ids,
+        )
+        from sglang.kernels.ops.attention.dsv4.candidate_table import (
+            CANDIDATE_BLOCK_SIZE,
+        )
+
     for tile, logits in score_tiles(data, kv):
-        topk_ragged(logits, lens[tile], out=out[tile], offsets=zero_offsets[tile])
+        lens = data.compress_lens[tile]
+        if two_level and logits.dtype == torch.float32:
+            nblocks = (lens + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
+            blocks = candidate_block_ids(logits, lens, nblocks, out.shape[1] + 1)
+            topk_transform_candidates(
+                logits,
+                lens,
+                blocks,
+                out_offsets=zero_offsets[tile],
+                out_indices=out[tile],
+            )
+            del blocks
+        else:
+            topk_ragged(logits, lens, out=out[tile], offsets=zero_offsets[tile])
         # Free this tile's logits before the generator scores the next one.
         del logits
 
@@ -378,12 +407,15 @@ def sharded_dense_prefill_topk(
     *,
     out: torch.Tensor,
     shard: RowShard,
+    two_level: bool = False,
 ) -> None:
     """``dense_prefill_topk`` over this rank's share of the rows, all-gathered
     into ``out`` for every row."""
     num_rows = data.num_rows
     local = out.new_full((shard.rows_per_rank(num_rows), out.shape[1]), -1)
-    dense_prefill_topk(data.narrow(shard.local_rows(num_rows)), kv, out=local)
+    dense_prefill_topk(
+        data.narrow(shard.local_rows(num_rows)), kv, out=local, two_level=two_level
+    )
     out.copy_(shard.gather(local, num_rows))
 
 
