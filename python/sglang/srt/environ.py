@@ -2211,7 +2211,7 @@ class Envs:
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
     # DeepSeek-V4.1 ratio-1/2 index layers: the DeepGEMM fp4 logits kernels store bf16 instead
     # of fp32 (the reference ranks bf16 scores); every consumer of those logits must take bf16.
-    # Unset: bf16 on SM100 (with bf16 head weights), fp32 elsewhere.
+    # Unset: bf16 on SM100 and on SAIL/PPU from sm89 (with bf16 head weights on SM100), fp32 elsewhere.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(None)
     # Use the shared FP8 scorer and ragged top-k for Hopper prefill candidates.
     SGLANG_OPT_DSV41_SM90_DEEPGEMM_PREFILL = EnvBool(False)
