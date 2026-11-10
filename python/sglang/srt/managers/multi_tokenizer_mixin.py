@@ -516,11 +516,19 @@ class MultiHttpWorkerDetokenizerMixin:
                 # In multi-detokenizer mode the upstream MultiDetokenizerRouter may
                 # forward either batched or single requests, so handle both shapes.
                 if isinstance(recv_obj, BaseBatchReq):
+                    # At most one batch per tokenizer worker (the return hop).
+                    groups: Dict[str, List[int]] = {}
                     for i, ipc_name in enumerate(recv_obj.http_worker_ipcs):
-                        new_output = _handle_output_by_index(output, i)
-                        self.socket_mapping.send_output(
-                            ipc_name, new_output, is_tokenizer=True
-                        )
+                        groups.setdefault(ipc_name, []).append(i)
+                    for ipc_name, indices in groups.items():
+                        try:
+                            parts = [_handle_output_by_indices(output, indices)]
+                        except _CannotSplitBatch:
+                            parts = [_handle_output_by_index(output, i) for i in indices]
+                        for part in parts:
+                            self.socket_mapping.send_output(
+                                ipc_name, part, is_tokenizer=True
+                            )
                 elif isinstance(recv_obj, BaseReq):
                     self.socket_mapping.send_output(
                         recv_obj.http_worker_ipc, output, is_tokenizer=True
@@ -661,9 +669,9 @@ class MultiTokenizerRouter:
 class MultiDetokenizerRouter:
     """Route scheduler outputs to one of N DetokenizerManager workers.
 
-    Each request is pinned to a worker by hashing its ``http_worker_ipc`` with
-    ``zlib.crc32`` (deterministic across runs), so all outputs of the same rid
-    always land on the same detokenizer and ``decode_status`` stays consistent.
+    Hash each request's RID so a hot tokenizer can use all detokenizers while
+    every stream stays on one worker. The original ``http_worker_ipc`` remains
+    the return address and is the routing fallback for messages without a RID.
     """
 
     def __init__(self, ipc_name_list: List[str], port_args: PortArgs):
@@ -675,7 +683,13 @@ class MultiDetokenizerRouter:
             context, zmq.PULL, port_args.detokenizer_ipc_name, True
         )
 
-    def _pick(self, key: str) -> str:
+        logger.info(
+            "Detokenizer routing: RID hash across %s workers (IPC fallback without RID)",
+            self.num_workers,
+        )
+
+    def _pick(self, rid: Optional[str], http_worker_ipc: str) -> str:
+        key = rid or http_worker_ipc
         return self.ipc_name_list[zlib.crc32(key.encode()) % self.num_workers]
 
     def _send(self, ipc_name: str, obj: Any) -> None:
@@ -691,7 +705,8 @@ class MultiDetokenizerRouter:
 
         indices_by_target: Dict[str, List[int]] = {}
         for index, ipc_key in enumerate(ipcs):
-            target = self._pick(ipc_key)
+            # Route by RID; ipc_key stays the tokenizer return address.
+            target = self._pick(recv_obj.rids[index], ipc_key)
             indices_by_target.setdefault(target, []).append(index)
 
         try:
@@ -718,7 +733,7 @@ class MultiDetokenizerRouter:
                 if one is recv_obj:
                     raise TypeError(f"Cannot split {type(recv_obj)}")
                 one.http_worker_ipcs = [ipc_key]
-                self._send(self._pick(ipc_key), one)
+                self._send(self._pick(recv_obj.rids[index], ipc_key), one)
             return
 
         for target, output, _ in grouped:
@@ -734,12 +749,12 @@ class MultiDetokenizerRouter:
                     self._send(ipc, recv_obj)
                 continue
 
-            # Single request: route by its own http_worker_ipc.
+            # Keep the return address separate from the request routing key.
             if isinstance(recv_obj, BaseReq):
                 assert recv_obj.http_worker_ipc is not None, (
                     f"Single req {recv_obj.rid=} missing http_worker_ipc"
                 )
-                self._send(self._pick(recv_obj.http_worker_ipc), recv_obj)
+                self._send(self._pick(recv_obj.rid, recv_obj.http_worker_ipc), recv_obj)
                 continue
 
             # Batch request.

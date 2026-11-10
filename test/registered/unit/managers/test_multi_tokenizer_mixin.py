@@ -180,7 +180,8 @@ def _make_router() -> MultiDetokenizerRouter:
     router = MultiDetokenizerRouter.__new__(MultiDetokenizerRouter)
     router.ipc_name_list = ["detok-a", "detok-b"]
     router.num_workers = 2
-    router._pick = lambda key: {
+    # Routing key is (rid, return address); these cases pin by address.
+    router._pick = lambda rid, key: {
         "worker-a": "detok-a",
         "worker-b": "detok-b",
     }[key]

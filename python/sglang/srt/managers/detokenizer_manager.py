@@ -302,14 +302,24 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         return results
 
     def _decode_batch_token_id_output(self, recv_obj: BatchTokenIDOutput):
-        bs = len(recv_obj.rids)
         vocab_size = self.vocab_size
 
-        # Initialize decode status
+        # Different tokenizer workers may accept the same caller-supplied RID.
+        # Namespace state by the return address even when RID routing sends those
+        # streams to the same detokenizer. A restarted tokenizer has a fresh IPC.
+        state_keys = [
+            (recv_obj.http_worker_ipcs[i], rid)
+            if recv_obj.http_worker_ipcs is not None
+            else rid
+            for i, rid in enumerate(recv_obj.rids)
+        ]
+
+        # Initialize decode status. Keep this batch's states locally: inserting a new
+        # stream into a full table can evict a stream that finishes in this batch.
+        states: List[DecodeStatus] = []
         read_ids, surr_ids = [], []
-        for i in range(bs):
-            rid = recv_obj.rids[i]
-            if rid not in self.decode_status:
+        for i, state_key in enumerate(state_keys):
+            if state_key not in self.decode_status:
                 s = DecodeStatus(
                     decoded_text=recv_obj.decoded_texts[i],
                     decode_ids=self._clamp_decode_ids(
@@ -318,12 +328,13 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     surr_offset=0,
                     read_offset=recv_obj.read_offsets[i],
                 )
-                self.decode_status[rid] = s
+                self.decode_status[state_key] = s
             else:
-                s = self.decode_status[rid]
+                s = self.decode_status[state_key]
                 s.decode_ids.extend(
                     self._clamp_decode_ids(recv_obj.decode_ids[i], vocab_size)
                 )
+            states.append(s)
 
             read_ids.append(
                 self.trim_matched_stop(
@@ -371,19 +382,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         # Incremental decoding
         output_strs = []
-        for i in range(bs):
-            rid = recv_obj.rids[i]
-            try:
-                s = self.decode_status[rid]
-            except KeyError:
-                raise RuntimeError(
-                    f"Decode status not found for request {rid}. "
-                    "It may be due to the request being evicted from the decode status due to memory pressure. "
-                    "Please increase the maximum number of requests by setting "
-                    "the SGLANG_DETOKENIZER_MAX_STATES environment variable to a bigger value than the default value. "
-                    f"The current value is {DETOKENIZER_MAX_STATES}. "
-                    "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
-                )
+        for i, (state_key, s) in enumerate(zip(state_keys, states)):
             new_text = read_texts[i][len(surr_texts[i]) :]
             if recv_obj.finished_reasons[i] is None:
                 # Streaming. Invariant: sent_offset >= decoded_text_len. The
@@ -407,12 +406,43 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     output_strs.append(printable[pending:] if pending else printable)
                 continue
 
-            if rid in self.decode_status:
-                del self.decode_status[rid]
+            if state_key in self.decode_status:
+                del self.decode_status[state_key]
+
+            reasoning_text_len = 0
+            if recv_obj.reasoning_tokens[i] and isinstance(
+                recv_obj.finished_reasons[i].get("matched"), str
+            ):
+                # Scheduler read_offsets retain the prompt context length;
+                # reasoning_tokens includes the complete thinking terminator.
+                prompt_len = recv_obj.read_offsets[i]
+                prefix_ids = [
+                    s.decode_ids[:prompt_len],
+                    s.decode_ids[: prompt_len + recv_obj.reasoning_tokens[i]],
+                ]
+                if self.disable_tokenizer_batch_decode:
+                    prefix_texts = [
+                        self.tokenizer.decode(
+                            ids,
+                            skip_special_tokens=recv_obj.skip_special_tokens[i],
+                            spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[
+                                i
+                            ],
+                        )
+                        for ids in prefix_ids
+                    ]
+                else:
+                    prefix_texts = self._grouped_batch_decode(
+                        prefix_ids,
+                        [recv_obj.skip_special_tokens[i]] * 2,
+                        [recv_obj.spaces_between_special_tokens[i]] * 2,
+                    )
+                reasoning_text_len = len(prefix_texts[1]) - len(prefix_texts[0])
 
             # Finished: materialize once, trim the matched stop, emit the tail.
-            output_str = self.trim_matched_stop(
-                s.get_decoded_text() + new_text,
+            output_str = s.get_decoded_text() + new_text
+            output_str = output_str[:reasoning_text_len] + self.trim_matched_stop(
+                output_str[reasoning_text_len:],
                 recv_obj.finished_reasons[i],
                 recv_obj.no_stop_trim[i],
             )
@@ -525,14 +555,24 @@ def is_health_check_request(rid: Optional[str]) -> bool:
 
 class LimitedCapacityDict(OrderedDict):
     def __init__(self, capacity: int, *args, **kwargs):
-        super().__init__(*args, **kwargs)
         self.capacity = capacity
+        self.num_evicted = 0
+        super().__init__(*args, **kwargs)
 
     def __setitem__(self, key, value):
-        if len(self) >= self.capacity:
-            # Remove the oldest element (first item in the dict)
-            self.popitem(last=False)
-        # Set the new item
+        if key not in self and len(self) >= self.capacity:
+            evicted, _ = self.popitem(last=False)
+            self.num_evicted += 1
+            # Log at 1, 2, 4, 8, ... evictions; a full table would otherwise flood.
+            if self.num_evicted & (self.num_evicted - 1) == 0:
+                logger.warning(
+                    "Detokenizer state table full (capacity %d): evicted %s, "
+                    "%d evictions so far. A stream evicted mid-output loses text; "
+                    "raise SGLANG_DETOKENIZER_MAX_STATES or check for leaked states.",
+                    self.capacity,
+                    evicted,
+                    self.num_evicted,
+                )
         super().__setitem__(key, value)
 
 

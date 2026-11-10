@@ -1731,15 +1731,19 @@ class Req(ReqDllmMixin):
         return self.surr_and_decode_ids, self.read_offset - self.surr_offset
 
     def _stop_match_tail_len(self, new_accepted_len: int) -> int:
+        # Reasoning-aware user stops currently target non-speculative decoding only.
+        content_len = len(self.output_ids)
+        if self.require_reasoning:
+            if not self._is_reasoning_over:
+                return 0
+            content_len -= self.reasoning_tokens
         max_len_tail_str = max(
             self.sampling_params.stop_str_max_len + 1,
             self.sampling_params.stop_regex_max_len + 1,
         )
         # Cover all newly accepted tokens so an early stop string is not missed
         # when speculative decoding accepts multiple tokens per step.
-        return min(
-            max_len_tail_str + max(new_accepted_len - 1, 0), len(self.output_ids)
-        )
+        return min(max_len_tail_str + max(new_accepted_len - 1, 0), content_len)
 
     def tail_str(self, new_accepted_len: int = 1) -> str:
         # Check stop strings and stop regex patterns together
@@ -1750,7 +1754,7 @@ class Req(ReqDllmMixin):
             return ""
 
         tail_len = self._stop_match_tail_len(new_accepted_len)
-        return self.tokenizer.decode(self.output_ids[-tail_len:])
+        return self.tokenizer.decode(self.output_ids[-tail_len:]) if tail_len else ""
 
     def check_match_stop_str_prefix(self) -> bool:
         if not self.sampling_params.stop_strs:
@@ -1786,7 +1790,13 @@ class Req(ReqDllmMixin):
         matched_eos = False
 
         for i, token_id in enumerate(new_accepted_tokens):
-            if self.sampling_params.stop_token_ids:
+            if self.sampling_params.stop_token_ids and (
+                not self.require_reasoning
+                or (
+                    self._is_reasoning_over
+                    and len(self.output_ids) > self.reasoning_tokens
+                )
+            ):
                 matched_eos |= token_id in self.sampling_params.stop_token_ids
             if self.eos_token_ids:
                 matched_eos |= token_id in self.eos_token_ids
@@ -1831,6 +1841,8 @@ class Req(ReqDllmMixin):
         return len(self.output_ids)
 
     def _check_str_based_finish(self, new_accepted_len: int = 1):
+        if self.require_reasoning and not self._is_reasoning_over:
+            return False
         if (
             len(self.sampling_params.stop_strs) > 0
             or len(self.sampling_params.stop_regex_strs) > 0
@@ -1841,7 +1853,9 @@ class Req(ReqDllmMixin):
             if len(self.sampling_params.stop_strs) > 0:
                 for stop_str in self.sampling_params.stop_strs:
                     stop_str_in_tail = stop_str in tail_str
-                    if stop_str_in_tail or stop_str in self.decoded_text:
+                    if stop_str_in_tail or (
+                        not self.require_reasoning and stop_str in self.decoded_text
+                    ):
                         self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
                         if stop_str_in_tail:
                             self.finished_len = self._locate_str_stop_finished_len(
