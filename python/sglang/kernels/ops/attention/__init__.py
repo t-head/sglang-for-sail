@@ -470,7 +470,11 @@ register_kernel(
     )
 )
 
-for _fn in ("fp4_index_logits_paged", "finish_paged_indexer_topk"):
+for _fn in (
+    "fp4_index_logits_paged",
+    "finish_paged_indexer_topk",
+    "store_index_k_norm_rope_fp4",
+):
     register_kernel(
         KernelSpec(
             op=f"attention.{_fn}",
