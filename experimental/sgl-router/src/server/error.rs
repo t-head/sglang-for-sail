@@ -9,6 +9,10 @@ use thiserror::Error;
 
 pub const X_ROUTER_ERROR_CODE: HeaderName = HeaderName::from_static("x-router-error-code");
 
+/// `x-router-error-code` on a PD prefill's 4xx, which reaches the client with the
+/// worker's own status and body. Gateways tell it apart from a decode rejection by it.
+pub const PREFILL_REQUEST_REJECTED: &str = "prefill_request_rejected";
+
 /// Original worker status when a failed prefill or incomplete body becomes a router 502.
 /// Absent when no upstream response arrived or its status was forwarded unchanged.
 pub const X_ROUTER_UPSTREAM_STATUS: HeaderName =
@@ -218,7 +222,8 @@ impl ApiError {
             // didn't. We surface a 502 but echo the worker's status in
             // `x-router-upstream-status` (see `into_response`).
             ApiError::UpstreamStatus { .. } => "upstream_body_incomplete",
-            ApiError::PrefillFailed { .. } => "prefill_failed",
+            // Prefill client errors pass through as `PREFILL_REQUEST_REJECTED`.
+            ApiError::PrefillFailed { .. } => "prefill_worker_error",
             ApiError::UpstreamTimeout { .. } => "upstream_timeout",
             ApiError::NoHealthyWorkers { .. } => "no_healthy_workers",
             ApiError::NoPrefillWorkersAvailable { .. } => "no_prefill_workers_available",
@@ -313,7 +318,8 @@ impl IntoResponse for ApiError {
                 );
                 "upstream response was incomplete".to_string()
             }
-            ApiError::PrefillFailed { .. } => self.to_string(),
+            // The prod v0.5.21 wording, which gateways already see.
+            ApiError::PrefillFailed { .. } => "prefill worker rejected the request".to_string(),
             ApiError::UpstreamTimeout { worker } => {
                 tracing::warn!(upstream = %worker, "upstream request timed out");
                 "upstream request timed out".to_string()

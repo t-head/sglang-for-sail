@@ -30,6 +30,9 @@ pub struct ProxyConfig {
     pub initial_backoff_ms: u64,
     /// Upper bound on any one backoff.
     pub max_backoff_ms: u64,
+    /// Maximum accepted body size for `/v1/chat/completions` and `/v1/responses`,
+    /// in bytes. Larger bodies are rejected with HTTP 413 before routing.
+    pub max_chat_body_bytes: usize,
 }
 
 impl ProxyConfig {
@@ -53,6 +56,11 @@ pub fn default_proxy_request_timeout_secs() -> u64 {
     300
 }
 
+/// Default maximum accepted chat/Responses body size, in bytes.
+pub const fn default_max_chat_body_bytes() -> usize {
+    70_000_000
+}
+
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
@@ -61,6 +69,7 @@ impl Default for ProxyConfig {
             max_attempts: NonZeroU32::MIN,
             initial_backoff_ms: 50,
             max_backoff_ms: 2000,
+            max_chat_body_bytes: default_max_chat_body_bytes(),
         }
     }
 }

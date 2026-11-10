@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Request validation, optional tokenization, and outgoing body preparation for
-//! chat completions, completions, the native `/generate` endpoint, embeddings,
-//! classify and rerank.
+//! chat completions, completions, Responses, the native `/generate` endpoint,
+//! embeddings, classify and rerank.
 
 use crate::config::{ConflictPolicy, ParamSpec, SamplingField, SamplingOverrides};
 use crate::discovery::ModelId;
@@ -28,6 +28,7 @@ const BYTES_PER_TOKEN_ESTIMATE: usize = 4;
 
 pub(super) const CHAT_PATH: &str = "/v1/chat/completions";
 pub(super) const COMPLETIONS_PATH: &str = "/v1/completions";
+pub(super) const RESPONSES_PATH: &str = "/v1/responses";
 const GENERATE_PATH: &str = "/generate";
 pub(super) const EMBEDDINGS_PATH: &str = "/v1/embeddings";
 pub(super) const CLASSIFY_PATH: &str = "/v1/classify";
@@ -85,10 +86,14 @@ impl PreparedRequest {
             .map(|(field, value)| (field.wire_name(), value.to_string()))
             .collect();
         let with_defaults = append_fields(&body, &defaults).unwrap_or_else(|| body.clone());
-        let lowered = lower_openai(ctx, path, &model, headers, &with_defaults);
-        ctx.metrics
-            .record_openai_route(&model.0, lowered.as_ref().err().copied());
-        if let Ok((mut generate, responder)) = lowered {
+        // SGLang's OpenAI layer is reproduced for chat and completions only.
+        let lowered = (path != RESPONSES_PATH).then(|| {
+            let lowered = lower_openai(ctx, path, &model, headers, &with_defaults);
+            ctx.metrics
+                .record_openai_route(&model.0, lowered.as_ref().err().copied());
+            lowered
+        });
+        if let Some(Ok((mut generate, responder))) = lowered {
             // Null fields are `GenerateReqInput`'s defaults; dropping them keeps the
             // router's own `routed_dp_rank` and bootstrap fields from duplicating keys.
             if let Value::Object(fields) = &mut generate {
@@ -107,11 +112,14 @@ impl PreparedRequest {
         let forwarding_scope = (path == CHAT_PATH).then(|| forwarding_scope(ctx, &model));
         let can_forward_input_ids =
             forwarding_scope.is_some_and(|scope| scope != ForwardingScope::Never);
-        let needs_tokens = should_tokenize_request(
-            can_forward_input_ids,
-            policy_needs_request_tokens,
-            ctx.bucket_selector.is_enabled(),
-        );
+        // Responses may carry instructions, tool items and stored history that the
+        // chat encoder cannot reproduce; route those on load and the size estimate.
+        let needs_tokens = path != RESPONSES_PATH
+            && should_tokenize_request(
+                can_forward_input_ids,
+                policy_needs_request_tokens,
+                ctx.bucket_selector.is_enabled(),
+            );
         // Parse the full body only when rendering or routing needs tokens.
         let parsed_body = needs_tokens
             .then(|| serde_json::from_slice(&body))
@@ -137,8 +145,10 @@ impl PreparedRequest {
             body,
             tokens,
             caller_set_rid: fields.caller_set_rid,
-            fans_out: requests_multiple_samples(&fields, &sampling_defaults)
-                || (path == COMPLETIONS_PATH && fields.prompt_batch),
+            // The Responses API has no `n`; one request is one engine generation.
+            fans_out: path != RESPONSES_PATH
+                && (requests_multiple_samples(&fields, &sampling_defaults)
+                    || (path == COMPLETIONS_PATH && fields.prompt_batch)),
             input_ids_forwarding: forwarding,
             forwarding_booked: false,
             parsed_body,
@@ -331,13 +341,47 @@ impl PreparedRequest {
         !matches!(self.path, EMBEDDINGS_PATH | CLASSIFY_PATH | RERANK_PATH)
     }
 
-    pub(super) fn engine_rid(&self) -> Option<String> {
-        // Caller IDs are unsafe for prefix aborts; fan-out regenerates IDs.
-        // PD shares the minted ID, but only decode arms abort-on-drop.
-        if self.caller_set_rid || self.fans_out {
+    pub(super) fn engine_rid(&self, pd_mode: bool) -> Option<String> {
+        // Caller IDs are unsafe for prefix aborts and fan-out regenerates IDs.
+        // Single-sample PD replaces a caller ID with a fixed-length private one,
+        // shared by both sides, so decode can still be aborted.
+        if self.fans_out || (self.caller_set_rid && !pd_mode) {
             return None;
         }
-        Some(uuid::Uuid::new_v4().simple().to_string())
+        if pd_mode {
+            return Some(format!("sgl-router-{}", uuid::Uuid::new_v4()));
+        }
+        let id = uuid::Uuid::new_v4().simple();
+        Some(match self.path {
+            // The engine echoes `request_id` as the response ID; keep its default shape.
+            RESPONSES_PATH => format!("resp_{id}"),
+            _ => id.to_string(),
+        })
+    }
+
+    /// The caller's own request ID, logged when PD replaces it with a private one.
+    pub(super) fn caller_rid(&self) -> Option<String> {
+        if !self.caller_set_rid {
+            return None;
+        }
+        let reparsed;
+        let body = match &self.parsed_body {
+            Some(body) => body,
+            None => {
+                reparsed = serde_json::from_slice::<Value>(&self.body).ok()?;
+                &reparsed
+            }
+        };
+        let rid = body.get(self.request_id_key()).filter(|rid| !rid.is_null())?;
+        Some(rid.as_str().map_or_else(|| rid.to_string(), str::to_owned))
+    }
+
+    /// The body key carrying the engine request ID.
+    fn request_id_key(&self) -> &'static str {
+        match self.path {
+            RESPONSES_PATH => "request_id",
+            _ => "rid",
+        }
     }
 
     /// The engine body for one dispatch attempt; each attempt brings its own
@@ -353,6 +397,7 @@ impl PreparedRequest {
             .as_ref()
             .filter(|_| self.input_ids_forwarding == Some(InputIdsForwarding::Forwarded))
             .map(|tokens| tokens.ids.as_slice());
+        let rid_key = self.request_id_key();
         // The first attempt consumes the cached parse; a retry re-parses `body`.
         let body = build_outgoing_body(
             &self.body,
@@ -360,7 +405,7 @@ impl PreparedRequest {
             input_ids,
             bootstrap,
             &self.sampling_defaults,
-            engine_rid,
+            engine_rid.map(|rid| (rid_key, rid)),
         )?;
         // Book only after the outgoing body exists; a request rejected here
         // (an f64-overflow literal re-parsed for PD bootstrap) was never dispatched.
@@ -610,6 +655,8 @@ pub(super) struct RoutingFields {
     pub(super) model: Option<String>,
     max_tokens: Option<u64>,
     max_completion_tokens: Option<u64>,
+    /// Responses API output budget; read only from Responses bodies.
+    max_output_tokens: Option<u64>,
     sampling: [SamplingValue; SamplingField::ALL.len()],
     // Preserve both string and list IDs without retaining their contents.
     caller_set_rid: bool,
@@ -722,6 +769,7 @@ enum RoutingKey {
     Model,
     MaxTokens,
     MaxCompletionTokens,
+    MaxOutputTokens,
 }
 
 impl RoutingKey {
@@ -731,6 +779,7 @@ impl RoutingKey {
             Self::Model => 1 << 1,
             Self::MaxTokens => 1 << 2,
             Self::MaxCompletionTokens => 1 << 3,
+            Self::MaxOutputTokens => 1 << 4,
         }
     }
 
@@ -740,6 +789,7 @@ impl RoutingKey {
             Self::Model => "model",
             Self::MaxTokens => "max_tokens",
             Self::MaxCompletionTokens => "max_completion_tokens",
+            Self::MaxOutputTokens => "max_output_tokens",
         }
     }
 }
@@ -748,8 +798,27 @@ enum RequestKey {
     Routing(RoutingKey),
     Sampling(SamplingField),
     Rid,
+    /// The Responses API request ID (`request_id`).
+    RequestId,
     Prompt,
     Other,
+}
+
+impl RequestKey {
+    /// Chat and completions parse as before; Responses reads its own budget and ID keys.
+    fn for_responses(self, responses: bool) -> Self {
+        match (responses, self) {
+            (false, Self::Routing(RoutingKey::MaxOutputTokens) | Self::RequestId) => Self::Other,
+            (
+                true,
+                Self::Routing(RoutingKey::MaxTokens | RoutingKey::MaxCompletionTokens)
+                | Self::Rid
+                | Self::Prompt,
+            ) => Self::Other,
+            (true, Self::RequestId) => Self::Rid,
+            (_, key) => key,
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for RequestKey {
@@ -768,7 +837,9 @@ impl<'de> Deserialize<'de> for RequestKey {
                     "model" => RequestKey::Routing(RoutingKey::Model),
                     "max_tokens" => RequestKey::Routing(RoutingKey::MaxTokens),
                     "max_completion_tokens" => RequestKey::Routing(RoutingKey::MaxCompletionTokens),
+                    "max_output_tokens" => RequestKey::Routing(RoutingKey::MaxOutputTokens),
                     "rid" => RequestKey::Rid,
+                    "request_id" => RequestKey::RequestId,
                     "prompt" => RequestKey::Prompt,
                     other => match SamplingField::from_wire_name(other) {
                         Some(field) => RequestKey::Sampling(field),
@@ -783,6 +854,7 @@ impl<'de> Deserialize<'de> for RequestKey {
 
 struct RoutingFieldsVisitor {
     read_sampling: bool,
+    responses: bool,
 }
 
 impl<'de> serde::de::Visitor<'de> for RoutingFieldsVisitor {
@@ -799,7 +871,7 @@ impl<'de> serde::de::Visitor<'de> for RoutingFieldsVisitor {
         let mut fields = RoutingFields::default();
         let mut seen_routing_keys = 0u8;
         while let Some(key) = map.next_key::<RequestKey>()? {
-            match key {
+            match key.for_responses(self.responses) {
                 RequestKey::Routing(field) => {
                     if seen_routing_keys & field.bit() != 0 {
                         return Err(serde::de::Error::custom(format_args!(
@@ -815,6 +887,9 @@ impl<'de> serde::de::Visitor<'de> for RoutingFieldsVisitor {
                         RoutingKey::MaxTokens => fields.max_tokens = map.next_value()?,
                         RoutingKey::MaxCompletionTokens => {
                             fields.max_completion_tokens = map.next_value()?
+                        }
+                        RoutingKey::MaxOutputTokens => {
+                            fields.max_output_tokens = map.next_value()?
                         }
                     }
                 }
@@ -835,7 +910,7 @@ impl<'de> serde::de::Visitor<'de> for RoutingFieldsVisitor {
                     fields.prompt_batch =
                         prompt.get(0).is_some_and(|p| p.is_string() || p.is_array());
                 }
-                RequestKey::Other => {
+                RequestKey::RequestId | RequestKey::Other => {
                     // Validate unrelated JSON without retaining its contents.
                     map.next_value::<IgnoredAny>()?;
                 }
@@ -849,17 +924,22 @@ impl<'de> Deserialize<'de> for RoutingFields {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         d.deserialize_map(RoutingFieldsVisitor {
             read_sampling: true,
+            responses: false,
         })
     }
 }
 
-/// Preserve valid JSON with sampling numbers outside f64 range (for example, 1e400).
-fn parse_without_sampling_values(body: &[u8]) -> Result<RoutingFields, serde_json::Error> {
+fn parse_fields(
+    body: &[u8],
+    read_sampling: bool,
+    responses: bool,
+) -> Result<RoutingFields, serde_json::Error> {
     let mut de = serde_json::Deserializer::from_slice(body);
     let fields = serde::Deserializer::deserialize_map(
         &mut de,
         RoutingFieldsVisitor {
-            read_sampling: false,
+            read_sampling,
+            responses,
         },
     )?;
     de.end()?;
@@ -867,8 +947,11 @@ fn parse_without_sampling_values(body: &[u8]) -> Result<RoutingFields, serde_jso
 }
 
 impl RoutingFields {
+    /// Only one of these is read per endpoint, so the first present one is the budget.
     fn requested_max_output_tokens(&self) -> Option<u64> {
-        self.max_completion_tokens.or(self.max_tokens)
+        self.max_completion_tokens
+            .or(self.max_tokens)
+            .or(self.max_output_tokens)
     }
 
     fn sampling_field(&self, field: SamplingField) -> SamplingValue {
@@ -958,6 +1041,21 @@ pub(super) fn append_fields(body: &Bytes, fields: &[(&str, String)]) -> Option<B
     Some(Bytes::from(output))
 }
 
+/// The PD prefill copy of an outgoing body. Prefill only fills KV for decode, so
+/// it never streams: its own error status then reaches the client unwrapped.
+/// `stream_options` goes with it, which the engine rejects without `stream`.
+pub(super) fn pd_prefill_body(body: &Bytes) -> Result<Bytes, ApiError> {
+    let mut value: Value = serde_json::from_slice(body).map_err(|_| invalid_request())?;
+    let Some(fields) = value.as_object_mut() else {
+        return Ok(body.clone());
+    };
+    fields.insert("stream".into(), Value::Bool(false));
+    fields.remove("stream_options");
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|e| ApiError::Internal(anyhow::Error::new(e).context("serialize PD prefill request")))
+}
+
 /// Preserve original bytes where possible; reuse parsed JSON for token or bootstrap injection.
 fn build_outgoing_body(
     body: &Bytes,
@@ -965,7 +1063,8 @@ fn build_outgoing_body(
     input_ids: Option<&[u32]>,
     bootstrap: Option<&BootstrapFields>,
     sampling_defaults: &[(SamplingField, Number)],
-    rid: Option<&str>,
+    // Request-ID key (`rid`, or `request_id` for Responses) and value.
+    rid: Option<(&str, &str)>,
 ) -> Result<Bytes, ApiError> {
     let needs_parse = input_ids.is_some() || bootstrap.is_some();
     if !needs_parse && sampling_defaults.is_empty() && rid.is_none() {
@@ -976,7 +1075,7 @@ fn build_outgoing_body(
         let defaults = sampling_defaults
             .iter()
             .map(|(field, value)| (field.wire_name(), value.to_string()));
-        let rid = rid.map(|rid| ("rid", Value::from(rid).to_string()));
+        let rid = rid.map(|(key, rid)| (key, Value::from(rid).to_string()));
         let fields: Vec<_> = defaults.chain(rid).collect();
         if let Some(spliced) = append_fields(body, &fields) {
             return Ok(spliced);
@@ -992,8 +1091,8 @@ fn build_outgoing_body(
             return Err(invalid_request());
         }
     };
-    if let Some(rid) = rid {
-        body_fields.insert("rid".into(), Value::String(rid.to_owned()));
+    if let Some((key, rid)) = rid {
+        body_fields.insert(key.into(), Value::String(rid.to_owned()));
     }
     for (field, default) in sampling_defaults {
         body_fields.insert(field.wire_name().into(), default.clone().into());
@@ -1249,17 +1348,27 @@ fn sampling_violation(spec: &ParamSpec, provided: SamplingValue) -> Option<Strin
     }
 }
 
+#[cfg(test)]
 pub(super) fn parse_routing_fields(body: &Bytes) -> Result<RoutingFields, ApiError> {
-    let err = match serde_json::from_slice::<RoutingFields>(body) {
+    parse_request_fields(body, CHAT_PATH)
+}
+
+/// Routing fields of an OpenAI chat, completions or Responses body.
+pub(super) fn parse_request_fields(
+    body: &Bytes,
+    path: &'static str,
+) -> Result<RoutingFields, ApiError> {
+    let responses = path == RESPONSES_PATH;
+    let err = match parse_fields(body, true, responses) {
         Ok(fields) => return Ok(fields),
         Err(e) => e,
     };
     // Retry without numeric conversion so sampling rules can handle values such as 1e400.
-    if let Ok(fields) = parse_without_sampling_values(body) {
+    if let Ok(fields) = parse_fields(body, false, responses) {
         return Ok(fields);
     }
     // Keep deserialization details out of the client-visible error.
-    tracing::debug!(error = %err, "chat-completions routing-fields deserialize failed");
+    tracing::debug!(error = %err, path, "routing-fields deserialize failed");
     Err(invalid_request())
 }
 

@@ -43,6 +43,7 @@ use crate::{
     },
     routers::{
         error,
+        error::truncate_error_body,
         grpc::utils::{error_type_from_status, route_to_endpoint},
         header_utils,
         streaming_utils::BreakerTrackedStream,
@@ -541,24 +542,27 @@ impl PDRouter {
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
             response_headers.remove(CONTENT_LENGTH);
             let error_payload = match res.bytes().await {
-                Ok(error_body) => match serde_json::from_slice::<Value>(&error_body) {
-                    Ok(error_json) => {
-                        json!({ "message": error_json, "status": status.as_u16() })
+                Ok(error_body) => {
+                    let error_body = truncate_error_body(error_body);
+                    match serde_json::from_slice::<Value>(&error_body) {
+                        Ok(error_json) => {
+                            json!({ "message": error_json, "status": status.as_u16() })
+                        }
+                        Err(parse_err) => {
+                            let body_text = String::from_utf8_lossy(&error_body).to_string();
+                            let preview: String = body_text.chars().take(256).collect();
+                            tracing::warn!(
+                                "Failed to parse decode error body as JSON from {}: {} \
+                                 (status={}, body preview: {:?})",
+                                decode.url(),
+                                parse_err,
+                                status.as_u16(),
+                                preview
+                            );
+                            json!({ "message": body_text, "status": status.as_u16() })
+                        }
                     }
-                    Err(parse_err) => {
-                        let body_text = String::from_utf8_lossy(&error_body).to_string();
-                        let preview: String = body_text.chars().take(256).collect();
-                        tracing::warn!(
-                            "Failed to parse decode error body as JSON from {}: {} \
-                             (status={}, body preview: {:?})",
-                            decode.url(),
-                            parse_err,
-                            status.as_u16(),
-                            preview
-                        );
-                        json!({ "message": body_text, "status": status.as_u16() })
-                    }
-                },
+                }
                 Err(e) => {
                     json!({ "message": format!("Decode server error: {}", e), "status": status.as_u16() })
                 }
@@ -580,6 +584,7 @@ impl PDRouter {
             // Handle non-streaming error response
             match res.bytes().await {
                 Ok(error_body) => {
+                    let error_body = truncate_error_body(error_body);
                     // Try to parse error message from body, fallback to status-based error
                     let error_message = if let Ok(error_json) =
                         serde_json::from_slice::<Value>(&error_body)
@@ -1296,11 +1301,14 @@ impl PDRouter {
 
         // Check if prefill succeeded
         if !prefill_status.is_success() {
-            // Get error body from prefill
-            let error_msg = prefill_response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown prefill error".to_string());
+            // Get error body from prefill. A worker validation error on a
+            // `Union` field echoes `input` once per branch, so an unbounded
+            // body here can balloon into tens of KB — cap it before it's
+            // embedded into the client-facing error message.
+            let error_msg = match prefill_response.bytes().await {
+                Ok(body) => String::from_utf8_lossy(&truncate_error_body(body)).into_owned(),
+                Err(_) => "Unknown prefill error".to_string(),
+            };
 
             error!(
                 "Prefill server returned error status prefill_url={} status={} body={}",

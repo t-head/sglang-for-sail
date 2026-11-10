@@ -72,7 +72,10 @@ fn config() -> Config {
 }
 
 fn build_ctx(specs: Vec<WorkerSpec>) -> Arc<AppContext> {
-    let cfg = config();
+    build_ctx_with_config(specs, config())
+}
+
+fn build_ctx_with_config(specs: Vec<WorkerSpec>, cfg: Config) -> Arc<AppContext> {
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
     for s in specs {
@@ -125,6 +128,16 @@ async fn await_captured_body(
 
 fn parse_body(b: &Bytes) -> Value {
     serde_json::from_slice(b).expect("body must be valid JSON")
+}
+
+fn assert_internal_rid(value: &Value) -> &str {
+    let rid = value["rid"]
+        .as_str()
+        .expect("PD request must carry a scalar RID");
+    let uuid = rid.strip_prefix("sgl-router-").expect("router RID prefix");
+    assert_eq!(uuid.len(), 36, "internal RIDs must have fixed length");
+    assert_eq!(uuid::Uuid::parse_str(uuid).unwrap().get_version_num(), 4);
+    rid
 }
 
 /// Helper: extract bootstrap_host as &str.
@@ -329,6 +342,215 @@ async fn pd_mode_bootstrap_port_matches_chosen_prefill_worker() {
         Some(22222),
         "prefill_b body should carry its own bootstrap_port"
     );
+}
+
+/// Match SGLang's prefix-based abort while two Decode requests are active.
+/// The sibling must remain pending until explicitly completed by the test.
+#[tokio::test]
+async fn pd_abort_does_not_cancel_another_callers_rid_prefix() {
+    use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use tokio::sync::oneshot;
+
+    #[derive(Default)]
+    struct DecodeState {
+        pending: HashMap<String, oneshot::Sender<StatusCode>>,
+        bodies: Vec<Value>,
+        aborted: Vec<String>,
+    }
+    let state = Arc::new(Mutex::new(DecodeState::default()));
+    let decode_app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(
+                |State(state): State<Arc<Mutex<DecodeState>>>, Json(body): Json<Value>| async move {
+                    let rid = body["rid"].as_str().unwrap().to_string();
+                    let (tx, rx) = oneshot::channel();
+                    {
+                        let mut state = state.lock().unwrap();
+                        state.bodies.push(body);
+                        assert!(state.pending.insert(rid, tx).is_none());
+                    }
+                    let status = rx.await.unwrap();
+                    (
+                        status,
+                        Json(json!({"choices":[{"message":{"content":"ok"}}]})),
+                    )
+                },
+            ),
+        )
+        .route(
+            "/abort_request",
+            post(
+                |State(state): State<Arc<Mutex<DecodeState>>>, Json(body): Json<Value>| async move {
+                    let prefix = body["rid"].as_str().unwrap();
+                    let mut state = state.lock().unwrap();
+                    let matches: Vec<_> = state
+                        .pending
+                        .keys()
+                        .filter(|rid| rid.starts_with(prefix))
+                        .cloned()
+                        .collect();
+                    for rid in matches {
+                        state.aborted.push(rid.clone());
+                        let _ = state
+                            .pending
+                            .remove(&rid)
+                            .unwrap()
+                            .send(StatusCode::INTERNAL_SERVER_ERROR);
+                    }
+                    StatusCode::OK
+                },
+            ),
+        )
+        .with_state(Arc::clone(&state));
+    let prefill_app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(
+                |State(state): State<Arc<Mutex<DecodeState>>>, Json(body): Json<Value>| async move {
+                    // Both decode requests must have arrived before the failure.
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        loop {
+                            if state.lock().unwrap().bodies.len() == 2 {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    let decode_body = state
+                        .lock()
+                        .unwrap()
+                        .bodies
+                        .iter()
+                        .find(|value| value["messages"] == body["messages"])
+                        .unwrap()
+                        .clone();
+                    assert_eq!(body["rid"], decode_body["rid"]);
+                    if body["messages"][0]["content"] == "fail" {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"error":"prefill failed"})),
+                        )
+                            .into_response()
+                    } else {
+                        Json(json!({})).into_response()
+                    }
+                },
+            ),
+        )
+        .with_state(Arc::clone(&state));
+    let p_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let d_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let p_url = format!("http://{}", p_listener.local_addr().unwrap());
+    let d_url = format!("http://{}", d_listener.local_addr().unwrap());
+    let p_task = tokio::spawn(async move { axum::serve(p_listener, prefill_app).await.unwrap() });
+    let d_task = tokio::spawn(async move { axum::serve(d_listener, decode_app).await.unwrap() });
+    // Ensure the listeners stop even if an assertion panics.
+    struct TestServers([tokio::task::JoinHandle<()>; 2]);
+    impl Drop for TestServers {
+        fn drop(&mut self) {
+            for task in &self.0 {
+                task.abort();
+            }
+        }
+    }
+    let _servers = TestServers([p_task, d_task]);
+    let mut cfg = config();
+    // Keep the decode body's `messages`, which the prefill mock matches on.
+    cfg.model.disable_input_ids_forwarding = true;
+    let ctx = build_ctx_with_config(
+        vec![
+            WorkerSpec {
+                id: WorkerId("p1".into()),
+                url: p_url,
+                mode: WorkerMode::Prefill,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: Some(8997),
+                ..Default::default()
+            },
+            WorkerSpec {
+                id: WorkerId("d1".into()),
+                url: d_url,
+                mode: WorkerMode::Decode,
+                model_ids: vec![ModelId("tiny".into())],
+                ..Default::default()
+            },
+        ],
+        cfg,
+    );
+    let app = build_router(Arc::clone(&ctx));
+    let request = |rid: &str, content: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"model":"tiny", "rid":rid, "stream":false,
+            "messages":[{"role":"user","content":content}]})
+                .to_string(),
+            ))
+            .unwrap()
+    };
+    let failed = tokio::spawn(app.clone().oneshot(request("request-1", "fail")));
+    let sibling = tokio::spawn(app.oneshot(request("request-10", "succeed")));
+    let response = tokio::time::timeout(Duration::from_secs(2), failed)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    // Dropping the failed decode sends its abort from a spawned task.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state.lock().unwrap().aborted.is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    {
+        let mut state = state.lock().unwrap();
+        assert_eq!(state.bodies.len(), 2);
+        assert_eq!(
+            state.aborted.len(),
+            1,
+            "abort must only match the failed request"
+        );
+        assert_eq!(
+            state.pending.len(),
+            1,
+            "sibling must remain active after abort"
+        );
+        let failed_body = state
+            .bodies
+            .iter()
+            .find(|b| b["messages"][0]["content"] == "fail")
+            .unwrap();
+        let failed_rid = assert_internal_rid(failed_body).to_string();
+        let sibling_body = state
+            .bodies
+            .iter()
+            .find(|b| b["messages"][0]["content"] == "succeed")
+            .unwrap();
+        let sibling_rid = assert_internal_rid(sibling_body).to_string();
+        assert_ne!(failed_rid, sibling_rid);
+        assert_eq!(state.aborted, vec![failed_rid]);
+        state
+            .pending
+            .remove(&sibling_rid)
+            .unwrap()
+            .send(StatusCode::OK)
+            .unwrap();
+    }
+    let response = tokio::time::timeout(Duration::from_secs(2), sibling)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 fn streaming_chat_request() -> Request<Body> {

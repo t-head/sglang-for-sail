@@ -35,7 +35,7 @@ use crate::{
         responses::{ResponsesGetParams, ResponsesRequest},
     },
     routers::{
-        error::{self, extract_error_code_from_response},
+        error::{self, extract_error_code_from_response, truncate_error_body},
         grpc::utils::{error_type_from_status, route_to_endpoint},
         header_utils,
         streaming_utils::BreakerTrackedStream,
@@ -592,11 +592,19 @@ impl Router {
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
         if !is_stream {
-            // For non-streaming requests, preserve headers
+            // For non-streaming requests, preserve headers. Non-2xx bodies
+            // are truncated for the same reason as the streaming branch
+            // below — an oversized `Union` validation error should not be
+            // forwarded unbounded.
             let response_headers = header_utils::preserve_response_headers(res.headers());
 
             let response = match res.bytes().await {
                 Ok(body) => {
+                    let body = if status.is_success() {
+                        body
+                    } else {
+                        truncate_error_body(body)
+                    };
                     let mut response = Response::new(Body::from(body));
                     *response.status_mut() = status;
                     *response.headers_mut() = response_headers;
@@ -610,6 +618,30 @@ impl Router {
 
             // load_guard dropped here automatically after response body is read
             response
+        } else if !status.is_success() {
+            // A non-2xx body is an error payload, not a generation: buffer
+            // and truncate it rather than pumping it through the SSE path.
+            // A worker validation error on a `Union` field echoes `input`
+            // once per branch, so an unbounded pump here can forward tens
+            // of KB of repeated request data for one bad field. There is no
+            // stream lifetime to track, so record the breaker outcome up
+            // front and let `load_guard` drop normally (no `AttachedBody`
+            // wrapping needed).
+            worker.record_outcome(false);
+            let response_headers = header_utils::preserve_response_headers(res.headers());
+            let response = match res.bytes().await {
+                Ok(body) => {
+                    let mut response = Response::new(Body::from(truncate_error_body(body)));
+                    *response.status_mut() = status;
+                    *response.headers_mut() = response_headers;
+                    response
+                }
+                Err(e) => {
+                    let error_msg = format!("Failed to get response body: {}", e);
+                    error::internal_error("read_response_body_failed", error_msg)
+                }
+            };
+            response
         } else {
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
@@ -622,19 +654,10 @@ impl Router {
             // no spawned task or channel needed. `BreakerTrackedStream`
             // updates the worker's circuit breaker exactly once on drop:
             // success on clean end, failure on stream error, neither on
-            // client disconnect. For non-2xx responses we pre-mark the
-            // wrapper as Errored — otherwise the small error body would
-            // stream cleanly to `None` and Drop would record a spurious
-            // success (and the streaming branch also skips the eager
-            // `record_outcome` above).
-            let mut tracked = BreakerTrackedStream::new(
-                res.bytes_stream(),
-                worker.clone(),
-                worker_url.to_string(),
-            );
-            if !status.is_success() {
-                tracked.mark_errored();
-            }
+            // client disconnect. Only reached for 2xx responses — non-2xx is
+            // handled above.
+            let tracked =
+                BreakerTrackedStream::new(res.bytes_stream(), worker.clone(), worker_url.to_string());
             let body = Body::from_stream(tracked);
 
             let mut response = Response::new(body);

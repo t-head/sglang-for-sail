@@ -93,26 +93,35 @@ async fn pd_failure_returns_without_waiting_for_the_other_side() {
     for reorg in [false, true] {
         for stream in [false, true] {
             // (prefill, decode, client status, router error code, whether prefill is blamed)
+            // Gateways key on these codes: a prefill 4xx keeps the worker's status
+            // and body, any other prefill failure is a 502.
             let cases = [
                 (
                     error(StatusCode::BAD_REQUEST).await,
                     hanging().await,
                     StatusCode::BAD_REQUEST,
-                    None,
+                    Some("prefill_request_rejected"),
+                    true,
+                ),
+                (
+                    error(StatusCode::TOO_MANY_REQUESTS).await,
+                    hanging().await,
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Some("prefill_request_rejected"),
                     true,
                 ),
                 (
                     error(StatusCode::SERVICE_UNAVAILABLE).await,
                     hanging().await,
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    None,
+                    StatusCode::BAD_GATEWAY,
+                    Some("prefill_worker_error"),
                     true,
                 ),
                 (
                     error(StatusCode::INTERNAL_SERVER_ERROR).await,
                     hanging().await,
                     StatusCode::BAD_GATEWAY,
-                    Some("prefill_failed"),
+                    Some("prefill_worker_error"),
                     true,
                 ),
                 // Transport failure: the prefill body is cut off.
@@ -143,9 +152,16 @@ async fn pd_failure_returns_without_waiting_for_the_other_side() {
                 assert_eq!(response.status(), expected);
                 let router_code = response.headers().get("x-router-error-code").cloned();
                 assert_eq!(router_code.as_ref().map(|c| c.to_str().unwrap()), code);
+                let upstream_status = response.headers().get("x-router-upstream-status").cloned();
                 let body = response.into_body().collect().await.unwrap().to_bytes();
-                if code.is_none() {
+                // Worker answers pass through verbatim; only router 502s carry the
+                // worker's status separately.
+                if matches!(code, None | Some("prefill_request_rejected")) {
                     assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), rejected);
+                    assert!(upstream_status.is_none());
+                }
+                if code == Some("prefill_worker_error") {
+                    assert!(upstream_status.is_some());
                 }
                 let (blamed, other) = match prefill_blamed {
                     true => ((&prefill.url, "prefill"), (&decode.url, "decode")),
@@ -270,14 +286,30 @@ async fn decode_failure_leaves_prefill_running() {
     }
 }
 
-/// A streaming prefill that fails after committing a 200 is still a prefill failure.
+/// A scheduler rejection reaches a streaming client as prefill's own 4xx, not a
+/// 502: prefill never streams, so the engine reports it as a status, not an SSE event.
 #[tokio::test]
-async fn prefill_sse_error_event_is_a_prefill_failure() {
+async fn streaming_pd_prefill_rejection_keeps_its_status() {
+    use axum::response::IntoResponse;
     for reorg in [false, true] {
-        let prefill =
-            MockWorker::start(vec!["data: {\"error\": {\"message\": \"boom\"}}\n\n"]).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let prefill_url = format!("http://{}", listener.local_addr().unwrap());
+        // Like the engine: a streaming request fails as a 200 SSE event, else as a status.
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|axum::Json(body): axum::Json<Value>| async move {
+                if body["stream"] == true {
+                    let event = "data: {\"error\": {\"message\": \"rejected\", \"code\": 400}}\n\n";
+                    (StatusCode::OK, event).into_response()
+                } else {
+                    let error = axum::Json(json!({"error": "rejected"}));
+                    (StatusCode::BAD_REQUEST, error).into_response()
+                }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let decode = MockWorker::start_hanging(Duration::from_secs(10)).await;
-        let ctx = pd_ctx(&prefill.url, &decode.url, reorg);
+        let ctx = pd_ctx(&prefill_url, &decode.url, reorg);
         let response = tokio::time::timeout(
             Duration::from_secs(1),
             build_router(ctx.clone()).oneshot(chat(true)),
@@ -285,8 +317,8 @@ async fn prefill_sse_error_event_is_a_prefill_failure() {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        assert_eq!(response.headers()["x-router-error-code"], "prefill_failed");
-        assert_eq!(outcomes(&ctx, &prefill.url, "prefill"), ["error"]);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.headers()["x-router-error-code"], "prefill_request_rejected");
+        assert_eq!(outcomes(&ctx, &prefill_url, "prefill"), ["client_error"]);
     }
 }

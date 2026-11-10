@@ -26,8 +26,8 @@ use axum::http::{HeaderMap, HeaderName, Response};
 use bytes::Bytes;
 use forward::{forward_request, RequestDurationGuard, SelectedWorkers};
 use preparation::{
-    parse_embedding_request, parse_routing_fields, PreparedRequest, CHAT_PATH, CLASSIFY_PATH,
-    COMPLETIONS_PATH, EMBEDDINGS_PATH,
+    parse_embedding_request, parse_request_fields, PreparedRequest, CHAT_PATH, CLASSIFY_PATH,
+    COMPLETIONS_PATH, EMBEDDINGS_PATH, RESPONSES_PATH,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -36,9 +36,10 @@ use std::time::Instant;
 const X_SGL_TTFT_SLO_MS: HeaderName = HeaderName::from_static("x-sgl-ttft-slo-ms");
 const X_SGL_TPS_SLO: HeaderName = HeaderName::from_static("x-sgl-tps-slo");
 
-/// Maximum buffered request body, including base64 multimodal inputs (32 MiB).
-/// Enforced by the `DefaultBodyLimit` layer in app.rs, which returns 413.
-pub const MAX_CHAT_BODY_BYTES: usize = 32 << 20;
+/// Maximum buffered request body, including base64 multimodal inputs.
+/// Enforced by the `DefaultBodyLimit` layers in app.rs, which return 413; chat
+/// and Responses use `--max-chat-body-bytes`, whose default this is.
+pub const MAX_CHAT_BODY_BYTES: usize = crate::config::default_max_chat_body_bytes();
 
 /// Validate, select workers, and forward a chat-completions request.
 pub async fn chat_completions(
@@ -58,6 +59,18 @@ pub async fn completions(
     openai_route(&ctx, COMPLETIONS_PATH, headers, body).await
 }
 
+/// OpenAI Responses, forwarded to the engine's `/v1/responses` as sent.
+///
+/// The chat encoder cannot render Responses input, so these route on load and
+/// the body-size token estimate instead of tokenized prompts.
+pub async fn responses(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    openai_route(&ctx, RESPONSES_PATH, headers, body).await
+}
+
 async fn openai_route(
     ctx: &AppContext,
     path: &'static str,
@@ -65,13 +78,13 @@ async fn openai_route(
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
     let start = Instant::now();
-    let mut fields = parse_routing_fields(&body)?;
-    let model = ModelId(
-        fields
-            .model
-            .take()
-            .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?,
-    );
+    let mut fields = parse_request_fields(&body, path)?;
+    let model = ModelId(match fields.model.take() {
+        Some(model) => model,
+        // `model` is optional in the Responses API; use the served model.
+        None if path == RESPONSES_PATH => ctx.config.model.id.clone(),
+        None => return Err(ApiError::BadRequest("missing `model` field".into())),
+    });
     let routing = ModelRouting::lookup(ctx, &model)?;
     let tokens = routing.needs_request_tokens(ctx);
     let request = PreparedRequest::openai(ctx, path, model, fields, &headers, body, tokens)?;

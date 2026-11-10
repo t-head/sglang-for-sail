@@ -762,6 +762,94 @@ async fn non_streaming_upstream_4xx_body_passthrough() {
 }
 
 #[tokio::test]
+async fn non_streaming_oversized_upstream_error_body_is_truncated() {
+    // A worker validation error on a `Union` field emits one entry per branch,
+    // each echoing `input`, so one bad value can balloon into tens of KB. The
+    // router caps what reaches the client. Small error bodies still pass
+    // through verbatim -- see the passthrough tests above.
+    let worker = crate::common::mock_worker::MockWorker::start_returning_error(
+        StatusCode::BAD_REQUEST,
+        serde_json::json!({"error": {"message": "x".repeat(64 * 1024)}}),
+    )
+    .await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "truncation must not change the upstream status",
+    );
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert!(
+        bytes.len() < 8 * 1024,
+        "oversized upstream error body must be truncated; got {} bytes",
+        bytes.len(),
+    );
+    let text = String::from_utf8(bytes.to_vec()).expect("truncated body must stay UTF-8");
+    assert!(
+        text.contains("[truncated,"),
+        "client must be told the body was cut: {text:.256}",
+    );
+}
+
+#[tokio::test]
+async fn streaming_oversized_upstream_error_body_is_truncated() {
+    // A `stream: true` request whose body fails worker-side validation gets
+    // the same oversized error payload, so the streaming path needs the same
+    // cap. It is returned buffered, not pumped as SSE.
+    let worker = crate::common::mock_worker::MockWorker::start_returning_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        serde_json::json!({"error": {"message": "x".repeat(64 * 1024)}}),
+    )
+    .await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true,
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        res.headers().get("content-type").unwrap().to_str().unwrap(),
+        "application/json",
+        "upstream content-type must survive the truncating path",
+    );
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert!(
+        bytes.len() < 8 * 1024,
+        "oversized streaming error body must be truncated; got {} bytes",
+        bytes.len(),
+    );
+    let text = String::from_utf8(bytes.to_vec()).expect("truncated body must stay UTF-8");
+    assert!(text.contains("[truncated,"), "cut must be marked: {text:.256}");
+}
+
+#[tokio::test]
 async fn oversized_request_body_returns_413() {
     // Regression: the router must enforce a body-size cap on
     // `/v1/chat/completions`. A multi-MiB body from a hostile client must be
@@ -1876,4 +1964,106 @@ async fn streaming_error_event_then_transport_failure_records_upstream_error() {
         worker.url,
     );
     wait_for_metric(&ctx, &expected).await;
+}
+
+async fn post_json(app: axum::Router, uri: &str, body: Vec<u8>) -> axum::response::Response {
+    let req = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    app.oneshot(req).await.unwrap()
+}
+
+#[tokio::test]
+async fn responses_forwards_to_responses_path_with_request_id() {
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let app = build_router(build_ctx_with_worker(&worker.url));
+
+    // `model` is optional for Responses; the router fills in the served model.
+    let body = serde_json::json!({"input": "hi", "max_output_tokens": 8});
+    let res = post_json(app, "/v1/responses", serde_json::to_vec(&body).unwrap()).await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let captured = worker.captured.lock().unwrap();
+    assert_eq!(
+        captured.headers.get("x-mock-path").map(String::as_str),
+        Some("/v1/responses"),
+        "Responses must reach the worker's /v1/responses endpoint",
+    );
+    let sent: serde_json::Value =
+        serde_json::from_slice(captured.last_body.as_ref().expect("forwarded")).unwrap();
+    let request_id = sent["request_id"].as_str().expect("router injects request_id");
+    assert!(request_id.starts_with("resp_"), "got {request_id}");
+    assert!(sent.get("rid").is_none(), "chat `rid` must not leak into Responses: {sent}");
+    assert!(
+        sent.get("input_ids").is_none(),
+        "chat tokens cannot represent Responses input: {sent}",
+    );
+}
+
+#[tokio::test]
+async fn responses_keeps_caller_request_id() {
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let app = build_router(build_ctx_with_worker(&worker.url));
+
+    let body = serde_json::json!({"model": "tiny", "input": "hi", "request_id": "resp_caller"});
+    let res = post_json(app, "/v1/responses", serde_json::to_vec(&body).unwrap()).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let captured = worker.captured.lock().unwrap();
+    let sent: serde_json::Value =
+        serde_json::from_slice(captured.last_body.as_ref().unwrap()).unwrap();
+    assert_eq!(sent["request_id"], "resp_caller");
+}
+
+#[tokio::test]
+async fn responses_unknown_model_returns_404() {
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let app = build_router(build_ctx_with_worker(&worker.url));
+    let body = serde_json::json!({"model": "other", "input": "hi"});
+    let res = post_json(app, "/v1/responses", serde_json::to_vec(&body).unwrap()).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    assert!(worker.captured.lock().unwrap().last_body.is_none());
+}
+
+#[tokio::test]
+async fn default_body_limit_accepts_bodies_above_32_mib() {
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let app = build_router(build_ctx_with_worker(&worker.url));
+
+    // Pad a valid request to 40 MiB: above the old hard-coded 32 MiB cap,
+    // below the 70 MB default.
+    let pad = "x".repeat(40 << 20);
+    let body = format!(
+        r#"{{"model":"tiny","messages":[{{"role":"user","content":"hi"}}],"pad":"{pad}"}}"#
+    );
+    assert!(body.len() < MAX_CHAT_BODY_BYTES);
+    let res = post_json(app, "/v1/chat/completions", body.into_bytes()).await;
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn configured_body_limit_applies_to_chat_and_responses() {
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let mut cfg = config_for(&worker.url);
+    cfg.proxy.max_chat_body_bytes = 1024;
+    let registry = Arc::new(WorkerRegistry::default());
+    let _ = registry.add(WorkerSpec {
+        id: WorkerId("w1".into()),
+        url: worker.url.clone(),
+        mode: WorkerMode::Plain,
+        model_ids: vec![ModelId("tiny".into())],
+        ..Default::default()
+    });
+    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
+    let app = build_router(Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies)));
+
+    for uri in ["/v1/chat/completions", "/v1/responses"] {
+        let res = post_json(app.clone(), uri, vec![b' '; 1025]).await;
+        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE, "{uri}");
+    }
+    assert!(worker.captured.lock().unwrap().last_body.is_none());
 }

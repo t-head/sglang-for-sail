@@ -11,7 +11,8 @@ use std::num::NonZeroU32;
 use crate::config::sampling::{parse_sampling_overrides, ConflictPolicy};
 use crate::config::types::is_selector_empty;
 use crate::config::{
-    default_cb_cool_down, default_host, default_port, default_proxy_request_timeout_secs,
+    default_cb_cool_down, default_host, default_max_chat_body_bytes, default_port,
+    default_proxy_request_timeout_secs,
     default_shutdown_drain_secs, default_stale_request_timeout_secs, resolve_mode, AffinityConfig,
     AffinityMode, BalancedBy, CacheAwareConfig, CachePrefixProvider, ChatRoutingKind,
     CircuitBreakerConfig, Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig,
@@ -151,6 +152,10 @@ pub struct ServerArgs {
     /// Maximum silence between upstream stream chunks, in seconds.
     #[arg(long, default_value_t = ProxyConfig::default().stream_idle_timeout_secs)]
     pub stream_idle_timeout_secs: u64,
+    /// Max accepted `/v1/chat/completions` and `/v1/responses` body size in bytes.
+    /// Larger bodies are rejected with 413 before routing.
+    #[arg(long, default_value_t = default_max_chat_body_bytes())]
+    pub max_chat_body_bytes: usize,
 
     /// Dispatch attempts per request, including the first. A request that fails
     /// before any response reaches the client (transport error, 5xx, 429) is
@@ -635,6 +640,7 @@ impl Cli {
                 max_attempts: self.server.retry_max_attempts,
                 initial_backoff_ms: self.server.retry_initial_backoff_ms,
                 max_backoff_ms: self.server.retry_max_backoff_ms,
+                max_chat_body_bytes: self.server.max_chat_body_bytes,
             },
             router_inflight_load: InflightLoadConfig {
                 stale_request_timeout_secs: self.server.stale_request_timeout_secs,
@@ -1153,6 +1159,23 @@ mod tests {
         DiscoveryBackend, ScoreTermKind, MAX_KV_BOOTSTRAP_TIMEOUT_MS,
         MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS,
     };
+
+    #[test]
+    fn max_chat_body_bytes_defaults_and_overrides() {
+        let base = [
+            "router",
+            "--model-id",
+            "tiny",
+            "--worker-urls",
+            "http://localhost:30000",
+        ];
+        let config = Cli::try_parse_from(base).unwrap().into_config().unwrap();
+        assert_eq!(config.proxy.max_chat_body_bytes, 70_000_000);
+
+        let args = base.iter().chain(["--max-chat-body-bytes", "536870912"].iter());
+        let config = Cli::try_parse_from(args).unwrap().into_config().unwrap();
+        assert_eq!(config.proxy.max_chat_body_bytes, 512 << 20);
+    }
 
     #[test]
     fn chat_routing_selects_policy_implementation_without_another_config() {

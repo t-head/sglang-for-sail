@@ -74,12 +74,15 @@ impl MockWorker {
         let app = axum::Router::new()
             .route("/v1/chat/completions", post(chat))
             .route("/v1/completions", post(chat))
+            .route("/v1/responses", post(responses))
             .route("/generate", post(generate))
             .route("/v1/embeddings", post(embeddings))
             .route("/v1/classify", post(classify))
             .route("/v1/rerank", post(rerank))
             .route("/server_info", get(serve_tiny_server_info))
             .route("/abort_request", abort_request_route(abort_log.clone()))
+            // Let router body-limit tests reach the worker with large payloads.
+            .layer(axum::extract::DefaultBodyLimit::disable())
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -473,6 +476,19 @@ fn stream_response(s: &MockWorkerState, request: &Value) -> Option<Response<Body
         "text/event-stream".parse().unwrap(),
     );
     Some(r)
+}
+
+#[allow(dead_code)] // Used by `MockWorker::start`, only some test files need it.
+/// Same as `chat`, but marks the upstream path so tests can tell the endpoints apart.
+async fn responses(state: State<MockWorkerState>, headers: HeaderMap, body: Bytes) -> Response<Body> {
+    let captured = state.captured.clone();
+    let response = chat(state, headers, body).await;
+    captured
+        .lock()
+        .unwrap()
+        .headers
+        .insert("x-mock-path".into(), "/v1/responses".into());
+    response
 }
 
 #[allow(dead_code)] // Used by `MockWorker::start`, only some test files need it.

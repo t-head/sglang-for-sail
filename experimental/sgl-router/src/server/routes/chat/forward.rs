@@ -5,13 +5,14 @@
 
 use super::nonempty_header;
 use super::preparation::{
-    append_fields, generate_room_id, generate_room_id_for_rank, BootstrapFields, PreparedRequest,
+    append_fields, generate_room_id, generate_room_id_for_rank, pd_prefill_body, BootstrapFields,
+    PreparedRequest,
 };
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::policies::dp_rank::select_dp_rank;
 use crate::proxy::sse::{self, StreamEnd, StreamEndReason};
 use crate::server::app_context::AppContext;
-use crate::server::error::ApiError;
+use crate::server::error::{ApiError, PREFILL_REQUEST_REJECTED, X_ROUTER_ERROR_CODE};
 use crate::server::metrics::{
     classify_stream_end, outcome_from_status, MetricsRegistry, RequestLogContext, RequestOutcome,
     StaleRequestOutcome, WorkerModeLabel,
@@ -119,14 +120,22 @@ pub(super) async fn forward_request(
         (decode, bootstrap)
     });
     let path = request.path;
-    let engine_rid = request.engine_rid();
+    let engine_rid = request.engine_rid(pd.is_some());
+    // Read before `outgoing_body`, which consumes the cached parse.
+    let caller_rid = pd.as_ref().and_then(|_| request.caller_rid());
     let body = request.outgoing_body(
         ctx,
         pd.as_ref().map(|(_, bootstrap)| bootstrap),
         engine_rid.as_deref(),
     )?;
+    // Without PD, "prefill" is the only worker and gets the client's body.
+    let first_body = if pd.is_some() {
+        pd_prefill_body(&body)?
+    } else {
+        body.clone()
+    };
     let (prefill_headers, prefill_body) =
-        with_dp_rank(dp_aware, headers.clone(), &body, prefill_rank);
+        with_dp_rank(dp_aware, headers.clone(), &first_body, prefill_rank);
     let prefill_load_guards = (
         worker_load_guard,
         active_request_guard,
@@ -137,6 +146,19 @@ pub(super) async fn forward_request(
     let stream_abort = CancellationToken::new();
     let (response_worker, response_headers, response_body, response_load_guards, prefill_task) =
         if let Some((decode, bootstrap)) = pd {
+            let request_id = ["venus-request-id", "x-request-id"]
+                .iter()
+                .find_map(|name| headers.get(*name).and_then(|value| value.to_str().ok()))
+                .unwrap_or("-");
+            tracing::info!(
+                request_id,
+                engine_rid = ?engine_rid,
+                caller_rid = ?caller_rid,
+                prefill_url = %prefill.url,
+                decode_url = %decode.url,
+                bootstrap_room = bootstrap.room,
+                "dispatching paired PD request",
+            );
             let task = spawn_prefill_request(
                 ctx,
                 &metrics,
@@ -232,6 +254,13 @@ pub(super) async fn forward_request(
         Ok(mut response) => {
             if let Some(hint) = decode_url_header {
                 response.headers_mut().insert(X_SGL_DECODE_URL, hint);
+            }
+            // Only a prefill client error ends a PD request as `Ok` with prefill blamed.
+            if blamed_prefill.is_some() && response.status().is_client_error() {
+                response.headers_mut().insert(
+                    X_ROUTER_ERROR_CODE,
+                    HeaderValue::from_static(PREFILL_REQUEST_REJECTED),
+                );
             }
             response
         }
@@ -339,11 +368,15 @@ fn spawn_prefill_request(
                 None,
             )
             .await;
+        // The worker's backpressure stays backpressure even when the client sees a 502.
+        let backpressure = matches!(dispatch_outcome(&result), RequestOutcome::Backpressure);
         let failure = prefill_failure(result).await;
         let prefill_url = &prefill_worker.url;
-        let outcome = failure
-            .as_ref()
-            .map_or(RequestOutcome::Success, dispatch_outcome);
+        let outcome = match &failure {
+            None => RequestOutcome::Success,
+            Some(_) if backpressure => RequestOutcome::Backpressure,
+            Some(failure) => dispatch_outcome(failure),
+        };
         registry.record_worker_request(prefill_url, &model, WorkerModeLabel::Prefill, outcome);
         match &failure {
             None => tracing::debug!(%prefill_url, bootstrap_room, "prefill side completed"),
@@ -362,8 +395,8 @@ fn spawn_prefill_request(
     })
 }
 
-/// Client errors and backpressure pass through; only a prefill fault becomes
-/// `prefill_failed`.
+/// A prefill 4xx (429 included) passes through with the worker's status and body;
+/// any other failure, 503 included, becomes `prefill_worker_error`, as on prod v0.5.21.
 async fn prefill_failure(result: Result<Response<Body>, ApiError>) -> PrefillFailure {
     let status = match result {
         // A streaming prefill reports a late failure as a 200 carrying an SSE error event.
@@ -374,14 +407,7 @@ async fn prefill_failure(result: Result<Response<Body>, ApiError>) -> PrefillFai
                 _ => status,
             }
         }
-        Ok(response)
-            if matches!(
-                outcome_from_status(response.status().as_u16()),
-                RequestOutcome::Error
-            ) =>
-        {
-            response.status()
-        }
+        Ok(response) if !response.status().is_client_error() => response.status(),
         result => return Some(result),
     };
     Some(Err(ApiError::PrefillFailed {
