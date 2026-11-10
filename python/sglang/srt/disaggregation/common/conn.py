@@ -3,12 +3,25 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import dataclasses
+import functools
 import logging
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import nullcontext
-from typing import Dict, List, NamedTuple, Optional, Set, Tuple, Union
+from enum import Enum
+from typing import (
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    List,
+    NamedTuple,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 import msgspec
 import numpy as np
@@ -33,6 +46,7 @@ from sglang.srt.disaggregation.common.bootstrap import (
     BootstrapNotification,
     DeferredBootstrap,
 )
+from sglang.srt.disaggregation.common.transfer_lifetime import TransferLifetimeTracker
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -59,6 +73,9 @@ logger = logging.getLogger(__name__)
 
 ABORT_TAG = b"ABORT"
 ABORT_ACK_TAG = b"ABORT_ACK"
+# Default for the generation-scoped deferred-abort helpers: act on whatever
+# generation holds the room (the pre-scoping behavior).
+_ANY_GENERATION = object()
 
 
 # Reuse a keep-alive session per bootstrap_addr for decode-side bootstrap queries
@@ -66,6 +83,43 @@ ABORT_ACK_TAG = b"ABORT_ACK"
 # sockets and can exhaust ephemeral ports under high concurrency). Thread-local
 # because requests.Session is not safe for concurrent cross-thread use.
 _bootstrap_sessions = threading.local()
+
+
+# Arbitrary; bootstrap workers mostly sit in socket reads, so the pool is cheap.
+_DECODE_BOOTSTRAP_WORKERS = 32
+# Arbitrary; bounds how many bootstrap workers one unresponsive prefill can hold.
+_MAX_SETUP_JOBS_PER_PREFILL = 2
+_PARALLEL_INFO_WORKERS = 4
+
+
+def _bootstrap_http_timeout() -> Tuple[float, float]:
+    # A half-dead prefill accepts TCP and never answers; only a read budget bounds it.
+    return (
+        envs.SGLANG_DISAGGREGATION_BOOTSTRAP_HTTP_CONNECT_TIMEOUT.get(),
+        envs.SGLANG_DISAGGREGATION_BOOTSTRAP_HTTP_READ_TIMEOUT.get(),
+    )
+
+
+class ParallelInfoState(Enum):
+    """Outcome of one ``try_ensure_parallel_info`` attempt; PENDING means a
+    background fetch is in flight and is neither a success nor a failed try."""
+
+    FAILED = "failed"
+    READY = "ready"
+    PENDING = "pending"
+
+
+class _KeySetupResult(NamedTuple):
+    # Exactly one of the two is set.
+    bootstrap_infos: Optional[List[Dict]]
+    error: Optional[str]
+
+
+class _SetupJob(NamedTuple):
+    # (bootstrap_key, epoch): one shared job per key and prefill incarnation.
+    job_key: Tuple[str, int]
+    fetch_and_register: Callable[[], _KeySetupResult]
+    future: concurrent.futures.Future
 
 
 def _get_bootstrap_session(bootstrap_addr: str) -> requests.Session:
@@ -120,6 +174,8 @@ class PrefillServerInfo:
     # /generate to http://{bootstrap_host}:{prefill_http_port} to trigger a KV
     # recompute -- no router-injected pd_rebootstrap_prefill_url needed.
     prefill_http_port: Optional[int] = None
+
+    supports_dcp_page: bool = False
 
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
@@ -277,6 +333,9 @@ class CommonKVManager(BaseKVManager):
     kv_status_msg_tag: Optional[bytes] = None
     kv_status_msg_carries_reason: bool = False
 
+    # Prefill-side source-buffer lease tracker; only Mooncake prefill sets it.
+    _transfer_lifetime: Optional[TransferLifetimeTracker] = None
+
     dsv41_spec_layout: Optional[dict] = None
 
     # Used by decode when the prefill reported Failed without a reason frame.
@@ -323,6 +382,7 @@ class CommonKVManager(BaseKVManager):
         self.attn_cp_rank = parallel.attn_cp_rank
         self.dcp_size = parallel.attn_dcp_size
         self.dcp_rank = parallel.attn_dcp_rank
+        self.dcp_kv_layout = parallel.dcp_kv_layout
         self.attn_dp_size = parallel.attn_dp_size
         self.attn_dp_rank = parallel.attn_dp_rank
         self.system_dp_size = get_parallel().dp_size
@@ -455,6 +515,7 @@ class CommonKVManager(BaseKVManager):
             ] = None
             self._prefill_recompute_executor_lock = threading.Lock()
             self._prefill_recompute_sessions = threading.local()
+            self._init_decode_handshake_state()
         else:
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
@@ -564,6 +625,8 @@ class CommonKVManager(BaseKVManager):
         return min(statuses)
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
+        if status == KVPoll.Failed and self._transfer_lifetime is not None:
+            self._transfer_lifetime.close(bootstrap_room)
         current = self.request_status.get(bootstrap_room)
         if current is None:
             # The room does not exist yet, or clear() already popped it. Only a
@@ -855,6 +918,36 @@ class CommonKVManager(BaseKVManager):
         )
         return generation
 
+    def arm_deferred_abort_room(
+        self, bootstrap_room: int, generation: Optional[int]
+    ) -> Optional[int]:
+        """Arm, or keep, ``generation``'s ACK state for a held room.
+
+        Returns the generation to put on the ABORT, or None while another
+        receiver's generation still holds the room. Under transfer drain an ACK
+        only proves the writers of its own generation stopped, so a newer
+        receiver of a reused room must not replace an undrained one's state:
+        its ACKs would then release buffers the older writers still target.
+        The caller retries once the older receiver releases and clears.
+        """
+        state = self._deferred_abort_ack_tracker.get(bootstrap_room)
+        if state is not None:
+            if generation is not None and state.generation == generation:
+                return generation
+            if self.requires_transfer_drain:
+                return None
+        return self.register_deferred_abort_room(bootstrap_room)
+
+    def is_deferred_abort_generation_armed(
+        self, bootstrap_room: int, generation: Optional[int]
+    ) -> bool:
+        state = self._deferred_abort_ack_tracker.get(bootstrap_room)
+        return (
+            generation is not None
+            and state is not None
+            and state.generation == generation
+        )
+
     def note_abort_ack(
         self, bootstrap_room: int, prefill_rank: int, generation: int
     ) -> None:
@@ -881,13 +974,37 @@ class CommonKVManager(BaseKVManager):
         self.note_abort_ack(ack.room, ack.prefill_rank, ack.generation)
         return True
 
-    def is_abort_release_safe(self, bootstrap_room: int, required_acks: int) -> bool:
-        """True once every prefill rank that could still write these pages has acked."""
+    def is_abort_release_safe(
+        self,
+        bootstrap_room: int,
+        required_acks: int,
+        *,
+        generation: Any = _ANY_GENERATION,
+    ) -> bool:
+        """True once every prefill rank that could still write these pages has acked.
+
+        With ``generation``, only that generation's ACKs count under transfer
+        drain: another receiver's ACKs say nothing about this one's writers.
+        """
         state = self._deferred_abort_ack_tracker.get(bootstrap_room)
+        if (
+            state is not None
+            and generation is not _ANY_GENERATION
+            and self.requires_transfer_drain
+            and state.generation != generation
+        ):
+            state = None
         acks = state.prefill_ranks if state is not None else ()
         return len(acks) >= required_acks
 
-    def clear_deferred_abort_state(self, bootstrap_room: int) -> None:
+    def clear_deferred_abort_state(
+        self, bootstrap_room: int, *, generation: Any = _ANY_GENERATION
+    ) -> None:
+        """With ``generation``, a newer owner's armed state is left alone."""
+        if generation is not _ANY_GENERATION and not (
+            self.is_deferred_abort_generation_armed(bootstrap_room, generation)
+        ):
+            return
         self._deferred_abort_ack_tracker.pop(bootstrap_room, None)
 
     def _prefill_unique_rank(self) -> int:
@@ -1026,6 +1143,153 @@ class CommonKVManager(BaseKVManager):
                 )
             return self._prefill_recompute_executor
 
+    def _init_decode_handshake_state(self) -> None:
+        """Bookkeeping for the decode-side bootstrap handshake, which runs its
+        network calls on executors so the scheduler thread never blocks on a
+        prefill. Everything below is guarded by ``connection_lock``."""
+        decode_bootstrap_timeout = (
+            envs.SGLANG_DISAGGREGATION_DECODE_BOOTSTRAP_TIMEOUT.get()
+        )
+        self.decode_bootstrap_timeout = (
+            decode_bootstrap_timeout
+            if decode_bootstrap_timeout is not None
+            else envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+        )
+        # ThreadPoolExecutor spawns its threads on first submit.
+        self._bootstrap_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=_DECODE_BOOTSTRAP_WORKERS,
+            thread_name_prefix="pd-bootstrap",
+        )
+        self._parallel_info_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=_PARALLEL_INFO_WORKERS,
+            thread_name_prefix="pd-parallel-info",
+        )
+        self._parallel_info_futures: Dict[
+            str, Tuple[int, concurrent.futures.Future]
+        ] = {}
+        # Bumped on eviction; work started under an older epoch must not publish.
+        self._parallel_info_epochs: Dict[str, int] = defaultdict(int)
+        # room -> the live receiver's generation; a reused room gets a new one.
+        self.room_generations: Dict[int, object] = {}
+        # (bootstrap_key, epoch) -> in-flight fetch+register, shared by receivers.
+        self._key_setup_jobs: Dict[Tuple[str, int], concurrent.futures.Future] = {}
+        # Per prefill addr: jobs waiting for one of its _MAX_SETUP_JOBS_PER_PREFILL slots.
+        self._setup_backlog: Dict[str, Deque[_SetupJob]] = defaultdict(deque)
+        self._setup_running: Dict[str, int] = defaultdict(int)
+
+    def parallel_info_epoch(self, bootstrap_addr: str) -> int:
+        with self.connection_lock:
+            return self._parallel_info_epochs.get(bootstrap_addr, 0)
+
+    def register_receiver_room(self, *, bootstrap_room: int, bootstrap_addr: str):
+        """Make a new receiver the owner of ``bootstrap_room``; returns its generation."""
+        generation = object()
+        with self.connection_lock:
+            self.room_generations[bootstrap_room] = generation
+            self.addr_to_rooms_tracker[bootstrap_addr].add(bootstrap_room)
+            self.update_status(bootstrap_room, KVPoll.Bootstrapping)
+        return generation
+
+    def release_receiver_room(
+        self, *, bootstrap_room: int, bootstrap_addr: str, generation: object
+    ) -> None:
+        """Drop per-room state, unless a newer receiver has taken the room over."""
+        with self.connection_lock:
+            if self.room_generations.get(bootstrap_room) is not generation:
+                return
+            del self.room_generations[bootstrap_room]
+            self.request_status.pop(bootstrap_room, None)
+            self.required_prefill_response_num_table.pop(bootstrap_room, None)
+            self.prefill_response_tracker.pop(bootstrap_room, None)
+            self.addr_to_rooms_tracker[bootstrap_addr].discard(bootstrap_room)
+
+    def submit_dp_rank_query(
+        self, *, bootstrap_addr: str, bootstrap_rooms: List[int]
+    ) -> concurrent.futures.Future:
+        return self._bootstrap_executor.submit(
+            CommonKVReceiver.query_prefill_dp_ranks,
+            bootstrap_addr,
+            list(bootstrap_rooms),
+        )
+
+    def get_or_start_key_setup(
+        self,
+        *,
+        bootstrap_key: str,
+        bootstrap_addr: str,
+        setup_epoch: int,
+        fetch_and_register: Callable[[], _KeySetupResult],
+    ) -> Union[List[Dict], concurrent.futures.Future]:
+        """Cached bootstrap infos for ``bootstrap_key``, else the one shared
+        in-flight fetch+register job for it (started here if there is none)."""
+        job_key = (bootstrap_key, setup_epoch)
+        with self.connection_lock:
+            cached = self.connection_pool.get(bootstrap_key)
+            if cached is not None:
+                return cached
+            future = self._key_setup_jobs.get(job_key)
+            if future is not None:
+                return future
+            future = concurrent.futures.Future()
+            self._key_setup_jobs[job_key] = future
+            self._setup_backlog[bootstrap_addr].append(
+                _SetupJob(
+                    job_key=job_key,
+                    fetch_and_register=fetch_and_register,
+                    future=future,
+                )
+            )
+        self._pump_setup_backlog(bootstrap_addr)
+        return future
+
+    def _pump_setup_backlog(self, bootstrap_addr: str) -> None:
+        while True:
+            with self.connection_lock:
+                backlog = self._setup_backlog[bootstrap_addr]
+                if (
+                    not backlog
+                    or self._setup_running[bootstrap_addr]
+                    >= _MAX_SETUP_JOBS_PER_PREFILL
+                ):
+                    return
+                job = backlog.popleft()
+                self._setup_running[bootstrap_addr] += 1
+            # Submitted outside the lock: the job itself takes connection_lock.
+            self._bootstrap_executor.submit(
+                self._run_setup_job, bootstrap_addr=bootstrap_addr, job=job
+            )
+
+    def _run_setup_job(self, *, bootstrap_addr: str, job: _SetupJob) -> None:
+        bootstrap_key = job.job_key[0]
+        try:
+            result = job.fetch_and_register()
+        except Exception as e:
+            logger.exception("Bootstrap setup for %s raised", bootstrap_key)
+            result = _KeySetupResult(
+                bootstrap_infos=None,
+                error=f"Bootstrap setup for {bootstrap_key} raised: {e}",
+            )
+        with self.connection_lock:
+            self._setup_running[bootstrap_addr] -= 1
+            if self._key_setup_jobs.get(job.job_key) is job.future:
+                del self._key_setup_jobs[job.job_key]
+        job.future.set_result(result)
+        self._pump_setup_backlog(bootstrap_addr)
+
+    def publish_bootstrap_infos(
+        self,
+        *,
+        bootstrap_key: str,
+        bootstrap_addr: str,
+        setup_epoch: int,
+        bootstrap_infos: List[Dict],
+    ) -> Optional[List[Dict]]:
+        """Cache freshly registered infos; None if the prefill was evicted meanwhile."""
+        with self.connection_lock:
+            if self._parallel_info_epochs.get(bootstrap_addr, 0) != setup_epoch:
+                return None
+            return self.connection_pool.setdefault(bootstrap_key, bootstrap_infos)
+
     def _get_prefill_recompute_session(self) -> requests.Session:
         """Per-thread ``requests.Session`` for the rebootstrap executor threads
         (``requests.Session`` is not safe for concurrent cross-thread use)."""
@@ -1159,33 +1423,70 @@ class CommonKVManager(BaseKVManager):
                 f"PD retract rebootstrap /generate request errored for rid={rid}.",
             )
 
-    def try_ensure_parallel_info(self, bootstrap_addr: str) -> bool:
-        """Single non-blocking attempt to fetch and cache prefill parallel info.
-        Returns True if info is available (cached or freshly fetched)."""
-        if bootstrap_addr in self.prefill_info_table:
-            return True
-
-        info: PrefillServerInfo = None
+    @staticmethod
+    def _fetch_parallel_info_payload(bootstrap_addr: str) -> Optional[Dict]:
+        # Runs on an executor thread: returns the raw payload, touches no state.
         try:
             url = (
                 f"http://{bootstrap_addr}/route?"
                 f"prefill_dp_rank={-1}&prefill_cp_rank={-1}&"
-                f"target_tp_rank={-1}&target_pp_rank={-1}"
+                f"target_tp_rank={-1}&target_pp_rank={-1}&"
+                "include_dcp_page_support=1"
             )
-            response = requests.get(url, timeout=5)
+            response = _get_bootstrap_session(bootstrap_addr).get(
+                url, timeout=_bootstrap_http_timeout()
+            )
             if response.status_code == 200:
-                data = response.json()
-                info = PrefillServerInfo(**data)
-            else:
-                logger.error(
-                    f"Failed to get prefill server info: {response.status_code}, {response.text}"
-                )
-                return False
+                return response.json()
+            logger.error(
+                f"Failed to get prefill server info: {response.status_code}, {response.text}"
+            )
+            return None
         except Exception as e:
             logger.error(f"Error fetching prefill server info from bootstrap: {e}")
-            return False
+            return None
 
-        # Sanity checks
+    def has_parallel_info(self, bootstrap_addr: str) -> bool:
+        with self.connection_lock:
+            return bootstrap_addr in self.prefill_info_table
+
+    def try_ensure_parallel_info(self, bootstrap_addr: str) -> ParallelInfoState:
+        """Advance the topology fetch for ``bootstrap_addr`` without blocking;
+        the HTTP GET runs on an executor and reports PENDING while in flight."""
+        with self.connection_lock:
+            if bootstrap_addr in self.prefill_info_table:
+                return ParallelInfoState.READY
+            entry = self._parallel_info_futures.get(bootstrap_addr)
+            if entry is None:
+                submitted_epoch = self._parallel_info_epochs.get(bootstrap_addr, 0)
+                future = self._parallel_info_executor.submit(
+                    self._fetch_parallel_info_payload, bootstrap_addr
+                )
+                self._parallel_info_futures[bootstrap_addr] = (
+                    submitted_epoch,
+                    future,
+                )
+                return ParallelInfoState.PENDING
+
+            submitted_epoch, future = entry
+            if not future.done():
+                return ParallelInfoState.PENDING
+            self._parallel_info_futures.pop(bootstrap_addr, None)
+
+        try:
+            data = future.result()
+        except Exception as e:
+            logger.error(f"Error fetching prefill server info from bootstrap: {e}")
+            return ParallelInfoState.FAILED
+        if data is None:
+            return ParallelInfoState.FAILED
+
+        try:
+            info = PrefillServerInfo(**data)
+        except Exception as e:
+            logger.error(f"Malformed prefill server info from {bootstrap_addr}: {e}")
+            return ParallelInfoState.FAILED
+
         if info.page_size is not None and info.page_size != self.kv_args.page_size:
             raise RuntimeError(
                 f"Page size mismatch: prefill server has page_size={info.page_size}, "
@@ -1266,10 +1567,27 @@ class CommonKVManager(BaseKVManager):
                     f"got {info.attn_cp_size}."
                 )
 
+        if self.dcp_kv_layout == "page" and info.supports_dcp_page is not True:
+            raise RuntimeError(
+                f"Prefill server {bootstrap_addr} does not advertise DCP page "
+                "transfer support. Page decode requires a page-capable "
+                "Mooncake prefill server with DCP size 1."
+            )
+
         self._resolve_rank_mapping(info)
-        self.prefill_info_table[bootstrap_addr] = info
+
+        with self.connection_lock:
+            current_epoch = self._parallel_info_epochs.get(bootstrap_addr, 0)
+            if current_epoch != submitted_epoch:
+                logger.debug(
+                    f"Discarding topology for [{bootstrap_addr}]: evicted while in flight "
+                    f"(epoch {submitted_epoch} -> {current_epoch})"
+                )
+                return ParallelInfoState.FAILED
+            self.prefill_info_table[bootstrap_addr] = info
+
         logger.debug(f"Prefill parallel info for [{bootstrap_addr}]: {info}")
-        return True
+        return ParallelInfoState.READY
 
     def _resolve_rank_mapping(self, info: PrefillServerInfo) -> None:
         """Compute TP/CP/PP rank mapping and store on the PrefillServerInfo object.
@@ -1419,6 +1737,10 @@ class CommonKVManager(BaseKVManager):
             "dsv41_spec_layout": self.dsv41_spec_layout,
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
+            "supports_dcp_page": (
+                get_disagg().disaggregation_transfer_backend == "mooncake"
+                and self.dcp_size == 1
+            ),
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
@@ -1878,8 +2200,10 @@ class CommonKVManager(BaseKVManager):
     def _handle_node_failure(self, failed_bootstrap_addr: str):
         """Handle failure of a prefill node."""
         with self.connection_lock:
+            # Connection keys are "{bootstrap_addr}_{dp}_{cp}_{tp}".
+            key_prefix = f"{failed_bootstrap_addr}_"
             keys_to_remove = [
-                k for k in self.connection_pool if k.startswith(failed_bootstrap_addr)
+                k for k in self.connection_pool if k.startswith(key_prefix)
             ]
             # Collect TCP endpoints from cached bootstrap_infos before deletion
             stale_endpoints = set()
@@ -1893,27 +2217,27 @@ class CommonKVManager(BaseKVManager):
             for k in keys_to_remove:
                 del self.connection_pool[k]
             self.prefill_info_table.pop(failed_bootstrap_addr, None)
+            # Fences topology fetches and setup jobs started before the eviction.
+            self._parallel_info_epochs[failed_bootstrap_addr] += 1
+            stale_entry = self._parallel_info_futures.pop(failed_bootstrap_addr, None)
+            if stale_entry is not None:
+                stale_entry[1].cancel()
 
-            possible_affected_rooms = list(
-                self.addr_to_rooms_tracker.get(failed_bootstrap_addr, [])
-            )
-            self.addr_to_rooms_tracker.pop(failed_bootstrap_addr, None)
-
-        for endpoint in stale_endpoints:
-            CommonKVReceiver.disconnect_endpoint(endpoint)
-
-        affected_rooms = []
-        for room in possible_affected_rooms:
-            if (
-                room in self.request_status
-                and self.check_status(room) != KVPoll.Success
-            ):
+            # Failed under the same lock that registers rooms, so a room reused
+            # after this point is never touched.
+            affected_rooms = []
+            for room in self.addr_to_rooms_tracker.pop(failed_bootstrap_addr, ()):
+                if self.request_status.get(room) in (None, KVPoll.Success):
+                    continue
                 self.record_failure(
                     room,
                     f"Lost connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr})",
                 )
                 self.update_status(room, KVPoll.Failed)
                 affected_rooms.append(room)
+
+        for endpoint in stale_endpoints:
+            CommonKVReceiver.disconnect_endpoint(endpoint)
 
         logger.error(
             f"Lost connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr}), "
@@ -1922,6 +2246,8 @@ class CommonKVManager(BaseKVManager):
 
 
 class CommonKVSender(BaseKVSender):
+    _abort_concluded: bool = False
+
     def __init__(
         self,
         mgr: CommonKVManager,
@@ -2157,10 +2483,16 @@ class CommonKVSender(BaseKVSender):
     def abort(self):
         if self.kv_mgr.deferred_bootstrap is not None and not self._owns_bootstrap_room:
             return
-        self.kv_mgr.conclude_failure(
-            bootstrap_room=self.bootstrap_room,
-            failure_reason="Aborted by AbortReq.",
-        )
+        # The prefill release loop calls abort() every pass until the room
+        # drains; send the Failed status to decode only once.
+        if not self._abort_concluded:
+            self._abort_concluded = (
+                self.kv_mgr.conclude_failure(
+                    bootstrap_room=self.bootstrap_room,
+                    failure_reason="Aborted by AbortReq.",
+                )
+                is not None
+            )
         self.conclude_state = KVPoll.Failed
 
 
@@ -2190,34 +2522,70 @@ class CommonKVReceiver(BaseKVReceiver):
         self.require_staging: bool = False
         self.init_time: Optional[float] = None
         self._prefill_wait_start: Optional[float] = None
+        self._decode_allocation_policy = "early"
         self.abort_notified: bool = False
         self._abort_generation: Optional[int] = None
+        # Set when this receiver failed without owning the room, so its reason
+        # must not be read from (or popped out of) the room's failure record.
+        self._local_failure_reason: Optional[str] = None
+        # Published whole, only once the handshake for every CP rank succeeded.
+        self.bootstrap_infos: Optional[List[Dict]] = None
         self._connection_pool_entries: Dict[str, List[Dict]] = {}
+        # One deadline for the whole handshake: topology, DP rank and setup.
+        self._bootstrap_deadline = time.monotonic() + mgr.decode_bootstrap_timeout
+        self._setup_epoch: Optional[int] = None
+        # (bootstrap_key, cached infos or the shared setup future) per CP rank.
+        self._setup_parts: Optional[
+            List[Tuple[str, Union[List[Dict], concurrent.futures.Future]]]
+        ] = None
+        self._setup_cancelled = False
+        self._room_generation: Optional[object] = None
         self._owns_bootstrap_room = not (
             mgr.defer_decode_allocation and bootstrap_room in mgr.request_status
         )
         if not self._owns_bootstrap_room:
+            # A duplicate never becomes the room's owner, so it cannot clear or
+            # abort the live receiver's state through the generation checks.
+            self._setup_cancelled = True
             mgr.record_failure(bootstrap_room, "Duplicate decode bootstrap room")
             mgr.update_status(bootstrap_room, KVPoll.Failed)
             self.conclude_state = KVPoll.Failed
             return
-        self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
+        if mgr.requires_transfer_drain:
+            with mgr.connection_lock:
+                room_held = bootstrap_room in mgr.room_generations
+            if room_held:
+                # Under transfer drain an earlier receiver keeps the room until
+                # its prefill writers drain, and only the owner may resend the
+                # ABORT that gets them there. Taking the room over would strand
+                # it, so fail fast before publishing any destination. The room's
+                # status and failure record stay the earlier receiver's.
+                self._owns_bootstrap_room = False
+                self._setup_cancelled = True
+                self._local_failure_reason = (
+                    "Bootstrap room is still held by an undrained receiver"
+                )
+                self.conclude_state = KVPoll.Failed
+                return
+        self._room_generation = mgr.register_receiver_room(
+            bootstrap_room=bootstrap_room, bootstrap_addr=bootstrap_addr
+        )
 
     def init(self, prefill_dp_rank: int):
-        if self.conclude_state == KVPoll.Failed:
+        if self._setup_cancelled:
             return
-        if self.bootstrap_addr not in self.kv_mgr.prefill_info_table:
-            self.kv_mgr.record_failure(
-                self.bootstrap_room,
+        with self.kv_mgr.connection_lock:
+            prefill_info = self.kv_mgr.prefill_info_table.get(self.bootstrap_addr)
+            setup_epoch = self.kv_mgr._parallel_info_epochs.get(self.bootstrap_addr, 0)
+        if prefill_info is None:
+            self._fail_setup(
                 f"Prefill server with bootstrap_addr: {self.bootstrap_addr} is healthy before, but now it is down. Request (bootstrap_room: {self.bootstrap_room}) has been marked as failed.",
+                invalidate=False,
             )
-            self.conclude_state = KVPoll.Failed
-            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             return
 
         # Read pre-computed rank mapping from prefill_info (computed in try_ensure_parallel_info)
-        self.prefill_info = self.kv_mgr.prefill_info_table[self.bootstrap_addr]
+        self.prefill_info = prefill_info
         info = self.prefill_info
         policy = get_disagg().disaggregation_decode_allocation_policy
         reason = None
@@ -2232,10 +2600,9 @@ class CommonKVReceiver(BaseKVReceiver):
         ):
             reason = "prefill_complete requires peer attention TP1/CP1/PP1"
         if reason is not None:
-            self.kv_mgr.record_failure(self.bootstrap_room, reason)
-            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-            self.conclude_state = KVPoll.Failed
+            self._fail_setup(reason, invalidate=False)
             return
+        self._decode_allocation_policy = policy
         self.target_tp_rank = self.prefill_info.target_tp_rank
         self.target_tp_ranks = self.prefill_info.target_tp_ranks
         self.target_cp_ranks = self.prefill_info.target_cp_ranks
@@ -2256,15 +2623,124 @@ class CommonKVReceiver(BaseKVReceiver):
             )
 
         self.prefill_dp_rank = prefill_dp_rank
-        self._setup_bootstrap_infos()
-        if self.conclude_state == KVPoll.Failed:
+        self._setup_epoch = setup_epoch
+        self._setup_parts = [
+            self._resolve_setup_part(target_cp_rank)
+            for target_cp_rank in self.target_cp_ranks
+        ]
+        # All-cached (the common case) publishes WaitingForInput right here.
+        self._advance_setup()
+
+    def _resolve_setup_part(
+        self, target_cp_rank: int
+    ) -> Tuple[str, Union[List[Dict], concurrent.futures.Future]]:
+        # NOTE: key distinguished by bootstrap_addr, prefill_dp_rank, prefill_cp_rank, and target_tp_rank
+        bootstrap_key = f"{self.bootstrap_addr}_{self.prefill_dp_rank}_{target_cp_rank}_{self.target_tp_rank}"
+        part = self.kv_mgr.get_or_start_key_setup(
+            bootstrap_key=bootstrap_key,
+            bootstrap_addr=self.bootstrap_addr,
+            setup_epoch=self._setup_epoch,
+            fetch_and_register=functools.partial(
+                self._fetch_and_register_key,
+                bootstrap_key=bootstrap_key,
+                target_cp_rank=target_cp_rank,
+                setup_epoch=self._setup_epoch,
+            ),
+        )
+        return bootstrap_key, part
+
+    def _fetch_and_register_key(
+        self, *, bootstrap_key: str, target_cp_rank: int, setup_epoch: int
+    ) -> _KeySetupResult:
+        """Runs on a bootstrap worker; must not mutate this receiver, since the
+        job is shared by every receiver that needs ``bootstrap_key``."""
+        bootstrap_infos = []
+        for target_tp_rank in self.target_tp_ranks:
+            # Enable higher PP ranks to be bootstrapped earlier to make PP PD requests bootstrap more robust
+            for target_pp_rank in reversed(self.target_pp_ranks):
+                if self.kv_mgr.parallel_info_epoch(self.bootstrap_addr) != setup_epoch:
+                    return _KeySetupResult(
+                        bootstrap_infos=None,
+                        error=f"Prefill {self.bootstrap_addr} was evicted during bootstrap",
+                    )
+                bootstrap_info = self._get_bootstrap_info_from_server(
+                    self.prefill_dp_rank,
+                    target_cp_rank,
+                    target_tp_rank,
+                    target_pp_rank,
+                )
+                if bootstrap_info is None:
+                    return _KeySetupResult(
+                        bootstrap_infos=None,
+                        error=f"Could not fetch bootstrap info for: prefill_dp_rank: {self.prefill_dp_rank} prefill_cp_rank: {target_cp_rank} target_tp_rank: {target_tp_rank} and target_pp_rank {target_pp_rank}",
+                    )
+                if self.kv_mgr.is_mla_backend:
+                    # For MLA: target_tp_rank is the selected real rank, others are dummy ranks
+                    bootstrap_info["is_dummy"] = not bool(
+                        target_tp_rank == self.target_tp_rank
+                        or self.target_tp_rank is None
+                    )
+                else:
+                    # For non-MLA: all target_tp_ranks are selected real ranks
+                    bootstrap_info["is_dummy"] = False
+                logger.debug(
+                    f"Fetched bootstrap info: {bootstrap_info} for DP {self.prefill_dp_rank} CP {target_cp_rank} TP {target_tp_rank} PP {target_pp_rank}"
+                )
+                bootstrap_infos.append(bootstrap_info)
+
+        # Register before caching so a failed registration leaves no stale entry.
+        if not self._register_kv_args(bootstrap_infos):
+            return _KeySetupResult(
+                bootstrap_infos=None,
+                error=f"Could not register KV args for bootstrap_addr {self.bootstrap_addr}",
+            )
+        published = self.kv_mgr.publish_bootstrap_infos(
+            bootstrap_key=bootstrap_key,
+            bootstrap_addr=self.bootstrap_addr,
+            setup_epoch=setup_epoch,
+            bootstrap_infos=bootstrap_infos,
+        )
+        if published is None:
+            return _KeySetupResult(
+                bootstrap_infos=None,
+                error=f"Prefill {self.bootstrap_addr} was evicted during bootstrap",
+            )
+        return _KeySetupResult(bootstrap_infos=published, error=None)
+
+    def _advance_setup(self) -> None:
+        """Publish the handshake once every CP rank's infos are in hand. Runs on
+        the scheduler thread only, so receiver state has a single writer."""
+        parts = self._setup_parts
+        if parts is None or any(
+            isinstance(part, concurrent.futures.Future) and not part.done()
+            for _, part in parts
+        ):
             return
-        if policy == "early":
-            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
-            return
-        self._prefill_wait_start = time.time()
+        self._setup_parts = None
+        all_bootstrap_infos = []
+        for bootstrap_key, part in parts:
+            if isinstance(part, concurrent.futures.Future):
+                result = part.result()
+                if result.bootstrap_infos is None:
+                    self._fail_setup(result.error, invalidate=True)
+                    return
+                part = result.bootstrap_infos
+            self._connection_pool_entries[bootstrap_key] = part
+            assert len(part) > 0
+            all_bootstrap_infos.extend(part)
+
+        with self.kv_mgr.connection_lock:
+            if not self._setup_is_current_locked():
+                return
+            self.bootstrap_infos = all_bootstrap_infos
+            if self._decode_allocation_policy == "early":
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
+                return
+            # prefill_complete: prefill reports readiness on the status channel;
+            # poll() bounds that wait with waiting_timeout.
+            self._prefill_wait_start = time.time()
         try:
-            for info in self.bootstrap_infos:
+            for info in all_bootstrap_infos:
                 sock, lock = self._connect_to_bootstrap_server(info)
                 with lock:
                     sock.send_multipart(
@@ -2278,114 +2754,46 @@ class CommonKVReceiver(BaseKVReceiver):
         except zmq.ZMQError:
             self.abort()
 
-    def poll(self) -> KVPoll:
-        with self._lifecycle_lock:
-            return self._poll()
+    def _owns_room_locked(self) -> bool:
+        return (
+            self.kv_mgr.room_generations.get(self.bootstrap_room)
+            is self._room_generation
+        )
 
-    def _poll(self) -> KVPoll:
-        if self.conclude_state is not None:
-            return self.conclude_state
-        status = self.kv_mgr.check_status(self.bootstrap_room)
-        if status in (KVPoll.Success, KVPoll.Failed):
-            self.conclude_state = status
-        elif status == KVPoll.Bootstrapping and self._prefill_wait_start is not None:
-            if time.time() - self._prefill_wait_start >= self.kv_mgr.waiting_timeout:
-                self.abort()
-                self.kv_mgr.record_failure(
-                    self.bootstrap_room, "Timed out waiting for prefill completion"
-                )
-                return KVPoll.Failed
-        elif status == KVPoll.WaitingForInput:
-            # Observe readiness before evaluating the old compute deadline.
-            # send_metadata starts the transfer timeout using this same clock.
-            if self._prefill_wait_start is not None:
-                self._prefill_wait_start = None
-                self.init_time = time.time()
-            timeout = self._check_waiting_timeout()
-            if timeout is not None:
-                return timeout
-        return status
+    def _setup_is_current_locked(self) -> bool:
+        return (
+            not self._setup_cancelled
+            and self._owns_room_locked()
+            and self.kv_mgr._parallel_info_epochs.get(self.bootstrap_addr, 0)
+            == self._setup_epoch
+            and self.kv_mgr.request_status.get(self.bootstrap_room)
+            == KVPoll.Bootstrapping
+        )
 
-    def _setup_bootstrap_infos(self):
-        all_bootstrap_infos = []
-        # NOTE: key distinguished by bootstrap_addr, prefill_dp_rank, prefill_cp_rank, and target_tp_rank
-        for target_cp_rank in self.target_cp_ranks:
-            bootstrap_key = f"{self.bootstrap_addr}_{self.prefill_dp_rank}_{target_cp_rank}_{self.target_tp_rank}"
+    def _fail_owned_room_locked(self, reason: str) -> bool:
+        """Fail the room; False, touching nothing, if a newer receiver owns it."""
+        if not self._owns_room_locked():
+            return False
+        # Keep the first root cause, e.g. a prefill node failure seen earlier.
+        if self.kv_mgr.request_status.get(self.bootstrap_room) != KVPoll.Failed:
+            self.kv_mgr.record_failure(self.bootstrap_room, reason)
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        return True
 
-            with self.kv_mgr.connection_lock:
-                cached_bootstrap_infos = self.kv_mgr.connection_pool.get(bootstrap_key)
-
-            if cached_bootstrap_infos is None:
-                bootstrap_infos = []
-                for target_tp_rank in self.target_tp_ranks:
-                    # Enable higher PP ranks to be bootstrapped earlier to make PP PD requests bootstrap more robust
-                    for target_pp_rank in reversed(self.target_pp_ranks):
-                        bootstrap_info = self._get_bootstrap_info_from_server(
-                            self.prefill_dp_rank,
-                            target_cp_rank,
-                            target_tp_rank,
-                            target_pp_rank,
-                        )
-                        if bootstrap_info is not None:
-                            if self.kv_mgr.is_mla_backend:
-                                # For MLA: target_tp_rank is the selected real rank, others are dummy ranks
-                                bootstrap_info["is_dummy"] = not bool(
-                                    target_tp_rank == self.target_tp_rank
-                                    or self.target_tp_rank is None
-                                )
-                            else:
-                                # For non-MLA: all target_tp_ranks are selected real ranks
-                                bootstrap_info["is_dummy"] = False
-                            logger.debug(
-                                f"Fetched bootstrap info: {bootstrap_info} for DP {self.prefill_dp_rank} CP {target_cp_rank} TP {target_tp_rank} PP {target_pp_rank}"
-                            )
-                            bootstrap_infos.append(bootstrap_info)
-                        else:
-                            self.kv_mgr.record_failure(
-                                self.bootstrap_room,
-                                f"Could not fetch bootstrap info for: prefill_dp_rank: {self.prefill_dp_rank} prefill_cp_rank: {target_cp_rank} target_tp_rank: {target_tp_rank} and target_pp_rank {target_pp_rank}",
-                            )
-                            self.conclude_state = KVPoll.Failed
-                            self.kv_mgr.update_status(
-                                self.bootstrap_room, KVPoll.Failed
-                            )
-                            self.bootstrap_infos = None
-                            self.invalidate_cached_bootstrap_infos()
-                            return
-
-                self.bootstrap_infos = bootstrap_infos
-                self._connection_pool_entries[bootstrap_key] = self.bootstrap_infos
-
-                # Register kv_args only once to prefill KVManager according to the info fetched
-                # from the bootstrap server. Do this before caching in connection_pool so a failed
-                # registration does not leave a stale entry that later requests would reuse.
-                if not self._register_kv_args():
-                    self.invalidate_cached_bootstrap_infos()
-                    return
-
-                with self.kv_mgr.connection_lock:
-                    cached_bootstrap_infos = self.kv_mgr.connection_pool.setdefault(
-                        bootstrap_key, self.bootstrap_infos
-                    )
-
-                if cached_bootstrap_infos is not self.bootstrap_infos:
-                    self.bootstrap_infos = cached_bootstrap_infos
-            else:
-                self.bootstrap_infos = cached_bootstrap_infos
-
-            self._connection_pool_entries[bootstrap_key] = self.bootstrap_infos
-
-            assert len(self.bootstrap_infos) > 0
-            all_bootstrap_infos.extend(self.bootstrap_infos)
-
-        self.bootstrap_infos = all_bootstrap_infos
+    def _fail_setup(self, reason: str, *, invalidate: bool) -> None:
+        self._setup_parts = None
+        self.conclude_state = KVPoll.Failed
+        with self.kv_mgr.connection_lock:
+            self._fail_owned_room_locked(reason)
+        if invalidate:
+            self.invalidate_cached_bootstrap_infos()
 
     def invalidate_cached_bootstrap_infos(self) -> None:
         with self.kv_mgr.connection_lock:
             for bootstrap_key, bootstrap_infos in self._connection_pool_entries.items():
                 if self.kv_mgr.connection_pool.get(bootstrap_key) is bootstrap_infos:
                     del self.kv_mgr.connection_pool[bootstrap_key]
-            self._connection_pool_entries.clear()
+        self._connection_pool_entries.clear()
 
     def _get_bootstrap_info_from_server(
         self, prefill_dp_rank, prefill_cp_rank, target_tp_rank, target_pp_rank
@@ -2393,7 +2801,9 @@ class CommonKVReceiver(BaseKVReceiver):
         """Fetch the bootstrap info from the bootstrap server."""
         try:
             url = f"http://{self.bootstrap_addr}/route?prefill_dp_rank={prefill_dp_rank}&prefill_cp_rank={prefill_cp_rank}&target_tp_rank={target_tp_rank}&target_pp_rank={target_pp_rank}"
-            response = _get_bootstrap_session(self.bootstrap_addr).get(url, timeout=5)
+            response = _get_bootstrap_session(self.bootstrap_addr).get(
+                url, timeout=_bootstrap_http_timeout()
+            )
             if response.status_code == 200:
                 bootstrap_info = response.json()
                 bootstrap_info["pp_rank"] = int(target_pp_rank)
@@ -2417,7 +2827,7 @@ class CommonKVReceiver(BaseKVReceiver):
             response = _get_bootstrap_session(bootstrap_addr).post(
                 url,
                 json={"bootstrap_rooms": bootstrap_rooms},
-                timeout=5,
+                timeout=_bootstrap_http_timeout(),
             )
             if response.status_code == 200:
                 return response.json()
@@ -2494,7 +2904,7 @@ class CommonKVReceiver(BaseKVReceiver):
         sock, lock = cls._connect(na.to_tcp(), is_ipv6=na.is_ipv6)
         return sock, lock
 
-    def _register_kv_args(self) -> bool:
+    def _register_kv_args(self, bootstrap_infos: List[Dict]) -> bool:
         return True
 
     def send_metadata(
@@ -2507,6 +2917,62 @@ class CommonKVReceiver(BaseKVReceiver):
     ):
         raise NotImplementedError
 
+    def poll(self) -> KVPoll:
+        with self._lifecycle_lock:
+            return self._poll()
+
+    def _poll(self) -> KVPoll:
+        if self.conclude_state is not None:
+            return self.conclude_state
+        status = self.kv_mgr.check_status(self.bootstrap_room)
+        if status in (KVPoll.Success, KVPoll.Failed):
+            self.conclude_state = status
+        elif status == KVPoll.Bootstrapping:
+            if self._prefill_wait_start is None:
+                return self._poll_bootstrapping()
+            # Handshake done; waiting for prefill_complete readiness.
+            if time.time() - self._prefill_wait_start >= self.kv_mgr.waiting_timeout:
+                self.abort()
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room, "Timed out waiting for prefill completion"
+                )
+                return KVPoll.Failed
+        elif status == KVPoll.WaitingForInput:
+            # Observe readiness before evaluating the old compute deadline.
+            # send_metadata starts the transfer timeout using this same clock.
+            if self._prefill_wait_start is not None:
+                self._prefill_wait_start = None
+                self.init_time = time.time()
+            timeout = self._check_waiting_timeout()
+            if timeout is not None:
+                return timeout
+        return status
+
+    def _poll_bootstrapping(self) -> KVPoll:
+        """Advance the handshake of a room that is still Bootstrapping, and fail
+        it once the decode-side deadline passes. Returns the resulting status."""
+        self._advance_setup()
+        if self.conclude_state is not None:
+            return self.conclude_state
+        status = self.kv_mgr.check_status(self.bootstrap_room)
+        if (
+            status != KVPoll.Bootstrapping
+            or time.monotonic() < self._bootstrap_deadline
+        ):
+            return status
+        logger.warning_once(
+            "Some requests did not finish the decode-side bootstrap handshake in time. "
+            "If a greater mean TTFT is acceptable, you can "
+            "'export SGLANG_DISAGGREGATION_DECODE_BOOTSTRAP_TIMEOUT=600' to relax it."
+        )
+        self._abort_room(
+            f"Request {self.bootstrap_room} timed out after "
+            f"{self.kv_mgr.decode_bootstrap_timeout}s in KVPoll.Bootstrapping",
+            invalidate=True,
+        )
+        self.conclude_state = KVPoll.Failed
+        return KVPoll.Failed
+
     def _check_waiting_timeout(self) -> Optional[KVPoll]:
         if self.init_time is None:
             return None
@@ -2517,21 +2983,30 @@ class CommonKVReceiver(BaseKVReceiver):
             "Some requests fail to receive KV Cache transfer done signal after bootstrapping. "
             "If a greater mean TTFT is acceptable, you can 'export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
         )
-        self.kv_mgr.record_failure(
-            self.bootstrap_room,
+        self._abort_room(
             f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
             f"in KVPoll.WaitingForInput",
+            invalidate=True,
         )
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-        self.invalidate_cached_bootstrap_infos()
-        if (
-            not self.abort_notified
-            and hasattr(self, "bootstrap_infos")
-            and self.bootstrap_infos is not None
-        ):
-            self._send_abort_notification()
-            self.abort_notified = True
         return KVPoll.Failed
+
+    def _abort_room(self, reason: str, *, invalidate: bool) -> None:
+        """Fail this receiver's room and notify prefill; a no-op on a room that
+        a newer receiver has taken over, whose state is not ours to touch."""
+        self._setup_cancelled = True
+        self._setup_parts = None
+        with self.kv_mgr.connection_lock:
+            owns_room = self._fail_owned_room_locked(reason)
+        if not owns_room:
+            return
+        if invalidate:
+            self.invalidate_cached_bootstrap_infos()
+        if self.kv_mgr.requires_transfer_drain:
+            # Retried on every deferred-release deadline until prefill drains.
+            self.retry_abort()
+        else:
+            # Arms the ACK tracker only once metadata is published (#37077).
+            self.ensure_abort_notified()
 
     def clear(self) -> None:
         with self._lifecycle_lock:
@@ -2540,20 +3015,27 @@ class CommonKVReceiver(BaseKVReceiver):
     def _clear(self) -> None:
         if not self._owns_bootstrap_room:
             return
+        self._setup_cancelled = True
+        self._setup_parts = None
         if (
             self.kv_mgr.defer_decode_allocation
             and self.kv_mgr.request_status.get(self.bootstrap_room) != KVPoll.Success
             and not self.abort_notified
-            and getattr(self, "bootstrap_infos", None) is not None
+            and self.bootstrap_infos is not None
         ):
             # Preserve the recorded root cause; this is cleanup, not a new abort.
-            self._send_abort_notification()
-            self.abort_notified = True
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
-        self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
-        self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
-        self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
-            self.bootstrap_room
+            self.ensure_abort_notified()
+        # Callers clear only once no destination is held (prealloc aborts,
+        # or after the deferred release). Drop this generation's ACK state;
+        # a newer owner's armed generation is left alone.
+        with self.kv_mgr.connection_lock:
+            self.kv_mgr.clear_deferred_abort_state(
+                self.bootstrap_room, generation=self._abort_generation
+            )
+        self.kv_mgr.release_receiver_room(
+            bootstrap_room=self.bootstrap_room,
+            bootstrap_addr=self.bootstrap_addr,
+            generation=self._room_generation,
         )
         if self.kv_mgr.defer_decode_allocation:
             self._owns_bootstrap_room = False
@@ -2562,54 +3044,164 @@ class CommonKVReceiver(BaseKVReceiver):
         if not self._owns_bootstrap_room:
             self.conclude_state = KVPoll.Failed
             return
-        self.kv_mgr.record_failure(
-            self.bootstrap_room,
-            "Aborted by AbortReq.",
-        )
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        self._abort_room("Aborted by AbortReq.", invalidate=False)
         self.conclude_state = KVPoll.Failed
-        self.ensure_abort_notified()
 
     def ensure_abort_notified(self, *, force_arm: bool = False) -> None:
-        """Notify the prefill ranks (and arm drain-ack accounting) exactly once.
-        Unlike abort(), does not overwrite the recorded root cause -- callable
-        for an already-Failed room whose failure decode did not initiate."""
-        if (
-            not self.abort_notified
-            and hasattr(self, "bootstrap_infos")
-            and self.bootstrap_infos is not None
-        ):
-            self._send_abort_notification(force_arm=force_arm)
-            self.abort_notified = True
+        """Notify once without overwriting the request's recorded failure."""
+        if not self.abort_notified:
+            self.retry_abort(force_arm=force_arm)
 
-    def _send_abort_notification(self, *, force_arm: bool = False):
-        # Both abort() and the waiting timeout reach here. Once metadata is
-        # published (init_time set) prefill may be writing, so arm the ACK
-        # tracker before the ABORT goes out and an immediate ACK can land.
-        # Prealloc-queue receivers (init_time None) never enter the
-        # deferred-release flow that would clean the tracker up, so they stay
-        # unarmed -- except on a partial publish, where init_time is still None
-        # but earlier ranks already hold destinations; those callers defer and
-        # pass force_arm.
-        if self.kv_mgr.enable_deferred_decode_kv_release and (
-            force_arm or self.init_time is not None
+    def retry_abort(self, *, force_arm: bool = True) -> bool:
+        """Retry cancellation, returning whether every target accepted this attempt.
+
+        Acceptance is local ZMQ queueing, not a drain ACK. A failed attempt must
+        retain the ACK state and destination buffers for a later retry.
+        """
+        accepted = self._send_abort_notification(force_arm=force_arm)
+        if accepted:
+            self.abort_notified = True
+        return accepted
+
+    @classmethod
+    def _try_send_cached_abort(cls, bootstrap_info: Dict, frames: List[bytes]) -> bool:
+        """Try ABORT on the shared metadata channel without waiting for a peer.
+
+        Recreate a missing cached socket, as the original ABORT path did:
+        heartbeat eviction does not prove the original writer is gone. Future
+        metadata shares this connection and its FIFO ordering. This does not
+        establish ordering across connections or fence a restarted writer.
+        """
+        address = NetworkAddress(
+            bootstrap_info["rank_ip"], int(bootstrap_info["rank_port"])
+        )
+        endpoint = address.to_tcp()
+        if not cls._global_lock.acquire(blocking=False):
+            return False
+        try:
+            sock = cls._socket_cache.get(endpoint)
+            lock = cls._socket_locks.get(endpoint)
+            if sock is None:
+                try:
+                    sock = cls._ctx.socket(zmq.PUSH)
+                    if address.is_ipv6:
+                        sock.setsockopt(zmq.IPV6, 1)
+                    sock.setsockopt(zmq.LINGER, 0)
+                    # Match the bounded libzmq default used by metadata sockets.
+                    sock.setsockopt(zmq.SNDHWM, 1000)
+                    sock.setsockopt(
+                        zmq.SNDTIMEO,
+                        envs.SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT.get() * 1000,
+                    )
+                    # libzmq starts the connection asynchronously; do not poll
+                    # for a handshake or call the blocking _connect helper.
+                    sock.connect(endpoint)
+                except Exception:
+                    if sock is not None:
+                        try:
+                            sock.close(linger=0)
+                        except zmq.ZMQError:
+                            pass
+                    return False
+                lock = threading.Lock()
+                # Publish only a fully configured socket and its matching lock.
+                cls._socket_cache[endpoint] = sock
+                cls._socket_locks[endpoint] = lock
+            if lock is None or not lock.acquire(blocking=False):
+                return False
+        finally:
+            cls._global_lock.release()
+        try:
+            sock.send_multipart(frames, flags=zmq.DONTWAIT)
+            return True
+        except zmq.ZMQError:
+            return False
+        finally:
+            lock.release()
+
+    def _send_abort_notification(self, *, force_arm: bool = False) -> bool:
+        """Arm this receiver's ACK state and send ABORT to every prefill writer.
+
+        Returns whether every target accepted the attempt. Under transfer drain
+        no lock or socket is waited on, so the caller can retry with backoff.
+        """
+        bootstrap_infos = self.bootstrap_infos
+        if bootstrap_infos is None:
+            return False
+        if not self.kv_mgr.connection_lock.acquire(
+            blocking=not self.kv_mgr.requires_transfer_drain
         ):
-            self._abort_generation = self.kv_mgr.register_deferred_abort_room(
-                self.bootstrap_room
+            return False
+        try:
+            # An ABORT for a reused room would cancel the new request's transfer.
+            if not self._owns_room_locked():
+                return False
+            # Fence this attempt against an eviction that races its send. A
+            # later retry captures the new epoch instead of staying suppressed.
+            expected_epoch = (
+                self.kv_mgr._parallel_info_epochs.get(self.bootstrap_addr, 0)
+                if self.kv_mgr.requires_transfer_drain
+                else None
             )
-        for bootstrap_info in self.bootstrap_infos:
+            # Arm before sending. Legacy prealloc cancellation has no held
+            # buffers; partial publication callers explicitly force arming.
+            if self.kv_mgr.enable_deferred_decode_kv_release and (
+                force_arm
+                or self.init_time is not None
+                or self.kv_mgr.requires_transfer_drain
+            ):
+                # A retry re-sends the armed generation so ACKs already received
+                # for this receiver are kept; only a new arm starts a generation.
+                generation = self.kv_mgr.arm_deferred_abort_room(
+                    self.bootstrap_room, self._abort_generation
+                )
+                if generation is None:
+                    # An older receiver of this room has not drained yet.
+                    return False
+                self._abort_generation = generation
+            frames = AbortNotification(
+                room=self.bootstrap_room,
+                decode_ip=self.kv_mgr.local_ip,
+                decode_port=self.kv_mgr.rank_port,
+                generation=self._abort_generation,
+            ).to_zmq()
+        finally:
+            self.kv_mgr.connection_lock.release()
+
+        if self.kv_mgr.requires_transfer_drain:
+            all_sent = True
+            for bootstrap_info in bootstrap_infos:
+                # Validate atomically with the nonblocking send. The manager
+                # lock is never held while waiting on another lock or the peer.
+                if not self.kv_mgr.connection_lock.acquire(blocking=False):
+                    return False
+                try:
+                    if (
+                        not self._owns_room_locked()
+                        or expected_epoch
+                        != self.kv_mgr._parallel_info_epochs.get(self.bootstrap_addr, 0)
+                    ):
+                        return False
+                    # These local fences cannot retract an already queued ABORT.
+                    # The frame's generation makes prefill ACK only this
+                    # receiver's attempt, so a late one cannot release a reuse.
+                    sent = self._try_send_cached_abort(bootstrap_info, frames)
+                finally:
+                    self.kv_mgr.connection_lock.release()
+                all_sent = sent and all_sent
+            return all_sent
+
+        # Other backends do not always retain aborted buffers and schedule
+        # retries. Keep their existing delivery behavior on the same channel.
+        for bootstrap_info in bootstrap_infos:
+            with self.kv_mgr.connection_lock:
+                if not self._owns_room_locked():
+                    return False
             # Best-effort notification to prefill side that this request was aborted.
             try:
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
                 with lock:
-                    sock.send_multipart(
-                        AbortNotification(
-                            room=self.bootstrap_room,
-                            decode_ip=self.kv_mgr.local_ip,
-                            decode_port=self.kv_mgr.rank_port,
-                            generation=self._abort_generation,
-                        ).to_zmq()
-                    )
+                    sock.send_multipart(frames)
                 logger.debug(
                     f"Sent abort notification for room {self.bootstrap_room} "
                     f"to {bootstrap_info.get('rank_ip', 'unknown')}:{bootstrap_info.get('rank_port', 'unknown')}"
@@ -2618,6 +3210,7 @@ class CommonKVReceiver(BaseKVReceiver):
                 logger.debug(
                     f"Failed to send abort notification for room {self.bootstrap_room}: {e}"
                 )
+        return True
 
 
 class CommonKVBootstrapServer(BaseKVBootstrapServer):
@@ -2638,6 +3231,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
         self.dsv41_spec_layout: Optional[dict] = None
+        self.supports_dcp_page: Optional[bool] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
@@ -2723,6 +3317,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             )
         self.dsv41_spec_layout = dsv41_spec_layout
         self.decode_allocation_policy = policy
+        supports_dcp_page = data.get("supports_dcp_page")
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -2741,6 +3336,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         if self.kv_cache_dtype is None and kv_cache_dtype is not None:
             self.kv_cache_dtype = kv_cache_dtype
+
+        if self.supports_dcp_page is None and supports_dcp_page is not None:
+            self.supports_dcp_page = supports_dcp_page
 
         if self.prefill_http_port is None and prefill_http_port is not None:
             self.prefill_http_port = int(prefill_http_port)
@@ -2823,10 +3421,14 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
                 prefill_http_port=self.prefill_http_port,
                 decode_allocation_policy=self.decode_allocation_policy,
+                supports_dcp_page=self.supports_dcp_page,
             )
             payload = dataclasses.asdict(info)
             if info.dsv41_spec_layout is None:
                 payload.pop("dsv41_spec_layout")
+            # Older decode servers reject unknown PrefillServerInfo fields.
+            if request.query.get("include_dcp_page_support") != "1":
+                payload.pop("supports_dcp_page")
             return web.json_response(payload, status=200)
 
         if not self._is_ready():

@@ -75,6 +75,7 @@ POSITIONAL_FIELD_ORDER = (
     "node_rank",
     "tp_size",
     "dcp_size",
+    "dcp_kv_layout",
     "pp_size",
     "pp_max_micro_batch_size",
     "pp_async_batch_depth",

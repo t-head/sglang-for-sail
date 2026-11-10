@@ -90,9 +90,11 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         """Call the flashinfer cute-dsl MLA decode kernel.
 
         Without DCP (``cp_world <= 1``) this defers to the base cute-dsl path.
-        With DCP, ``seq_lens`` are this rank's cyclic-local KV lengths and
+        With token DCP, ``seq_lens`` are this rank's cyclic-local KV lengths and
         ``causal_seqs`` the global per-request KV lengths; the kernel returns a
         rank-local ``(out, lse)``, the LSE in natural log.
+        Page DCP uses local lengths for both inputs and passes ``cp_world=1``
+        and ``cp_rank=0`` to the kernel.
         """
         if cp_world <= 1:
             return super()._run_decode_kernel(
@@ -112,6 +114,17 @@ class CuteDslMLABackend(TRTLLMMLABackend):
                 "causal_seqs (global per-request KV lengths) is required for DCP "
                 "MLA decode."
             )
+        if self.dcp_kv_layout == "page":
+            # With q_len=1 every valid local KV is visible. For multiple queries,
+            # cp_world=1 would incorrectly subtract the query suffix on every rank;
+            # page shards need per-query local bounds, not a shared local tail.
+            q_len = query.shape[1] if query.dim() == 4 else 1
+            if q_len != 1:
+                raise NotImplementedError(
+                    f"dcp_kv_layout='page' supports single-token decode only, got q_len={q_len}"
+                )
+            causal_seqs = seq_lens
+            cp_world, cp_rank = 1, 0
         bmm1_scale = self._compute_decode_bmm1_scale(layer)
         raw_out, lse = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=query,

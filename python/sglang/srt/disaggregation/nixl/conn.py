@@ -3504,6 +3504,8 @@ class NixlKVReceiver(CommonKVReceiver):
         if status in (KVPoll.Success, KVPoll.Failed):
             self.conclude_state = status
             return status
+        if status == KVPoll.Bootstrapping:
+            return self._poll_bootstrapping()
         if not self.started_transfer:
             return status
 
@@ -3523,8 +3525,8 @@ class NixlKVReceiver(CommonKVReceiver):
 
         return KVPoll.WaitingForInput  # type: ignore
 
-    def _register_kv_args(self) -> bool:
-        for bootstrap_info in self.bootstrap_infos:
+    def _register_kv_args(self, bootstrap_infos: List[Dict]) -> bool:
+        for bootstrap_info in bootstrap_infos:
             packed_kv_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
             )
@@ -3610,12 +3612,11 @@ class NixlKVReceiver(CommonKVReceiver):
                         ]
                     )
             except zmq.ZMQError:
-                self.kv_mgr.record_failure(
-                    self.bootstrap_room,
-                    f"_register_kv_args to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
+                logger.error(
+                    "_register_kv_args to prefill %s:%s failed",
+                    bootstrap_info.get("rank_ip"),
+                    bootstrap_info.get("rank_port"),
                 )
-                self.conclude_state = KVPoll.Failed
-                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                 return False
         return True
 
@@ -3623,8 +3624,8 @@ class NixlKVReceiver(CommonKVReceiver):
         if self.conclude_state is None:
             self.conclude_state = KVPoll.Failed
 
-        self.clear()
-
+        # No clear() here: a deferred release must still abort() this room, and
+        # clear() gives up the room ownership that abort() needs to arm ACKs.
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
         is_propagated = failure_reason is None

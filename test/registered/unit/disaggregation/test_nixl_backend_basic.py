@@ -1,5 +1,6 @@
 """Basic CPU unit tests for NIXL disaggregation control paths."""
 
+import functools
 import struct
 import sys
 import threading
@@ -10,9 +11,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+from disagg_test_utils import make_decode_kv_manager
 
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
-from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.common.conn import CommonKVManager, KVTransferError
 from sglang.srt.disaggregation.common.staging_handler import PrefillStagingContext
 from sglang.srt.disaggregation.common.utils import pack_int_lists
 from sglang.srt.disaggregation.nixl.conn import (
@@ -884,21 +886,23 @@ class TestNixlReceiverPoll(CustomTestCase):
     def _make_receiver(self, status=KVPoll.WaitingForInput):
         mgr = MagicMock()
         mgr.waiting_timeout = 5
+        mgr.decode_bootstrap_timeout = 300
         mgr.check_status.return_value = status
         mgr.check_transfer_done.return_value = False
         mgr.transfer_statuses = {}
+        mgr.connection_lock = threading.Lock()
         mgr.addr_to_rooms_tracker = defaultdict(set)
-        mgr.addr_to_rooms_tracker["prefill:8998"].add(11)
+        mgr.room_generations = {}
+        # Room ownership bookkeeping is the real one; everything else is mocked.
+        mgr.register_receiver_room = functools.partial(
+            CommonKVManager.register_receiver_room, mgr
+        )
+        mgr.release_receiver_room = functools.partial(
+            CommonKVManager.release_receiver_room, mgr
+        )
 
-        receiver = object.__new__(NixlKVReceiver)
-        receiver.kv_mgr = mgr
-        receiver.bootstrap_room = 11
-        receiver.bootstrap_addr = "prefill:8998"
-        receiver.started_transfer = False
-        receiver.init_time = None
-        receiver.conclude_state = None
-        receiver.abort_notified = False
-        receiver._connection_pool_entries = {}
+        receiver = NixlKVReceiver(mgr, "prefill:8998", 11)
+        mgr.update_status.reset_mock()
         return receiver, mgr
 
     def test_returns_existing_conclude_state_without_polling_manager(self):
@@ -976,6 +980,38 @@ class TestNixlReceiverPoll(CustomTestCase):
         self.assertNotIn(11, mgr.addr_to_rooms_tracker["prefill:8998"])
 
 
+class TestNixlReceiverDeferredRelease(CustomTestCase):
+    def test_failed_transfer_still_arms_abort_for_deferred_release(self):
+        """A failed transfer is reported via failure_exception() and then
+        aborted for deferred KV release; the receiver must still send ABORT to
+        every prefill writer and count their ACKs, or its KV is never freed."""
+        mgr = make_decode_kv_manager(
+            self, enable_deferred_decode_kv_release=True, transfer_statuses={}
+        )
+        receiver = NixlKVReceiver(mgr, "prefill:8998", 7)
+        receiver.bootstrap_infos = [
+            {"rank_ip": "10.0.0.1", "rank_port": 9000 + rank} for rank in (0, 1)
+        ]
+        # Metadata was published (send_metadata), so prefill may be writing.
+        receiver.init_time = 1.0
+        sends = []
+        receiver._connect_to_bootstrap_server = lambda info: (
+            SimpleNamespace(send_multipart=sends.append),
+            threading.Lock(),
+        )
+        mgr.record_failure(7, "prefill transfer failed")
+        mgr.update_status(7, KVPoll.Failed)
+
+        with self.assertRaisesRegex(KVTransferError, "prefill transfer failed"):
+            receiver.failure_exception()
+        receiver.abort()
+        for rank in (0, 1):
+            mgr.note_abort_ack(7, rank, receiver._abort_generation)
+
+        self.assertEqual([parts[0] for parts in sends], [b"ABORT", b"ABORT"])
+        self.assertTrue(mgr.is_abort_release_safe(7, 2))
+
+
 class TestNixlNodeFailure(CustomTestCase):
     def _make_manager(self):
         mgr = object.__new__(NixlKVManager)
@@ -1004,6 +1040,9 @@ class TestNixlNodeFailure(CustomTestCase):
         mgr.record_failure = CommonKVManager.record_failure.__get__(
             mgr, CommonKVManager
         )
+        mgr._init_decode_handshake_state()
+        self.addCleanup(mgr._bootstrap_executor.shutdown, wait=True)
+        self.addCleanup(mgr._parallel_info_executor.shutdown, wait=True)
         return mgr
 
     def test_handle_node_failure_removes_connections_and_marks_pending_rooms(self):

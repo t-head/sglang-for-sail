@@ -103,6 +103,48 @@ Serving-side capability enforcement is tracked in [#39122](https://github.com/sg
 
 
 ## Mooncake
+
+### Failed prefill recovery
+
+Decode sends Mooncake ABORT notifications without waiting for control-socket
+locks or writable capacity. Heartbeat failure invalidates discovery caches but
+does not permanently disable cancellation of existing rooms: the original
+writer may still be alive. Decode recreates a missing control socket without
+waiting for a connection handshake, then sends with `DONTWAIT`. An unsuccessful
+socket setup leaves no partially initialized cache entry.
+
+ABORT uses the shared metadata connection. Each retry snapshots the current
+connection epoch; ownership and that epoch are checked under the same lock as
+the nonblocking send. An epoch change during a retry cancels that attempt; the
+next attempt captures the new epoch. The original handshake epoch does not
+permanently prevent cancellation after a false heartbeat failure.
+
+A notification skipped because of lock contention or backpressure is retried
+starting at 50 milliseconds, with exponential backoff capped at 60 seconds.
+Once a notification is accepted by the local socket, Decode first allows the
+normal ACK wait before retrying. The deferred-release timeout controls warnings
+separately; it is not a memory-reclamation deadline. Matching drain ACKs can
+complete normal cleanup during retry backoff, once local copies also complete.
+
+There is an existing protocol limitation: connection-local FIFO and Decode's
+ownership check cannot revoke an ABORT already queued on an older connection.
+After reconnection, a delayed old ABORT can cancel a newer use of the same room.
+ACK tokens also do not identify the prefill process that performed the writes.
+This change preserves the existing reconnect semantics; it does not add writer
+fencing or automatic reclamation after a prefill process dies. A follow-up must
+carry the abort token in metadata and have prefill cancel the matching transfer
+rather than selecting a transfer only by room ID.
+
+If drain cannot be confirmed, Decode keeps the destination buffers quarantined
+and logs warnings while retrying. It does not restart automatically. To recover
+held capacity, stop routing new traffic to the affected decode instance, drain
+its remaining requests, and restart the complete instance through your
+deployment controller. Do not clear room tables or force-free KV pages in place.
+
+This nonblocking retry path applies to Mooncake. Other transfer backends retain
+their existing control-message delivery behavior. Metadata and staging control
+messages are outside this change's scope.
+
 ### Requirements
 
 ```bash
@@ -293,6 +335,21 @@ The `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` environment variable enables the custom me
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`300`</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><code>SGLANG_DISAGGREGATION_DECODE_BOOTSTRAP_TIMEOUT</code></strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Decode side: seconds from a request's arrival until its prefill handshake (topology, DP rank and bootstrap lookups) must finish; the request fails after that. Unset follows <code>SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Unset</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><code>SGLANG_DISAGGREGATION_BOOTSTRAP_HTTP_CONNECT_TIMEOUT</code></strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Decode side: connect timeout (seconds) of each HTTP call to a prefill bootstrap server.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>5.0</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><code>SGLANG_DISAGGREGATION_BOOTSTRAP_HTTP_READ_TIMEOUT</code></strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Decode side: read timeout (seconds) of each HTTP call to a prefill bootstrap server; bounds a prefill that accepts connections but never answers.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>5.0</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><code>SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL</code></strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Interval (seconds) between cleanups of bootstrap entries</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>120</code></td>
@@ -302,6 +359,7 @@ The `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` environment variable enables the custom me
 
 If a greater mean TTFT is acceptable, you can `export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600` (10 minutes) to relax the timeout condition.
 Please be aware that this setting will cause prefill instances to take a longer time to clean up the affected memory resources when a running decode node loses connection.
+On the decode side the same value bounds each request's handshake unless `SGLANG_DISAGGREGATION_DECODE_BOOTSTRAP_TIMEOUT` is set, so the two sides can be tuned separately.
 
 #### Decode Server Configuration
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>

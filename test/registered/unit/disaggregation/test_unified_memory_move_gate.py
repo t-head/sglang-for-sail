@@ -31,6 +31,10 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 class _FakeTransferQueue:
     def __init__(self):
         self.queue: List[object] = []
+        self._deferred_releases: List[object] = []
+
+    def has_pending_deferred_releases(self):
+        return bool(self._deferred_releases)
 
 
 class _FakePreallocQueue:
@@ -88,6 +92,27 @@ class TestDecodeMoveGate(CustomTestCase):
         scheduler.disagg_decode_transfer_queue.queue.clear()
         self.assertTrue(gate())
 
+    def test_closed_after_failed_transfer_moves_to_quarantine(self):
+        scheduler = _FakeScheduler(DisaggregationMode.DECODE)
+        gate = unified_memory_disagg_move_gate(scheduler)
+        transfer_queue = scheduler.disagg_decode_transfer_queue
+        request = object()
+        transfer_queue.queue.append(request)
+        self.assertFalse(gate())
+
+        # Removing a failed request from the polling queue is not a transport
+        # fence: its published physical pages remain targets of remote writes.
+        transfer_queue._deferred_releases.append(request)
+        transfer_queue.queue.remove(request)
+        self.assertFalse(
+            scheduler.disagg_decode_prealloc_queue.has_published_destinations
+        )
+        self.assertFalse(gate(), "quarantined RDMA destinations must not move")
+
+        # Only after the drain resolver retires the hold can compaction resume.
+        transfer_queue._deferred_releases.clear()
+        self.assertTrue(gate())
+
 
 class TestPrefillMoveGate(CustomTestCase):
     def test_closed_after_final_chunk_clears_chunked_req(self):
@@ -132,9 +157,14 @@ class TestPrefillMoveGate(CustomTestCase):
         scheduler.disagg_prefill_pending_chunk_rids.add("r0")
         self.assertFalse(gate())
 
-        # Aborted mid-chunking: chunked_req dropped, no final send, never queued.
+        # Aborted mid-chunking: the source-drain queue owns cleanup even though
+        # no final chunk will be sent. Clearing the chunk marker is safe only
+        # while this queue continues to hold the request.
         scheduler.chunked_req = None
+        scheduler.disagg_prefill_inflight_queue.append(object())
         scheduler.disagg_prefill_pending_chunk_rids.discard("r0")
+        self.assertFalse(gate(), "cancelled source buffers must not move before drain")
+        scheduler.disagg_prefill_inflight_queue.clear()
         self.assertTrue(gate(), "abort cleanup must let compaction resume")
 
 

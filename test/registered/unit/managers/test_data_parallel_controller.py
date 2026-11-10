@@ -478,6 +478,8 @@ class TestRefreshLoadBudgetThrottle(CustomTestCase):
     @staticmethod
     def _controller_with_reader(num_dp_ranks, snapshots):
         ctl = _make_controller(num_dp_ranks)
+        # Like __init__, only CONTEXT_BUCKET builds its own budget.
+        ctl.context_bucket_budget = None
         ctl.load_snapshot_reader = MagicMock()
         ctl.load_snapshot_reader.read_all.return_value = snapshots
         return ctl

@@ -27,10 +27,11 @@ from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
@@ -42,7 +43,11 @@ from sglang.srt.disaggregation.checksum import (
     page_indices_for_request,
     state_indices_for_request,
 )
-from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVManager,
+    CommonKVReceiver,
+    ParallelInfoState,
+)
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodeHiCacheTransferMixin,
@@ -356,6 +361,10 @@ class DecodeRequest:
     is_rebootstrap: bool = False
     host_staged: bool = False
 
+    # Cancellation retries are independent of the quarantine warning interval.
+    _abort_retry_deadline: float = 0.0
+    _abort_retry_interval: float = 0.05
+
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
     hicache_restored_kv_indices: Optional[torch.Tensor] = None
@@ -371,6 +380,14 @@ class DecodeRequest:
     @property
     def priority(self) -> Optional[int]:
         return self.req.priority
+
+
+class _DpRankQuery(NamedTuple):
+    # Epoch of the prefill addr at submit; an eviction since then voids the answer.
+    epoch: int
+    # The exact requests asked about; a later request reusing a room is not covered.
+    decode_reqs: Tuple[DecodeRequest, ...]
+    future: Future
 
 
 class DecodePreallocQueue(DecodeHiCachePreallocMixin):
@@ -422,14 +439,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
         self.pending_reqs: List[DecodeRequest] = []
-        # In-flight authoritative room -> DP-rank lookups, consumed below.
-        self._prefill_dp_rank_queries: Dict[
-            str, Tuple[Tuple[int, ...], Future[Dict[str, int]]]
-        ] = {}
+        # At most one in-flight authoritative room -> DP-rank lookup per addr.
+        self._prefill_dp_rank_queries: Dict[str, _DpRankQuery] = {}
         self._ensure_retry_count: Dict[str, int] = {}
-        self._max_ensure_retries: int = 15  # scheduling cycles
+        self._max_ensure_retries: int = 15  # failed topology fetches
         self._ensure_last_attempt_time: Dict[str, float] = {}
-        self._ensure_retry_interval: float = 1.0  # seconds
+        self._ensure_retry_interval: float = 1.0  # seconds, first retry
+        self._ensure_retry_interval_max: float = 4.0  # seconds
         # Retracted requests staged for rebootstrap while generation is paused.
         # Enqueued into ``self.queue`` only on ``continue_generation`` so the
         # prefix KV is recomputed under the post-retract (updated) weights.
@@ -1157,6 +1173,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
+    def _retry_delay_for(self, bootstrap_addr: str) -> float:
+        """Exponential backoff for the topology fetch, capped at the ceiling."""
+        count = self._ensure_retry_count.get(bootstrap_addr, 0)
+        if count <= 0:
+            return self._ensure_retry_interval
+        return min(
+            self._ensure_retry_interval * (2 ** (count - 1)),
+            self._ensure_retry_interval_max,
+        )
+
     def _ensure_prefill_info(
         self, addr_to_reqs: Dict[str, List[DecodeRequest]]
     ) -> Tuple[Dict[str, List[DecodeRequest]], List[DecodeRequest]]:
@@ -1167,23 +1193,32 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         now = time.monotonic()
         for bootstrap_addr, reqs in addr_to_reqs.items():
+            # Checked before the pacing gate so a fetch that just landed is used now.
+            if self.kv_manager.has_parallel_info(bootstrap_addr):
+                self._ensure_retry_count.pop(bootstrap_addr, None)
+                self._ensure_last_attempt_time.pop(bootstrap_addr, None)
+                ready[bootstrap_addr] = reqs
+                continue
+
             last_attempt = self._ensure_last_attempt_time.get(bootstrap_addr)
             if last_attempt is not None and (
-                now - last_attempt < self._ensure_retry_interval
+                now - last_attempt < self._retry_delay_for(bootstrap_addr)
             ):
                 remaining.extend(reqs)
                 continue
 
-            self._ensure_last_attempt_time[bootstrap_addr] = now
-
-            if self.kv_manager.try_ensure_parallel_info(bootstrap_addr):
-                if bootstrap_addr in self._ensure_retry_count:
-                    del self._ensure_retry_count[bootstrap_addr]
-                if bootstrap_addr in self._ensure_last_attempt_time:
-                    del self._ensure_last_attempt_time[bootstrap_addr]
+            state = self.kv_manager.try_ensure_parallel_info(bootstrap_addr)
+            if state == ParallelInfoState.PENDING:
+                # Not a failed try; each receiver's handshake deadline bounds the wait.
+                remaining.extend(reqs)
+                continue
+            if state == ParallelInfoState.READY:
+                self._ensure_retry_count.pop(bootstrap_addr, None)
+                self._ensure_last_attempt_time.pop(bootstrap_addr, None)
                 ready[bootstrap_addr] = reqs
                 continue
 
+            self._ensure_last_attempt_time[bootstrap_addr] = now
             count = self._ensure_retry_count.get(bootstrap_addr, 0) + 1
             self._ensure_retry_count[bootstrap_addr] = count
 
@@ -1201,59 +1236,130 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         return ready, remaining
 
-    def prefetch_prefill_dp_rank_queries(self) -> None:
-        """Start DP-rank lookups before their normal consume point."""
-        if not self.pending_reqs:
-            return
+    def _prune_pending_reqs(self) -> None:
+        # A request aborted or cleared elsewhere must not be resolved or queried.
+        self.pending_reqs = [
+            decode_req
+            for decode_req in self.pending_reqs
+            if decode_req.kv_receiver is not None
+            and not isinstance(decode_req.req.finished_reason, FINISH_ABORT)
+        ]
 
-        queries = self._prefill_dp_rank_queries
-
+    def _group_pending_reqs_by_addr(self) -> Dict[str, List[DecodeRequest]]:
         addr_to_reqs: Dict[str, List[DecodeRequest]] = {}
         for decode_req in self.pending_reqs:
             addr = _bootstrap_addr(decode_req.req)
             addr_to_reqs.setdefault(addr, []).append(decode_req)
+        return addr_to_reqs
 
-        for bootstrap_addr in set(queries) - set(addr_to_reqs):
-            _, stale_future = queries.pop(bootstrap_addr)
-            stale_future.cancel()
-
+    def prefetch_prefill_dp_rank_queries(self) -> None:
+        """Start DP-rank lookups before their normal consume point."""
+        self._prune_pending_reqs()
+        addr_to_reqs = self._group_pending_reqs_by_addr()
+        self._drop_stale_dp_rank_queries(active_addrs=addr_to_reqs.keys())
         for bootstrap_addr, decode_reqs in addr_to_reqs.items():
-            if bootstrap_addr in queries:
+            if bootstrap_addr in self._prefill_dp_rank_queries:
                 continue
-            if self.kv_manager.prefill_info_table.get(bootstrap_addr) is None:
+            if not self.kv_manager.has_parallel_info(bootstrap_addr):
                 continue
-
-            rooms = tuple(
-                decode_req.req.bootstrap_room
-                for decode_req in decode_reqs
-                if self._resolve_prefill_dp_rank(decode_req.req) is None
+            self._submit_prefill_dp_rank_query(
+                bootstrap_addr=bootstrap_addr,
+                decode_reqs=[
+                    decode_req
+                    for decode_req in decode_reqs
+                    if self._resolve_prefill_dp_rank(decode_req.req) is None
+                ],
             )
-            if not rooms:
-                continue
-
-            future = self.kv_manager._ensure_prefill_recompute_executor().submit(
-                CommonKVReceiver.query_prefill_dp_ranks,
-                bootstrap_addr,
-                list(rooms),
-            )
-            queries[bootstrap_addr] = (rooms, future)
 
     def _cancel_prefill_dp_rank_queries(self) -> None:
-        for _, future in self._prefill_dp_rank_queries.values():
-            future.cancel()
+        for query in self._prefill_dp_rank_queries.values():
+            query.future.cancel()
         self._prefill_dp_rank_queries.clear()
+
+    def _cancel_prefill_dp_rank_query(self, bootstrap_addr: str) -> None:
+        query = self._prefill_dp_rank_queries.pop(bootstrap_addr, None)
+        if query is not None:
+            query.future.cancel()
+
+    def _drop_stale_dp_rank_queries(self, *, active_addrs) -> None:
+        for bootstrap_addr in set(self._prefill_dp_rank_queries) - set(active_addrs):
+            self._cancel_prefill_dp_rank_query(bootstrap_addr)
+
+    def _submit_prefill_dp_rank_query(
+        self, *, bootstrap_addr: str, decode_reqs: List[DecodeRequest]
+    ) -> None:
+        """Submit a DP-rank lookup without waiting on the scheduler thread."""
+        if not decode_reqs:
+            return
+        self._prefill_dp_rank_queries[bootstrap_addr] = _DpRankQuery(
+            epoch=self.kv_manager.parallel_info_epoch(bootstrap_addr),
+            decode_reqs=tuple(decode_reqs),
+            future=self.kv_manager.submit_dp_rank_query(
+                bootstrap_addr=bootstrap_addr,
+                bootstrap_rooms=[
+                    decode_req.req.bootstrap_room for decode_req in decode_reqs
+                ],
+            ),
+        )
+
+    def _take_dp_rank_answers(
+        self, bootstrap_addr: str, query: _DpRankQuery
+    ) -> Dict[int, int]:
+        """Answers of a finished lookup, keyed by ``id(decode_req)`` of the asked
+        requests; empty when the prefill was evicted since the lookup started."""
+        if query.epoch != self.kv_manager.parallel_info_epoch(bootstrap_addr):
+            return {}
+        try:
+            room_to_rank = query.future.result()
+        except Exception as e:
+            logger.warning("Prefill DP-rank query failed for %s: %s", bootstrap_addr, e)
+            return {}
+        answers: Dict[int, int] = {}
+        for decode_req in query.decode_reqs:
+            prefill_dp_rank = room_to_rank.get(str(decode_req.req.bootstrap_room))
+            if prefill_dp_rank is not None:
+                answers[id(decode_req)] = int(prefill_dp_rank)
+        return answers
+
+    def _consume_dp_rank_query(
+        self, bootstrap_addr: str, need_query: List[DecodeRequest]
+    ) -> Tuple[List[Tuple[DecodeRequest, int]], List[DecodeRequest]]:
+        """Split ``need_query`` into (resolved, still pending); never waits on the
+        lookup, and keeps at most one lookup in flight for ``bootstrap_addr``."""
+        query = self._prefill_dp_rank_queries.get(bootstrap_addr)
+        if query is not None and not query.future.done():
+            return [], need_query
+
+        answers: Dict[int, int] = {}
+        if query is not None:
+            del self._prefill_dp_rank_queries[bootstrap_addr]
+            answers = self._take_dp_rank_answers(bootstrap_addr, query)
+
+        # Matched by request identity, not room: an answer given for a room
+        # does not cover a later request that reuses it.
+        resolved: List[Tuple[DecodeRequest, int]] = []
+        unresolved: List[DecodeRequest] = []
+        for decode_req in need_query:
+            prefill_dp_rank = answers.get(id(decode_req))
+            if prefill_dp_rank is not None:
+                resolved.append((decode_req, prefill_dp_rank))
+            else:
+                unresolved.append(decode_req)
+
+        # Rooms the prefill has not registered yet are asked again; each
+        # receiver's handshake deadline bounds how long that goes on.
+        self._submit_prefill_dp_rank_query(
+            bootstrap_addr=bootstrap_addr, decode_reqs=unresolved
+        )
+        return resolved, unresolved
 
     def _resolve_pending_reqs(self) -> None:
         """Batch-resolve prefill_dp_ranks for pending requests and initialize receivers."""
-        if not self.pending_reqs:
-            self._cancel_prefill_dp_rank_queries()
+        self._prune_pending_reqs()
+        addr_to_reqs = self._group_pending_reqs_by_addr()
+        self._drop_stale_dp_rank_queries(active_addrs=addr_to_reqs.keys())
+        if not addr_to_reqs:
             return
-
-        # Group pending requests by bootstrap_addr
-        addr_to_reqs: Dict[str, List[DecodeRequest]] = {}
-        for decode_req in self.pending_reqs:
-            addr = _bootstrap_addr(decode_req.req)
-            addr_to_reqs.setdefault(addr, []).append(decode_req)
 
         # Pass 1: ensure parallel info for each addr
         ready_addrs, remaining = self._ensure_prefill_info(addr_to_reqs)
@@ -1270,39 +1376,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             # Pass 2: resolve dp rank for addrs whose info is available
             if need_query:
-                rooms = [decode_req.req.bootstrap_room for decode_req in need_query]
-                prefetched = self._prefill_dp_rank_queries.pop(bootstrap_addr, None)
-                prefetched_rooms = prefetched[0] if prefetched is not None else ()
-                if (
-                    prefetched is not None
-                    and tuple(rooms[: len(prefetched_rooms)]) == prefetched_rooms
-                ):
-                    room_to_rank = prefetched[1].result()
-                    remaining_rooms = rooms[len(prefetched_rooms) :]
-                    if remaining_rooms:
-                        room_to_rank.update(
-                            CommonKVReceiver.query_prefill_dp_ranks(
-                                bootstrap_addr, remaining_rooms
-                            )
-                        )
-                else:
-                    if prefetched is not None:
-                        prefetched[1].cancel()
-                    room_to_rank = CommonKVReceiver.query_prefill_dp_ranks(
-                        bootstrap_addr, rooms
-                    )
-                for decode_req in need_query:
-                    prefill_dp_rank = room_to_rank.get(
-                        str(decode_req.req.bootstrap_room)
-                    )
-                    if prefill_dp_rank is not None:
-                        resolved.append((decode_req, int(prefill_dp_rank)))
-                    else:
-                        remaining.append(decode_req)
+                answered, unanswered = self._consume_dp_rank_query(
+                    bootstrap_addr, need_query
+                )
+                resolved.extend(answered)
+                remaining.extend(unanswered)
             else:
-                prefetched = self._prefill_dp_rank_queries.pop(bootstrap_addr, None)
-                if prefetched is not None:
-                    prefetched[1].cancel()
+                self._cancel_prefill_dp_rank_query(bootstrap_addr)
 
         self.pending_reqs = remaining
 
@@ -2510,10 +2590,18 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.deferred_kv_release_timeout = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT.get()
         )
-        # Aborted-mid-transfer requests whose KV pages/slot are held until drained
-        # or timed out. Entries:
-        # (decode_req, start_time, deadline, metadata_idx, required_acks).
-        self._deferred_releases: List[Tuple[DecodeRequest, float, float, int, int]] = []
+        # Failed transfers retain every destination until all writers drain.
+        # The deadline only controls warnings/retries, never memory reclamation.
+        # None required_acks means the writer set is unknown, so fail closed.
+        # Entries: (decode_req, start_time, deadline, metadata_idx, required_acks).
+        self._deferred_releases: List[
+            Tuple[DecodeRequest, float, float, int, Optional[int]]
+        ] = []
+        # A cleanup exception may leave local DMA or partially released state.
+        # Keep administrative/compaction gates closed without retrying a free.
+        self._failed_deferred_releases: List[DecodeRequest] = []
+        self._release_tp_size = dist.get_world_size(self.gloo_group)
+        self._deferred_release_error: Optional[str] = None
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -2791,7 +2879,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     is_propagated = False
                     failure_reason = "HiCache restore failed"
                     error_message += " (HiCache local restore failed on this rank)"
-                self._clean_hicache_prefetch_resources(decode_req)
                 # Mute error message for propagated exceptions to avoid duplicate logging
                 if is_propagated:
                     logger.debug(error_message)
@@ -2806,16 +2893,24 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     [decode_req.req],
                     decode_req.req.return_logprob,
                 )
-                if self.scheduler.enable_hisparse:
-                    self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
+                kv_mgr = decode_req.kv_receiver.kv_mgr
                 requires_host_drain = (
                     self.enable_host_receive and decode_req.host_staged
                 )
-                deferrable = (
-                    self.enable_deferred_kv_release
-                    and decode_req.kv_receiver.kv_mgr.enable_deferred_decode_kv_release
+                # Mooncake must always drain a receiver whose destinations were
+                # published; one with none (e.g. a FakeKVReceiver health check)
+                # has nothing in flight and releases at once.
+                requires_transfer_drain = kv_mgr.requires_transfer_drain and bool(
+                    getattr(decode_req.kv_receiver, "bootstrap_infos", None)
                 )
-                if deferrable and not decode_req.kv_receiver.abort_notified:
+                if (
+                    requires_host_drain
+                    or requires_transfer_drain
+                    or (
+                        self.enable_deferred_kv_release
+                        and kv_mgr.enable_deferred_decode_kv_release
+                    )
+                ):
                     # A failure decode did not initiate (prefill fault, transport
                     # error, hicache restore failure) can still have sibling-rank
                     # writes in flight toward these pages. force_arm: a partial
@@ -2823,22 +2918,29 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     # already hold destinations; this path always reaches
                     # _do_release, which clears the tracker.
                     decode_req.kv_receiver.ensure_abort_notified(force_arm=True)
-                if requires_host_drain or (
-                    deferrable and decode_req.kv_receiver.abort_notified
-                ):
-                    # Host pages always await a drain ack. A receiver that could
-                    # not notify (metadata never published, so no prefill holds
-                    # its destination info) has nothing in flight and releases
-                    # immediately below.
-                    self._defer_release(decode_req)
-                    deferred_indices.add(i)
-                    indices_to_remove.add(i)
-                else:
-                    # release pre-allocated kv cache, but don't insert into the tree since it's failed
-                    self._release_request(decode_req)
-                    decode_req.kv_receiver.clear()
-                    decode_req.kv_receiver = None
-                    indices_to_remove.add(i)
+                    if (
+                        requires_host_drain
+                        or requires_transfer_drain
+                        or decode_req.kv_receiver.abort_notified
+                    ):
+                        # _do_release cleans HiCache/HiSparse once writers drain.
+                        self._defer_release(decode_req)
+                        deferred_indices.add(i)
+                        indices_to_remove.add(i)
+                        self._record_transfer_failure(failure_reason)
+                        continue
+                # A receiver that could not notify (metadata never published, so
+                # no prefill holds its destination info) has nothing in flight.
+                self._clean_hicache_prefetch_resources(decode_req)
+                if self.scheduler.enable_hisparse:
+                    self.scheduler.hisparse_coordinator.request_finished(
+                        decode_req.req
+                    )
+                # release pre-allocated kv cache, but don't insert into the tree since it's failed
+                self._release_request(decode_req)
+                decode_req.kv_receiver.clear()
+                decode_req.kv_receiver = None
+                indices_to_remove.add(i)
                 self._record_transfer_failure(failure_reason)
                 continue
             elif poll == KVPoll.Success:
@@ -2908,15 +3010,32 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         return transferred_reqs
 
     def _defer_release(self, decode_req: DecodeRequest) -> None:
+        if any(entry[0] is decode_req for entry in self._deferred_releases):
+            return
         start_time = time.monotonic()
         deadline = start_time + self.deferred_kv_release_timeout
-        # Host-capable receivers own their drain tracking. Device destinations
-        # snapshot the number of prefill acknowledgements required by the manager.
-        required_acks = (
-            0
-            if self.enable_host_receive and decode_req.host_staged
-            else len(decode_req.kv_receiver.bootstrap_infos)
-        )
+        receiver = decode_req.kv_receiver
+        if receiver.kv_mgr.requires_transfer_drain:
+            # A skipped nonblocking send should not wait for a 30s warning.
+            # Once accepted, allow the normal ACK wait before retrying.
+            delay = (
+                min(max(self.deferred_kv_release_timeout, 0.05), 60.0)
+                if receiver.abort_notified
+                else 0.05
+            )
+        else:
+            delay = max(self.deferred_kv_release_timeout, 1.0)
+        decode_req._abort_retry_deadline = start_time + delay
+        decode_req._abort_retry_interval = min(delay * 2, 60.0)
+        if self.enable_host_receive and decode_req.host_staged:
+            # Host-capable receivers own their drain tracking.
+            required_acks = 0
+        else:
+            # Require an ack from every notified prefill rank (dummy-proof).
+            # Snapshot now -- the receiver may be cleared by resolve time.
+            # Unknown writer set (None) fails closed.
+            bootstrap_infos = receiver.bootstrap_infos
+            required_acks = len(bootstrap_infos) if bootstrap_infos else None
         self._deferred_releases.append(
             (
                 decode_req,
@@ -2927,21 +3046,90 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             )
         )
 
+    def _retry_deferred_abort(
+        self, decode_req: DecodeRequest, now: float, warning_deadline: float
+    ) -> None:
+        if now < decode_req._abort_retry_deadline:
+            return
+        receiver = decode_req.kv_receiver
+        sent = receiver.retry_abort()
+        if receiver.kv_mgr.requires_transfer_drain:
+            delay = decode_req._abort_retry_interval
+            if sent is not False:
+                # Accepted by ZMQ is not a drain ACK. Keep holding the buffers.
+                delay = max(
+                    delay, min(max(self.deferred_kv_release_timeout, 0.05), 60.0)
+                )
+            delay = min(delay, 60.0)
+            decode_req._abort_retry_interval = min(delay * 2, 60.0)
+        else:
+            delay = max(self.deferred_kv_release_timeout, 1.0)
+        decode_req._abort_retry_deadline = time.monotonic() + delay
+
     def _do_release(self, decode_req: DecodeRequest, idx: int) -> None:
         room = decode_req.req.bootstrap_room
         if self.enable_staging and self.staging_handler.is_staging_room(room):
             self.staging_handler.unregister_decode_req(room)
+        self._clean_hicache_prefetch_resources(decode_req)
+        if self.scheduler.enable_hisparse:
+            self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
         # release pre-allocated kv cache, but don't insert into the tree since it's failed
         self._release_request(decode_req)
         self.metadata_buffers.bootstrap_room[idx] = 0
         self.req_to_metadata_buffer_idx_allocator.free(idx)
         if not (self.enable_host_receive and decode_req.host_staged):
-            decode_req.kv_receiver.kv_mgr.clear_deferred_abort_state(room)
+            # Leave a newer receiver's armed state for the reused room alone.
+            decode_req.kv_receiver.kv_mgr.clear_deferred_abort_state(
+                room,
+                generation=decode_req.kv_receiver._abort_generation,
+            )
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
 
     def has_pending_deferred_releases(self) -> bool:
-        return bool(self._deferred_releases)
+        return bool(
+            self._deferred_releases
+            or self._failed_deferred_releases
+            or self._deferred_release_error
+        )
+
+    def _local_deferred_release_ready(
+        self, decode_req: DecodeRequest, required_acks: Optional[int]
+    ) -> bool:
+        room = decode_req.req.bootstrap_room
+        if self.enable_host_receive and decode_req.host_staged:
+            # A timeout cannot prove that a remote host write has stopped.
+            if not decode_req.kv_receiver.is_abort_release_safe():
+                return False
+        elif (
+            required_acks is None
+            or not decode_req.kv_receiver.kv_mgr.is_abort_release_safe(
+                room,
+                required_acks,
+                # Only this receiver's ACKs prove its writers stopped.
+                generation=decode_req.kv_receiver._abort_generation,
+            )
+        ):
+            return False
+        if decode_req.hicache_restore_lock is not None:
+            # An in-flight L2->L1 load-back still writes into these pages.
+            consumer_index = decode_req.hicache_load_consumer_index
+            if consumer_index >= 0 and not self.tree_cache.is_load_back_event_done(
+                consumer_index
+            ):
+                return False
+        if self.enable_staging and self.staging_handler.is_staging_room(room):
+            # Mooncake ACKs follow this room's CHUNK_READY messages on the same
+            # socket. Once all ACKs arrive, its scatter events are registered.
+            if any(not event.query() for event, _ in decode_req._chunk_events):
+                return False
+        return True
+
+    def _fail_deferred_release(self, reason: str) -> None:
+        # A partially completed free cannot be rolled back. Stop every TP rank
+        # before any can admit new work using a different allocator state.
+        self._deferred_release_error = reason
+        raise RuntimeError(f"Decode deferred release stopped: {reason}")
 
     def num_pending_deferred_releases(self) -> int:
         return len(self._deferred_releases)
@@ -2956,81 +3144,123 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             )
 
     def resolve_deferred_releases(self) -> None:
-        """Release drained transfers; device destinations may also time out."""
-        if not self._deferred_releases:
-            return
-        host_ready = torch.tensor(
+        """Reclaim the same requests in the same order on every Attention TP rank.
+
+        This is called at a common scheduler point, including on ranks whose
+        local hold list is empty. Never make collective participation depend on
+        rank-local ACK timing, DMA completion, or allocator capacity.
+        """
+        distributed = self._release_tp_size > 1
+        state = torch.tensor(
             [
-                req.kv_receiver.is_abort_release_safe()
-                for req, _, _, _, _ in self._deferred_releases
-                if self.enable_host_receive and req.host_staged
+                bool(self._deferred_releases),
+                bool(self._deferred_release_error or self._failed_deferred_releases),
             ],
             dtype=torch.int32,
+            device="cpu",
         )
-        if host_ready.numel() and torch.distributed.get_world_size(self.gloo_group) > 1:
-            # Admission must see identical host capacity and page order on every rank.
-            torch.distributed.all_reduce(
-                host_ready, op=torch.distributed.ReduceOp.MIN, group=self.gloo_group
+        if distributed:
+            dist.all_reduce(state, op=dist.ReduceOp.MAX, group=self.gloo_group)
+        if state[1].item():
+            self._fail_deferred_release(
+                "an Attention TP peer has a prior cleanup failure"
             )
-        host_ready = iter(host_ready.tolist())
+        if not state[0].item():
+            return
+
+        entries = sorted(
+            self._deferred_releases,
+            key=lambda entry: (entry[0].req.rid, entry[0].req.bootstrap_room, entry[3]),
+        )
+        identities = [
+            (entry[0].req.rid, entry[0].req.bootstrap_room, entry[3])
+            for entry in entries
+        ]
+        if distributed:
+            peer_identities = [None] * self._release_tp_size
+            dist.all_gather_object(peer_identities, identities, group=self.gloo_group)
+            if any(peer != peer_identities[0] for peer in peer_identities):
+                self._fail_deferred_release(
+                    "held request identities differ across Attention TP"
+                )
+        if len({(rid, room) for rid, room, _ in identities}) != len(identities):
+            self._fail_deferred_release("duplicate held request identity")
+
         now = time.monotonic()
-        still_held = []
-        to_release = []
-        for (
-            decode_req,
-            start_time,
-            deadline,
-            idx,
-            required_acks,
-        ) in self._deferred_releases:
+        refreshed = []
+        readiness = []
+        for decode_req, start_time, deadline, idx, required_acks in entries:
             room = decode_req.req.bootstrap_room
-            if self.enable_host_receive and decode_req.host_staged:
-                if next(host_ready):
-                    to_release.append((decode_req, start_time, idx, room, True))
-                else:
-                    # A timeout cannot prove that a remote write has stopped.
-                    still_held.append(
-                        (decode_req, start_time, deadline, idx, required_acks)
-                    )
+            try:
+                ready = self._local_deferred_release_ready(decode_req, required_acks)
+                if not ready:
+                    self._retry_deferred_abort(decode_req, now, deadline)
+                    if now >= deadline:
+                        logger.warning(
+                            "Deferred KV release for room %s still lacks a complete "
+                            "transfer drain after %ss; keeping its buffers quarantined "
+                            "and retrying ABORT with backoff.",
+                            room,
+                            self.deferred_kv_release_timeout,
+                        )
+                        deadline = time.monotonic() + max(
+                            self.deferred_kv_release_timeout, 1.0
+                        )
+                readiness.append(int(ready))
+            except Exception:
+                logger.exception("Failed to check deferred release for room %s", room)
+                readiness.append(-1)
+            refreshed.append((decode_req, start_time, deadline, idx, required_acks))
+
+        ready_tensor = torch.tensor(readiness, dtype=torch.int32, device="cpu")
+        if distributed:
+            dist.all_reduce(ready_tensor, op=dist.ReduceOp.MIN, group=self.gloo_group)
+        if (ready_tensor < 0).any().item():
+            self._fail_deferred_release("an Attention TP peer failed its drain check")
+        can_release = ready_tensor.tolist()
+        self._deferred_releases = [
+            entry for entry, ready in zip(refreshed, can_release) if not ready
+        ]
+        if not any(can_release):
+            return
+
+        cleanup_failed = False
+        for (decode_req, start_time, _, idx, _), ready in zip(refreshed, can_release):
+            if not ready:
                 continue
-            kv_mgr = decode_req.kv_receiver.kv_mgr
-            drained = kv_mgr.is_abort_release_safe(room, required_acks)
-            if not drained and now < deadline:
-                still_held.append(
-                    (decode_req, start_time, deadline, idx, required_acks)
-                )
-            else:
-                to_release.append((decode_req, start_time, idx, room, drained))
-        # Commit the survivors before releasing so a _do_release exception can't
-        # leave a released entry in the list (double-free / None receiver on retry).
-        self._deferred_releases = still_held
-        for decode_req, start_time, idx, room, drained in to_release:
-            if not drained:
-                logger.warning(
-                    f"Deferred KV release for room {room} timed out after "
-                    f"{self.deferred_kv_release_timeout}s without a full drain "
-                    f"ack from prefill; releasing anyway."
-                )
-            outcome = "drained" if drained else "timeout"
+            outcome = "drained"
             try:
                 self._do_release(decode_req, idx)
             except Exception:
-                # Isolate a failed release so the rest still run; entry already dropped.
-                logger.exception(f"Deferred KV release failed for room {room}")
+                cleanup_failed = True
                 outcome = "error"
+                self._failed_deferred_releases.append(decode_req)
+                logger.exception(
+                    "Deferred KV release failed for room %s",
+                    decode_req.req.bootstrap_room,
+                )
+            # Buffers are never released on timeout, so "timeout" is not observed.
             self._observe_deferred_kv_release(
-                duration_seconds=max(0.0, now - start_time),
-                outcome=outcome,
+                duration_seconds=max(0.0, now - start_time), outcome=outcome
             )
+        outcome = torch.tensor([cleanup_failed], dtype=torch.int32, device="cpu")
+        if distributed:
+            # This is also the post-free barrier: no rank can allocate new
+            # requests while a peer is still tearing down its local copies.
+            dist.all_reduce(outcome, op=dist.ReduceOp.MAX, group=self.gloo_group)
+        if outcome.item():
+            self._fail_deferred_release("an Attention TP peer failed buffer cleanup")
 
     def release_memory_occupation(self):
-        """Clean up in-flight transfers before releasing GPU memory."""
-        self.queue.clear()
-        # Pool is being torn down; drop held entries without per-request release.
-        self._deferred_releases.clear()
+        """Reject offload while any remote transfer can still access the pool."""
+        if self.queue or self.has_pending_deferred_releases():
+            raise RuntimeError(
+                "Cannot release decode memory while KV transfers or quarantined "
+                "transfer buffers are pending."
+            )
 
     def resume_memory_occupation(self):
-        """Queues are already cleared on release; new transfers can be accepted."""
+        """Release requires empty queues, so new transfers can be accepted."""
         pass
 
 

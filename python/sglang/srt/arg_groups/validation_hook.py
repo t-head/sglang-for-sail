@@ -172,8 +172,11 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
 
 def check_server_args(server_args: Any):
     from sglang.srt.arg_groups.lora_hook import check_lora_server_args
+    from sglang.srt.managers.request_validation import validate_request_limits
 
     cfg = resolving_view(server_args)
+
+    validate_request_limits(cfg.max_parallel_samples, cfg.max_batch_outputs)
 
     # Check parallel size constraints
     if cfg.ep_join_mode != "scale":

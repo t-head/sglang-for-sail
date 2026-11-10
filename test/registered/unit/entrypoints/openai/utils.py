@@ -71,6 +71,8 @@ class MockTokenizerManager:
         self.num_reserved_tokens = 0
         self.generate_request = Mock()
         self.create_abort_task = Mock()
+        # create_responses preflights the adapted request before dispatch.
+        self.validate_request_params = Mock()
 
     def config_value(self, name: str):
         """The value in effect for one config field."""

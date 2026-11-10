@@ -230,6 +230,14 @@ class Serving(msgspec.Struct):
             choices=["openai", "model"],
         ),
     ] = "model"
+    max_parallel_samples: A[
+        int,
+        "Maximum n (candidate responses) per input. Must be positive. Checked before request expansion.",
+    ] = 128
+    max_batch_outputs: A[
+        int,
+        "Maximum batch_size * n per generation request. Must be positive. Checked before request expansion, including n=1.",
+    ] = 1024
     asr_max_buffer_seconds: A[
         int,
         "Maximum seconds of PCM audio the streaming ASR WebSocket handler will accumulate before closing the session with a buffer_overflow error. Guards against OOM when a client streams audio faster than inference can consume it. Default 60s.",

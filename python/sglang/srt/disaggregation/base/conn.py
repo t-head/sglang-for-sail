@@ -131,6 +131,9 @@ class BaseKVManager(ABC):
 
     enable_deferred_decode_kv_release: bool = False
     supports_host_destination: bool = False
+    # Fail-closed source/destination lifetime: never free on a timeout, only
+    # after every writer's drain ACK (Mooncake).
+    requires_transfer_drain: bool = False
 
     @abstractmethod
     def __init__(

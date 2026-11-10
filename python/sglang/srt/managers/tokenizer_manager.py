@@ -64,7 +64,10 @@ from sglang.srt.beam_search.output import (
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    MAX_DISAGGREGATION_TOP_LOGPROBS,
+    DisaggregationMode,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.joint_schema_head import (
     max_joint_prompt_tokens,
@@ -117,6 +120,10 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.positional_embeds_transport import PositionalEmbedsTransport
+from sglang.srt.managers.request_validation import (
+    validate_generation_request,
+    validate_input_ids,
+)
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     get_request_return_hidden_states_mode,
@@ -993,12 +1000,86 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.sampling_params_class = SamplingParams
         self.signal_handler_class = SignalHandler
 
+    def validate_request_params(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> None:
+        """Preflight before streaming headers, expansion, or Scheduler dispatch."""
+        validate_input_ids(
+            obj.input_ids,
+            self.model_config.vocab_size,
+            allow_empty=(
+                isinstance(obj, GenerateReqInput)
+                and isinstance(obj.session_params, dict)
+                and bool(obj.session_params.get("id"))
+            ),
+        )
+        if not isinstance(obj, GenerateReqInput):
+            return
+        self.validate_logprob_params(obj)
+        validate_generation_request(
+            obj,
+            vocab_size=self.model_config.vocab_size,
+            max_parallel_samples=get_serving().max_parallel_samples,
+            max_batch_outputs=get_serving().max_batch_outputs,
+            preferred_sampling_params=self.preferred_sampling_params,
+            is_disaggregated=self.disaggregation_mode != DisaggregationMode.NULL,
+            sampling_mask_enabled=envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.get(),
+            sampling_mask_capacity=get_exec().features.sampling_mask_max_tokens,
+            speculative=get_spec().speculative_algorithm is not None,
+            sampling_backend=get_exec().kernel.sampling_backend,
+            sampling_params_class=self.sampling_params_class,
+        )
+
+    def validate_logprob_params(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> None:
+        """Validate raw logprob sizes before inference or streaming headers."""
+        if not isinstance(obj, GenerateReqInput):
+            return
+        values = obj.top_logprobs_num
+        if values is None:
+            return
+        if not isinstance(values, list):
+            values = [values]
+        max_logprobs = self.model_config.vocab_size
+        if self.disaggregation_mode in (
+            DisaggregationMode.PREFILL,
+            DisaggregationMode.DECODE,
+        ):
+            max_logprobs = min(max_logprobs, MAX_DISAGGREGATION_TOP_LOGPROBS)
+        for value in values:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(
+                    f"top_logprobs_num must be a non-negative integer, got {value!r}."
+                )
+            if value > max_logprobs:
+                raise ValueError(
+                    f"top_logprobs_num must be at most {max_logprobs} "
+                    f"for this server, got {value}."
+                )
+        if isinstance(obj.top_logprobs_num, list):
+            # Reuse input-shape detection without mutating or expanding the request.
+            shape = copy.copy(obj)
+            shape._validate_inputs()
+            shape._determine_batch_size()
+            if shape.is_single:
+                raise ValueError(
+                    "top_logprobs_num must be an integer for a single request."
+                )
+            if len(values) != shape.batch_size:
+                raise ValueError(
+                    "top_logprobs_num must contain one value per input in a batch."
+                )
+
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
+
+        # Reject the entire raw batch before expansion or dispatch of any member.
+        self.validate_request_params(obj)
 
         # Normalize the request
         obj.normalize_batch_and_arguments()

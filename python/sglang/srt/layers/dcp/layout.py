@@ -109,6 +109,23 @@ def maybe_dcp_kernel_indices(
     return indices[dcp_rank::dcp_size] // dcp_size
 
 
+def get_dcp_page_lens(
+    lens: torch.Tensor,
+    dcp_size: int,
+    dcp_rank: int,
+    page_size: int,
+) -> torch.Tensor:
+    """Per-rank KV length when logical pages are striped starting at rank zero."""
+    tokens_per_round = dcp_size * page_size
+    full_rounds = lens // tokens_per_round
+    tail = torch.clamp(
+        lens % tokens_per_round - dcp_rank * page_size,
+        min=0,
+        max=page_size,
+    )
+    return full_rounds * page_size + tail
+
+
 def filter_dcp_local_kv_indices(kv_indices: torch.Tensor):
     """Keep this rank's share of a read-index tensor, still WIDENED.
 

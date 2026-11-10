@@ -4834,7 +4834,11 @@ class MLATokenToKVPool(KVCache):
             set_mla_kv_buffer_triton(dst_buffer, loc, cache_k_nope, cache_k_rope)
         else:
             set_mla_kv_buffer_dcp_sharded_triton(
-                dst_buffer, loc, cache_k_nope, cache_k_rope
+                dst_buffer,
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+                physical_page_size=self.page_size,
             )
 
     def set_kv_buffer(
@@ -5027,10 +5031,28 @@ class MLATokenToKVPool(KVCache):
         for kv_cache in self.kv_buffer:
             kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
 
+    def _dcp_retraction_local_rows(self, indices: torch.Tensor) -> torch.Tensor:
+        """Map widened DCP slots to this rank's local KV rows."""
+        parallel = get_parallel()
+        if not (parallel.dcp_enabled and parallel.dcp_kv_layout == "page"):
+            if self._write_loc_dcp_span == 1:
+                return indices
+            return maybe_dcp_kernel_indices(
+                indices, self._write_loc_dcp_span, parallel.attn_dcp_rank
+            )
+        dcp_size = parallel.dcp_size
+        page_size = self.page_size
+        virtual_page_size = dcp_size * page_size
+
+        local_mask = (indices // page_size) % dcp_size == parallel.dcp_rank
+        local_indices = indices[local_mask]
+
+        page_ids = local_indices // virtual_page_size
+        page_offsets = local_indices % page_size
+        return page_ids * page_size + page_offsets
+
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
-        indices = maybe_dcp_kernel_indices(
-            indices, self._write_loc_dcp_span, get_parallel().attn_dcp_rank
-        )
+        indices = self._dcp_retraction_local_rows(indices)
         current_platform.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
@@ -5050,9 +5072,7 @@ class MLATokenToKVPool(KVCache):
     def load_cpu_copy(
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
-        indices = maybe_dcp_kernel_indices(
-            indices, self._write_loc_dcp_span, get_parallel().attn_dcp_rank
-        )
+        indices = self._dcp_retraction_local_rows(indices)
         current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):

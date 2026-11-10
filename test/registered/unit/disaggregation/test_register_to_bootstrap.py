@@ -407,6 +407,7 @@ class TestRegisterToBootstrap(CustomTestCase):
         mgr.attn_tp_rank = 0
         mgr.attn_cp_size = 1
         mgr.attn_cp_rank = 0
+        mgr.dcp_size = 1
         mgr.attn_dp_size = 1
         mgr.attn_dp_rank = 0
         mgr.pp_size = 1

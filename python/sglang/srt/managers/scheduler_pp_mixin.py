@@ -638,29 +638,25 @@ class SchedulerPPMixin:
 
     @scheduler_stage_method(SCHEDULER_STAGE_PD_CONSENSUS)
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
-        # get the current stage transfer success
-        if self.pp_group.is_first_rank:
-            transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
-                True,
-                [KVPoll.Success, KVPoll.Failed],
-            )
-        # if other ranks, do intersection with the previous rank's transferred rids
-        else:
-            # 2 (Release): Receive the transferred rids from the previous rank
-            # 1. recv previous stage's transferred reqs info
+        # Keep the PP receive before local TP/CP collectives, as in get_rids.
+        if not self.pp_group.is_first_rank:
             prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
-            # 2. get the current stage's transferred reqs info
-            curr_transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
-                True,
-                [KVPoll.Success, KVPoll.Failed],
-            )
-            # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
-            transferred_rids = list(
-                set(prev_transferred_rids) & set(curr_transferred_rids)
-            )
-        return transferred_rids
+
+        # A peer's Failed poll does not prove this stage stopped reading source
+        # buffers. Establish source/GPU drain before publishing the release ID;
+        # otherwise one stage can retire it while another retains it forever,
+        # since later PP intersections no longer contain the retired request.
+        polls = self.poll_prefill_transfer_releasable(
+            self.disagg_prefill_inflight_queue
+        )
+        transferred_rids = [
+            req.rid
+            for req, poll in zip(self.disagg_prefill_inflight_queue, polls)
+            if poll in (KVPoll.Success, KVPoll.Failed)
+        ]
+        if self.pp_group.is_first_rank:
+            return transferred_rids
+        return list(set(prev_transferred_rids) & set(transferred_rids))
 
     def _pp_pd_send_consensus_bootstrapped_ids(
         self: Scheduler,

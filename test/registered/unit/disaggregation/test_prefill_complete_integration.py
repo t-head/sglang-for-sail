@@ -16,6 +16,7 @@ from sglang.srt.disaggregation.common.conn import CommonKVReceiver, PrefillServe
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
 from sglang.srt.disaggregation.fake.conn import FakeKVSender
+from sglang.srt.disaggregation.common.transfer_lifetime import TransferLifetimeTracker
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVManager,
     MooncakeKVReceiver,
@@ -129,6 +130,8 @@ class TestAllocationIntegration(CustomTestCase):
         mgr.transfer_infos = {}
         mgr._deferred_ack_targets = {}
         mgr._deferred_ack_poisoned_rooms = set()
+        mgr._deferred_abort_ack_tracker = {}
+        mgr._deferred_abort_generation = 0
         mgr.required_prefill_response_num_table = {}
         mgr.prefill_response_tracker = defaultdict(set)
         mgr.addr_to_rooms_tracker = defaultdict(set)
@@ -138,7 +141,18 @@ class TestAllocationIntegration(CustomTestCase):
         mgr.enable_staging = False
         mgr.is_dummy_cp_rank = False
         mgr._staging_outstanding = {}
+        # Source-buffer leases: production __init__ creates these on prefill.
+        mgr._abort_drain_lock = threading.RLock()
+        if ip == "prefill":
+            mgr._transfer_lifetime = TransferLifetimeTracker()
         mgr._prefill_unique_rank = Mock(return_value=0)
+        mgr.connection_pool = {}
+        mgr.prefill_info_table = {}
+        mgr.enable_deferred_decode_kv_release = False
+        mgr.waiting_timeout = 5
+        mgr._init_decode_handshake_state()
+        self.addCleanup(mgr._bootstrap_executor.shutdown, wait=True)
+        self.addCleanup(mgr._parallel_info_executor.shutdown, wait=True)
         mgr.get_session_id = Mock(return_value="decode-session")
         mgr._send_multipart_locked = lambda endpoint, msg, **kw: self.wire.append(
             (endpoint, msg)
@@ -190,8 +204,15 @@ class TestAllocationIntegration(CustomTestCase):
         receiver._connect_to_bootstrap_server = Mock(
             return_value=(sock, threading.Lock())
         )
-        with patch.object(receiver, "_setup_bootstrap_infos"):
-            receiver.init(0)
+        # Mooncake ABORTs ride the shared cached metadata socket (non-blocking).
+        receiver._try_send_cached_abort = lambda info, frames: (
+            sock.send_multipart(frames) or True
+        )
+        # A cached connection makes init() finish the handshake inline (#39).
+        self.decode.connection_pool[f"{receiver.bootstrap_addr}_0_0_0"] = [
+            {"rank_ip": "prefill", "rank_port": 1}
+        ]
+        receiver.init(0)
         return receiver
 
     def test_receiver_hides_allocatable_status_until_source_finishes(self):
@@ -423,7 +444,7 @@ class TestAllocationIntegration(CustomTestCase):
                 decode_allocation_policy="early",
             )
         }
-        with patch.object(receiver, "_setup_bootstrap_infos") as setup:
+        with patch.object(receiver, "_resolve_setup_part") as setup:
             CommonKVReceiver.init(receiver, 0)
         self.assertEqual(receiver.conclude_state, KVPoll.Failed)
         self.assertIn("policy mismatch", self.decode.failure_records[1])
@@ -616,6 +637,8 @@ class TestAllocationIntegration(CustomTestCase):
             pending_bootstrap=True,
             prefill_attempt_count=1,
             skip_radix_cache_insert=False,
+            to_finish=None,
+            finished_reason=None,
         )
         scheduler = self.inflight_scheduler([req])
         scheduler.req_to_token_pool = SimpleNamespace(available_size=lambda: 0)

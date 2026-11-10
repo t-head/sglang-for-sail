@@ -871,6 +871,8 @@ def _make_tm_for_generate(case, enable_lora=False) -> TokenizerManager:
     tm.server_args.tokenizer_worker_num = 1
     tm.server_args.enable_strict_thinking = False
     tm.auto_create_handle_loop = Mock()
+    # These tests cover cleanup after preflight; request validation has its own suite.
+    tm.validate_request_params = Mock()
     tm._set_default_priority = Mock()
     tm.request_logger = Mock()
     tm.tokenizer = None

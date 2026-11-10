@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, call, patch
 import numpy as np
 
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
+from sglang.srt.disaggregation.common.transfer_lifetime import TransferLifetimeTracker
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -539,17 +540,22 @@ class TestMooncakeEarlySend(unittest.TestCase):
     def test_manager_preserves_event_in_queued_chunk(self):
         queue = SimpleQueue()
         ready = MagicMock()
+        lifetime = TransferLifetimeTracker()
+        lifetime.open(1)  # the room's sender exists
         manager = SimpleNamespace(
             disaggregation_mode=DisaggregationMode.PREFILL,
             request_status={1: KVPoll.WaitingForInput},
             check_status=lambda room: KVPoll.WaitingForInput,
             transfer_infos={1: {"127.0.0.1:80": object()}},
             transfer_queues=[queue],
+            _transfer_lifetime=lifetime,
         )
         MooncakeKVManager.add_transfer_request(
             manager, 1, [0], slice(0, 1), False, wait_event=ready
         )
-        self.assertIs(queue.get_nowait().wait_event, ready)
+        chunk = queue.get_nowait()
+        self.assertIs(chunk.wait_event, ready)
+        self.assertTrue(chunk.lease_held)
         ready.synchronize.assert_not_called()
 
     def _worker(self, event):
@@ -595,6 +601,14 @@ class TestMooncakeEarlySend(unittest.TestCase):
             bootstrap_port=8998,
         )
         manager.check_status = lambda room: manager.request_status[room]
+        # add_transfer_request leases the source before queueing the chunk.
+        manager._transfer_lifetime = TransferLifetimeTracker()
+        manager._transfer_lifetime.open(1)
+        manager._transfer_lifetime.try_acquire(1)
+        chunk.lease_held = True
+        manager._release_transfer_lease = lambda c: (
+            MooncakeKVManager._release_transfer_lease(manager, c)
+        )
         return manager, queue
 
     def test_worker_waits_before_reading_kv(self):

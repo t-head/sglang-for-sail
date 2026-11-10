@@ -25,6 +25,8 @@ def set_mla_kv_buffer_kernel(
     BLOCK: tl.constexpr,
     DCP_RANK: tl.constexpr,
     DCP_WORLD_SIZE: tl.constexpr,
+    DCP_PAGE_SIZE: tl.constexpr = 1,
+    PAGE_LAYOUT: tl.constexpr = False,
     USE_GDC: tl.constexpr = False,
 ):
     pid_loc = tl.program_id(0)
@@ -39,9 +41,16 @@ def set_mla_kv_buffer_kernel(
         tl.extra.cuda.gdc_wait()
 
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
-    is_valid = (loc != reserved_skip_index) & (loc % DCP_WORLD_SIZE == DCP_RANK)
-    safe_loc = tl.where(is_valid, loc, 0)
-    safe_loc = safe_loc // DCP_WORLD_SIZE
+    if PAGE_LAYOUT:
+        is_owner = (loc >= 0) & ((loc // DCP_PAGE_SIZE) % DCP_WORLD_SIZE == DCP_RANK)
+        physical_loc = (
+            loc // (DCP_PAGE_SIZE * DCP_WORLD_SIZE)
+        ) * DCP_PAGE_SIZE + loc % DCP_PAGE_SIZE
+    else:
+        is_owner = loc % DCP_WORLD_SIZE == DCP_RANK
+        physical_loc = loc // DCP_WORLD_SIZE
+    is_valid = (loc != reserved_skip_index) & is_owner
+    safe_loc = tl.where(is_valid, physical_loc, 0)
     dst_ptr = kv_buffer_ptr + safe_loc * buffer_stride + offs
 
     # Three-way branch to handle boundary correctly while preserving fast path
@@ -168,6 +177,8 @@ def _set_mla_kv_buffer_impl(
     reserved_skip_index: int,
     dcp_world_size: int,
     dcp_rank: int,
+    dcp_page_size: int = 1,
+    page_layout: bool = False,
 ):
     """Dispatch MLA paged-KV scatter writes to the fastest available path.
 
@@ -283,6 +294,8 @@ def _set_mla_kv_buffer_impl(
         BLOCK=BLOCK,
         DCP_RANK=dcp_rank,
         DCP_WORLD_SIZE=dcp_world_size,
+        DCP_PAGE_SIZE=dcp_page_size,
+        PAGE_LAYOUT=page_layout,
         **pdl_kwargs,
     )
 
@@ -315,6 +328,7 @@ def set_mla_kv_buffer_dcp_sharded_triton(
     cache_k_rope: torch.Tensor,
     *,
     reserved_skip_index: int = 0,
+    physical_page_size: int = 1,
 ):
     """Scatter at DCP-WIDENED locs: select this rank's ids and collapse them."""
     parallel = get_parallel()
@@ -326,6 +340,8 @@ def set_mla_kv_buffer_dcp_sharded_triton(
         reserved_skip_index=reserved_skip_index,
         dcp_world_size=parallel.attn_dcp_size,
         dcp_rank=parallel.attn_dcp_rank,
+        dcp_page_size=physical_page_size,
+        page_layout=parallel.dcp_kv_layout == "page",
     )
 
 

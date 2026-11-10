@@ -2162,9 +2162,7 @@ class MoriKVReceiver(CommonKVReceiver):
     ):
         super().init(prefill_dp_rank)
 
-    def _register_kv_args(self) -> bool:
-        if self.bootstrap_infos is None:
-            return False
+    def _register_kv_args(self, bootstrap_infos: List[Dict]) -> bool:
         engine_desc_blob = self.kv_mgr.engine_desc.pack()
         packed_kv_descs = _pack_mem_desc_list(self.kv_mgr.kv_mem_descs)
         packed_aux_descs = _pack_mem_desc_list(self.kv_mgr.aux_mem_descs)
@@ -2189,7 +2187,7 @@ class MoriKVReceiver(CommonKVReceiver):
         dcp_size = str(self.kv_mgr.dcp_size).encode("ascii")
         dcp_rank = str(self.kv_mgr.dcp_rank).encode("ascii")
 
-        for bootstrap_info in self.bootstrap_infos:
+        for bootstrap_info in bootstrap_infos:
             try:
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
                 with lock:
@@ -2216,12 +2214,11 @@ class MoriKVReceiver(CommonKVReceiver):
                         ]
                     )
             except zmq.ZMQError:
-                self.kv_mgr.record_failure(
-                    self.bootstrap_room,
-                    f"_register_kv_args to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
+                logger.error(
+                    "_register_kv_args to prefill %s:%s failed",
+                    bootstrap_info.get("rank_ip"),
+                    bootstrap_info.get("rank_port"),
                 )
-                self.conclude_state = KVPoll.Failed
-                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                 return False
         return True
 
@@ -2294,6 +2291,8 @@ class MoriKVReceiver(CommonKVReceiver):
             timeout_result = self._check_waiting_timeout()
             if timeout_result is not None:
                 return timeout_result
+        elif status == KVPoll.Bootstrapping:
+            return self._poll_bootstrapping()
 
         return status
 

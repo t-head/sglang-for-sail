@@ -560,6 +560,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                         require_reasoning=require_reasoning,
                     )
 
+                    # Background responses acknowledge the request before running
+                    # the generator, so validate before returning the queued result.
+                    self.tokenizer_manager.validate_request_params(adapted_request)
                     generator = self._generate_with_builtin_tools(
                         request.request_id,
                         request_prompts[i],

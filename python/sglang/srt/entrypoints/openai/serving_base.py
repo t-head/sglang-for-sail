@@ -14,7 +14,6 @@ from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
-from sglang.srt.managers.process_request_preprocessor import ProcessRequestPreprocessor
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.runtime_context import get_observability
 from sglang.srt.server_args import ServerArgs
@@ -163,10 +162,8 @@ class OpenAIServingBase(ABC):
         """_convert_to_internal_request off the event loop: in a preprocessor
         child process when one is running and this handler opted in, otherwise
         on the tokenizer manager's preprocessing thread."""
-        preprocessor = getattr(
-            self.tokenizer_manager, "process_request_preprocessor", None
-        )
-        if isinstance(preprocessor, ProcessRequestPreprocessor):
+        preprocessor = self.tokenizer_manager.process_request_preprocessor
+        if preprocessor is not None:
             converted = await preprocessor.convert(self, request, raw_request)
             if converted is not None:
                 return converted

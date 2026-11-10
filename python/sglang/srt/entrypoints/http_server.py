@@ -958,6 +958,11 @@ async def serve_generate_request(obj: GenerateReqInput, request: Request):
     this directly, so the body is not decoded and checked a second time."""
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
+    # Native streaming must reject invalid parameters before sending HTTP 200 headers.
+    try:
+        _global_state.tokenizer_manager.validate_request_params(obj)
+    except ValueError as e:
+        return _create_error_response(e)
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:

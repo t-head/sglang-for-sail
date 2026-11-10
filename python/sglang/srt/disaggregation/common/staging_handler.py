@@ -102,6 +102,10 @@ class DecodeStagingHandler:
         # room -> chunk_idx -> [(page_start, num_pages, writer_id)] fan-in
         # arrivals; handler-owned so room teardown can purge them.
         self._writer_counts: dict = {}
+        # STAGING_REQ uses a different socket from transfer completion/abort
+        # ACKs and may arrive after them. Serialize its allocation/publication
+        # with scheduler teardown so it cannot publish into a retired room.
+        self._lifecycle_lock = threading.RLock()
 
     def register_wm_subscriber(self, receiver, session_id: str) -> None:
         """Register a prefill's bootstrap connection for watermark broadcasts."""
@@ -192,14 +196,16 @@ class DecodeStagingHandler:
             decode_req._staging_failed = True
 
     def unregister_decode_req(self, room: int) -> None:
-        # Pop before release_room so no new arrival can start consuming the slots.
-        decode_req = self._room_to_decode_req.pop(room, None)
-        receiver = self._room_to_receiver.pop(room, None)
-        self._writer_counts.pop(room, None)
-        if decode_req is not None:
-            self.release_room(room, decode_req, receiver)
-        self.kv_manager._staging_ctx.room_receivers.pop(room, None)
-        self.kv_manager._staging_ctx.room_bootstrap.pop(room, None)
+        with self._lifecycle_lock:
+            # Remove the room before release; a late allocation either finishes
+            # before this point (and is reclaimed here), or sees no receiver.
+            decode_req = self._room_to_decode_req.pop(room, None)
+            receiver = self._room_to_receiver.pop(room, None)
+            self._writer_counts.pop(room, None)
+            if decode_req is not None:
+                self.release_room(room, decode_req, receiver)
+            self.kv_manager._staging_ctx.room_receivers.pop(room, None)
+            self.kv_manager._staging_ctx.room_bootstrap.pop(room, None)
 
     def release_room(self, room: int, decode_req: DecodeRequest, receiver) -> None:
         """Free outstanding staging allocations of a room; no-op after a
@@ -586,6 +592,14 @@ class StagingRegisterInfo:
         )
 
 
+class StagingTransferRejected(RuntimeError):
+    """Staging admission failed before any gather or native transfer started.
+
+    Only pre-I/O validation may raise this exception. A transport failure must
+    preserve its transfer lease until native quiescence can be established.
+    """
+
+
 class PrefillStagingStrategy:
     """Prefill-side staging transfer: readiness check + gather-RDMA execution.
 
@@ -664,7 +678,7 @@ class PrefillStagingStrategy:
     ) -> int:
         """Execute staged transfer (gather + RDMA).
 
-        Returns 0 on success, -1 to signal fallback to slice path.
+        Returns 0 on success. Pre-I/O rejection raises StagingTransferRejected.
         """
         try:
             return self.kv_manager.send_kvcache_staged(
@@ -683,6 +697,9 @@ class PrefillStagingStrategy:
                     else None
                 ),
             )
+        except StagingTransferRejected:
+            # Preserve the explicit pre-I/O result for the worker's lease fence.
+            raise
         except Exception as e:
             raise RuntimeError(
                 f"[Staging] KV transfer via staging buffer failed: {e}. "
@@ -904,28 +921,30 @@ class StagingManagerMixin:
         assert handler is not None, (
             "STAGING_REQ received before staging handler initialized"
         )
-        decode_req = handler._room_to_decode_req.get(room)
-        if decode_req is None:
-            logger.warning(
-                "STAGING_REQ received for unregistered room=%s, skipping",
-                room,
+        with handler._lifecycle_lock:
+            decode_req = handler._room_to_decode_req.get(room)
+            receiver = handler._room_to_receiver.get(room)
+            if decode_req is None or receiver is None:
+                logger.warning(
+                    "STAGING_REQ received for unregistered room=%s, skipping",
+                    room,
+                )
+                return
+            prefill_tp = receiver.prefill_info.attn_tp_size
+            handle_staging_req(
+                msg,
+                self._staging_ctx.allocator,
+                self.kv_args,
+                self.attn_tp_size,
+                prefill_tp,
+                getattr(self, "kv_buffer_tensors", None),
+                self._staging_ctx.room_receivers,
+                self._staging_ctx.room_bootstrap,
             )
-            return
-        prefill_tp = decode_req.kv_receiver.prefill_info.attn_tp_size
-        handle_staging_req(
-            msg,
-            self._staging_ctx.allocator,
-            self.kv_args,
-            self.attn_tp_size,
-            prefill_tp,
-            getattr(self, "kv_buffer_tensors", None),
-            self._staging_ctx.room_receivers,
-            self._staging_ctx.room_bootstrap,
-        )
 
-        receiver = self._staging_ctx.room_receivers.get(room)
-        if receiver is not None:
-            handler.register_wm_subscriber(receiver, session_id)
+            receiver = self._staging_ctx.room_receivers.get(room)
+            if receiver is not None:
+                handler.register_wm_subscriber(receiver, session_id)
 
 
 def prefetch_staging_reqs(
