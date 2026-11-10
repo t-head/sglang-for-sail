@@ -55,3 +55,4 @@ if is_sail_available():
     import sglang.srt.hardware_backend.sail.attention.ops_hooks  # noqa: F401
     import sglang.srt.hardware_backend.sail.attention.ppu_msa_hook  # noqa: F401
     import sglang.srt.hardware_backend.sail.moe.deepep_hooks  # noqa: F401
+    import sglang.srt.hardware_backend.sail.ppu_cuda_graph_hooks  # noqa: F401
