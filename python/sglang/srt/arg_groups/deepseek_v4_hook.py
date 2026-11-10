@@ -114,16 +114,26 @@ def _resolve_engram_config(server_args: ServerArgs) -> None:
 
 
 def _dsv41_dspark_pd_parallelism_supported(cfg) -> bool:
-    # Preserve v1.0.0's broader attention-DP admission. Sender/receiver layout
-    # compatibility is checked by CommonKVManager using the actual peer sizes.
-    supported_prefill_cp = (
+    if cfg.disaggregation_mode not in ("prefill", "decode") or cfg.dcp_size != 1:
+        return False
+
+    # CP size may still be implicit at this validation slot; the CP hook declares
+    # it later from tp_size. Only the canonical prefill interleave strategy is
+    # inside the validated transfer layout.
+    prefill_cp = (
         cfg.disaggregation_mode == "prefill"
         and cfg.enable_prefill_cp
         and cfg.cp_strategy == "interleave"
     )
-    return cfg.dcp_size == 1 and (
-        not (cfg.enable_prefill_cp or cfg.attn_cp_size != 1) or supported_prefill_cp
-    )
+    has_cp = cfg.enable_prefill_cp or cfg.attn_cp_size != 1
+    if has_cp and not prefill_cp:
+        return False
+
+    # Attention DP is admitted on either role as long as both servers agree on
+    # the block size and the target/draft KV layout; the PD handshake enforces
+    # that. Each attention-DP rank owns whole requests, so no head sharding
+    # crosses the transfer.
+    return True
 
 
 def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None:
@@ -466,8 +476,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             or not _dsv41_dspark_pd_parallelism_supported(cfg)
         ):
             raise ValueError(
-                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, NIXL, "
-                "or MoRI, DCP=1, and CP=1 on decode. Prefill CP requires "
+                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, NIXL or MoRI, "
+                "DCP=1, and CP=1 on decode. Prefill CP requires "
                 "--enable-prefill-cp with the interleave strategy. "
                 "DP attention is supported when "
                 "both servers use the same block size and target/draft KV layout."
