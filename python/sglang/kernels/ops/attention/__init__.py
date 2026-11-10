@@ -792,3 +792,21 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
     )
 )
+
+register_kernel(
+    KernelSpec(
+        op="attention.topk_transform_candidates",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsv4.topk:topk_transform_candidates",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="attention.topk_transform_candidates",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsv4.topk:topk_transform_candidates",
+        capabilities=CUDA_ONLY,
+    )
+)

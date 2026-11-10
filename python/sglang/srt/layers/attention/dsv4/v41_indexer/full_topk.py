@@ -15,6 +15,7 @@ from sglang.kernels.ops.attention.dsa.litetopk_prefill import fp4_indexer_topk
 from sglang.kernels.ops.attention.dsv4.index_logits import (
     deep_gemm_fp4_paged_mqa_logits,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_from_metadata
 
 from .scoring import (
@@ -104,9 +105,17 @@ class FullTopKIndexer:
             inputs.layer_id, data.k_slots
         )
         if shard is None:
-            dense_prefill_topk(data, kv, out=out)
+            dense_prefill_topk(
+                data, kv, out=out, two_level=envs.SGLANG_OPT_DSV41_TOPK_CANDIDATES.get()
+            )
         else:
-            sharded_dense_prefill_topk(data, kv, out=out, shard=shard)
+            sharded_dense_prefill_topk(
+                data,
+                kv,
+                out=out,
+                shard=shard,
+                two_level=envs.SGLANG_OPT_DSV41_TOPK_CANDIDATES.get(),
+            )
         data.write_page_indices(inputs)
 
     def _prefill_lite_topk(

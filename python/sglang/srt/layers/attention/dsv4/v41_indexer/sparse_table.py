@@ -23,9 +23,11 @@ from sglang.kernels.ops.attention.dsv4.index_logits import (
     sparse_logits,
 )
 from sglang.kernels.ops.attention.dsv4.topk import (
+    topk_transform_candidates,
     topk_transform_paged,
     topk_transform_sparse,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_bf16
 from sglang.srt.layers.attention.dsv4.metadata import expand_index_page_table
 from sglang.srt.utils.device import async_h2d
@@ -516,13 +518,29 @@ def select_prefill_rows(
     each output per scored row, with ``nblocks`` matching the view."""
     lens_all = data.compress_lens
     zero_offsets = torch.zeros_like(lens_all)
+    topk_blocks = out_blocks.shape[1]
+    two_level = (
+        envs.SGLANG_OPT_DSV41_TOPK_CANDIDATES.get()
+        and 0 < out_positions.shape[1] < topk_blocks
+    )
     for tile, logits in score_tiles(data, kv):
         lens = lens_all[tile]
-        topk_ragged(logits, lens, out=out_positions[tile], offsets=zero_offsets[tile])
         select_prefill_block_ids(
             logits, lens, nblocks[tile], out_blocks[tile], offsets=zero_offsets[tile]
         )
-        del logits  # release this tile before scoring the next
+        if two_level and logits.dtype == torch.float32:
+            topk_transform_candidates(
+                logits,
+                lens,
+                out_blocks[tile],
+                out_offsets=zero_offsets[tile],
+                out_indices=out_positions[tile],
+            )
+        else:
+            topk_ragged(
+                logits, lens, out=out_positions[tile], offsets=zero_offsets[tile]
+            )
+        del logits
 
 
 # TODO(dark): support fusion of publish + topk of publish layer
