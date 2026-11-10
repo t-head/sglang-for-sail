@@ -1,4 +1,7 @@
+import math
+import mmap
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest import mock
 
@@ -10,12 +13,18 @@ from sglang.srt.mem_cache.mla_host_dedup import (
     MLAHostDedupContext,
     maybe_create_mla_host_dedup_context,
 )
+from sglang.srt.mem_cache.pool_host.common import (
+    ALLOC_MEMORY_FUNCS,
+    HostTensorAllocator,
+    alloc_with_host_register,
+)
 from sglang.srt.mem_cache.pool_host.dsa import (
     DSAIndexerPoolHost,
     make_dsa_indexer_pool_decl,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -54,15 +63,20 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
             start_layer=0,
             end_layer=2,
         )
-        mla_host = MLATokenToKVPoolHost(
-            mla_device_pool,
-            host_to_device_ratio=2,
-            host_size=0,
-            page_size=2,
-            layout="page_first",
-            pin_memory=False,
-            is_dummy=True,
-        )
+        with mock.patch.object(
+            HostTensorAllocator,
+            "allocate",
+            side_effect=AssertionError("ordinary dummy must not allocate"),
+        ):
+            mla_host = MLATokenToKVPoolHost(
+                mla_device_pool,
+                host_to_device_ratio=2,
+                host_size=0,
+                page_size=2,
+                layout="page_first",
+                pin_memory=False,
+                is_dummy=True,
+            )
 
         self.assertTrue(mla_host._is_dummy)
         self.assertIsNone(mla_host.kv_buffer)
@@ -305,6 +319,95 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
         )
         self.assertIsNone(context.prefetch_hits_sync_groups)
         self.assertIsNone(context.prefetch_completion_sync_groups)
+
+
+class _MappingAllocator(HostTensorAllocator):
+    def __init__(self):
+        super().__init__()
+        self.byte_counts = []
+        self.mappings = []
+
+    def allocate(self, dims, dtype, device):
+        size = math.prod(dims) * dtype.itemsize
+        mm = mmap.mmap(-1, size)
+        self.byte_counts.append(size)
+        self.mappings.append(weakref.ref(mm))
+        return torch.frombuffer(mm, dtype=dtype).reshape(dims)
+
+
+class TestSharedMLAHostInitialization(CustomTestCase):
+    def _device_pool(self):
+        return _device_pool_stub(
+            layer_num=2,
+            store_dtype=torch.float16,
+            kv_lora_rank=4,
+            qk_rope_head_dim=2,
+            size=8,
+            start_layer=0,
+            end_layer=2,
+            device="cpu",
+        )
+
+    def test_dummy_initializes_the_same_bytes_without_retaining_or_pinning(self):
+        """A broadcast follower must populate its share without becoming a data owner."""
+        module = "sglang.srt.mem_cache.pool_host"
+        for layout, host_size in (
+            ("layer_first", 0),
+            ("page_first", 0),
+            # 1 kB fixed size: dummy and real also agree on the host_size > 0 branch.
+            ("page_first_direct", 0.000001),
+        ):
+            real_allocator, dummy_allocator = (
+                _MappingAllocator(),
+                _MappingAllocator(),
+            )
+            with (
+                self.subTest(layout=layout, host_size=host_size),
+                mock.patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": alloc_with_host_register}),
+                mock.patch(f"{module}.common._cuda_host_register") as pin,
+                mock.patch(
+                    f"{module}.base.sync_fixed_hicache_size",
+                    side_effect=lambda size, _: size,
+                ),
+                mock.patch(
+                    f"{module}.mla.sync_fixed_hicache_size",
+                    side_effect=lambda size, _: size,
+                ),
+            ):
+                real = MLATokenToKVPoolHost(
+                    self._device_pool(),
+                    2,
+                    host_size,
+                    2,
+                    layout,
+                    host_allocator=real_allocator,
+                    host_buffer_read_only=True,
+                )
+                self.assertEqual(pin.call_count, 1)
+                pin.reset_mock()
+                dummy = MLATokenToKVPoolHost(
+                    self._device_pool(),
+                    2,
+                    host_size,
+                    2,
+                    layout,
+                    is_dummy=True,
+                    host_allocator=dummy_allocator,
+                    host_buffer_read_only=True,
+                )
+                pin.assert_not_called()
+            with self.subTest(layout=layout, host_size=host_size):
+                self.assertEqual(real.size, dummy.size)
+                self.assertEqual(
+                    real_allocator.byte_counts, dummy_allocator.byte_counts
+                )
+                self.assertIsNone(dummy.kv_buffer)
+                self.assertIsNone(dummy.data_refs)
+                self.assertIsNone(dummy.data_ptrs)
+                self.assertEqual(dummy.get_contiguous_buf_infos(), ([], [], []))
+                self.assertIsNone(dummy_allocator.mappings[0]())
+                self.assertIsNotNone(real_allocator.mappings[0]())
+                self.assertEqual(dummy.alloc(2).tolist(), [0, 1])
 
 
 if __name__ == "__main__":

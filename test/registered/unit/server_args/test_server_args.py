@@ -2154,6 +2154,116 @@ class TestSSLArgs(unittest.TestCase):
 
 
 class TestHiCacheArgs(CustomTestCase):
+    def test_mla_hicache_mode_and_write_policy_admission(self):
+        """With the flag on, shm rejects write_back; flag off ignores the mode."""
+        cases = (
+            (True, "shm", "write_back", "does not support"),
+            (False, "shm", "write_back", None),
+            (True, "broadcast", "write_back", None),
+            (True, "shm", "write_through", None),
+            (True, "shm", "write_through_selective", None),
+        )
+        for enabled, mode, policy, error in cases:
+            with self.subTest(enabled=enabled, mode=mode, policy=policy):
+                args = self._make_args(
+                    enable_hierarchical_cache=True,
+                    enable_mla_hicache_per_node=enabled,
+                    mla_hicache_per_node_mode=mode,
+                    hicache_write_policy=policy,
+                )
+                if error is not None:
+                    with self.assertRaisesRegex(ValueError, error):
+                        handle_hicache(args)
+                else:
+                    handle_hicache(args)
+
+    def test_mla_hicache_per_node_mode_is_a_choice_server_arg(self):
+        """The restore mode is a CLI choice defaulting to broadcast."""
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        base = ["--model-path", "dummy"]
+        self.assertEqual(parser.parse_args(base).mla_hicache_per_node_mode, "broadcast")
+        self.assertEqual(
+            parser.parse_args(
+                base + ["--mla-hicache-per-node-mode", "shm"]
+            ).mla_hicache_per_node_mode,
+            "shm",
+        )
+        with self.assertRaises(SystemExit):
+            parser.parse_args(base + ["--mla-hicache-per-node-mode", "invalid"])
+
+    def test_mla_hicache_per_node_rejects_unsupported_deployments(self):
+        """Per-node MLA HiCache must fail at launch, not fall back to per-rank copies."""
+        standalone = json.dumps(
+            {"client_server_address": "localhost:50052", "standalone_storage": True}
+        )
+        shared = json.dumps(
+            {"client_server_address": "localhost:50052", "standalone_storage": False}
+        )
+        for overrides, error in (
+            ({"disaggregation_mode": "decode"}, "PD decode"),
+            ({"dcp_size": 2, "tp_size": 2}, "--dcp-size"),
+            (
+                {
+                    "hicache_storage_backend": "mooncake",
+                    "hicache_storage_backend_extra_config": standalone,
+                },
+                "standalone_storage=True",
+            ),
+            (
+                {
+                    "hicache_storage_backend": "mooncake",
+                    "hicache_storage_backend_extra_config": shared,
+                },
+                None,
+            ),
+        ):
+            with self.subTest(overrides=overrides):
+                args = self._make_args(
+                    enable_hierarchical_cache=True,
+                    enable_mla_hicache_per_node=True,
+                    **overrides,
+                )
+                if error is not None:
+                    with self.assertRaisesRegex(ValueError, error):
+                        handle_hicache(args)
+                else:
+                    handle_hicache(args)
+
+    def test_mla_hicache_per_node_requires_pp_size_one(self):
+        """Per-node MLA HiCache must reject PP even on inactive or linker paths."""
+        for enabled, mode, cache_path, pp_size, rejects in (
+            (True, "broadcast", {"enable_hierarchical_cache": True}, 2, True),
+            (True, "shm", {"enable_hierarchical_cache": True}, 2, True),
+            (True, "broadcast", {}, 2, True),
+            (
+                True,
+                "broadcast",
+                {"enable_unified_cache_external_linker": True},
+                2,
+                True,
+            ),
+            (True, "shm", {"enable_hierarchical_cache": True}, 1, False),
+            (False, "shm", {"enable_hierarchical_cache": True}, 2, False),
+        ):
+            with self.subTest(
+                enabled=enabled, mode=mode, cache_path=cache_path, pp_size=pp_size
+            ):
+                args = self._make_args(
+                    enable_mla_hicache_per_node=enabled,
+                    mla_hicache_per_node_mode=mode,
+                    pp_size=pp_size,
+                    **cache_path,
+                )
+                if rejects:
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "--enable-mla-hicache-per-node requires --pp-size 1",
+                    ):
+                        handle_hicache(args)
+                else:
+                    handle_hicache(args)
+
     def test_host_receive_speculative_uses_shared_retraction_pool(self):
         """Speculation must still resolve host receive to the shared host pool."""
         for algorithm, threshold in (

@@ -24,6 +24,7 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetricsCollector,
     resolve_collector_class,
 )
+from sglang.srt.runtime_context import get_memory
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -34,6 +35,15 @@ logger = logging.getLogger(__name__)
 # carrying a bad policy is rejected before it can touch the controller.
 _PREFETCH_POLICIES = ("best_effort", "wait_complete", "timeout")
 _WRITE_POLICIES = ("write_back", "write_through", "write_through_selective")
+
+
+def validate_runtime_storage_update() -> None:
+    if get_memory().enable_mla_hicache_per_node:
+        raise ValueError(
+            "HiCache L3 configuration is startup-only when "
+            "--enable-mla-hicache-per-node is set; runtime attach, detach, "
+            "and policy updates are not supported. Configure storage at launch."
+        )
 
 
 class StorageAttachment:
@@ -177,7 +187,7 @@ class StorageAttachment:
         return True, "Attached HiCache storage backend successfully."
 
     def detach(self) -> tuple[bool, str]:
-        """Disable the storage backend at runtime.
+        """Disable the storage backend for runtime detach or shutdown.
 
         The caller must ensure there are no running or queued requests. Ordering
         matters and is the reason this is not just ``controller.detach()``:

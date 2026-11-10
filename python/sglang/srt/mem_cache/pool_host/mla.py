@@ -26,6 +26,8 @@ from sglang.srt.mem_cache.pool_host.base import (
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
+    HostTensorAllocator,
+    get_allocator_from_storage,
     make_kernel_ptr_table,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
@@ -84,10 +86,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         *,
         pool_label: str = "kv",
         is_dummy: bool = False,
+        host_allocator: Optional[HostTensorAllocator] = None,
+        host_buffer_read_only: bool = False,
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
         self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
         self._is_dummy = is_dummy
+        # This rank does not own the MLA host data; the node leader writes it.
+        self.host_buffer_read_only = host_buffer_read_only
 
         # Transfer buffers are captured below. The pool remains available for
         # NPU transfer APIs and device layer ownership.
@@ -129,6 +135,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             dcp_rank=dcp_rank,
             pool_label=pool_label,
             is_dummy=is_dummy,
+            host_allocator=host_allocator,
         )
         if is_dummy:
             self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
@@ -140,9 +147,17 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             self.kv_buffer = None
             self.data_refs = None
             self.data_ptrs = None
+            if host_allocator is not None:
+                # Collective with the leader's allocate: prefault this rank's
+                # share, then drop the mapping.
+                self.allocator.allocate(
+                    (self.size * self.size_per_token,),
+                    dtype=torch.uint8,
+                    device=self.device,
+                )
             logger.info(
                 "MLATokenToKVPoolHost dummy mode: allocator-only, size=%d tokens, "
-                "saving %.2f GB host memory",
+                "no retained %.2f GB host data mapping",
                 self.size,
                 self.size * self.size_per_token / 1e9,
             )
@@ -369,7 +384,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self.can_use_write_back_jit = False
         # The staged kernel reads whole device pages, so it needs packed rows.
         if (
-            self.layout != "page_first"
+            self.host_buffer_read_only
+            or self.layout != "page_first"
             or not self.device_rows_packed
             or not current_platform.capabilities.hicache_device_kernels
         ):

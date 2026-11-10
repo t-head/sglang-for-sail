@@ -42,11 +42,13 @@ from sglang.srt.mem_cache.l2_transfer import L2Transfer
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.base import uses_shared_host_layout
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.mla_host_node_leader import NodeLeaderMLABroadcast
 
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.utils import broadcast_pyobj
@@ -231,8 +233,16 @@ class HybridCacheController(BaseHiCacheController):
         transfer_layer_id_max: Optional[int] = None,
         enable_storage_metrics: bool = False,
         host_memory_mode: str = "cache",
+        node_leader_broadcast: Optional[NodeLeaderMLABroadcast] = None,
     ):
         startup_storage_backend = storage_backend
+        # The MLA anchor host buffer is another rank's copy (shared or none):
+        # this rank never writes it (D2H backup, L3 prefetch).
+        anchor_host_pool = mem_pool_host.anchor_entry.host_pool
+        self.mla_host_read_only = (
+            isinstance(anchor_host_pool, MLATokenToKVPoolHost)
+            and anchor_host_pool.host_buffer_read_only
+        )
         self.extra_host_mem_release_queues: dict[PoolName, Queue[torch.Tensor]] = {}
         self.pp_prefetch_command_group = None
         self.pp_prefetch_command_thread = None
@@ -257,6 +267,7 @@ class HybridCacheController(BaseHiCacheController):
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
             host_memory_mode=host_memory_mode,
+            node_leader_broadcast=node_leader_broadcast,
         )
         # Hybrid transfer IDs span every component pool, including holes for
         # uncached layers that the anchor pool alone cannot describe.
@@ -265,7 +276,10 @@ class HybridCacheController(BaseHiCacheController):
             and transfer_layer_id_max != self.transfer_layer_id_max
         ):
             self.transfer_layer_id_max = transfer_layer_id_max
-            self.layer_done_counter = LayerDoneCounter(self.transfer_layer_id_max)
+            self.layer_done_counter = LayerDoneCounter(
+                self.transfer_layer_id_max,
+                on_layer_ready=self.layer_done_counter.on_layer_ready,
+            )
 
         self.storage_host_pool = mem_pool_host.anchor_entry.host_pool
         if startup_storage_backend is not None:
@@ -346,6 +360,8 @@ class HybridCacheController(BaseHiCacheController):
                 model_name=model_name,
                 storage_backend_extra_config=storage_backend_extra_config,
             )
+            if self.mla_host_read_only:
+                self.page_get_func = self._page_get_shared_by_leader
         except Exception:
             if self.pp_prefetch_command_group is not None:
                 torch.distributed.destroy_process_group(self.pp_prefetch_command_group)
@@ -858,15 +874,28 @@ class HybridCacheController(BaseHiCacheController):
 
         return self.move_hybrid_indices(op, write_back_jit=True)
 
+    def _page_get_shared_by_leader(
+        self, operation, hash_values, host_indices, extra_info=None
+    ) -> int:
+        # The node leader reads these pages into the shared host buffer; the
+        # completed-token all_reduce(MIN) takes its count.
+        return len(hash_values)
+
     def _l2_transfers(
         self,
         host_indices: torch.Tensor,
         device_indices: torch.Tensor,
         pool_transfers: Optional[list[PoolTransfer]] = None,
+        *,
+        include_anchor: Optional[bool] = None,
     ) -> list[L2Transfer]:
+        if include_anchor is None:
+            include_anchor = not self.mla_host_read_only
         anchor = self.mem_pool_host.anchor_entry
         transfers = []
-        if host_indices.numel() > 0:
+        # Node-leader MLA followers skip the anchor on D2H (read-only host copy)
+        # and, in broadcast mode, on H2D (KV comes from the leader's broadcast).
+        if host_indices.numel() > 0 and include_anchor:
             transfers.append(
                 L2Transfer(
                     host_pool=anchor.host_pool,
@@ -900,7 +929,15 @@ class HybridCacheController(BaseHiCacheController):
         device_indices: torch.Tensor,
         pool_transfers: Optional[list[PoolTransfer]] = None,
     ) -> list[L2Transfer]:
-        transfers = self._l2_transfers(host_indices, device_indices, pool_transfers)
+        transfers = self._l2_transfers(
+            host_indices,
+            device_indices,
+            pool_transfers,
+            include_anchor=(
+                self.node_leader_broadcast is None
+                or not self.node_leader_broadcast.is_follower
+            ),
+        )
         transfers_by_entry = {
             (id(t.host_pool), id(t.device_pool)): t for t in transfers
         }

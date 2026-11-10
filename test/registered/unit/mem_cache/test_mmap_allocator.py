@@ -9,6 +9,7 @@ import ctypes
 import ctypes.util
 import mmap
 import os
+import tempfile
 import unittest
 import unittest.mock
 
@@ -16,7 +17,13 @@ import torch
 
 from sglang.srt.mem_cache.pool_host.common import ShmHostTensorAllocator
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap, alloc_shm
-from sglang.srt.mem_cache.storage.mmap.mmap_allocator import _mmap_prefaulted
+from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
+    _mmap_prefaulted,
+    _prefault_shm_shard,
+    create_shm,
+    map_shm,
+)
+from sglang.test.test_utils import CustomTestCase
 
 
 class TestMmapAllocator(unittest.TestCase):
@@ -159,6 +166,108 @@ class TestMmapAllocator(unittest.TestCase):
         with self.assertRaises(AssertionError) as ctx:
             allocator.allocate((2, 2), torch.float32, device="cuda")
         self.assertIn("only supports CPU allocations", str(ctx.exception))
+
+
+class TestShardedShmPopulation(CustomTestCase):
+    def test_failed_shared_mapping_is_closed(self):
+        """Failure during prefault or tensor creation must release the open mapping."""
+        module = "sglang.srt.mem_cache.storage.mmap.mmap_allocator"
+        for stage in ("prefault", "tensor"):
+            with self.subTest(stage=stage), tempfile.TemporaryFile() as file:
+                file.truncate(mmap.PAGESIZE)
+                mappings = []
+
+                def populate(mm, *, index, count):
+                    mappings.append(mm)
+                    if stage == "prefault":
+                        raise OSError("prefault allocation failed")
+
+                try:
+                    with (
+                        unittest.mock.patch(
+                            f"{module}._prefault_shm_shard", side_effect=populate
+                        ),
+                        unittest.mock.patch(
+                            "torch.frombuffer",
+                            side_effect=MemoryError("tensor allocation failed"),
+                        ),
+                    ):
+                        error = OSError if stage == "prefault" else MemoryError
+                        with self.assertRaisesRegex(
+                            error, f"{stage} allocation failed"
+                        ):
+                            map_shm(
+                                file.fileno(),
+                                (mmap.PAGESIZE,),
+                                torch.uint8,
+                                populate_shard=(0, 1),
+                            )
+                    self.assertTrue(mappings[0].closed)
+                finally:
+                    for mm in mappings:
+                        mm.close()
+
+    @unittest.skipUnless(sys.platform == "linux", "memfd residency needs Linux")
+    def test_create_does_not_claim_pages_before_workers_touch_them(self):
+        """The creator must leave placement to the workers' first touches."""
+        fd = create_shm((16 * mmap.PAGESIZE,), torch.uint8)
+        try:
+            self.assertEqual(os.fstat(fd).st_size, 16 * mmap.PAGESIZE)
+            self.assertEqual(os.fstat(fd).st_blocks, 0)
+        finally:
+            os.close(fd)
+
+    @unittest.skipUnless(sys.platform == "linux", "Shared prefault uses Linux madvise")
+    def test_shards_cover_uneven_and_smaller_than_world_mappings(self):
+        """Shards must not overlap or omit pages, including empty shares."""
+        for pages, workers in ((13, 4), (2, 4)):
+            with self.subTest(pages=pages, workers=workers):
+                fd = create_shm((pages * mmap.PAGESIZE,), torch.uint8)
+                mm = mmap.mmap(fd, pages * mmap.PAGESIZE, flags=mmap.MAP_SHARED)
+                os.close(fd)
+                try:
+                    # Keep mincore residency page-granular;
+                    # a THP fault would mark a whole huge page.
+                    mm.madvise(mmap.MADV_NOHUGEPAGE)
+                    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+                    addr = ctypes.addressof(ctypes.c_char.from_buffer(mm))
+                    previous = [0] * pages
+                    sizes = []
+                    for rank in range(workers):
+                        _prefault_shm_shard(mm, index=rank, count=workers)
+                        resident = (ctypes.c_ubyte * pages)()
+                        self.assertEqual(
+                            libc.mincore(
+                                ctypes.c_void_p(addr),
+                                ctypes.c_size_t(len(mm)),
+                                resident,
+                            ),
+                            0,
+                        )
+                        current = [value & 1 for value in resident]
+                        new_pages = [
+                            i for i in range(pages) if current[i] and not previous[i]
+                        ]
+                        if new_pages:
+                            self.assertEqual(
+                                new_pages,
+                                list(range(new_pages[0], new_pages[-1] + 1)),
+                            )
+                        sizes.append(len(new_pages))
+                        previous = current
+                    self.assertEqual(previous, [1] * pages)
+                    self.assertEqual(sum(sizes), pages)
+                    self.assertLessEqual(max(sizes) - min(sizes), 1)
+                finally:
+                    mm.close()
+
+    def test_shard_population_failure_propagates(self):
+        """A failed shard madvise must raise instead of leaving pages lazily faulted."""
+        mm = unittest.mock.create_autospec(mmap.mmap, instance=True)
+        mm.__len__.return_value = 4 * mmap.PAGESIZE
+        mm.madvise.side_effect = OSError("unsupported population")
+        with self.assertRaisesRegex(OSError, "unsupported population"):
+            _prefault_shm_shard(mm, index=0, count=2)
 
 
 if __name__ == "__main__":

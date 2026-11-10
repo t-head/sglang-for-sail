@@ -8,6 +8,7 @@ and the published instance stays as the launcher left it.
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.managers.io_struct import (
@@ -58,6 +59,43 @@ class TestSchedulerHiCacheAttach(CustomTestCase):
             "file",
         )
         self.assertIsNone(self.server_args.hicache_storage_backend)
+
+    def test_per_node_storage_changes_reject_before_admission_or_mutation(self):
+        """Per-node MLA HiCache rejects runtime attach/detach before the idle check."""
+        for operation, attached in (("attach", False), ("detach", True)):
+            with self.subTest(operation=operation, attached=attached):
+                scheduler = self._scheduler(
+                    enable_mla_hicache_per_node=True,
+                    hicache_storage_backend="mooncake" if attached else None,
+                )
+                scheduler.enable_hicache_storage = attached
+                # Attach is busy, so an idle-first check gives the wrong message;
+                # detach is idle, so a missed guard reaches the tree_cache effects.
+                scheduler.is_fully_idle = mock.Mock(return_value=attached)
+                scheduler.waiting_queue = []
+                scheduler.running_batch = SimpleNamespace(reqs=[])
+                scheduler.tree_cache = SimpleNamespace(
+                    attach_storage_backend=mock.Mock(
+                        side_effect=AssertionError("attach effect")
+                    ),
+                    detach_storage_backend=mock.Mock(
+                        side_effect=AssertionError("detach effect")
+                    ),
+                )
+                before = get_context().resolved_server_args_dict()
+                if operation == "detach":
+                    result = scheduler.detach_hicache_storage_wrapped(
+                        DetachHiCacheStorageReqInput()
+                    )
+                else:
+                    result = scheduler.attach_hicache_storage_wrapped(
+                        AttachHiCacheStorageReqInput(hicache_storage_backend="mooncake")
+                    )
+                self.assertFalse(result.success)
+                self.assertIn("startup-only", result.message)
+                self.assertEqual(scheduler.enable_hicache_storage, attached)
+                self.assertEqual(get_context().resolved_server_args_dict(), before)
+                scheduler.is_fully_idle.assert_not_called()
 
     def test_detach_clears_the_backend_for_the_same_readers(self):
         scheduler = self._scheduler(hicache_storage_backend="file")

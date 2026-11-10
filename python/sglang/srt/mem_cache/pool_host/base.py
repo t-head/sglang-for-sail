@@ -13,6 +13,7 @@ import torch
 
 from sglang.srt.mem_cache.host_memory import available_host_memory_bytes
 from sglang.srt.mem_cache.pool_host.common import (
+    HostTensorAllocator,
     _cuda_host_unregister,
     get_allocator_from_storage,
 )
@@ -167,6 +168,7 @@ class HostKVCache(abc.ABC):
     # Names this pool's page byte format in storage keys when it has one of its
     # own, so pages persisted in another format miss instead of loading.
     storage_format_tag: Optional[str] = None
+    host_buffer_read_only = False
 
     def __init__(
         self,
@@ -187,6 +189,7 @@ class HostKVCache(abc.ABC):
         dcp_rank: int = 0,
         pool_label: str = "kv",
         is_dummy: bool = False,
+        host_allocator: Optional[HostTensorAllocator] = None,
     ):
         """Allocate host pages from geometry prepared by the concrete host pool."""
         self.pool_label = pool_label
@@ -202,7 +205,11 @@ class HostKVCache(abc.ABC):
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
-        self.allocator = get_allocator_from_storage(allocator_type)
+        self.allocator = (
+            get_allocator_from_storage(allocator_type)
+            if host_allocator is None
+            else host_allocator
+        )
         self.can_use_write_back_jit = False
 
         self.dtype = dtype
@@ -235,9 +242,14 @@ class HostKVCache(abc.ABC):
                 self.device_capacity_tokens,
             )
 
-        # Verify there is enough available host memory.
+        # The leader budgets the shared allocation; a follower's mapping is
+        # not a second copy. Keep the available-memory check on the owner.
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_memory_budget_bytes(requested_bytes)
+        available_bytes = (
+            requested_bytes
+            if self.host_buffer_read_only
+            else host_memory_budget_bytes(requested_bytes)
+        )
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "

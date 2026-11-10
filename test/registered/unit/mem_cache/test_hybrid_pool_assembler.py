@@ -1,5 +1,6 @@
 """Unit tests for hybrid HiCache pool assembly."""
 
+import contextlib
 import unittest
 from queue import Queue
 from types import SimpleNamespace
@@ -35,6 +36,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     build_hybrid_swa_group,
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
+from sglang.srt.mem_cache.mla_host_node_leader import NodeLeaderMLAContext
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host import dsa as pool_host_dsa
 from sglang.srt.mem_cache.pool_host.host_pool_decl import (
@@ -47,6 +49,184 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+class TestNodeLeaderPoolAssembly(CustomTestCase):
+    def _build(self, *, mode, follower, host_size=0):
+        events, budgets = [], []
+        tp_cache_group = object()
+        shared_allocator = object() if mode is not None else None
+        broadcast = object() if mode == "broadcast" else None
+        context = (
+            None
+            if mode is None
+            else NodeLeaderMLAContext(
+                is_follower=follower,
+                capacity_multiplier=4,
+                broadcast=broadcast,
+                shared_allocator=shared_allocator,
+            )
+        )
+        params = SimpleNamespace(
+            page_size=64,
+            tp_cache_group=tp_cache_group,
+            attn_tp_cache_group=object(),
+            attn_cp_cache_group=None,
+            pp_cache_group=None,
+            mtp_draft_device_pools=(),
+            req_to_token_pool=SimpleNamespace(mamba_allocator=MagicMock()),
+            token_to_kv_pool_allocator=None,
+        )
+        memory = SimpleNamespace(
+            hicache_size=host_size,
+            hicache_ratio=2,
+            hicache_mem_layout="page_first",
+            hicache_write_policy="write_through",
+            hicache_io_backend="kernel",
+            hicache_host_memory_mode="cache",
+        )
+
+        @contextlib.contextmanager
+        def budget_scope(value):
+            budgets.append(value)
+            try:
+                yield
+            finally:
+                budgets.pop()
+
+        def host_pool(pool, ratio, host_size, page_size=64, layout="page_first", **kw):
+            events.append("kv" if pool is kv_pool else "mamba")
+            return SimpleNamespace(
+                layout=layout,
+                page_size=page_size,
+                device="cpu",
+                size=64,
+                logical_size=64,
+                can_use_write_back_jit=pool is not kv_pool,
+                ratio=ratio,
+                host_size=host_size,
+                is_dummy=kw.get("is_dummy", False),
+                host_buffer_read_only=kw.get("host_buffer_read_only", False),
+                allocator=kw.get("host_allocator"),
+                budget=budgets[-1] if budgets else None,
+            )
+
+        def barrier(*, group):
+            self.assertIs(group, tp_cache_group)
+            events.append("barrier")
+
+        kv_pool = SimpleNamespace(layer_num=1, get_kv_size_bytes=lambda: 6)
+        mamba_pool = SimpleNamespace(get_kv_size_bytes=lambda: (1, 1))
+        node_module = "sglang.srt.mem_cache.mla_host_node_leader"
+        with (
+            patch.object(
+                hybrid_pool_assembler,
+                "maybe_create_node_leader_context",
+                autospec=True,
+                return_value=context,
+            ),
+            patch(f"{node_module}.host_memory_budget_bytes", return_value=8 << 30),
+            patch(f"{node_module}.host_memory_budget_scope", budget_scope),
+            patch.object(hybrid_pool_assembler, "get_memory", return_value=memory),
+            patch.object(
+                hybrid_pool_assembler,
+                "get_parallel",
+                return_value=SimpleNamespace(dcp_enabled=False),
+            ),
+            patch.object(
+                hybrid_pool_assembler, "_get_allocator_type", return_value="default"
+            ),
+            patch.object(
+                hybrid_pool_assembler,
+                "MLATokenToKVPoolHost",
+                autospec=True,
+                side_effect=host_pool,
+            ),
+            patch.object(
+                hybrid_pool_assembler,
+                "MambaPoolHost",
+                autospec=True,
+                side_effect=host_pool,
+            ),
+            patch.object(hybrid_pool_assembler.dist, "barrier", side_effect=barrier),
+            patch.object(
+                hybrid_pool_assembler,
+                "HybridCacheController",
+                autospec=True,
+                side_effect=lambda *args, **kw: SimpleNamespace(**kw),
+            ),
+        ):
+            group, controller = hybrid_pool_assembler.build_hybrid_mamba_stack(
+                params=params,
+                kv_pool=kv_pool,
+                mamba_pool=mamba_pool,
+                full_layer_mapping={3: 0},
+                mamba_layer_mapping={0: 0},
+                load_cache_event=None,
+                storage_backend=None,
+                use_mla=True,
+            )
+        self.assertIs(controller.node_leader_broadcast, broadcast)
+        return group, events, shared_allocator
+
+    def test_pool_roles_and_allocation_order(self):
+        """Shm followers retain H2D buffers; both node-leader modes fence MLA before Mamba."""
+        # hicache_size=1 splits 6:2 by device bytes, so MLA gets 0.75 and Mamba 0.25;
+        # capacity_multiplier=4 scales MLA ratio 2->8, size 0.75->3.0
+        # and leader budget 8G->32G.
+        gated = ["kv", "barrier", "mamba"]
+        for mode, follower, ratio, kv_size, dummy, read_only, budget, events_seen in (
+            (None, False, 2, 0.75, False, False, None, ["kv", "mamba"]),
+            ("broadcast", False, 8, 3.0, False, False, 32 << 30, gated),
+            ("broadcast", True, 8, 3.0, True, True, None, gated),
+            ("shm", False, 8, 3.0, False, False, 32 << 30, gated),
+            ("shm", True, 8, 3.0, False, True, None, gated),
+        ):
+            with self.subTest(mode=mode, follower=follower):
+                group, events, allocator = self._build(
+                    mode=mode, follower=follower, host_size=1
+                )
+                kv = group.get_pool(PoolName.KV)
+                mamba = group.get_pool(PoolName.MAMBA)
+                self.assertEqual(kv.ratio, ratio)
+                self.assertEqual(mamba.ratio, 2)
+                self.assertEqual(kv.host_size, kv_size)
+                self.assertEqual(mamba.host_size, 0.25)
+                self.assertEqual(kv.is_dummy, dummy)
+                self.assertEqual(kv.host_buffer_read_only, read_only)
+                self.assertIs(kv.allocator, allocator)
+                self.assertEqual(kv.budget, budget)
+                self.assertIsNone(mamba.budget)
+                self.assertEqual(events, events_seen)
+
+
+class TestMlaHiCachePerNodeStackAdmission(CustomTestCase):
+    def test_per_node_rejects_non_mamba_stack_before_build(self):
+        """The flag must fail on stacks without node-leader wiring, not be ignored."""
+        strategy = next(
+            s
+            for s in hybrid_pool_assembler._STRATEGIES
+            if not isinstance(s, hybrid_pool_assembler._MambaStrategy)
+        )
+        params = SimpleNamespace(
+            token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=object)
+        )
+        with (
+            patch.object(
+                hybrid_pool_assembler, "_select_strategy", return_value=strategy
+            ),
+            patch.object(
+                hybrid_pool_assembler,
+                "get_memory",
+                return_value=SimpleNamespace(enable_mla_hicache_per_node=True),
+            ),
+            patch.object(type(strategy), "build") as build,
+        ):
+            with self.assertRaisesRegex(ValueError, "Mamba/KDA"):
+                hybrid_pool_assembler.attach_hybrid_pool_to_unified_cache(
+                    SimpleNamespace(components={}), params, None, load_cache_event=None
+                )
+        build.assert_not_called()
 
 
 class TestDeepSeekV4SWAPageLayout(CustomTestCase):

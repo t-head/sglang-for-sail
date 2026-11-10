@@ -168,13 +168,43 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     return torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
 
 
-def alloc_shm(dims: tuple, dtype: torch.dtype) -> tuple[torch.Tensor, int, mmap.mmap]:
-    """Allocate a host tensor via shared memory (/dev/shm).
+def map_shm(
+    fd: int,
+    dims: tuple,
+    dtype: torch.dtype,
+    *,
+    populate_shard: tuple[int, int],
+) -> torch.Tensor:
+    """Map shared pages and populate one shard; synchronize before pinning."""
+    n_bytes = math.prod(dims) * torch.empty([], dtype=dtype).element_size()
+    alloc_bytes = math.ceil(n_bytes / mmap.PAGESIZE) * mmap.PAGESIZE
+    # Both sides derive dims from their own config; a mismatch must not map.
+    actual_bytes = os.fstat(fd).st_size
+    if actual_bytes != alloc_bytes:
+        raise ValueError(
+            f"Shared host buffer is {actual_bytes} bytes, expected {alloc_bytes} "
+            f"for dims={dims} dtype={dtype}."
+        )
+    mm = mmap.mmap(fd, alloc_bytes, flags=mmap.MAP_SHARED, prot=_PROT_RW)
+    try:
+        _prefault_shm_shard(mm, index=populate_shard[0], count=populate_shard[1])
+        return torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
+    except Exception:
+        mm.close()
+        raise
 
-    Returns a tuple of (tensor, fd, mm).
-    The caller is responsible for keeping the fd open if they need to share it,
-    and closing it when they are done.
-    """
+
+def _prefault_shm_shard(mm: mmap.mmap, index: int, count: int) -> None:
+    pages = len(mm) // mmap.PAGESIZE
+    start = (pages * index // count) * mmap.PAGESIZE
+    end = (pages * (index + 1) // count) * mmap.PAGESIZE
+    if end > start:
+        # No MAP_POPULATE fallback: each rank must fault only its own shard.
+        mm.madvise(_MADV_POPULATE_WRITE, start, end - start)
+
+
+def create_shm(dims: tuple, dtype: torch.dtype) -> int:
+    """Create and size a shared buffer without allocating its physical pages."""
     hugepage_size = (envs.SGLANG_HUGEPAGE_SIZE.get() or "").strip().upper()
     n_bytes = math.prod(dims) * torch.empty([], dtype=dtype).element_size()
 
@@ -211,11 +241,19 @@ def alloc_shm(dims: tuple, dtype: torch.dtype) -> tuple[torch.Tensor, int, mmap.
 
     try:
         os.ftruncate(fd, alloc_bytes)
-        mm = _mmap_prefaulted(fd, alloc_bytes, mmap.MAP_SHARED)
-    except Exception as e:
-        if fd is not None:
-            os.close(fd)
-        raise e
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
 
+
+def alloc_shm(dims: tuple, dtype: torch.dtype) -> tuple[torch.Tensor, int, mmap.mmap]:
+    """Allocate and prefault a shared tensor; the caller owns the returned fd."""
+    fd = create_shm(dims, dtype)
+    try:
+        mm = _mmap_prefaulted(fd, os.fstat(fd).st_size, mmap.MAP_SHARED)
+    except Exception:
+        os.close(fd)
+        raise
     tensor = torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
     return tensor, fd, mm

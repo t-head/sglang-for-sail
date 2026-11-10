@@ -23,6 +23,8 @@ def handle_hicache(server_args: Any):
     2) Storage <-> layout compatibility (may rewrite layout).
     """
     cfg = resolving_view(server_args)
+    if cfg.enable_mla_hicache_per_node:
+        validate_mla_hicache_per_node(server_args)
     if cfg.enable_linker_mla_dedup and (
         not cfg.enable_unified_cache_external_linker
         or cfg.unified_cache_external_linker_backend != "mooncake"
@@ -76,6 +78,52 @@ def handle_hicache(server_args: Any):
 
     # Step 3: DCP compatibility for the L2 (device<->host) path.
     resolve_hicache_dcp_compatibility(server_args)
+
+
+def validate_mla_hicache_per_node(server_args: Any):
+    cfg = resolving_view(server_args)
+    if cfg.pp_size > 1:
+        raise ValueError(
+            "--enable-mla-hicache-per-node requires --pp-size 1; "
+            "pipeline parallelism is not supported in broadcast or shm mode."
+        )
+    if cfg.disaggregation_mode == "decode":
+        # Broadcast needs a forward to run the layer-wait hook; shm is unvalidated.
+        raise ValueError(
+            "--enable-mla-hicache-per-node is not supported on PD decode instances."
+        )
+    if cfg.dcp_size > 1:
+        # DCP pages are rank-sharded in the current transfer contract.
+        raise ValueError(
+            "--enable-mla-hicache-per-node is not supported with --dcp-size > 1."
+        )
+    # Write-back eviction syncs locally: a follower could load shared pages before
+    # the leader's D2H into them finishes.
+    if (
+        cfg.mla_hicache_per_node_mode == "shm"
+        and cfg.hicache_write_policy == "write_back"
+    ):
+        raise ValueError(
+            "--mla-hicache-per-node-mode shm does not support "
+            "--hicache-write-policy write_back."
+        )
+    if cfg.hicache_storage_backend == "mooncake":
+        # Lazy: only per-node Mooncake launches pay for these imports.
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStoreConfig,
+        )
+
+        extra_config = HybridCacheController.parse_storage_backend_extra_config(
+            cfg.hicache_storage_backend_extra_config
+        )[0]
+        if MooncakeStoreConfig.load(extra_config).standalone_storage:
+            raise ValueError(
+                "--enable-mla-hicache-per-node is incompatible with Mooncake "
+                "standalone_storage=True, which requires MooncakeHostTensorAllocator."
+            )
 
 
 def handle_hicache_ratio_default(server_args: Any):

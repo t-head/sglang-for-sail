@@ -218,6 +218,17 @@ class Memory(msgspec.Struct):
         bool,
         "Load replicated MLA KV on rank 0 and broadcast each layer with the Mooncake linker.",
     ] = False
+    enable_mla_hicache_per_node: A[
+        bool,
+        "Keep one HiCache host copy of replicated MLA KV per node instead of per rank.",
+    ] = False
+    mla_hicache_per_node_mode: A[
+        str,
+        Arg(
+            help="Per-node MLA HiCache restore: leader H2D plus NCCL broadcast, or per-GPU H2D from shared host memory.",
+            choices=["broadcast", "shm"],
+        ),
+    ] = "broadcast"
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
