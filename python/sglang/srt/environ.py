@@ -355,6 +355,13 @@ class Envs:
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
     SGLANG_EXPOSE_OWN_ENV_VARS = EnvBool(False)
     SGLANG_DIAG_BYPASS_HEALTH_GENERATE = EnvBool(False)
+    # Where the HTTP frontend runs OpenAI request preprocessing (chat template
+    # rendering + tokenization): "thread" keeps it on a helper thread of the
+    # tokenizer worker; "process" moves it into child processes so it stops
+    # contending for the GIL with the loop that streams every request's output.
+    SGLANG_REQUEST_PREPROCESSOR_MODE = EnvStr("thread")
+    # Child processes per tokenizer worker when the mode is "process".
+    SGLANG_REQUEST_PREPROCESSOR_PROCESSES = EnvInt(1)
 
     # ===================================================================
     # Logging
@@ -364,7 +371,20 @@ class Envs:
     SGLANG_LOG_DECODE_GRAPH_KEY = EnvBool(False)
     SGLANG_LOG_MS = EnvBool(False)
     SGLANG_LOG_REQUEST_EXCEEDED_MS = EnvInt(-1)
+    # WARNING when chat tool schema validation (on the tokenizer worker's event
+    # loop) or request conversion on the in-process preprocessing thread
+    # (queueing excluded) takes at least this many ms; either delays the next
+    # token of every stream on that worker. <= 0 disables.
+    SGLANG_LOG_SLOW_PREPROCESSING_MS = EnvInt(200)
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
+    # Request-log fields (any nesting depth) logged as their length plus a hash
+    # at --log-requests-level 1 and 2: grammar constraints such as a tool-call
+    # structural_tag can be hundreds of KB per request. Empty logs them verbatim.
+    SGLANG_LOG_REQUEST_ABBREVIATE_FIELDS = EnvTuple(
+        ("structural_tag", "json_schema", "ebnf", "regex")
+    )
+    # Only string values longer than this many characters are abbreviated.
+    SGLANG_LOG_REQUEST_ABBREVIATE_MIN_CHARS = EnvInt(256)
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
     SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
     SGLANG_ENABLE_RANK_CONSENSUS_CHECKER = EnvBool(False)

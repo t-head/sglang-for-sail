@@ -11,7 +11,7 @@ from collections import OrderedDict
 from collections.abc import AsyncGenerator
 from enum import Enum
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from sglang.srt.runtime_context import get_model, get_serving
 
@@ -39,7 +39,7 @@ _CHAT_TEMPLATE_CLIENT_ERRORS: tuple[type[BaseException], ...] = (
     TypeError,
 ) + _MISTRAL_COMMON_ERRORS
 from fastapi.responses import ORJSONResponse, StreamingResponse
-from jsonschema import Draft202012Validator, SchemaError
+from jsonschema import SchemaError
 
 from sglang.srt.entrypoints.openai import (
     chat_encoding,
@@ -79,7 +79,10 @@ from sglang.srt.entrypoints.openai.protocol import (
     TopLogprob,
     UsageInfo,
 )
-from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.entrypoints.openai.serving_base import (
+    OpenAIServingBase,
+    warn_if_slow_preprocessing,
+)
 from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
@@ -99,12 +102,14 @@ from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.utils import (
+    check_tool_parameters_schema,
     get_json_schema_constraint,
     normalize_json_schema_types,
     strip_structural_tag_excludes,
     without_schema_identifiers,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.hunyuan_reasoning import (
     normalize_hunyuan_reasoning_effort,
@@ -307,6 +312,7 @@ def _build_video_config(request: ChatCompletionRequest) -> dict[str, Any] | None
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
+    supports_process_preprocessing = True
     _default_sampling_params_logged = False
     _KIMI_K3_GENERATION_STUB_TOKENS = 3
 
@@ -1192,30 +1198,19 @@ class OpenAIServingChat(OpenAIServingBase):
             if len(names) != len(set(names)):
                 return "Tool names must be unique across request and message tools."
 
-        # Validate tool definitions
-        for i, tool in enumerate(effective_tools):
-            if tool.function.parameters is None:
-                continue
-            try:
-                # Rewrite DB/ORM-style aliases (e.g. "varchar", "enum", "int")
-                # to standard JSON Schema types before validation. RecursionError
-                # guards against hand-crafted cyclic schemas so the request gets
-                # a 400 instead of crashing into a 500.
-                normalize_json_schema_types(tool.function.parameters)
-                # Identifier keywords are checked for URI form by the 2020-12
-                # metaschema but constrain no instance, so a draft-07-style
-                # `$id: "#name"` would 400 a schema this stack renders and
-                # constrains correctly. Validate without them.
-                Draft202012Validator.check_schema(
-                    without_schema_identifiers(tool.function.parameters)
-                )
-            except SchemaError as e:
-                return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
-            except RecursionError:
-                return (
-                    f"Tool {i} function 'parameters' schema is too deeply nested "
-                    "or contains a cycle."
-                )
+        # Validate tool definitions. This runs on the event loop of every entry
+        # point that validates chat requests (chat, Anthropic, tokenize).
+        started = monotonic_time()
+        error_msg, python_fallbacks = self._validate_tool_schemas(effective_tools)
+        warn_if_slow_preprocessing(
+            "tool schema validation on the event loop",
+            monotonic_time() - started,
+            request,
+            tools=len(effective_tools),
+            python_fallbacks=python_fallbacks,
+        )
+        if error_msg:
+            return error_msg
 
         max_output_tokens = request.max_completion_tokens or request.max_tokens
         server_context_length = get_model().context_length
@@ -1235,6 +1230,43 @@ class OpenAIServingChat(OpenAIServingBase):
                 return "schema_ is required for json_schema response format request."
 
         return None
+
+    @staticmethod
+    def _validate_tool_schemas(tools: List[Tool]) -> tuple[Optional[str], int]:
+        """The first parameters schema error, if any, and Python fallbacks."""
+        python_fallbacks = 0
+        for i, tool in enumerate(tools):
+            if tool.function.parameters is None:
+                continue
+            try:
+                # Rewrite DB/ORM-style aliases (e.g. "varchar", "enum", "int")
+                # to standard JSON Schema types before validation. RecursionError
+                # guards against hand-crafted cyclic schemas so the request gets
+                # a 400 instead of crashing into a 500.
+                normalize_json_schema_types(tool.function.parameters)
+                # Identifier keywords are checked for URI form by the 2020-12
+                # metaschema but constrain no instance, so a draft-07-style
+                # `$id: "#name"` would 400 a schema this stack renders and
+                # constrains correctly. Validate without them.
+                # Count before checking so Python errors are included as well.
+                # A Rust success returns False and removes the provisional count.
+                python_fallbacks += 1
+                if not check_tool_parameters_schema(
+                    without_schema_identifiers(tool.function.parameters)
+                ):
+                    python_fallbacks -= 1
+            except SchemaError as e:
+                return (
+                    f"Tool {i} function has invalid 'parameters' schema: {str(e)}",
+                    python_fallbacks,
+                )
+            except RecursionError:
+                return (
+                    f"Tool {i} function 'parameters' schema is too deeply nested "
+                    "or contains a cycle.",
+                    python_fallbacks,
+                )
+        return None, python_fallbacks
 
     def _validate_media_content(self, request: ChatCompletionRequest) -> str | None:
         if self.tokenizer_manager.model_config.is_multimodal:

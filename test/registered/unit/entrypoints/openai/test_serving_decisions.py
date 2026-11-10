@@ -188,6 +188,12 @@ class ScoringManager(TokenizerManagerScoreMixin):
     def config_value(self, name):
         return None
 
+    async def run_in_request_preprocessor(self, func, *args, **kwargs):
+        # Off-loop like TokenizerManager, so conversion yields to other tasks.
+        return await asyncio.get_running_loop().run_in_executor(
+            None, lambda: func(*args, **kwargs)
+        )
+
     async def generate_request(self, request, raw_request):
         self.requests.append(request)
         request.normalize_batch_and_arguments()

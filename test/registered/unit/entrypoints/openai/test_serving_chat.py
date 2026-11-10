@@ -12,6 +12,7 @@ maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
 import asyncio
 import gc
+import itertools
 import json
 import tempfile
 import unittest
@@ -23,6 +24,7 @@ from unittest.mock import Mock, patch
 
 from fastapi import Request
 from transformers.utils.chat_template_utils import _compile_jinja_template
+from jsonschema import Draft202012Validator, SchemaError
 
 from sglang.srt.entrypoints.openai.chat_encoding import (
     resolve_dsv4_reasoning_effort_profile,
@@ -30,6 +32,7 @@ from sglang.srt.entrypoints.openai.chat_encoding import (
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     MessageProcessingResult,
+    Tool,
     ToolChoice,
     ToolChoiceFuncName,
 )
@@ -40,6 +43,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
 from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
+from sglang.srt.function_call.utils import check_tool_parameters_schema
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.jinja_template_utils import (
     jinja_template_may_reorder_tool_results,
@@ -177,6 +181,9 @@ class _MockTokenizerManager:
         self.generate_request = Mock(return_value=_mock_generate())
         self.create_abort_task = Mock()
         self.request_logger = Mock(log_requests=False, log_requests_level=0)
+
+    async def run_in_request_preprocessor(self, func, *args, **kwargs):
+        return func(*args, **kwargs)
 
     def config_value(self, name: str):
         """The value in effect for one config field."""
@@ -1733,6 +1740,109 @@ class ServingChatTestCase(CustomTestCase):
                     self.chat._validate_request(duplicate),
                     "Tool names must be unique across request and message tools.",
                 )
+
+    def test_slow_tool_schema_validation_is_reported(self):
+        def tool(name):
+            return {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {uuid.uuid4().hex: {"type": "string"}},
+                    },
+                },
+            }
+
+        messages = [
+            {"role": "system", "content": "", "tools": [tool("from_message")]},
+            {"role": "user", "content": "hi"},
+        ]
+        tools = [tool("from_request")]
+        # Every clock read advances 0.5 s, so the validation looks slow.
+        clock = patch(
+            "sglang.srt.entrypoints.openai.serving_chat.monotonic_time",
+            side_effect=itertools.count(step=0.5),
+        )
+        with (
+            clock,
+            envs.SGLANG_LOG_SLOW_PREPROCESSING_MS.override(100),
+            patch(
+                "sglang.srt.entrypoints.openai.serving_chat.check_tool_parameters_schema",
+                return_value=False,
+            ),
+        ):
+            for expected_fallbacks in (0, 0):  # valid schemas use the Rust check
+                request = ChatCompletionRequest(
+                    model="x", messages=messages, tools=tools, rid="rid-7"
+                )
+                with self.assertLogs(
+                    "sglang.srt.entrypoints.openai.serving_base", level="WARNING"
+                ) as logs:
+                    self.assertIsNone(self.chat._validate_request(request))
+                self.assertEqual(len(logs.output), 1)
+                self.assertIn(
+                    "tool schema validation on the event loop", logs.output[0]
+                )
+                self.assertIn(
+                    f"rid=rid-7, tools=2, python_fallbacks={expected_fallbacks}",
+                    logs.output[0],
+                )
+
+    def test_tool_schema_validation_counts_failed_full_checks(self):
+        def tools(*parameters):
+            return [
+                Tool.model_validate(
+                    {"type": "function", "function": {"name": f"t{i}", "parameters": p}}
+                )
+                for i, p in enumerate(parameters)
+            ]
+
+        valid = {"type": "object", "properties": {uuid.uuid4().hex: {}}}
+        invalid = {"type": "object", "required": uuid.uuid4().hex}  # not an array
+        cyclic = {"type": "object", "properties": {}}
+        cyclic["properties"]["self"] = cyclic
+        valid_fallbacks = int(check_tool_parameters_schema(valid))
+
+        error, checked = self.chat._validate_tool_schemas(tools(invalid))
+        self.assertIn("Tool 0 function has invalid 'parameters' schema", error)
+        self.assertEqual(checked, 1)
+        self.assertEqual(
+            self.chat._validate_tool_schemas(tools(valid)), (None, valid_fallbacks)
+        )
+        # A successful check followed by a failed check.
+        error, checked = self.chat._validate_tool_schemas(tools(valid, invalid))
+        self.assertIn("Tool 1 function has invalid 'parameters' schema", error)
+        self.assertEqual(checked, valid_fallbacks + 1)
+        # The cycle stops normalization before any check runs.
+        error, checked = self.chat._validate_tool_schemas(tools(cyclic))
+        self.assertIn("too deeply nested or contains a cycle", error)
+        self.assertEqual(checked, 0)
+
+    def test_tool_schema_validation_counts_only_python_fallbacks(self):
+        def tool(name, parameters):
+            payload = {
+                "type": "function",
+                "function": {"name": name},
+            }
+            if parameters is not None:
+                payload["function"]["parameters"] = parameters
+            return Tool.model_validate(payload)
+
+        schemas = [
+            tool("rust", {"type": "object"}),
+            tool("python", {"type": "object"}),
+            tool("none", None),
+        ]
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.check_tool_parameters_schema",
+            side_effect=[False, True],
+        ) as check_schema:
+            error, python_fallbacks = self.chat._validate_tool_schemas(schemas)
+
+        self.assertIsNone(error)
+        self.assertEqual(python_fallbacks, 1)
+        self.assertEqual(check_schema.call_count, 2)
 
     def test_jinja_rejects_non_object_tool_call_arguments(self):
         """History tool call arguments must parse to a JSON object."""

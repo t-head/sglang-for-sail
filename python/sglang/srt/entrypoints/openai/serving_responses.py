@@ -159,6 +159,9 @@ def _should_emit_normal_text_as_message(
 class OpenAIServingResponses(OpenAIServingChat):
     """Handler for /v1/responses requests"""
 
+    # Needs a tool server and extra constructor arguments a preprocessor child lacks.
+    supports_process_preprocessing = False
+
     def __init__(
         self,
         tokenizer_manager: TokenizerManager,
