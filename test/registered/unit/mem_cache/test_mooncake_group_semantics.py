@@ -639,5 +639,56 @@ class TestMooncakeGroupSemantics(CustomTestCase):
         self.assertTrue(set(keys_a).isdisjoint(keys_b))
 
 
+class TestMooncakeReadFailureMetrics(CustomTestCase):
+    def _store_with_reads(self, results):
+        store, fake_store = _make_store(is_mla_model=True)
+        store.enable_storage_metrics = True
+        store.enable_diagnostic_metrics = True
+        fake_store.batch_get_into = lambda keys, ptrs, sizes: results
+        indexer_pool = FakeIndexerPool()
+        store.register_mem_host_pool_v2(indexer_pool, PoolName.INDEXER)
+        return store
+
+    def _read(self, store, pages=2):
+        return store.batch_get_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.INDEXER,
+                    keys=[f"page{i}" for i in range(pages)],
+                    host_indices=torch.arange(pages),
+                )
+            ]
+        )
+
+    def test_failures_are_counted_per_pool_value_and_raw_code(self):
+        """Each failed key is counted under the pool's value ("indexer", not the
+        enum repr) and the raw return value: 0 bytes read and an error code stay
+        distinct, and a fully successful batch records nothing."""
+        store = self._store_with_reads([0, -704])
+        result = self._read(store)
+
+        self.assertEqual(result[PoolName.INDEXER], [False, False])
+        self.assertEqual(
+            store.get_stats().read_failed_keys,
+            {("indexer", 0): 1, ("indexer", -704): 1},
+        )
+
+        store = self._store_with_reads([8, 8])
+        self.assertEqual(self._read(store)[PoolName.INDEXER], [True, True])
+        self.assertEqual(store.get_stats().read_failed_keys, {})
+
+    def test_get_stats_drains_so_counts_are_not_exported_twice(self):
+        store = self._store_with_reads([-800, 8])
+        self._read(store)
+        self.assertEqual(store.get_stats().read_failed_keys, {("indexer", -800): 1})
+        self.assertEqual(store.get_stats().read_failed_keys, {})
+
+    def test_flag_off_counts_nothing(self):
+        store = self._store_with_reads([-704, 8])
+        store.enable_diagnostic_metrics = False
+        self.assertEqual(self._read(store)[PoolName.INDEXER], [False, True])
+        self.assertEqual(store.get_stats().read_failed_keys, {})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=3)

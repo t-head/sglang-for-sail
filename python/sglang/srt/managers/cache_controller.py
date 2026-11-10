@@ -43,6 +43,9 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.utils import get_storage_hash_str
+from sglang.srt.observability.metrics_collector import (
+    hicache_diagnostic_metrics_enabled,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
 
@@ -373,6 +376,8 @@ class HiCacheController:
         self.storage_backend = None
         self.storage_backend_type = None
         self.enable_storage_metrics = enable_storage_metrics
+        # Read once so every collective in this process uses the same shape.
+        self.enable_diagnostic_metrics = hicache_diagnostic_metrics_enabled()
         # Buffer mode: wired by the tree cache after attach; the load rate
         # limiter subtracts write staging from actual pool usage.
         self.host_write_staged_tokens_fn: Optional[Callable[[], int]] = None
@@ -1184,6 +1189,8 @@ class HiCacheController:
                 # Get one batch token, and update the completed_tokens if succeed
                 extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
 
+                operation.kv_last_ts = time.monotonic()
+
                 try:
                     hit_pages = self._page_transfer_kv_batch(
                         operation,
@@ -1377,13 +1384,30 @@ class HiCacheController:
     def _sync_prefetch_hit_query(self, operation, storage_hit_count: int) -> int:
         """Rank-reduce a hit query (MIN) so every rank agrees on the usable
         prefix. Runs for every operation, hit or miss."""
-        hit_count = torch.tensor(storage_hit_count, dtype=torch.int)
+        # [x, -x] under MIN yields [min x, -max x] in one collective, so
+        # the cross-rank spread costs no extra communication. PP-ticket
+        # mode reduces a scalar on these groups elsewhere, so keep the
+        # scalar shape there to avoid mismatched collectives.
+        pack_spread = (
+            self.enable_diagnostic_metrics
+            and getattr(self, "pp_prefetch_command_group", None) is None
+        )
+        hit_count = torch.tensor(
+            [storage_hit_count, -storage_hit_count]
+            if pack_spread
+            else storage_hit_count,
+            dtype=torch.int,
+        )
         self._all_reduce(
             hit_count,
             torch.distributed.ReduceOp.MIN,
             self.prefetch_hits_sync_groups,
         )
-        return int(hit_count.item())
+        if not pack_spread:
+            return int(hit_count.item())
+        min_hits, neg_max_hits = hit_count.tolist()
+        operation.query_rank_spread = -neg_max_hits - min_hits
+        return int(min_hits)
 
     def write_storage(
         self,

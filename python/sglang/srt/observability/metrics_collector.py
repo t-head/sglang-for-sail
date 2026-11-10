@@ -21,7 +21,17 @@ import os
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 import msgspec
 
@@ -163,6 +173,8 @@ class SchedulerStats:
     # HiCache metrics
     hicache_host_used_tokens: int = 0
     hicache_host_total_tokens: int = 0
+    # Allocator-owning non-KV L2 host pools by name: (used_slots, total_slots).
+    hicache_host_pool_stats: Dict[str, Tuple[int, int]] = field(default_factory=dict)
 
     # Streaming session metrics
     num_streaming_sessions: int = 0
@@ -298,6 +310,14 @@ def resolve_collector_class(role: str, default_cls: type) -> type:
     if not stat_loggers:
         return default_cls
     return stat_loggers.get(role, default_cls)
+
+
+def hicache_diagnostic_metrics_enabled() -> bool:
+    """--enable-hicache-diagnostic-metrics, effective only with --enable-metrics."""
+    if not get_context().is_config_namespace_published("observability"):
+        return False
+    obs = get_observability()
+    return bool(obs.enable_metrics and obs.enable_hicache_diagnostic_metrics)
 
 
 class _StatLoggerDIMixin:
@@ -759,6 +779,22 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 labelnames=labels.keys(),
                 multiprocess_mode="mostrecent",
             )
+            if hicache_diagnostic_metrics_enabled():
+                self.hicache_host_pool_used_slots = Gauge(
+                    name="sglang:hicache_host_pool_used_slots",
+                    documentation="Used slots of L2 host pools that own an allocator "
+                    "(currently only mamba: KDA state slots). The KV pool is "
+                    "hicache_host_used_tokens; derived pools reuse KV indices.",
+                    labelnames=list(labels.keys()) + ["pool"],
+                    multiprocess_mode="mostrecent",
+                )
+                self.hicache_host_pool_total_slots = Gauge(
+                    name="sglang:hicache_host_pool_total_slots",
+                    documentation="Total slots of L2 host pools that own an "
+                    "allocator (currently only mamba).",
+                    labelnames=list(labels.keys()) + ["pool"],
+                    multiprocess_mode="mostrecent",
+                )
 
         # =================================================================
         # Streaming session metrics (only created when streaming sessions are enabled)
@@ -1698,6 +1734,13 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             self._log_gauge(
                 self.hicache_host_total_tokens, stats.hicache_host_total_tokens
             )
+            for pool, (used, total) in stats.hicache_host_pool_stats.items():
+                self.hicache_host_pool_used_slots.labels(**self.labels, pool=pool).set(
+                    used
+                )
+                self.hicache_host_pool_total_slots.labels(**self.labels, pool=pool).set(
+                    total
+                )
 
         # Streaming session metrics
         if self.enable_streaming_session:
@@ -2127,6 +2170,9 @@ class StorageMetrics:
     backup_pgs: List[int] = field(default_factory=list)
     prefetch_bandwidth: List[float] = field(default_factory=list)
     backup_bandwidth: List[float] = field(default_factory=list)
+    # (pool, raw batch_get return value) -> failed key count. A value of 0 means
+    # the key was found but zero bytes were read; negative values are error codes.
+    read_failed_keys: Dict[Tuple[str, int], int] = field(default_factory=dict)
 
 
 class StorageMetricsCollector(_StatLoggerDIMixin):
@@ -2223,6 +2269,73 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+        if hicache_diagnostic_metrics_enabled():
+            self.storage_read_failed_keys_total = Counter(
+                name="sglang:hicache_storage_read_failed_keys_total",
+                documentation="L3 keys whose batch read did not return data, by "
+                "storage pool and the raw per-key return value of the Mooncake "
+                "batch read (0 = zero bytes read, negative = error code). Keys of "
+                "the mamba pool are only read when the KV read fully succeeded, so "
+                "its count is conditional on that.",
+                labelnames=list(labels.keys()) + ["pool", "code"],
+            )
+
+            self.hybrid_prefetch_result_total = Counter(
+                name="sglang:hicache_hybrid_prefetch_result_total",
+                documentation="Hybrid (KV + non-KV pool) L3 prefetch results at the "
+                "all-or-nothing check. kind: success; discard_terminated (the prefetch "
+                "was terminated, so the non-KV pool was skipped); discard_kv_short (the "
+                "KV read did not complete the expected tokens); discard_pool_short (KV "
+                "read fully, a non-KV pool came up short). assume_stored=1 means the "
+                "existence query was skipped for this operation.",
+                labelnames=list(labels.keys()) + ["kind", "assume_stored"],
+            )
+            self.storage_read_age_seconds = Histogram(
+                name="sglang:hicache_storage_read_age_seconds",
+                documentation="Per hybrid prefetch at the all-or-nothing check: seconds "
+                "from the L3 existence query finishing to the start of the last read "
+                "(the non-KV pool read if it ran, else the last KV batch), on the "
+                "rank's monotonic clock. The master grants a short read lease at "
+                "query time, so this shows whether waiting used it up. For "
+                "assume_stored=1 there was no query; the age is measured from the "
+                "point the query was skipped. kind matches "
+                "hicache_hybrid_prefetch_result_total; compare discard_pool_short "
+                "with success, since terminated / kv_short ages are biased by "
+                "slowness.",
+                labelnames=list(labels.keys()) + ["kind", "assume_stored"],
+                buckets=[0.1, 0.5, 1, 2, 3, 4, 5, 6, 10, 30],
+            )
+            self.prefetch_query_rank_spread_tokens = Histogram(
+                name="sglang:hicache_prefetch_query_rank_spread_tokens",
+                documentation="Max minus min across ranks of the L3 hit tokens found "
+                "by the existence query, before the ranks agree on the minimum. "
+                "Non-zero means ranks saw different L3 contents for the same prefix.",
+                labelnames=labels.keys(),
+                buckets=[0, 64, 256, 1024, 4096, 16384, 65536],
+            )
+            self._query_rank_spread_child = (
+                self.prefetch_query_rank_spread_tokens.labels(**self.labels)
+            )
+            self._hybrid_result_children = {}
+            self._read_age_children = {}
+            for assume in ("0", "1"):
+                for kind in (
+                    "success",
+                    "discard_terminated",
+                    "discard_kv_short",
+                    "discard_pool_short",
+                ):
+                    self._hybrid_result_children[(kind, assume)] = (
+                        self.hybrid_prefetch_result_total.labels(
+                            **self.labels, kind=kind, assume_stored=assume
+                        )
+                    )
+                    self._read_age_children[(kind, assume)] = (
+                        self.storage_read_age_seconds.labels(
+                            **self.labels, kind=kind, assume_stored=assume
+                        )
+                    )
+
         bucket_io = [
             1,
             5,
@@ -2312,6 +2425,15 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
                 num_tokens
             )
 
+    def log_hybrid_prefetch_result(self, kind: str, assume_stored: str) -> None:
+        self._hybrid_result_children[(kind, assume_stored)].inc()
+
+    def log_prefetch_query_rank_spread(self, spread_tokens: int) -> None:
+        self._query_rank_spread_child.observe(spread_tokens)
+
+    def log_storage_read_age(self, kind: str, assume_stored: str, age: float) -> None:
+        self._read_age_children[(kind, assume_stored)].observe(age)
+
     def _log_histogram(self, histogram, data: Union[int, float]):
         histogram.labels(**self.labels).observe(data)
 
@@ -2329,6 +2451,10 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             self._log_histogram(self.histogram_prefetch_bandwidth, v)
         for v in storage_metrics.backup_bandwidth:
             self._log_histogram(self.histogram_backup_bandwidth, v)
+        for (pool, code), count in storage_metrics.read_failed_keys.items():
+            self.storage_read_failed_keys_total.labels(
+                **self.labels, pool=pool, code=str(code)
+            ).inc(count)
 
 
 class ExpertDispatchCollector(_StatLoggerDIMixin):

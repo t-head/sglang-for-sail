@@ -1,6 +1,7 @@
 """Staged L3 prefetch lifecycle through the buffer pipeline; no GPU kernels."""
 
 import tempfile
+import threading
 import unittest
 from array import array
 from collections import defaultdict, deque
@@ -12,6 +13,10 @@ from unittest.mock import Mock
 import torch
 
 from sglang.srt.managers.schedule_batch import split_cached_prefix_by_tier
+from sglang.srt.managers.cache_controller import HiCacheController, PrefetchAck
+from sglang.srt.managers.scheduler_components.metrics_reporter import (
+    SchedulerMetricsReporter,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     InitLoadBackParams,
@@ -31,7 +36,14 @@ from sglang.srt.mem_cache.unified_radix_cache import (
     _OngoingPrefetch,
 )
 from sglang.srt.mem_cache.utils import get_hash_str
+from sglang.srt.observability.metrics_collector import (
+    SchedulerStats,
+    StorageMetricsCollector,
+    hicache_diagnostic_metrics_enabled,
+)
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -59,6 +71,7 @@ def _staged_fixture(full_match=2):
     cache.prefetch_loaded_storage_start_by_reqid = {_REQ: 2}
     cache._storage_prefetch_hit_remaining_by_reqid = {}
     cache.enable_storage_metrics = False
+    cache.enable_diagnostic_metrics = False
     cache.storage_metrics_collector = None
     cache.ongoing_prefetch = {}
     cache._prefetch_outcome_stats = defaultdict(int)
@@ -132,6 +145,7 @@ def _hit_drain_fixture():
     cache.host_memory_mode = "buffer_only"
     cache.prefetch_threshold = 2
     cache.enable_storage_metrics = False
+    cache.enable_diagnostic_metrics = False
     cache.storage_metrics_collector = None
     cache.storage_prefetch_retries = StoragePrefetchRetries()
     cache._prefetch_outcome_stats = defaultdict(int)
@@ -594,6 +608,382 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
         collector.log_storage_prefetch_unfulfilled_tokens.assert_called_once_with(
             6, "unservable_prefix"
         )
+
+
+class _FakeMetric:
+    """Records label sets like prometheus_client, so a label typo fails loudly."""
+
+    def __init__(self, name, documentation, labelnames=(), **kwargs):
+        self.labelnames = set(labelnames)
+        self.values = {}
+
+    def labels(self, **kwargs):
+        assert set(kwargs) == self.labelnames, (kwargs, self.labelnames)
+        values, key = self.values, tuple(sorted(kwargs.items()))
+
+        class _Child:
+            def inc(self, n=1):
+                values[key] = values.get(key, 0) + n
+
+            def observe(self, v):
+                values.setdefault(key, []).append(v)
+
+            def set(self, v):
+                values[key] = v
+
+        return _Child()
+
+
+class _FakeStorageCollector(StorageMetricsCollector):
+    _counter_cls = _FakeMetric
+    _gauge_cls = _FakeMetric
+    _histogram_cls = _FakeMetric
+
+
+def _label_hits(metric, **labels):
+    return [
+        v
+        for k, v in metric.values.items()
+        if all(dict(k).get(a) == b for a, b in labels.items())
+    ]
+
+
+def _diagnostic_flag(test, on, metrics=True):
+    """Install --enable-hicache-diagnostic-metrics for one test."""
+    override = get_context().override_server_args(
+        enable_metrics=metrics, enable_hicache_diagnostic_metrics=on
+    )
+    override.install()
+    test.addCleanup(override.restore)
+
+
+class TestHybridPrefetchOutcomeMetrics(CustomTestCase):
+    def _run_outcome(self, completed, expected, ok, diagnostic=True, **op):
+        _diagnostic_flag(self, True)
+        collector = _FakeStorageCollector({"model_name": "m"})
+        fake_self = SimpleNamespace(
+            enable_storage_metrics=True,
+            enable_diagnostic_metrics=diagnostic,
+            storage_metrics_collector=collector,
+        )
+        fields = dict(
+            assume_stored=False,
+            skip_reason=None,
+            query_done_ts=None,
+            kv_last_ts=None,
+            sidecar_ts=None,
+        )
+        fields.update(op)
+        UnifiedRadixCache._log_hybrid_prefetch_outcome(
+            fake_self, SimpleNamespace(**fields), completed, expected, ok
+        )
+        return collector
+
+    def test_kind_classification_and_precedence(self):
+        """Every kind the radix cache can emit has a pre-built collector child
+        (a typo would raise KeyError on the scheduler thread), a terminated
+        prefetch is never reported as a short KV read even though its
+        completed_tokens is short too."""
+        cases = [
+            ("success", dict(completed=1024, expected=1024, ok=True)),
+            (
+                "discard_terminated",
+                dict(completed=0, expected=2048, ok=False, skip_reason="terminated"),
+            ),
+            (
+                "discard_kv_short",
+                dict(completed=512, expected=2048, ok=False, skip_reason="kv_short"),
+            ),
+            ("discard_pool_short", dict(completed=2048, expected=2048, ok=False)),
+        ]
+        for kind, kwargs in cases:
+            with self.subTest(kind=kind):
+                collector = self._run_outcome(**kwargs)
+                self.assertEqual(
+                    _label_hits(collector.hybrid_prefetch_result_total, kind=kind),
+                    [1],
+                )
+
+    def test_read_age_uses_the_last_read_started(self):
+        """One age per prefetch, from the query to the last read that started:
+        the non-KV pool read when it ran, else the last KV batch."""
+        collector = self._run_outcome(
+            2048,
+            2048,
+            False,
+            assume_stored=True,
+            query_done_ts=100.0,
+            kv_last_ts=102.0,
+            sidecar_ts=None,
+        )
+        ages = collector.storage_read_age_seconds
+        self.assertEqual(
+            _label_hits(ages, kind="discard_pool_short", assume_stored="1"), [[2.0]]
+        )
+
+        collector = self._run_outcome(
+            2048, 2048, True, query_done_ts=100.0, kv_last_ts=102.0, sidecar_ts=103.5
+        )
+        ages = collector.storage_read_age_seconds
+        self.assertEqual(_label_hits(ages, kind="success", assume_stored="0"), [[3.5]])
+
+    def test_read_age_keeps_terminated_apart_from_pool_short(self):
+        """Terminated prefetches are slow by construction under the timeout
+        policy, so their age must not land in the series the lease check reads."""
+        collector = self._run_outcome(
+            0,
+            2048,
+            False,
+            skip_reason="terminated",
+            query_done_ts=100.0,
+            kv_last_ts=109.0,
+        )
+        ages = collector.storage_read_age_seconds
+        self.assertEqual(_label_hits(ages, kind="discard_terminated"), [[9.0]])
+        self.assertEqual(_label_hits(ages, kind="discard_pool_short"), [])
+
+        # No existence query timestamp (e.g. the query path raised): no age.
+        collector = self._run_outcome(
+            0, 2048, False, query_done_ts=None, kv_last_ts=5.0
+        )
+        self.assertEqual(collector.storage_read_age_seconds.values, {})
+
+
+class _Pool:
+    def __init__(self, size, free):
+        self.size = self.logical_size = size
+        self.free = free
+
+    def available_size(self):
+        return self.free
+
+
+class _NoAllocatorPool(_Pool):
+    def available_size(self):
+        raise NotImplementedError("reuses SWA transfer indices and has no allocator")
+
+
+class TestDiagnosticFlagOff(CustomTestCase):
+    def test_flag_needs_enable_metrics(self):
+        """Without --enable-metrics nothing would be recorded, so the flag must
+        not switch the hit-count all-reduce to the packed shape either."""
+        _diagnostic_flag(self, True, metrics=False)
+        self.assertFalse(hicache_diagnostic_metrics_enabled())
+        collector = _FakeStorageCollector({"model_name": "m"})
+        self.assertFalse(hasattr(collector, "storage_read_failed_keys_total"))
+
+        _diagnostic_flag(self, True, metrics=True)
+        self.assertTrue(hicache_diagnostic_metrics_enabled())
+
+    def test_collector_registers_no_diagnostic_metrics(self):
+        """With the flag off the new series are never created, so /metrics
+        shows nothing extra."""
+        _diagnostic_flag(self, False)
+        collector = _FakeStorageCollector({"model_name": "m"})
+        for name in (
+            "storage_read_failed_keys_total",
+            "hybrid_prefetch_result_total",
+            "storage_read_age_seconds",
+            "prefetch_query_rank_spread_tokens",
+        ):
+            self.assertFalse(hasattr(collector, name), name)
+
+    def test_outcome_logging_is_skipped(self):
+        collector = TestHybridPrefetchOutcomeMetrics._run_outcome(
+            self, 2048, 2048, False, diagnostic=False, query_done_ts=1.0, kv_last_ts=2.0
+        )
+        self.assertEqual(collector.hybrid_prefetch_result_total.values, {})
+        self.assertEqual(collector.storage_read_age_seconds.values, {})
+
+
+class TestHostPoolStats(CustomTestCase):
+    def _reporter(self):
+        group = SimpleNamespace(
+            entry_map={
+                PoolName.KV: SimpleNamespace(host_pool=_Pool(1024, 1024)),
+                PoolName.MAMBA: SimpleNamespace(host_pool=_Pool(64, 16)),
+                PoolName.INDEXER: SimpleNamespace(host_pool=_Pool(1024, 1024)),
+                PoolName.DEEPSEEK_V4_C4_STATE: SimpleNamespace(
+                    host_pool=_NoAllocatorPool(32, 0)
+                ),
+            }
+        )
+        reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
+        reporter.stats = SchedulerStats()
+        reporter.scheduler = SimpleNamespace(
+            enable_hierarchical_cache=True,
+            tree_cache=SimpleNamespace(
+                token_to_kv_pool_host=_Pool(1024, 1000), host_pool_group=group
+            ),
+        )
+        return reporter
+
+    def test_flag_off_reports_no_pool_stats(self):
+        _diagnostic_flag(self, False)
+        reporter = self._reporter()
+        reporter._log_hicache_stats()
+        self.assertEqual(reporter.stats.hicache_host_pool_stats, {})
+        self.assertEqual(reporter.stats.hicache_host_used_tokens, 24)
+
+    def test_only_allocator_pools_are_read(self):
+        """A pool whose available_size() raises (DeepSeek V4 state pools) must
+        not take the scheduler down, and derived pools that never allocate must
+        not be reported as idle."""
+        _diagnostic_flag(self, True)
+        reporter = self._reporter()
+        reporter._log_hicache_stats()
+        self.assertEqual(reporter.stats.hicache_host_pool_stats, {"mamba": (48, 64)})
+        self.assertEqual(reporter.stats.hicache_host_used_tokens, 24)
+
+
+def _peer_min(peers):
+    """_all_reduce stand-in for a two-rank group: elementwise MIN with a peer."""
+
+    def reduce(tensor, op, groups):
+        assert op == torch.distributed.ReduceOp.MIN
+        peer = peers.pop(0)
+        assert tensor.shape == peer.shape, "ranks must pack identically"
+        tensor.copy_(torch.minimum(tensor, peer))
+
+    return reduce
+
+
+class TestPrefetchRankSpread(CustomTestCase):
+    def test_query_spread_drops_non_signal_samples(self):
+        """Only clean queries where some rank hit are recorded: a rank that saw
+        the terminate reports 0 without querying, assume_stored skips the query,
+        and all-rank misses would flood the zero bucket."""
+        cache = _hit_drain_fixture()
+        cache.enable_storage_metrics = True
+        cache.enable_diagnostic_metrics = True
+        cache.storage_metrics_collector = Mock()
+        cache._invalidate_absent_from_hit_query = Mock()
+        cache.discard_storage_prefetch_accounting = Mock()
+        cases = [
+            ("clean", 1024, 0, False, False),
+            ("disagree", 0, 2048, False, False),
+            ("terminated", 0, 2048, True, False),
+            ("assumed", 1024, 0, False, True),
+            ("all_miss", 0, 0, False, False),
+        ]
+        for rid, hit, spread, terminated, assumed in cases:
+            cache.cache_controller.prefetch_hit_queue.put(
+                SimpleNamespace(
+                    handle=CacheRequestHandle(rid, 0),
+                    storage_hit_count=hit,
+                    query_rank_spread=spread,
+                    assume_stored=assumed,
+                    is_terminated=lambda t=terminated: t,
+                )
+            )
+        cache._drain_storage_control_queues_impl(
+            n_storage_hit=len(cases),
+            n_ack_prefetch=0,
+            n_backup=0,
+            n_release=0,
+            extra_release_counts={},
+            log_metrics=False,
+        )
+        logged = [
+            c.args[0]
+            for c in cache.storage_metrics_collector.log_prefetch_query_rank_spread.call_args_list
+        ]
+        self.assertEqual(logged, [0, 2048])
+
+    def test_query_spread_flag_off_records_nothing(self):
+        cache = _hit_drain_fixture()
+        cache.enable_storage_metrics = True
+        cache.storage_metrics_collector = Mock()
+        cache._invalidate_absent_from_hit_query = Mock()
+        cache.discard_storage_prefetch_accounting = Mock()
+        cache.cache_controller.prefetch_hit_queue.put(
+            SimpleNamespace(
+                handle=CacheRequestHandle("disagree", 0),
+                storage_hit_count=0,
+                query_rank_spread=2048,
+                assume_stored=False,
+                is_terminated=lambda: False,
+            )
+        )
+        cache._drain_storage_control_queues_impl(
+            n_storage_hit=1,
+            n_ack_prefetch=0,
+            n_backup=0,
+            n_release=0,
+            extra_release_counts={},
+            log_metrics=False,
+        )
+        cache.storage_metrics_collector.log_prefetch_query_rank_spread.assert_not_called()
+
+    def test_ack_reduction_keeps_scalar_shape(self):
+        """The completion-sync collectives carry no spread: completed_tokens is
+        a scalar and pool hits one int per pool, as before."""
+        ctrl = object.__new__(HybridCacheController)
+        ctrl.prefetch_completion_sync_groups = []
+        pools = list(PoolName)
+        peer_hits = [0] * len(pools)
+        peer_hits[pools.index(PoolName.MAMBA)] = 3
+        ctrl._all_reduce = _peer_min(
+            [
+                torch.tensor(60, dtype=torch.int),
+                torch.tensor(peer_hits, dtype=torch.int),
+            ]
+        )
+        ack = PrefetchAck(
+            rid="r",
+            operation=None,
+            completed_tokens=100,
+            pool_hits={PoolName.MAMBA.value: 5},
+        )
+        ctrl._reduce_prefetch_ack(ack)
+        self.assertEqual(ack.completed_tokens, 60)
+        self.assertEqual(ack.pool_hits[PoolName.MAMBA.value], 3)
+
+    def _query(self, ctrl, peer_tensor):
+        ctrl.storage_stop_event = threading.Event()
+        ctrl.prefetch_queue = Queue()
+        ctrl.prefetch_hit_queue = Queue()
+        ctrl.prefetch_hits_sync_groups = []
+        ctrl.page_size = 64
+        ctrl._storage_hit_query = lambda op: (["h"] * 4, 256)
+        reduce = _peer_min([peer_tensor])
+
+        def reduce_then_stop(tensor, op, groups):
+            reduce(tensor, op, groups)
+            ctrl.storage_stop_event.set()
+
+        ctrl._all_reduce = reduce_then_stop
+        ctrl.prefetch_queue.put(SimpleNamespace(is_terminated=lambda: False))
+        HiCacheController.prefetch_thread_func(ctrl)
+        return ctrl.prefetch_hit_queue.get_nowait()
+
+    def test_query_reduction_shape_matches_the_other_collective_users(self):
+        """The hit-sync groups are also reduced as a scalar by the PP prefetch
+        ticket path; a rank that packs a different shape deadlocks the group.
+        Packing is therefore enabled only when the PP ticket group is absent."""
+        ctrl = object.__new__(HiCacheController)
+        ctrl.enable_diagnostic_metrics = True
+        ctrl.pp_prefetch_command_group = None
+        op = self._query(ctrl, torch.tensor([128, -128], dtype=torch.int))
+        self.assertEqual((op.storage_hit_count, op.query_rank_spread), (128, 128))
+        self.assertEqual(op.hash_value, ["h"] * 2)
+
+        ctrl = object.__new__(HiCacheController)
+        ctrl.enable_diagnostic_metrics = True
+        ctrl.pp_prefetch_command_group = object()
+        op = self._query(ctrl, torch.tensor(128, dtype=torch.int))
+        self.assertEqual(op.storage_hit_count, 128)
+        self.assertFalse(hasattr(op, "query_rank_spread"))
+
+    def test_flag_off_keeps_the_original_scalar_collective(self):
+        """With the flag off the hit-count all-reduce has the pre-change shape,
+        so a mixed rollout of this code with the flag off cannot mismatch."""
+        ctrl = object.__new__(HiCacheController)
+        ctrl.enable_diagnostic_metrics = False
+        ctrl.pp_prefetch_command_group = None
+        op = self._query(ctrl, torch.tensor(128, dtype=torch.int))
+        self.assertEqual(op.storage_hit_count, 128)
+        self.assertFalse(hasattr(op, "query_rank_spread"))
 
 
 if __name__ == "__main__":

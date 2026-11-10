@@ -79,6 +79,10 @@ class Observability(msgspec.Struct):
         bool,
         "Enable estimated MFU-related prometheus metrics.",
     ] = False
+    enable_hicache_diagnostic_metrics: A[
+        bool,
+        "Enable diagnostic prometheus metrics for hybrid HiCache L3 prefetch discards and non-KV L2 host pools. Requires --enable-metrics. Every rank of an instance must use the same value, because it changes the shape of the L3 hit-count all-reduce.",
+    ] = False
     enable_metrics_for_all_schedulers: A[
         bool,
         "Enable --enable-metrics-for-all-schedulers when you want schedulers on all TP ranks (not just TP 0) to record request metrics separately. This is especially useful when dp_attention is enabled, as otherwise all metrics appear to come from TP 0.",

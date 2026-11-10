@@ -2,6 +2,7 @@ import ctypes
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from collections.abc import Sequence
@@ -25,7 +26,10 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEntry
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-from sglang.srt.observability.metrics_collector import StorageMetrics
+from sglang.srt.observability.metrics_collector import (
+    StorageMetrics,
+    hicache_diagnostic_metrics_enabled,
+)
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600  # 10min
@@ -608,6 +612,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.pp_size = 1
                 self.attn_cp_rank = 0
                 self.attn_cp_size = 1
+            self.enable_diagnostic_metrics = (
+                self.enable_storage_metrics and hicache_diagnostic_metrics_enabled()
+            )
 
             self.enable_pp = self.pp_size > 1
             if self.enable_pp:
@@ -640,6 +647,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.backup_pgs = []
             self.prefetch_bandwidth = []
             self.backup_bandwidth = []
+            # (pool, raw return value) -> failed key count, drained by get_stats().
+            # The lock is only taken when a batch read had a failure.
+            self._read_failed_keys = {}
+            self._read_failed_keys_lock = threading.Lock()
+            self._read_codes_logged = set()
 
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
@@ -1043,11 +1055,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     io_results[i] = res
         else:
             io_results = self._get_batch_zero_copy_impl(
-                all_key_strs, all_ptrs, all_sizes
+                all_key_strs, all_ptrs, all_sizes, pool=None
             )
 
         results: dict = {}
         for name, key_multiplier, start, end in prepared:
+            if (
+                not is_set
+                and self.enable_diagnostic_metrics
+                and io_results[start:end]
+                and min(io_results[start:end]) <= 0
+            ):
+                self._record_read_failures(str(name), io_results[start:end])
             results[name] = self._batch_postprocess(
                 io_results[start:end],
                 is_set_operate=is_set,
@@ -1500,13 +1519,49 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
 
     def _get_batch_zero_copy_impl(
-        self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
+        self,
+        key_strs: List[str],
+        buffer_ptrs: List[Any],
+        buffer_sizes: List[Any],
+        # None: the caller spans several pools and attributes failures itself.
+        pool: Optional[str] = "kv",
     ) -> List[int]:
         if self._uses_multi_buffer(buffer_ptrs):
-            return self.store.batch_get_into_multi_buffers(
+            results = self.store.batch_get_into_multi_buffers(
                 key_strs, buffer_ptrs, buffer_sizes
             )
-        return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+        else:
+            results = self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+        # Fast path: one min() over the batch; per-key counting only on failure.
+        if (
+            pool is not None
+            and self.enable_diagnostic_metrics
+            and results
+            and min(results) <= 0
+        ):
+            self._record_read_failures(pool, results)
+        return results
+
+    def _record_read_failures(self, pool: str, results: List[int]) -> None:
+        failed = {}
+        for res in results:
+            if res <= 0:
+                failed[res] = failed.get(res, 0) + 1
+        with self._read_failed_keys_lock:
+            for code, count in failed.items():
+                key = (pool, code)
+                self._read_failed_keys[key] = self._read_failed_keys.get(key, 0) + count
+                if key not in self._read_codes_logged:
+                    # Once per (pool, raw value): shows which values batch_get
+                    # actually returns, to map them onto Mooncake error codes.
+                    self._read_codes_logged.add(key)
+                    logger.warning(
+                        "Mooncake batch read first saw value %d for pool=%s "
+                        "(%d keys in this batch)",
+                        code,
+                        pool,
+                        count,
+                    )
 
     def _batch_exist(
         self, key_strs: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
@@ -1535,4 +1590,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self.backup_pgs.clear()
         self.prefetch_bandwidth.clear()
         self.backup_bandwidth.clear()
+        with self._read_failed_keys_lock:
+            storage_metrics.read_failed_keys = self._read_failed_keys
+            self._read_failed_keys = {}
         return storage_metrics

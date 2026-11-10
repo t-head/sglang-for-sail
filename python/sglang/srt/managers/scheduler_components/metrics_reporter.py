@@ -16,6 +16,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import EPLB_BALANCEDNESS_WINDOW_SIZES
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
     QueueCount,
@@ -23,6 +24,7 @@ from sglang.srt.observability.metrics_collector import (
     SchedulerMetricsCollectorContext,
     SchedulerStats,
     compute_routing_key_stats,
+    hicache_diagnostic_metrics_enabled,
 )
 from sglang.srt.observability.scheduler_stage_metrics import (
     SchedulerStageMetricsRecorder,
@@ -1225,6 +1227,19 @@ class SchedulerMetricsReporter:
         host_total = host_pool.logical_size
         self.stats.hicache_host_used_tokens = host_total - host_pool.available_size()
         self.stats.hicache_host_total_tokens = host_total
+
+        group = getattr(self.scheduler.tree_cache, "host_pool_group", None)
+        if group is not None and hicache_diagnostic_metrics_enabled():
+            pool_stats = {}
+            # Pools that own an allocator; derived pools reuse KV's indices,
+            # and some (DeepSeek V4 state pools) raise on available_size().
+            for name in (PoolName.MAMBA,):
+                entry = group.entry_map.get(name)
+                if entry is None:
+                    continue
+                pool = entry.host_pool
+                pool_stats[name.value] = (pool.size - pool.available_size(), pool.size)
+            self.stats.hicache_host_pool_stats = pool_stats
 
     def _update_lora_metrics(self):
         """Update LoRA pool metrics for monitoring and autoscaling."""
