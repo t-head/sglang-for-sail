@@ -218,6 +218,14 @@ class MooncakeTransferEngine:
             timeout_s=envs.SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT.get(),
             what=f"Mooncake TransferEngine.initialize({hostname!r}, {protocol!r}, {device_name!r})",
         )
+        logger.info(
+            "Mooncake TransferEngine initialized: hostname=%s, protocol=%s, "
+            "gpu_id=%s, device_name=%r (empty means mooncake auto-selects)",
+            hostname,
+            protocol,
+            self.gpu_id,
+            device_name if device_name is not None else "",
+        )
         if ret_value != 0:
             logger.error("Mooncake Transfer Engine initialization failed.")
             raise RuntimeError("Mooncake Transfer Engine initialization failed.")
