@@ -2213,6 +2213,10 @@ class Envs:
     SGLANG_OPT_USE_PREFILL_LITE_TOPK = EnvBool(False)
     # Raise the per-rank prefill Indexer score tile limit to 2 GiB.
     SGLANG_OPT_DSV41_LARGE_PREFILL_SCORE_BUDGET = EnvBool(False)
+    # DeepSeek-V4.1 eager prefill indexer top-k: select through the two-level
+    # candidate structure (block maxima, then only the kept blocks) instead of a
+    # full-width pass. 0 restores the dense top-k for A/B.
+    SGLANG_OPT_DSV41_TOPK_CANDIDATES = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
