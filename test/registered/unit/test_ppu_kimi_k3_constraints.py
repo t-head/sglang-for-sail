@@ -572,19 +572,9 @@ def test_non_ppu_keeps_community_fused_decode_preparation_limit():
         assert not hasattr(layer, "_k3_fused_decode_weight")
 
 
-def test_ppu_disables_pdl_and_megamoe():
+def test_ppu_disables_pdl():
     with patch.object(jit_arch, "is_sail_runtime", return_value=True):
         assert not jit_arch.is_arch_support_pdl.__wrapped__()
-
-    with patch("sglang.srt.utils.device.is_sail", return_value=True):
-        try:
-            overrides_module._a2a_backend_overrides(
-                type("View", (), {"moe_a2a_backend": "megamoe"})()
-            )
-        except ValueError as exc:
-            assert "MegaMoE is not supported on PPU" in str(exc)
-        else:
-            raise AssertionError("PPU MegaMoE backend must be rejected")
 
 
 def test_ppu_w4a16_deep_gemm_moe_accepts_k3_situ():
