@@ -193,8 +193,18 @@ class SchedulePolicy:
         enable_hierarchical_cache: bool,
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
+        enable_hrrn_prefill_chunk_limit: bool = False,
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
+        self.enable_hrrn_prefill_chunk_limit = enable_hrrn_prefill_chunk_limit
+        if enable_hrrn_prefill_chunk_limit and self.policy != CacheAwarePolicy.HRRN:
+            logger.warning(
+                "--enable-hrrn-prefill-chunk-limit has no effect: the effective "
+                f"schedule policy is {self.policy.value}, not hrrn."
+            )
+        self._chunk_limit_batches = 0
+        self._chunk_limit_reserved_tokens = 0
+        self._chunk_limit_unused_tokens = 0
         self.tree_cache = tree_cache
         self.enable_hierarchical_cache = enable_hierarchical_cache
         self.enable_priority_scheduling = enable_priority_scheduling
@@ -412,26 +422,68 @@ class SchedulePolicy:
         )
 
     def shortest_prefill_chunk_limit(
-        self, chunked_req: Req, waiting_queue: List[Req], budget: int, page_size: int
+        self,
+        chunked_req: Req,
+        waiting_queue: List[Req],
+        budget: int,
+        page_size: int,
+        max_reqs: Optional[int] = None,
     ) -> Optional[int]:
-        """Cap the active prefill chunk to reserve tokens for shorter waiting requests."""
+        """Cap the active prefill chunk to reserve tokens for shorter waiting requests.
+
+        `max_reqs` caps how many waiting requests get a reservation; pass the
+        number this pass can still admit so rows or state slots that are not
+        free do not leave reserved budget unused.
+        """
+        hrrn_limited = (
+            self.policy == CacheAwarePolicy.HRRN
+            and self.enable_hrrn_prefill_chunk_limit
+        )
         if (
-            self.policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+            not (self.policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST or hrrn_limited)
             or budget < 2 * page_size
         ):
             return None
         remaining = len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
+        max_reserved = budget - page_size
+        if hrrn_limited:
+            # HRRN aging never sees the chunked request, so keep half of every
+            # chunk for it; this bounds its slowdown at 2x. Arbitrary, not tuned.
+            max_reserved = budget // 2 // page_size * page_size
         reserved = 0
+        num_reserved = 0
         for req in waiting_queue:
+            if max_reqs is not None and num_reserved >= max_reqs:
+                break
             work = self._shortest_prefill_work(req)
             charge = _ceil_div(work, page_size) * page_size
-            if work >= remaining or reserved + charge > budget - page_size:
+            if work >= remaining or reserved + charge > max_reserved:
                 break
             reserved += charge
+            num_reserved += 1
         if not reserved:
             return None
         # Page alignment keeps continuation boundaries allocator-compatible.
         return (budget - reserved) // page_size * page_size
+
+    def record_chunk_limit_outcome(
+        self, *, limit: Optional[int], budget: int, leftover_tokens: int
+    ) -> None:
+        """Count reserved chunk tokens that no waiting request ended up using."""
+        if limit is None:
+            return
+        reserved = budget - limit
+        self._chunk_limit_batches += 1
+        self._chunk_limit_reserved_tokens += reserved
+        self._chunk_limit_unused_tokens += min(max(leftover_tokens, 0), reserved)
+        if self._chunk_limit_batches % 128 == 1:
+            logger.info(
+                "Prefill chunk limit: limited_batches=%d reserved_tokens=%d "
+                "unused_reserved_tokens=%d",
+                self._chunk_limit_batches,
+                self._chunk_limit_reserved_tokens,
+                self._chunk_limit_unused_tokens,
+            )
 
     @staticmethod
     def _sort_by_longest_prefix(
@@ -826,6 +878,19 @@ class PrefillAdder:
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
+
+    def reservable_new_reqs(self, row_cap: int) -> int:
+        """New requests this pass can admit next to the chunked continuation.
+
+        `row_cap` is the scheduler's row gate for `can_run_list`, which also
+        counts the continuation; the continuation already holds its state slot.
+        """
+        num = row_cap - len(self.can_run_list) - 1
+        if self.prefill_max_requests is not None:
+            num = min(num, self.prefill_max_requests - len(self.can_run_list) - 1)
+        if self.rem_mamba_slots is not None:
+            num = min(num, self.rem_mamba_slots)
+        return max(num, 0)
 
     def budget_state(self):
         no_token = not self.memory_budget.has_capacity()
@@ -1547,9 +1612,9 @@ class PrefillAdder:
                 return AddReqResult.OTHER
             max_new_tokens = 0
         elif chunk_tokens_limit is not None and chunk_fit_tokens > chunk_tokens_limit:
-            if (
-                has_chunked_req
-                and get_schedule().schedule_policy == "shortest-prefill-first"
+            if has_chunked_req and (
+                self.chunked_req_limit is not None
+                or get_schedule().schedule_policy == "shortest-prefill-first"
             ):
                 # Only one unfinished chunked request can be tracked.
                 return AddReqResult.OTHER

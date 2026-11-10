@@ -204,10 +204,10 @@ class TestPrefillAdder(CustomTestCase):
         req.full_untruncated_fill_ids = list(range(12))
         return req
 
-    def create_shortest_prefill_adder(self, *, chunk_tokens=4096):
-        override = get_context().override_server_args(
-            schedule_policy="shortest-prefill-first"
-        )
+    def create_shortest_prefill_adder(
+        self, *, chunk_tokens=4096, schedule_policy="shortest-prefill-first"
+    ):
+        override = get_context().override_server_args(schedule_policy=schedule_policy)
         override.install()
         self.addCleanup(override.restore)
         self.mock_tree_cache.supports_mamba.return_value = False
@@ -257,6 +257,30 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIsNone(adder.new_chunked_req)
         self.assertIsNone(req.extend_end)
         self.mock_tree_cache.init_load_back.assert_not_called()
+
+    def test_hrrn_chunk_limit_guards_single_unfinished_chunk(self):
+        # With a limit applied the capped continuation leaves budget behind; a
+        # second truncated request would trip `assert self.chunked_req is None`.
+        for limit, expect_rejected in [(256, True), (None, False)]:
+            with self.subTest(limit=limit):
+                adder = self.create_shortest_prefill_adder(
+                    chunk_tokens=512, schedule_policy="hrrn"
+                )
+                adder.chunked_req_limit = limit
+                req = self.create_shared_req("second-chunk")
+                req.full_untruncated_fill_ids = list(range(1024))
+                adder.add_one_req(req, has_chunked_req=True, truncation_align_size=None)
+                self.assertEqual(adder.new_chunked_req is None, expect_rejected)
+
+    def test_reservable_new_reqs_respects_admission_gates(self):
+        adder = self.create_shortest_prefill_adder(schedule_policy="hrrn")
+        # The row gate also counts the continuation, so one row is never free.
+        self.assertEqual(adder.reservable_new_reqs(8), 7)
+        self.assertEqual(adder.reservable_new_reqs(0), 0)
+        adder.prefill_max_requests = 3
+        self.assertEqual(adder.reservable_new_reqs(8), 2)
+        adder.rem_mamba_slots = 1
+        self.assertEqual(adder.reservable_new_reqs(8), 1)
 
     def test_shortest_prefill_rechecks_chunk_limit_after_host_miss(self):
         adder = self.create_shortest_prefill_adder(chunk_tokens=512)

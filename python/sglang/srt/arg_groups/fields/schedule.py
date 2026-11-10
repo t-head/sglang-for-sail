@@ -104,6 +104,15 @@ class Schedule(msgspec.Struct):
             ],
         ),
     ] = "fcfs"
+    enable_hrrn_prefill_chunk_limit: A[
+        bool,
+        "Enable the shortest-prefill-first chunk budget control under hrrn: "
+        "a long request being chunk-prefilled gives part of each batch to "
+        "shorter waiting requests, at most half of the chunk budget and only as "
+        "many requests as the batch can still admit. With more than 128 waiting "
+        "requests hrrn sorting falls back to fcfs and the reservation follows "
+        "arrival order.",
+    ] = False
     enable_priority_scheduling: A[
         bool,
         "Enable priority scheduling. Requests with higher priority integer values will be scheduled first by default.",
