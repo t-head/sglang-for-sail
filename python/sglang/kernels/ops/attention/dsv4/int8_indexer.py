@@ -90,8 +90,13 @@ def int8_index_logits(q, weights, kv, lens):
 
 
 def int8_paged_index_logits(
-    q, weights, cache, lens, page_table, plan, width, page_size
+    q, weights, cache, lens, page_table, plan, width, page_size, rows_per_request=1
 ):
+    """Weighted paged logits keep one query per row, even for multi-row MTP.
+
+    Current PPU DeepGEMM requires next_n=1 for weighted logits. The grouping
+    hint describes callers' flattened rows; it must not merge their lengths.
+    """
     from deep_gemm import int8_paged_mqa_logits
 
     assert q.shape[-1] == 128 and cache.shape[1] == page_size * 132

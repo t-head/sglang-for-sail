@@ -729,6 +729,8 @@ def decode_score_chunks(
 
     def score_rows(rows, plan):
         if indexer.use_int8:
+            # Weighted PPU kernels consume each MTP row independently.
+            group = metadata.rows_per_request
             return int8_paged_index_logits(
                 q[rows],
                 weights[rows],
@@ -738,6 +740,7 @@ def decode_score_chunks(
                 plan,
                 metadata.max_compressed_seq_len,
                 metadata.compressed_page_size,
+                rows_per_request=group,
             )[:, :lmax]
         return deep_gemm_fp4_paged_mqa_logits(
             (q_fp4[rows].unsqueeze(1), q_sf[rows].unsqueeze(1)),
