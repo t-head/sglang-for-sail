@@ -664,6 +664,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 )
             )
             stack.enter_context(get_parallel().override(moe_ep_rank=0))
+            stack.enter_context(patch.object(mega_gate_runtime, "_is_sail", False))
             stack.enter_context(patch.dict(sys.modules, {"deep_gemm": deep_gemm}))
             stack.enter_context(patch.object(topk_module, "_is_cuda", True))
             stack.enter_context(
