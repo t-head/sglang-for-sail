@@ -985,7 +985,12 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
             return current_platform.supports_speculative_draft_attention_backend(
                 "DFLASH", backend
             )
-        if backend in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
+        mla_draft_backends = (
+            ("flashmla",) if get_platform().is_sail else DFLASH_MLA_ONLY_DRAFT_BACKENDS
+        )
+        if get_platform().is_sail and backend in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
+            return False
+        if backend in mla_draft_backends:
             # trtllm_mla has no bidirectional mask: taken only when named.
             if (
                 backend == "trtllm_mla"

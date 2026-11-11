@@ -819,3 +819,23 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+
+
+register_kernel(
+    KernelSpec(
+        op="attention.bf16_head_gate_q_scale",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsa.head_gate:bf16_head_gate_q_scale",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 0))}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.sail_deep_select_ragged",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsa.deep_select:topk_transform_ragged",
+        # Triton packing plus the SAIL DeepSelect wheel; selected only by SAIL
+        # BF16 runtime callers, not a claim of NVIDIA or wheel availability.
+        capabilities=CUDA_ONLY,
+    )
+)

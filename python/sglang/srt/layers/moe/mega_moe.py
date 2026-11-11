@@ -622,14 +622,15 @@ def run_mega_routed_experts(
             activation=activation,
         )
 
+    topk_ids_dtype = torch.int64 if _is_sail else torch.int32
     if routing_in_buffer:
         assert num_tokens > 0 and _device_sm != 90 and mma_type == "fp8xfp4"
         topk_ids_in = topk_weights_in = None
     elif num_tokens > 0:
-        topk_ids_in = topk_ids.to(torch.int32)
+        topk_ids_in = topk_ids.to(topk_ids_dtype)
         topk_weights_in = topk_weights.to(torch.float32)
     else:
-        topk_ids_in = hidden_states.new_empty((0, top_k), dtype=torch.int32)
+        topk_ids_in = hidden_states.new_empty((0, top_k), dtype=topk_ids_dtype)
         topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
 
     if _device_sm == 90 and not _is_sail:
@@ -647,7 +648,7 @@ def run_mega_routed_experts(
 
     # Both FP8 types go through the JIT pre-dispatch below, which folds the scale
     # in-kernel; scaling here as well would apply it twice.
-    jit_pre_dispatch = mma_type in ("fp8xfp4", "fp8xfp8")
+    jit_pre_dispatch = not _is_sail and mma_type in ("fp8xfp4", "fp8xfp8")
     if routed_scaling_factor != 1.0:
         assert not routing_in_buffer
         if not jit_pre_dispatch:
@@ -655,7 +656,22 @@ def run_mega_routed_experts(
 
     global_num_tokens = _mega_moe_global_tokens_hint(buf)
     mega_kwargs = {"recipe": (1, 1, 32)}
-    if mma_type == "nvfp4xnvfp4":
+    if _is_sail:
+        deep_gemm.mega_moe_pre_dispatch(
+            hidden_states.contiguous(),
+            topk_ids_in.contiguous(),
+            topk_weights_in.contiguous(),
+            buf.x,
+            buf.x_sf,
+            buf.topk_idx,
+            buf.topk_weights,
+            num_tokens=num_tokens,
+            group_size=32,
+            mma_type=_ppu_mega_moe_mma_type(mma_type),
+        )
+        if mma_type != "mxf4xmxf4":
+            mega_kwargs = {}
+    elif mma_type == "nvfp4xnvfp4":
         # Per-token outer scales go to buf.x_scales; the kernel folds them with
         # the per-expert alphas in the L1 / L2 epilogues.
         deep_gemm.mega_moe_pre_dispatch(
@@ -739,7 +755,7 @@ def run_mega_routed_experts(
     # Allocate at least one row so y has a non-null CUDA data_ptr;
     # the DeepGEMM tvm-ffi binding rejects nullptr in convert_to_torch_tensor().
     y = torch.empty(
-        (max(num_tokens, 1), hidden_size),
+        (num_tokens if _is_sail else max(num_tokens, 1), hidden_size),
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
@@ -754,11 +770,14 @@ def run_mega_routed_experts(
         kernel_kwargs["shared_l1_weights"] = shared_l1_weights
         kernel_kwargs["shared_l2_weights"] = shared_l2_weights
     with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
-        mega_moe_kernel = (
-            deep_gemm.fp4_fp4_mega_moe
-            if _is_sail and mma_type == "mxf4xmxf4"
-            else deep_gemm.fp8_fp4_mega_moe
-        )
+        if _is_sail:
+            mega_moe_kernel = {
+                "mxf4xmxf4": deep_gemm.fp4_fp4_mega_moe,
+                "fp8xmxfp4": deep_gemm.fp8_fp4_mega_moe,
+                "bf16xmxfp4": deep_gemm.bf16_fp4_mega_moe,
+            }[mma_type]
+        else:
+            mega_moe_kernel = deep_gemm.fp8_fp4_mega_moe
         mega_moe_kernel(
             y,
             experts.mega_l1_weights,
