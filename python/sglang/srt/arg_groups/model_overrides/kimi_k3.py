@@ -82,6 +82,9 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
             # lacks that DCP path (TypeError: unexpected kwarg 'causal_seqs').
             overrides["speculative_attention_mode"] = "decode"
 
+        if get_platform().is_sail and cfg.speculative_algorithm == "EAGLE3":
+            overrides["speculative_attention_mode"] = "decode"
+
         if get_platform().is_npu:
             overrides.update(
                 dcp_comm_backend="a2a",
@@ -180,6 +183,8 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
 @_register_for("KimiK31ForConditionalGeneration")
 def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
+    if get_platform().is_sail and cfg.enable_unified_memory:
+        raise ValueError("Kimi-K3.1 does not support --enable-unified-memory on SAIL.")
     overrides = {}
     if cfg.dcp_size > 1:
         if cfg.dcp_size & (cfg.dcp_size - 1) or cfg.tp_size % cfg.dcp_size:
@@ -217,7 +222,9 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
                 dflash_dcp_mla_draft_backend,
             )
 
-            draft_backend = dflash_dcp_mla_draft_backend()
+            draft_backend = (
+                "flashmla" if get_platform().is_sail else dflash_dcp_mla_draft_backend()
+            )
             if cfg.speculative_draft_attention_backend not in (None, draft_backend):
                 raise ValueError(
                     "Kimi-K3.1 DCP + DFLASH needs "
@@ -253,6 +260,9 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
     if cfg.enable_flashmla_prefill_token_packing is None:
         logger.info("Kimi-K3.1 enables FlashMLA prefill token packing by default.")
         overrides["enable_flashmla_prefill_token_packing"] = True
+    if get_platform().is_sail:
+        # PPU sparse MLA uses its own metadata rather than the native token-packing ABI.
+        overrides["enable_flashmla_prefill_token_packing"] = False
     overrides["decode_state_free_radix_default"] = True
     return overrides
 

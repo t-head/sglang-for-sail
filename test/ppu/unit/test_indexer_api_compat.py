@@ -280,6 +280,7 @@ class TestIndexerAPI(unittest.TestCase):
             "_is_gfx95_supported": False,
             "_index_k_dcp": lambda: (1, 0),
             "is_sail": lambda: True,
+            "_index_k_dcp": lambda: (1, 0),
         }
         path = ATTENTION / "dsa/dsa_indexer.py"
         paged = load_symbol(path, "_get_topk_paged", namespace)

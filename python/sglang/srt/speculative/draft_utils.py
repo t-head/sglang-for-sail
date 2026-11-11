@@ -577,13 +577,11 @@ class DraftBackendFactory:
 
     def _create_flashmla_prefill_backend(self):
         if is_sail():
-            logger.warning(
-                "FlashMLA draft-extend backend construction is not supported on SAIL; "
-                "retaining the draft runner's existing attention backend."
+            from sglang.srt.hardware_backend.sail.attention.flashmla_backend import (
+                SailFlashMLABackend as FlashMLABackend,
             )
-            return None, None
-
-        from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
+        else:
+            from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 
         return (
             "flashmla",

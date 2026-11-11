@@ -592,9 +592,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             num_total_tokens = q.shape[0]
             real_bs = self.forward_metadata.block_kv_indices.shape[0]
             num_tokens_per_req = self.num_draft_tokens
-            if (
-                forward_batch.forward_mode.is_target_verify()
-                and forward_batch.spec_algorithm.is_dspark()
+            if forward_batch.forward_mode.is_target_verify() and (
+                forward_batch.spec_algorithm.is_dspark()
+                or forward_batch.spec_algorithm.is_dflash()
             ):
                 num_tokens_per_req = forward_batch.spec_info.draft_token_num
             strip_pad = (
@@ -611,8 +611,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
             if forward_batch.forward_mode.is_target_verify():
                 cache_seqlens = (
-                    forward_batch.seq_lens[:eff_bs].to(torch.int32)
-                    + self.num_draft_tokens
+                    forward_batch.seq_lens[:eff_bs].to(torch.int32) + num_tokens_per_req
                 )
             else:
                 cache_seqlens = self.forward_metadata.seq_lens_k[:eff_bs]

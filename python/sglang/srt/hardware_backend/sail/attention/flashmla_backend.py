@@ -23,6 +23,7 @@ from sglang.srt.layers.attention.flashmla_backend import (
 )
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -43,10 +44,115 @@ class SailFlashMLABackend(FlashMLABackend):
 
     def __init__(self, model_runner: ModelRunner, **kwargs):
         super().__init__(model_runner, **kwargs)
+        from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+
+        hf_config = model_runner.model_config.hf_config
+        self.is_dflash_mla_draft = bool(
+            model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_dflash_family()
+            and parse_dflash_draft_config(draft_hf_config=hf_config).is_mla
+        )
+        if self.is_dflash_mla_draft and not self.causal:
+            raise ValueError("SAIL FlashMLA DFLASH requires causal MLA draft layers.")
         if self.is_fp8_kvcache:
             raise NotImplementedError(
                 "FP8 KV cache is not supported by FlashMLA on SAIL."
             )
+
+    def _forward_ppu_dflash_sliding_window(
+        self, q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
+    ):
+        from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
+        from sglang.kernels.ops.attention.mla_window_indices import (
+            mla_window_sparse_indices,
+        )
+        from sglang.srt.hardware_backend.sail.attention.flash_mla import (
+            flash_mla_sparse_fwd,
+        )
+
+        if k is not None:
+            assert v is not None
+            if save_kv_cache:
+                cache_loc = KVWriteLoc.for_batch(forward_batch)
+                if k_rope is not None:
+                    self.kv_layers.layer(layer.layer_id).store_mla(
+                        layer, cache_loc, k, k_rope
+                    )
+                else:
+                    self.kv_layers.layer(layer.layer_id).store(layer, cache_loc, k, v)
+        if q_rope is not None:
+            q = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            q_rope = q_rope.view(
+                -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+            )
+            q = concat_mla_absorb_q_general(q, q_rope)
+
+        parallel = get_parallel()
+        total_rows = q.shape[0]
+        bs = self.forward_metadata.block_kv_indices.shape[0]
+        rows = bs * forward_batch.spec_info.draft_token_num
+        if rows == 0:
+            self._ppu_dflash_window_cache = None
+            out = q.new_zeros((total_rows, layer.tp_q_head_num * self.kv_lora_rank))
+            lse = torch.full(
+                (total_rows, layer.tp_q_head_num),
+                -float("inf"),
+                dtype=torch.float32,
+                device=q.device,
+            )
+            return (out, lse) if parallel.dcp_enabled else out
+
+        cache = getattr(self, "_ppu_dflash_window_cache", None)
+        if (
+            cache is not None
+            and cache[0] is forward_batch
+            and cache[1] == layer.layer_id - 1
+            and cache[2] == layer.sliding_window_size
+            and cache[3] == rows
+        ):
+            indices, counts, row_indptr = cache[4:]
+        else:
+            indices, counts = mla_window_sparse_indices(
+                req_to_token=self.req_to_token,
+                req_pool_indices=forward_batch.req_pool_indices[:bs],
+                positions=forward_batch.positions[:rows],
+                window_left=layer.sliding_window_size,
+                dcp_size=parallel.dcp_size if parallel.dcp_enabled else 1,
+                dcp_rank=parallel.dcp_rank if parallel.dcp_enabled else 0,
+                page_size=self.page_size,
+                v2p=self.runner_ids.full_v2p_table,
+                # Generate the PPU-required alignment in the index kernel.
+                top_k_alignment=256,
+            )
+            row_indptr = torch.arange(rows + 1, dtype=torch.int32, device=q.device)
+        self._ppu_dflash_window_cache = (
+            forward_batch,
+            layer.layer_id,
+            layer.sliding_window_size,
+            rows,
+            indices,
+            counts,
+            row_indptr,
+        )
+        kv = self.kv_layers.read(layer.layer_id).key()
+        out, _, lse = flash_mla_sparse_fwd(
+            q[:rows].reshape(rows, layer.tp_q_head_num, self.kv_cache_dim),
+            kv.view(-1, 1, self.kv_cache_dim),
+            indices.unsqueeze(1),
+            layer.scaling,
+            d_v=self.kv_lora_rank,
+            topk_length=counts,
+        )
+        # The PPU kernel returns +inf LSE for empty rows; DCP needs neutral
+        # partials (out=0, lse=-inf) for ranks owning no key in the window.
+        fixup_zero_kv_rows(out, lse, counts, row_indptr, 1)
+        out = out.reshape(rows, -1)
+        if rows < total_rows:
+            out = torch.nn.functional.pad(out, (0, 0, 0, total_rows - rows))
+            lse = torch.nn.functional.pad(
+                lse, (0, 0, 0, total_rows - rows), value=-float("inf")
+            )
+        return (out, lse) if parallel.dcp_enabled else out
 
     def _call_get_mla_metadata(self, *args, **kwargs):
         return get_mla_metadata(*args, **kwargs)
@@ -185,6 +291,10 @@ class SailFlashMLABackend(FlashMLABackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
+        if self.is_dflash_mla_draft and layer.sliding_window_size >= 0:
+            return self._forward_ppu_dflash_sliding_window(
+                q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
+            )
         if forward_batch.forward_mode == ForwardMode.EXTEND:
             return FlashInferMLAAttnBackend.forward_extend(
                 self,
