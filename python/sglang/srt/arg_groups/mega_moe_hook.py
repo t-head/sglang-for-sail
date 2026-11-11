@@ -202,6 +202,13 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
         decode_tokens = mega_moe_decode_tokens_per_rank(cfg)
         if (
             model_label == "KimiK31ForConditionalGeneration"
+            and cfg.max_running_requests is None
+        ):
+            raise ValueError(
+                "Kimi MegaMoE needs --max-running-requests to bound eager decode / verify rows."
+            )
+        if (
+            model_label == "KimiK31ForConditionalGeneration"
             and cfg.max_running_requests is not None
         ):
             # Kimi repacks its experts at load and has no oversized eager fallback.

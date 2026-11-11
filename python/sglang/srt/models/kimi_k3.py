@@ -914,6 +914,7 @@ class KimiK3MoE(nn.Module):
         from sglang.srt.environ import envs
         from sglang.srt.layers.moe.mega_moe import (
             _configure_mega_moe_deep_gemm_num_sms,
+            _mega_moe_mma_type,
         )
 
         # Under SP-MoE these rows are this rank's shard of the batch; an unpadded
@@ -928,6 +929,7 @@ class KimiK3MoE(nn.Module):
             f"{num_max_tokens_per_rank}; K3 has no non-mega fallback — raise "
             f"the env var to cover the per-rank rows"
         )
+        mma_type = _mega_moe_mma_type(self.experts)
         buf = self._mega_moe_buffer()
 
         if num_tokens > 0:
@@ -941,7 +943,18 @@ class KimiK3MoE(nn.Module):
                 (0, self._mega_top_k), dtype=torch.float32
             )
 
-        mega_moe_pre_dispatch(
+        valid_rows = None
+        if valid_token_count is not None and mma_type == "mxf4xmxf4":
+            # The graph bucket is static; its live CP prefix changes on replay.
+            # Mask NaNs as well as routes before quantization/dispatch.
+            valid_rows = (
+                torch.arange(num_tokens, device=routed_input.device) < valid_token_count
+            )
+            routed_input = routed_input.masked_fill(~valid_rows[:, None], 0)
+            topk_ids_in = topk_ids_in.masked_fill(~valid_rows[:, None], -1)
+            topk_weights_in = topk_weights_in.masked_fill(~valid_rows[:, None], 0)
+
+        dispatch_args = (
             routed_input,
             topk_ids_in,
             topk_weights_in,
@@ -949,9 +962,21 @@ class KimiK3MoE(nn.Module):
             buf.x_sf,
             buf.topk_idx,
             buf.topk_weights,
-            quant_group_size=32,
-            num_token_non_padded=valid_token_count,
         )
+        if mma_type == "mxf4xmxf4":
+            # The SGLang dispatcher writes FP8; packed E2M1 uses DeepGEMM.
+            deep_gemm.mega_moe_pre_dispatch(
+                *dispatch_args,
+                num_tokens=num_tokens,
+                group_size=32,
+                mma_type=mma_type,
+            )
+        else:
+            mega_moe_pre_dispatch(
+                *dispatch_args,
+                quant_group_size=32,
+                num_token_non_padded=valid_token_count,
+            )
         # At least one row so the tvm-ffi binding sees a non-null data_ptr.
         y = torch.empty(
             (max(num_tokens, 1), self.moe_hidden_size),
@@ -969,8 +994,9 @@ class KimiK3MoE(nn.Module):
                 fast_math=True,
             )
         y = y[:num_tokens]
-        if valid_token_count is not None:
-            valid_rows = torch.arange(num_tokens, device=y.device) < valid_token_count
+        # fp8xfp4: the pre-dispatch routes rows past valid_token_count to -1 and
+        # the combine writes zeros for a row with no route, so only mxf4 masks.
+        if valid_rows is not None:
             y.masked_fill_(~valid_rows[:, None], 0)
         if not self.experts.should_fuse_routed_scaling_factor_in_topk:
             if (
@@ -3834,6 +3860,15 @@ class KimiK3LinearForCausalLM(nn.Module):
         expected = {
             name for name, _ in self.named_parameters() if ".self_attn.indexer." in name
         }
+        num_dsa_layers = sum(
+            self.config.is_dsa_layer(i)
+            for i in range(self.model.start_layer, self.model.end_layer)
+        )
+        assert num_dsa_layers > 0 or not expected
+        assert len(expected) == 5 * num_dsa_layers, (
+            f"Kimi-K3.1: built {len(expected)} DSA indexer params, expected "
+            f"5 per DSA layer x {num_dsa_layers} layers."
+        )
         missing = sorted(expected - loaded_params)
         assert not missing, (
             f"Kimi-K3.1: {len(missing)} DSA indexer params were not loaded, "
@@ -3931,7 +3966,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                 continue
             if isinstance(layer.mlp, KimiK3MoE):
                 layer.mlp._merge_front_weights()
-                if layer.mlp._use_mega_moe and get_parallel().attn_cp_size > 1:
+                if layer.mlp._use_mega_moe:
                     # Under prefill CP the shared EP workspace must count
                     # against the KV budget, not first appear during warmup or
                     # graph capture. Other MegaMoE recipes are sized with the
@@ -3946,6 +3981,11 @@ class KimiK3LinearForCausalLM(nn.Module):
             if isinstance(layer.self_attn, KimiK3DeltaAttention):
                 layer.self_attn._merge_bfa_weights()
                 layer.self_attn._prepare_fused_decode()
+            if (
+                isinstance(layer.self_attn, KimiK3MLAAttention)
+                and layer.self_attn.indexer is not None
+            ):
+                layer.self_attn.indexer.prepare_merged_k_gate()
 
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer) or not isinstance(

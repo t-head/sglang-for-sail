@@ -1161,11 +1161,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
         # Match and lock only reusable FULL KV. The entire SWA tail must be
         # freshly allocated, including when the prefix comes from L2/L3.
+        full_kv_only = self.tree_cache.supports_full_kv_only_match()
         result = match_kv_cache(
             req,
             self.tree_cache,
             req.origin_input_ids,
-            cow_mamba=self.tree_cache.supports_mamba(),
+            cow_mamba=self.tree_cache.supports_mamba() and not full_kv_only,
+            full_kv_only=full_kv_only,
             max_prefix_len=max_prefix_len,
         )
         req.lock = self.tree_cache.lock(result.last_device_node)

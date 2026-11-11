@@ -72,3 +72,48 @@ def indexer_q_quant_head_gate(
             num_stages=0 if scale_fmt is not None else 2,
         )
     return q8, weights
+
+
+@triton.jit
+def _bf16_head_gate_q_scale_kernel(
+    gate_ptr,
+    q_scale_ptr,
+    out_ptr,
+    gate_stride,
+    n_heads,
+    gate_scale,
+    softmax_scale,
+    BLOCK: tl.constexpr,
+):
+    # out = float(bf16(float(gate) * gate_scale)) * q_scale * softmax_scale, i.e.
+    # bf16 `gate * n_heads**-0.5` then the fp32 q-scale fold, in one launch
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    mask = offs < n_heads
+    g = tl.load(gate_ptr + row * gate_stride + offs, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    g = (g * gate_scale).to(tl.bfloat16).to(tl.float32)
+    qs = tl.load(q_scale_ptr + row * n_heads + offs, mask=mask, other=0.0)
+    tl.store(out_ptr + row * n_heads + offs, g * qs * softmax_scale, mask=mask)
+
+
+def bf16_head_gate_q_scale(
+    gate: torch.Tensor, q_scale: torch.Tensor, softmax_scale: float
+) -> torch.Tensor:
+    """DSA indexer head weights [tokens, n_heads, 1] fp32 from the bf16 head
+    gate [tokens, n_heads] (row stride free) and the per-head q scales."""
+    num_tokens, n_heads = gate.shape
+    out = torch.empty((num_tokens, n_heads, 1), dtype=torch.float32, device=gate.device)
+    if num_tokens > 0:
+        _bf16_head_gate_q_scale_kernel[(num_tokens,)](
+            gate,
+            q_scale.contiguous(),
+            out,
+            gate.stride(0),
+            n_heads,
+            n_heads**-0.5,
+            softmax_scale,
+            BLOCK=triton.next_power_of_2(n_heads),
+        )
+    return out

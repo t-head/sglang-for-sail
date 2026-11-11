@@ -14,6 +14,7 @@ from sglang.kernels.ops.attention.dsa.fp8_fused_writer_hip import (
     fused_fp8_writer_geometry_supported,
     prepare_aiter_rope_caches,
 )
+from sglang.kernels.ops.attention.dsa.head_gate import bf16_head_gate_q_scale
 from sglang.kernels.ops.kvcache import dsa_index_k_cache as index_buf_accessor
 from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import (
     can_use_dsa_fused_store,
@@ -24,14 +25,17 @@ from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import (
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.configs.model_config import is_kimi_k31
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_dcp import (
     dcp_all_gather_rows_,
     dcp_split_rows,
 )
 from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import (
+    dcp_all_visible,
     dcp_gather_request_rows,
     dcp_local_topk,
+    dcp_localize_compact,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import DSANPUIndexerMixin
@@ -99,6 +103,7 @@ from sglang.srt.utils import (
     is_xpu,
 )
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.utils.log_utils import print_info_once
 
 logger = logging.getLogger(__name__)
 _FUSED_FP8_WRITER_LOGGED = False
@@ -121,6 +126,9 @@ def _decline_fused(reason: str) -> None:
         _FUSED_DECLINE_LOGGED.add(reason)
         logger.info("gfx950 fused DSA indexer declined this call: %s", reason)
 
+
+_MERGED_K_GATE_MAX_M = 16
+_INDEXER_TP_SPLIT_MIN_ROWS = 1024
 
 _is_npu = is_npu()
 _is_xpu = is_xpu()
@@ -392,6 +400,138 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     def _mqa_logits_free_mem_fraction() -> float:
         return mqa_logits_free_mem_fraction()
 
+    def prepare_merged_k_gate(self) -> None:
+        # Post-load, before graph capture: the bf16-head-gate decode reads x once
+        # through [wk | weights_proj], whose weights become views of it.
+        if not (
+            _is_cuda
+            and not is_sail()
+            and self.use_fp8
+            and self.bf16_head_gate
+            and self.skip_rope
+            and not self.use_dsa_indexer_fusion
+            and self.wk.weight.dtype == torch.bfloat16
+            and self.weights_proj.weight.dtype == torch.bfloat16
+        ):
+            return
+        from sglang.kernels.ops.gemm.tiny_gemm import can_use_tiny_gemm
+
+        n, k = self.head_dim + self.n_heads, self.wk.weight.shape[1]
+        if not can_use_tiny_gemm(n, k, max_m=_MERGED_K_GATE_MAX_M):
+            return
+        merged = torch.cat([self.wk.weight.data, self.weights_proj.weight.data])
+        if self._wk_gate_weight is not None:
+            # Captured graphs keep this storage across online weight reloads.
+            self._wk_gate_weight.copy_(merged)
+            merged = self._wk_gate_weight
+        self.wk.weight.data = merged[: self.head_dim]
+        self.weights_proj.weight.data = merged[self.head_dim :]
+        self._wk_gate_weight = merged
+
+    def _decode_merged_k_gate(
+        self,
+        q_lora: torch.Tensor,
+        x: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        act_quant,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # bf16 head gate without RoPE/Hadamard: wq_b + q quant on this stream
+        # || [wk | weights_proj] GEMM + k_norm + index-K store on alt_stream.
+        from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
+
+        current_stream = torch.cuda.current_stream()
+        self.alt_stream.wait_stream(current_stream)
+        # current stream first: replay keeps the join on the first-captured parent
+        with deep_gemm_wrapper.configure_deep_gemm_num_sms(self.half_device_sm_count):
+            query, _ = self.wq_b(q_lora)
+        query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
+        q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+        with torch.cuda.stream(self.alt_stream):
+            if x.shape[0] <= _MERGED_K_GATE_MAX_M:
+                kw = tiny_gemm_bf16(x, self._wk_gate_weight, max_m=_MERGED_K_GATE_MAX_M)
+            else:
+                kw = torch.mm(x, self._wk_gate_weight.t())
+            key, gate = self._split_k_weights(kw)
+            key = self.k_norm(key)
+            self._store_index_k_cache(
+                forward_batch=forward_batch,
+                layer_id=layer_id,
+                key=key,
+                act_quant=act_quant,
+            )
+        current_stream.wait_stream(self.alt_stream)
+
+        return q_fp8, bf16_head_gate_q_scale(gate, q_scale, self.softmax_scale)
+
+    def _split_k_weights(self, kw: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # [key | head gate] output of a merged wk / weights_proj GEMM
+        return kw.split([self.head_dim, self.n_heads], dim=-1)
+
+    def _indexer_tp_split(
+        self, forward_batch: ForwardBatch, q_offset: int
+    ) -> Optional[Tuple[Any, int, int, List[int]]]:
+        # (attn-TP group, lo, hi, rows per rank), or None for the replicated path.
+        # Every input here is identical on all ranks of the group (same batch and
+        # mode), so all ranks take the same branch and the all-gather cannot diverge.
+        if not _is_cuda or self.tp_split_min_rows is None:
+            return None
+        if self.dsa_enable_prefill_cp or is_cp_active(forward_batch):
+            return None
+        if get_is_capture_mode() or torch.cuda.is_current_stream_capturing():
+            return None
+        group = get_parallel().attn_tp_group
+        tp = group.world_size
+        min_rows = max(tp, self.tp_split_min_rows)
+        if (
+            tp <= 1
+            or q_offset < min_rows
+            # the top-k gather is all_gatherv, which runs on PyNCCL only
+            or group.pynccl_comm is None
+            or not group.pynccl_comm.available
+        ):
+            return None
+        bounds = self._indexer_tp_split_bounds(
+            seq_lens_cpu=forward_batch.seq_lens_cpu,
+            extend_lens=forward_batch.extend_seq_lens_cpu,
+            q_offset=q_offset,
+            tp=tp,
+        )
+        rank = group.rank_in_group
+        print_info_once(
+            "DSA indexer: prefill logits/top-k rows split across attn-TP "
+            f"(tp={tp}) for extends of at least {min_rows} rows"
+        )
+        sizes = [hi - lo for lo, hi in zip(bounds[:-1], bounds[1:])]
+        return group, bounds[rank], bounds[rank + 1], sizes
+
+    @staticmethod
+    def _indexer_tp_split_bounds(
+        seq_lens_cpu: torch.Tensor, extend_lens: List[int], q_offset: int, tp: int
+    ) -> List[int]:
+        # Contiguous row bounds 0 = b_0 < ... < b_tp = q_offset, balanced by each
+        # row's KV length (what logits and top-k cost scales with); host-only math.
+        seq = seq_lens_cpu.to(torch.int64)
+        if (
+            len(extend_lens) == seq.numel()
+            and sum(extend_lens) == q_offset
+            and min(extend_lens) >= 0
+        ):
+            ext = torch.tensor(extend_lens, dtype=torch.int64)
+            row_req_start = torch.repeat_interleave(torch.cumsum(ext, 0) - ext, ext)
+            row_pos = torch.arange(q_offset, dtype=torch.int64) - row_req_start
+            row_kv = torch.repeat_interleave(seq - ext, ext) + row_pos + 1
+            cum = torch.cumsum(row_kv.clamp_(min=1), 0)
+            targets = cum[-1] * torch.arange(1, tp, dtype=torch.int64) // tp
+            cuts = torch.searchsorted(cum, targets, right=True).tolist()
+        else:
+            cuts = [q_offset * r // tp for r in range(1, tp)]
+        bounds = [0]
+        for r, cut in enumerate(cuts, start=1):
+            bounds.append(min(max(cut, bounds[-1] + 1), q_offset - (tp - r)))
+        bounds.append(q_offset)
+        return bounds
+
     def __init__(
         self,
         hidden_size: int,
@@ -597,6 +737,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self._fused_fp8_rope_cache_key = None
             self._fused_fp8_cos_cache = None
             self._fused_fp8_sin_cache = None
+        self._wk_gate_weight = None
+        self.tp_split_min_rows = (
+            _INDEXER_TP_SPLIT_MIN_ROWS
+            if config is not None and is_kimi_k31(config)
+            else None
+        )
         self.softmax_scale = self.head_dim**-0.5
         self.num_init_tokens = self.num_local_tokens = 0
         if config is not None:
@@ -1966,7 +2112,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             batch_size, chunk_next_n = q.shape[:2]
             if batch_size == 0:
                 return torch.empty((0, max_len), dtype=torch.float32, device=q.device)
-            if batch_size <= self.sm_count:
+            if batch_size <= self.sm_count or (
+                not is_sail()
+                and envs.SGLANG_DSA_FULL_BATCH_MQA.get()
+                and dcp_size > 1
+                and chunk_next_n <= 8
+                and batch_size <= 1024
+                and torch.cuda.get_device_capability(q.device)[0] == 10
+            ):
                 return self._paged_mqa_logits(
                     q,
                     kv_cache,
@@ -2351,6 +2504,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 )
         else:
             row_lo, row_hi = 0, q_offset
+        tp_split = None if split else self._indexer_tp_split(forward_batch, q_offset)
+        if tp_split is not None:
+            row_lo, row_hi = tp_split[1:3]
+            topk_dst = topk_result.new_empty((row_hi - row_lo, self.index_topk))
         need_chunk, logits_budget_bytes = mqa_logits_should_chunk(
             num_rows=row_hi - row_lo,
             num_cols=mqa_logits_row_bytes(logits_width) // 4
@@ -2366,7 +2523,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 return (q_packed[start:end], q_sf[start:end])
             return q_fp8[start:end]
 
-        if not need_chunk and not split:
+        if not need_chunk and not split and tp_split is None:
             q_first = _slice_q(0, q_offset)
             q_first_rows = q_first[0].shape[0] if self.use_fp4 else q_first.shape[0]
             assert q_first_rows != 0
@@ -2532,13 +2689,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 batch_idx_list=batch_idx_chunk,
                 topk_indices_offset_override=topk_offset_chunk,
             )
-            topk_dst[start:end] = raw_topk_chunk
+            dst_base = row_lo if tp_split is not None else 0
+            topk_dst[start - dst_base : end - dst_base] = raw_topk_chunk
+            del logits_chunk
             start = end
 
         if split:
             dcp_all_gather_rows_(topk_dst, row_per, row_slot)
             if topk_dst is not topk_result:
                 topk_result[:q_offset] = topk_dst[:q_offset]
+        if tp_split is not None:
+            group, _, _, sizes = tp_split
+            group.all_gatherv(topk_dst, sizes=sizes, output=topk_result[:q_offset])
         return topk_result
 
     @staticmethod
@@ -2648,14 +2810,26 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # MLA: use dummy logits with topk kernel's fast path to generate indices
         # When length <= 2048, naive_topk_cuda directly generates [0,1,...,length-1,-1,...]
         seq_lens_expanded = metadata.get_seqlens_expanded()
-        # TODO(dark): replace the stupid transform with 1 kernel launch here
-        dummy_logits = torch.zeros(
-            seq_lens_expanded.shape[0],
-            self.index_topk,
-            dtype=torch.float32,
-            device=x_meta.device,
-        )
-        raw_topk_result = metadata.topk_transform(dummy_logits, self.index_topk)
+        if dsa_shards_index_k() and forward_batch.forward_mode.is_decode_or_idle():
+            slots = dcp_all_visible(
+                seq_lens_expanded,
+                metadata.get_page_table_64(),
+                self.index_topk,
+                get_token_to_kv_pool().page_size,
+            )
+            # Current attention consumes local slots and the live counts directly.
+            out_len = metadata.attn_metadata.dcp_topk_length
+            assert out_len is not None
+            raw_topk_result, _ = dcp_localize_compact(slots, out_len[: slots.shape[0]])
+        else:
+            # TODO(dark): replace the stupid transform with 1 kernel launch here
+            dummy_logits = torch.zeros(
+                seq_lens_expanded.shape[0],
+                self.index_topk,
+                dtype=torch.float32,
+                device=x_meta.device,
+            )
+            raw_topk_result = metadata.topk_transform(dummy_logits, self.index_topk)
         if topk_result is not None:
             # PCG/BCG: fill the valid prefix of the padded static buffer and
             # leave padded rows at the -1 sentinel.
@@ -3177,6 +3351,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
             return maybe_capture_indexer_topk(layer_id, result)
 
+        elif (
+            enable_dual_stream
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and self._wk_gate_weight is not None
+            and not weights_proj_lora
+            and isinstance(x, torch.Tensor)
+            and not is_cp_active(forward_batch)
+            and not is_sail()
+        ):
+            q_fp8, weights = self._decode_merged_k_gate(
+                q_lora, x, forward_batch, layer_id, act_quant
+            )
         elif (
             self.use_fp8
             and enable_dual_stream

@@ -188,6 +188,14 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
         raise ValueError("Kimi-K3.1 does not support --enable-unified-memory yet.")
     overrides = {}
     if cfg.dcp_size > 1:
+        if cfg.dcp_size & (cfg.dcp_size - 1) or cfg.tp_size % cfg.dcp_size:
+            raise ValueError(
+                "Kimi-K3.1 DCP needs a power-of-two --dcp-size dividing --tp-size."
+            )
+        if cfg.enable_hisparse or cfg.enable_prefill_cp or (cfg.attn_cp_size or 1) > 1:
+            raise ValueError(
+                "Kimi-K3.1 DCP does not support HiSparse or prefill context parallel."
+            )
         if cfg.speculative_algorithm not in (None, "DSPARK", "DFLASH"):
             raise ValueError(
                 "Kimi-K3.1 DCP supports only DSPARK and DFLASH speculative decoding."

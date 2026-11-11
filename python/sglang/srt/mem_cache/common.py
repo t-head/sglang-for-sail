@@ -187,6 +187,7 @@ def match_kv_cache(
     token_ids: Optional[array] = None,
     *,
     cow_mamba: bool = False,
+    full_kv_only: bool = False,
     defer_cow_slot: bool = False,
     max_prefix_len: Optional[int] = None,
 ) -> MatchResult:
@@ -198,6 +199,7 @@ def match_kv_cache(
         MatchPrefixParams(
             key=_req_radix_key(tree_cache, req, token_ids, max_prefix_len),
             cow_mamba=cow_mamba,
+            full_kv_only=full_kv_only,
             defer_cow_slot=defer_cow_slot,
             req=req,
         )

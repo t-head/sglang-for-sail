@@ -79,6 +79,7 @@ class MatchPrefixParams:
     # matched state, and the slot is bound with the request's row.
     defer_cow_slot: bool = False
     req: Optional[Req] = None
+    full_kv_only: bool = False
 
 
 @dataclasses.dataclass
@@ -484,6 +485,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     storage_prefetch_retries: Optional[StoragePrefetchRetries] = None
     # Set by caches that publish KV placement events; None means they don't.
     kv_events: Optional[KVCacheEventRecorder] = None
+
+    def supports_full_kv_only_match(self) -> bool:
+        """Whether `MatchPrefixParams.full_kv_only` is honored."""
+        return False
 
     def init_metrics_collector(self):
         from sglang.srt.layers.dp_attention import is_dp_attention_enabled

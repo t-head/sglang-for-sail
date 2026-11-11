@@ -279,6 +279,8 @@ def startup_weight_load_overlap_of(cfg: Any) -> bool:
 
 def mamba_extra_buffer_of(cfg: Any) -> bool:
     """Return whether the resolved Mamba cache strategy requires an extra buffer."""
+    if decode_state_free_radix_of(cfg):
+        return False
     return cfg.disable_radix_cache is False and cfg.mamba_radix_cache_strategy in (
         "extra_buffer",
         "extra_buffer_lazy",
@@ -405,4 +407,17 @@ def is_no_spec_infer_or_topk_one(cfg):
     return cfg.speculative_eagle_topk is None or (
         cfg.speculative_eagle_topk == 1
         and (cfg.page_size == 1 or cfg.page_size is None)
+    )
+
+
+def decode_state_free_radix_of(cfg: Any) -> bool:
+    """Whether a PD decode server's radix cache holds FULL KV only (no Mamba
+    state), see SGLANG_DECODE_STATE_FREE_RADIX. Read by hybrid-SSM paths only."""
+    from sglang.srt.environ import envs
+
+    return (
+        cfg.disaggregation_mode == "decode"
+        and bool(cfg.disaggregation_decode_enable_radix_cache)
+        and cfg.disable_radix_cache is False
+        and envs.SGLANG_DECODE_STATE_FREE_RADIX.get()
     )

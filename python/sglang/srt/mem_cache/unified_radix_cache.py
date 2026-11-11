@@ -224,6 +224,40 @@ class UnifiedRadixCache(BasePrefixCache):
     # eviction policy at construction (a cache built piecemeal walks per component).
     evicts_by_joint_lru: bool = False
 
+    def _release_request_mamba(self, req: Req) -> None:
+        """Free the request's own Mamba state slot when no tree component takes
+        it over (``request_mamba_only``)."""
+        if self.request_mamba_only and req.kv.holds_mamba:
+            self.kv_storage().release_state("mamba", req)
+
+    def _match_full_kv_only(self, params: MatchPrefixParams) -> MatchResult:
+        """The deepest FULL-KV device hit, past the last cached Mamba state. The
+        caller supplies the request's Mamba state, so nothing is copied from the
+        tree. The regular walk still splits the matched node and refreshes LRU."""
+        assert not params.cow_mamba, "a FULL-KV-only hit has no Mamba state to copy"
+        result = self.tree_core.match_prefix(params)
+        self._apply_cache_actions(result.cache_actions)
+        matched_len, node, _ = self.tree_core.match_full_device_prefix(params.key)
+        result = result._replace(cache_actions=())
+        if matched_len <= result.device_prefix_len:
+            return result
+        return result._replace(
+            device_prefix_len=matched_len,
+            last_device_node=node,
+            last_host_node=node,
+            best_match_node=node,
+            mamba_branching_seqlen=None,
+        )
+
+    def supports_full_kv_only_match(self) -> bool:
+        # Host or external-store hits carry Mamba-gated load plans.
+        return (
+            (self.is_mamba_enabled or self.request_mamba_only)
+            and not self.disable
+            and self.cache_controller is None
+            and self.linker is None
+        )
+
     def __init__(
         self,
         params: CacheInitParams,
@@ -276,6 +310,8 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         # Whether a slot keeps a prefix's recurrent state checkpoints.
         self.is_mamba_enabled = TREE_STATE in families
+        self.request_mamba_only = params.request_mamba_only
+        assert not (self.request_mamba_only and self.is_mamba_enabled)
         # Whether the mamba extra (ping-pong) buffer is enabled.
         self.enable_mamba_extra_buffer = (
             params.enable_mamba_extra_buffer if self.is_mamba_enabled else False
@@ -687,6 +723,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def _match_tree(self, params: MatchPrefixParams) -> MatchResult:
         if self.disable:
             return self.tree_core.empty_match_result
+        if params.full_kv_only:
+            assert self.supports_full_kv_only_match()
+            return self._match_full_kv_only(params)
         result = self.tree_core.match_prefix(params)
         # Apply the walk's actions (e.g. a pending write-through relocation on
         # a split) before the finalizers, which can evict or raise.
@@ -1551,6 +1590,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(req, is_finished=True)
+        self._release_request_mamba(req)
 
     @rank_consensus(same_params=["req.rid", "up_to"])
     def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> None:
@@ -1559,6 +1599,12 @@ class UnifiedRadixCache(BasePrefixCache):
         self.checkpoint_into_tree(req, up_to=up_to, **kwargs)
 
     def checkpoint_into_tree(self, req: Req, *, up_to: int, **kwargs) -> None:
+        is_finished = req.finished()
+        self._checkpoint_into_tree(req, up_to=up_to, **kwargs)
+        if is_finished:
+            self._release_request_mamba(req)
+
+    def _checkpoint_into_tree(self, req: Req, *, up_to: int, **kwargs) -> None:
         """Insert ``[cache_protected_len, up_to)`` of the request's record and
         move its tree lock onto the node the insert ended on."""
         # A finished request hands its component state (mamba) to the tree
@@ -4536,7 +4582,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
     def supports_mamba(self) -> bool:
-        return self.is_mamba_enabled
+        return self.is_mamba_enabled or self.request_mamba_only
 
     # ---- Session radix cache API (delegates to composed UnifiedSessionRefTracker) ----
 
@@ -4617,6 +4663,8 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.tree_core.all_values_flatten()
 
     def all_mamba_values_flatten(self) -> torch.Tensor:
+        if not self.is_mamba_enabled:
+            return torch.empty((0,), dtype=torch.int64)
         return self.tree_core.all_mamba_values_flatten()
 
     def available_and_evictable_str(self) -> str:

@@ -263,7 +263,7 @@ def remote_instance_transfer_engine_of(cfg: Any, load_format: Any = None) -> boo
 def mamba_extra_buffer_lazy_of(cfg: Any) -> bool:
     """The lazy variant of :func:`mamba_extra_buffer_of`."""
     return (
-        cfg.disable_radix_cache is False
+        model_override_base.mamba_extra_buffer_of(cfg)
         and cfg.mamba_radix_cache_strategy == "extra_buffer_lazy"
     )
 

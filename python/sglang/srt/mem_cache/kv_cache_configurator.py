@@ -3061,7 +3061,7 @@ class KVCacheConfigurator:
         return int(rest_memory * (1 << 30))  # return in bytes
 
     def _calculate_mamba_ratio(self) -> int:
-        if get_memory().disable_radix_cache:
+        if get_memory().disable_radix_cache or get_exec().mamba.decode_state_free_radix:
             return 1
 
         # Host-only checkpoints keep the live slot plus the ping-pong slots
@@ -3595,9 +3595,8 @@ class KVCacheConfigurator:
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         elif (
-            get_memory().disable_radix_cache
-            and get_schedule().max_running_requests is not None
-        ):
+            get_memory().disable_radix_cache or get_exec().mamba.decode_state_free_radix
+        ) and get_schedule().max_running_requests is not None:
             # Use explicitly set max_running_requests when radix cache is disabled
             get_context().override(
                 "mamba_pool.from_max_running_requests",

@@ -769,11 +769,16 @@ class ModelRunner:
         # Load the model
         self.sampler = create_sampler()
         self.load_model()
+        from sglang.srt.model_executor.model_runner_components.bf16_gemm_warmup import (
+            warmup_bf16_gemms,
+        )
+
         if self.model_config.is_layer_types_hybrid_swa:
             check_layer_types_hybrid_swa_split(
                 model=self.model, model_config=self.model_config
             )
         prepare_moe_topk(model=self.model, model_config=self.model_config)
+        warmup_bf16_gemms(model=self.model, device=self.device)
 
         self.maybe_init_dwdp()
 

@@ -81,7 +81,9 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
         "enable-mixed-chunk": cfg.enable_mixed_chunk,
         "moe-dp-size > 1": cfg.moe_dp_size > 1,
     }
-    if arch == "Qwen4ExpForConditionalGeneration":
+    if arch == "KimiK31ForConditionalGeneration":
+        unsupported["disaggregation-mode decode"] = cfg.disaggregation_mode == "decode"
+    elif arch == "Qwen4ExpForConditionalGeneration":
         unsupported |= {
             # The MoE runs TP experts on rows gathered over the TP group.
             # Waterfill turns on DeepEP and EP after this hook.

@@ -53,6 +53,7 @@ from sglang.kernels.ops.attention.dsa.dcp_topk_merge import (
 )
 from sglang.kernels.ops.attention.dsv4.topk import (
     topk_transform_candidates_v2,
+    topk_transform_packed_v2,
     topk_transform_paged_v2,
 )
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
@@ -667,3 +668,29 @@ def init_dcp_fused_topk(
             parallel.dcp_group, max_rows, topk, page_size, parallel.attn_dcp_rank
         )
     return _FUSED_TOPK is not None
+
+
+def dcp_all_visible(
+    global_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    topk: int,
+    page_size: int,
+) -> torch.Tensor:
+    """Decode / target verify: every visible position as widened KV slots, for
+    rows that see at most ``topk`` keys (the indexer's k-only path), -1 padded."""
+    span = page_size * get_parallel().attn_dcp_size
+    rows = global_lens.shape[0]
+    scores = torch.zeros((rows, topk), dtype=torch.float32, device=global_lens.device)
+    out = torch.empty((rows, topk), dtype=torch.int32, device=global_lens.device)
+    if rows == 0:
+        return out
+    topk_transform_packed_v2(
+        scores,
+        global_lens.to(torch.int32),
+        page_table,
+        out,
+        span,
+        row_starts=torch.zeros(rows, dtype=torch.int32, device=global_lens.device),
+        deterministic=True,
+    )
+    return out
