@@ -169,6 +169,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._decode_seq_lens_i32_cg: dict[int, torch.Tensor] = {}
         self._verify_meta_cg: dict[tuple, SimpleNamespace] = {}
         self._linear_verify_meta: Optional[SimpleNamespace] = None
+        # TARGET_VERIFY pre/post-write KV lengths derived INSIDE the decode graph
+        # (init_forward_metadata_in_graph), so a replay reads that step's seq_lens
+        # instead of the capture-time fill value. None on the eager path.
+        self._graph_verify_meta: Optional[SimpleNamespace] = None
 
         self.block_size_q = 1
         self.block_size_k = sparse_cfg["sparse_block_size"]
@@ -429,6 +433,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     ):
         # getattr covers replay views lacking extend_seq_lens_cpu and TARGET_VERIFY.
         self._msa_dec_meta = None
+        # Dropped per forward; only init_forward_metadata_in_graph (a captured
+        # op) may install graph-owned verify lengths for this capture.
+        self._graph_verify_meta = None
         # New forward -> drop the per-forward index-cache top-k (prefill only).
         if self.index_cache_enabled:
             self._topk_cache = {}
@@ -587,6 +594,27 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         if not self.is_npu:
+            if (
+                getattr(self, "use_msa_ppu", False)
+                and forward_batch.forward_mode.is_target_verify()
+            ):
+                # TARGET_VERIFY's pre/post-write KV lengths depend on the live
+                # seq_lens; deriving them here makes them captured ops that
+                # re-run on every replay with the refreshed seq_lens buffer.
+                # Computing them in forward_extend would freeze the capture
+                # fill value into the graph and verify against a bogus prefix.
+                ndt = int(self.speculative_num_draft_tokens or 0)
+                if ndt > 0:
+                    base = forward_batch.seq_lens.to(torch.int32)
+                    self._graph_verify_meta = SimpleNamespace(
+                        prefix_lens=base,
+                        seq_lens=base + ndt,
+                    )
+                    # Warmups and the capture run share one ForwardBatch, so the
+                    # per-forward seqblock cache would otherwise hand the capture
+                    # run warmup-allocated (non-graph-pool) lengths and the graph
+                    # would bind stale/garbage prefix lengths at replay.
+                    self._prefill_seqblock_meta = None
             if self._linear_verify and forward_batch.forward_mode.is_target_verify():
                 self._init_linear_verify_metadata(forward_batch)
             return
@@ -1463,8 +1491,15 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             # EAGLE TARGET_VERIFY leaves seq_lens at the committed prefix. The
             # draft tokens are written after it, so sparse attention needs the
             # pre-write prefix and post-write total KV lengths separately.
-            prefix_lens = base_seq_lens
-            seq_lens = base_seq_lens + resolved_extend_seq_lens
+            # Under a decode graph use the lengths init_forward_metadata_in_graph
+            # derived inside the captured region: those re-read each replay's
+            # seq_lens, whereas the tensors built below are frozen at capture.
+            gm = getattr(self, "_graph_verify_meta", None)
+            if gm is not None:
+                prefix_lens, seq_lens = gm.prefix_lens, gm.seq_lens
+            else:
+                prefix_lens = base_seq_lens
+                seq_lens = base_seq_lens + resolved_extend_seq_lens
         elif forward_batch.extend_prefix_lens is not None:
             seq_lens = base_seq_lens
             prefix_lens = forward_batch.extend_prefix_lens.to(torch.int32)
