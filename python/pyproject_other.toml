@@ -173,6 +173,7 @@ srt_sail = [
   "flash-attention-for-sail",
   "flashinfer-for-sail",
   "flashmla-for-sail",
+  "msa_for_sail==0.1.1",
   "sailify==1.0.0",
   "sglang[runtime_common]",
   "torch-for-sail",
