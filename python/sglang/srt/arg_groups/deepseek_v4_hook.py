@@ -266,6 +266,25 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
             )
 
 
+def _sail_sparse_prefill_cp_supported(cfg) -> bool:
+    from sglang.srt.utils.device import is_sail
+
+    if not is_sail():
+        return False
+    from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
+        use_dsv4_q8kv8_sparse_prefill,
+    )
+
+    return (
+        cfg.enable_prefill_cp
+        and cfg.cp_strategy == "interleave"
+        and cfg.dp_size == 1
+        and cfg.tp_size > 1
+        and cfg.moe_a2a_backend in ("none", "deepep", "megamoe", "mori")
+        and not use_dsv4_q8kv8_sparse_prefill(cfg.dsv4_prefill_backend)
+    )
+
+
 def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     """Validate DeepSeek V4 context-parallel configuration."""
     from sglang.srt.utils import is_sail
@@ -350,8 +369,12 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
             f"DeepSeekV4 CP supports moe_a2a_backend in {supported_a2a_backends}, "
             f"got {cfg.moe_a2a_backend!r}."
         )
-    if model_config_of(server_args).hf_config.model_type != "deepseek_v41":
-        # The CP-aware sparse prefill chunk cache is validated on V4.1 only.
+    if model_config_of(
+        server_args
+    ).hf_config.model_type != "deepseek_v41" and not _sail_sparse_prefill_cp_supported(
+        cfg
+    ):
+        # Keep native policy; the SAIL interleave layout supports sparse prefill.
         logger.warning(
             "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL because DeepSeekV4 "
             "context parallelism is enabled."
