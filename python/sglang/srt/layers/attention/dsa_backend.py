@@ -631,7 +631,8 @@ class DeepseekSparseAttnBackend(
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
         # Every model's PAGED extend takes the packed v2 top-k for an unsharded
         # batch; this flag also sends prefill-CP shards to it (DSATopKBackend).
-        self.dsa_packed_extend_topk = _is_hip or is_kimi_k31(hf_config)
+        self.kimi_k31 = is_kimi_k31(hf_config)
+        self.dsa_packed_extend_topk = _is_hip or self.kimi_k31
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
         self.physical_page_size = model_runner.page_size // self.dsa_index_kpool
         self.dsa_shards_index_k = dsa_shards_index_k()
@@ -2029,11 +2030,13 @@ class DeepseekSparseAttnBackend(
             # CUDA graph captures the schedule tensor's shape and data pointer.
             # Reserve schedule capacity for the largest context this graph can
             # replay; per-replay code refreshes the valid prefix in-place.
-            paged_mqa_ctx_lens_2d = torch.full_like(
+            capacity_ctx_lens = torch.full_like(
                 paged_mqa_ctx_lens_2d, self.req_to_token.shape[1]
             )
+            if not self.dsa_shards_index_k:
+                paged_mqa_ctx_lens_2d = capacity_ctx_lens
             paged_mqa_schedule_metadata = self._build_paged_mqa_schedule_metadata(
-                paged_mqa_ctx_lens_2d
+                capacity_ctx_lens
             )
 
         metadata = DSAMetadata(
@@ -2678,7 +2681,11 @@ class DeepseekSparseAttnBackend(
             # The PPU sparse FlashMLA kernel requires 64 query heads. Preserve
             # its padding contract independently of the community helper's
             # architecture-specific padding.
-            if _is_sail and layer.tp_q_head_num % self.flashmla_padding != 0:
+            if (
+                _is_sail
+                and not self.kimi_k31
+                and layer.tp_q_head_num % self.flashmla_padding != 0
+            ):
                 assert self.flashmla_padding % layer.tp_q_head_num == 0
                 print_info_once(
                     f"padding num_heads to {self.flashmla_padding} due to sparse attn kernel requirement"
@@ -2751,6 +2758,16 @@ class DeepseekSparseAttnBackend(
                         self.forward_metadata.page_table_1_flattened
                     )
                     assert page_table_1_flattened is not None
+                    if (
+                        _is_sail
+                        and self.dsa_shards_index_k
+                        and dsa_impl == "flashmla_sparse"
+                    ):
+                        page_table_1_flattened = torch.arange(
+                            page_table_1_flattened.numel(),
+                            dtype=page_table_1_flattened.dtype,
+                            device=page_table_1_flattened.device,
+                        )
                     kv_cache = dequantize_k_cache_paged_dsa(
                         kv_cache, page_table_1_flattened
                     )
@@ -3164,11 +3181,17 @@ class DeepseekSparseAttnBackend(
 
         # Determine required padding based on GPU architecture (use cached value)
         required_padding = 128 if self.device_sm_major >= 10 else 64
+        if _is_sail and self.kimi_k31:
+            required_padding = (
+                (num_heads + required_padding - 1) // required_padding
+            ) * required_padding
 
         need_padding = num_heads % required_padding != 0
 
         if need_padding:
-            assert required_padding % num_heads == 0, (
+            assert required_padding % num_heads == 0 or (
+                _is_sail and self.kimi_k31 and num_heads < required_padding
+            ), (
                 f"num_heads {num_heads} cannot be padded to {required_padding}. "
                 f"TP size may be too large for this model."
             )

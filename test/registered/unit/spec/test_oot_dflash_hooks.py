@@ -117,6 +117,7 @@ class TestDFlashDraftBackendResolution(CustomTestCase):
         mla,
         target_backend="fa3",
         resolver=_resolve_dflash_draft_attention_backend,
+        sail=False,
     ):
         args = _make_dflash_args(draft_backend)
         platform = Mock(spec=SRTPlatform)
@@ -127,6 +128,7 @@ class TestDFlashDraftBackendResolution(CustomTestCase):
             dflash_config={"attention_mode": "mla" if mla else "gqa"},
         )
         with (
+            patch("sglang.srt.utils.device.is_sail", return_value=sail),
             patch(f"{HOOK_MODULE}.current_platform", platform),
             patch(
                 f"{HOOK_MODULE}.get_platform",
@@ -143,6 +145,11 @@ class TestDFlashDraftBackendResolution(CustomTestCase):
         ):
             resolver(args)
         return resolution_result(args, "speculative_draft_attention_backend")
+
+    def test_ppu_flashmla_requires_mla_draft(self):
+        self.assertEqual(self._resolve("flashmla", mla=True, sail=True), "flashmla")
+        self.assertEqual(self._resolve("flashmla", mla=False, sail=True), "flashinfer")
+        self.assertEqual(self._resolve("flashmla", mla=True, sail=False), "flashinfer")
 
     def test_mla_drafts_take_the_default_mla_backend(self):
         # On SM100 a non-MLA draft leaving trtllm_mha goes to fa4 instead.

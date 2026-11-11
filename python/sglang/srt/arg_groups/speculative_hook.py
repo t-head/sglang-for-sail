@@ -958,7 +958,7 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
             return current_platform.supports_speculative_draft_attention_backend(
                 "DFLASH", backend
             )
-        if backend == "cutedsl_mla":
+        if backend in ("cutedsl_mla", "trtllm_mla", "flashmla"):
             from sglang.srt.hf_transformers import get_config
             from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 
@@ -968,6 +968,12 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
                 revision=cfg.speculative_draft_model_revision,
                 model_override_args=json.loads(cfg.json_model_override_args),
             )
+            from sglang.srt.utils.device import is_sail
+
+            if backend == "flashmla" and not is_sail():
+                return False
+            if backend == "cutedsl_mla" and is_sail():
+                return False
             return parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla
         return backend in supported_draft_backends
 

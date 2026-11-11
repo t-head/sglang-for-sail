@@ -85,6 +85,8 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
             # "prefill" routes verify to trtllm_mla, whose base _run_decode_kernel
             # lacks that DCP path (TypeError: unexpected kwarg 'causal_seqs').
             overrides["speculative_attention_mode"] = "decode"
+        if cfg.speculative_algorithm == "EAGLE3":
+            overrides["speculative_attention_mode"] = "decode"
 
         if get_platform().is_npu:
             overrides.update(
@@ -186,68 +188,76 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
     if cfg.enable_unified_memory:
         raise ValueError("Kimi-K3.1 does not support --enable-unified-memory yet.")
-    overrides = {}
-    if cfg.dcp_size > 1:
-        if cfg.dcp_size & (cfg.dcp_size - 1) or cfg.tp_size % cfg.dcp_size:
-            raise ValueError(
-                "Kimi-K3.1 DCP needs a power-of-two --dcp-size dividing --tp-size."
-            )
-        if cfg.enable_hisparse or cfg.enable_prefill_cp or (cfg.attn_cp_size or 1) > 1:
-            raise ValueError(
-                "Kimi-K3.1 DCP does not support HiSparse or prefill context parallel."
-            )
-        if cfg.speculative_algorithm not in (None, "DSPARK", "DFLASH"):
-            raise ValueError(
-                "Kimi-K3.1 DCP supports only DSPARK and DFLASH speculative decoding."
-            )
-        if (
-            cfg.disaggregation_mode != "null"
-            and cfg.disaggregation_transfer_backend != "mooncake"
-        ):
-            raise ValueError("Kimi-K3.1 DCP supports PD only over Mooncake.")
-        if cfg.speculative_algorithm == "DSPARK":
-            from sglang.srt.speculative.ragged_verify import (
-                RaggedVerifyMode,
-                read_ragged_verify_mode,
-            )
+    return _kimi_k31_dcp_overrides(cfg) if cfg.dcp_size > 1 else {}
 
-            if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
-                raise ValueError(
-                    "Kimi-K3.1 DCP + DSPARK requires SGLANG_RAGGED_VERIFY_MODE=static."
-                )
-        if cfg.speculative_algorithm == "DFLASH":
-            if cfg.speculative_draft_attention_backend not in (None, "cutedsl_mla"):
-                raise ValueError(
-                    "Kimi-K3.1 DCP + DFLASH needs "
-                    "--speculative-draft-attention-backend cutedsl_mla."
-                )
-            overrides["speculative_draft_attention_backend"] = "cutedsl_mla"
-        if cfg.speculative_algorithm is not None:
-            # NOTE(yhyang201): DCP target verify runs the DSA decode path; each
-            # rank attends over its KV shard and the (o, lse) partials are merged.
-            overrides["speculative_attention_mode"] = "decode"
-        if (
-            cfg.dsa_topk_backend != "sgl-kernel"
-            or not envs.SGLANG_OPT_USE_TOPK_V2.get()
-            or not envs.SGLANG_DSA_FUSE_TOPK.get()
-        ):
+
+def _kimi_k31_dcp_overrides(cfg: Any) -> dict:
+    from sglang.srt.utils.device import is_sail
+
+    overrides = {}
+    if cfg.dcp_size & (cfg.dcp_size - 1) or cfg.tp_size % cfg.dcp_size:
+        raise ValueError(
+            "Kimi-K3.1 DCP needs a power-of-two --dcp-size dividing --tp-size."
+        )
+    if cfg.enable_hisparse or cfg.enable_prefill_cp or (cfg.attn_cp_size or 1) > 1:
+        raise ValueError(
+            "Kimi-K3.1 DCP does not support HiSparse or prefill context parallel."
+        )
+    if cfg.speculative_algorithm not in (None, "DSPARK", "DFLASH"):
+        raise ValueError(
+            "Kimi-K3.1 DCP supports only DSPARK and DFLASH speculative decoding."
+        )
+    if (
+        cfg.disaggregation_mode != "null"
+        and cfg.disaggregation_transfer_backend != "mooncake"
+    ):
+        raise ValueError("Kimi-K3.1 DCP supports PD only over Mooncake.")
+    if cfg.speculative_algorithm == "DSPARK":
+        from sglang.srt.speculative.ragged_verify import (
+            RaggedVerifyMode,
+            read_ragged_verify_mode,
+        )
+
+        if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
             raise ValueError(
-                "Kimi-K3.1 DCP needs the fused sgl-kernel v2 DSA top-k "
-                "(--dsa-topk-backend sgl-kernel, SGLANG_OPT_USE_TOPK_V2 and "
-                "SGLANG_DSA_FUSE_TOPK on)."
+                "Kimi-K3.1 DCP + DSPARK requires SGLANG_RAGGED_VERIFY_MODE=static."
             )
-        if cfg.enable_return_indexer_topk or envs.SGLANG_DSA_TOPK_BROADCAST.get():
-            # the sharded indexer returns only this rank's local KV slots
+    if cfg.speculative_algorithm == "DFLASH":
+        choices = ("flashmla",) if is_sail() else ("cutedsl_mla", "trtllm_mla")
+        if cfg.speculative_draft_attention_backend not in (None, *choices):
             raise ValueError(
-                "Kimi-K3.1 DCP does not support --enable-return-indexer-topk "
-                "or SGLANG_DSA_TOPK_BROADCAST."
+                "Kimi-K3.1 DCP + DFLASH needs "
+                f"--speculative-draft-attention-backend in {choices}."
             )
-        if cfg.dcp_replicate_q_proj is None and cfg.dcp_comm_backend in (
-            "a2a",
-            "fi_a2a",
-        ):
-            logger.info("Kimi-K3.1 DCP enables replicated Q projection by default.")
-            overrides["dcp_replicate_q_proj"] = True
+        overrides["speculative_draft_attention_backend"] = (
+            "flashmla" if is_sail() else "cutedsl_mla"
+        )
+    if cfg.speculative_algorithm is not None:
+        # NOTE(yhyang201): DCP target verify runs the DSA decode path; each
+        # rank attends over its KV shard and the (o, lse) partials are merged.
+        overrides["speculative_attention_mode"] = "decode"
+    if (
+        cfg.dsa_topk_backend != "sgl-kernel"
+        or not envs.SGLANG_OPT_USE_TOPK_V2.get()
+        or not envs.SGLANG_DSA_FUSE_TOPK.get()
+    ):
+        raise ValueError(
+            "Kimi-K3.1 DCP needs the fused sgl-kernel v2 DSA top-k "
+            "(--dsa-topk-backend sgl-kernel, SGLANG_OPT_USE_TOPK_V2 and "
+            "SGLANG_DSA_FUSE_TOPK on)."
+        )
+    if cfg.enable_return_indexer_topk or envs.SGLANG_DSA_TOPK_BROADCAST.get():
+        # the sharded indexer returns only this rank's local KV slots
+        raise ValueError(
+            "Kimi-K3.1 DCP does not support --enable-return-indexer-topk "
+            "or SGLANG_DSA_TOPK_BROADCAST."
+        )
+    if cfg.dcp_replicate_q_proj is None and cfg.dcp_comm_backend in (
+        "a2a",
+        "fi_a2a",
+    ):
+        logger.info("Kimi-K3.1 DCP enables replicated Q projection by default.")
+        overrides["dcp_replicate_q_proj"] = True
     return overrides
 
 
