@@ -48,7 +48,7 @@ from sglang.srt.disaggregation.common.utils import (
 )
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mooncake.utils import (
-    _validate_efa_allocator_compatibility,
+    _validate_mooncake_allocator_compatibility,
     check_mooncake_custom_mem_pool_enabled,
 )
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
@@ -292,7 +292,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         enable_custom_mem_pool, custom_mem_pool_type = (
             check_mooncake_custom_mem_pool_enabled()
         )
-        _validate_efa_allocator_compatibility(
+        _validate_mooncake_allocator_compatibility(
             enable_custom_mem_pool, custom_mem_pool_type
         )
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
@@ -456,10 +456,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         return regions
 
     def register_buffer_to_engine(self):
-        regions = self._registerable_regions()
-        if regions:
-            ptrs, lens = zip(*regions)
-            self.engine.batch_register(list(ptrs), list(lens))
+        # Mooncake's batch_register_memory only logs per-region failures and
+        # still returns 0, so register one by one to fail loud.
+        for ptr, length in self._registerable_regions():
+            self.engine.register(ptr, length)
 
     def deregister_buffer_to_engine(self):
         regions = self._registerable_regions()
@@ -587,7 +587,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         }
 
     def _register_staging_memory(self, ptr: int, size: int) -> None:
-        self.engine.batch_register([ptr], [size])
+        self.engine.register(ptr, size)
 
     def _init_staging_buffers(self, count: int):
         from sglang.srt.disaggregation.common.staging_handler import (
