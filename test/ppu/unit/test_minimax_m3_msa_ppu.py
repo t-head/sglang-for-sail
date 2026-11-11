@@ -331,7 +331,7 @@ class TestPpuMsaIndexerFp8Allocation(_MsaGateFixture):
             ({"page_size": 1}, "page_size!=128"),
             ({"msa_enabled": False}, "SGLANG_SAIL_MINIMAX_M3_MSA=0"),
             ({"sm": 79}, "SM<80"),
-            ({"api_available": False}, "fmha_sm100 unavailable or API drifted"),
+            ({"api_available": False}, "msa_for_sail unavailable or API drifted"),
             ({"speculative": "EAGLE"}, "speculative decoding enabled"),
             ({"head_dim": 64}, "main head_dim!=128"),
             ({"kv_heads": 128}, "num_kv_heads==128 is layout-ambiguous"),
@@ -472,11 +472,11 @@ class TestPagedNhdView(CustomTestCase):
 
 @unittest.skipUnless(
     _HAS_MODULE and HAS_GPU and ppu_msa_available(),
-    "msa_ppu module or fmha_sm100/CUDA unavailable",
+    "msa_ppu module or msa_for_sail/CUDA unavailable",
 )
 class TestPlanWorkspaceIsolation(CustomTestCase):
     def test_dedicated_workspaces_preserve_plan_metadata(self):
-        from fmha_sm100 import allocate_graph_workspace, fmha_sm100_plan
+        from msa_for_sail import allocate_graph_workspace, fmha_sail_plan
 
         indexer_workspace = allocate_graph_workspace(
             1,
@@ -488,7 +488,7 @@ class TestPlanWorkspaceIsolation(CustomTestCase):
             device="cuda",
             output_maxscore=True,
         )
-        indexer_plan = fmha_sm100_plan(
+        indexer_plan = fmha_sail_plan(
             torch.tensor([186], dtype=torch.int32),
             torch.tensor([186], dtype=torch.int32),
             4,
@@ -511,7 +511,7 @@ class TestPlanWorkspaceIsolation(CustomTestCase):
             num_kv_splits=-1,
             device="cuda",
         )
-        fmha_sm100_plan(
+        fmha_sail_plan(
             torch.tensor([16], dtype=torch.int32),
             torch.tensor([16], dtype=torch.int32),
             4,
@@ -527,7 +527,7 @@ class TestPlanWorkspaceIsolation(CustomTestCase):
         self.assertEqual(indexer_plan[3]["qo_segment_lens"].cpu().tolist(), [186])
 
     def test_exact_workspace_handles_skewed_prefill_batch(self):
-        from fmha_sm100 import fmha_sm100_plan
+        from msa_for_sail import fmha_sail_plan
 
         qo_lens = torch.tensor([1024] + [1] * 63, dtype=torch.int32)
         kv_lens = qo_lens + 4096
@@ -542,7 +542,7 @@ class TestPlanWorkspaceIsolation(CustomTestCase):
             use_fp8_kvcache=False,
             device=torch.device("cuda"),
         )
-        indexer_plan = fmha_sm100_plan(
+        indexer_plan = fmha_sail_plan(
             qo_lens,
             kv_lens,
             4,
@@ -568,7 +568,7 @@ class TestPlanWorkspaceIsolation(CustomTestCase):
             use_fp8_kvcache=False,
             device=torch.device("cuda"),
         )
-        attend_plan = fmha_sm100_plan(
+        attend_plan = fmha_sail_plan(
             qo_lens,
             kv_lens,
             8,
@@ -672,11 +672,11 @@ class TestGpuMetadataKernels(CustomTestCase):
 
 @unittest.skipUnless(
     _HAS_MODULE and HAS_GPU and ppu_msa_available(),
-    "msa_ppu module, fmha_sm100, or CUDA/PPU device unavailable",
+    "msa_ppu module, msa_for_sail, or CUDA/PPU device unavailable",
 )
 class TestDecodeFp8AttendStaging(CustomTestCase):
     def test_direct_attend_stages_bf16_q_to_fixed_fp8_buffer(self):
-        import fmha_sm100
+        import msa_for_sail
 
         device = torch.device("cuda")
         bs, max_bs, pages, h_idx, h_q, h_kv = 2, 4, 2, 4, 8, 4
@@ -719,8 +719,8 @@ class TestDecodeFp8AttendStaging(CustomTestCase):
         ).to(torch.float8_e4m3fn)
         run_mock = mock.MagicMock(return_value=(None, None))
         with (
-            mock.patch.object(fmha_sm100, "fmha_sm100", run_mock),
-            mock.patch.object(fmha_sm100, "sparse_topk_select", mock.MagicMock()),
+            mock.patch.object(msa_for_sail, "fmha_sail", run_mock),
+            mock.patch.object(msa_for_sail, "sparse_topk_select", mock.MagicMock()),
             mock.patch(
                 "sglang.srt.layers.attention.minimax_sparse_ops.msa_ppu"
                 "._force_init_local_scores_into"
@@ -792,7 +792,7 @@ class TestExtendReuseKey(CustomTestCase):
 
 @unittest.skipUnless(
     _HAS_MODULE and HAS_GPU and ppu_msa_available(),
-    "msa_ppu module or fmha_sm100/CUDA unavailable",
+    "msa_ppu module or msa_for_sail/CUDA unavailable",
 )
 class TestPrefillPlanReuse(CustomTestCase):
     """All sparse layers of one prefill forward share one set of plans.
@@ -800,12 +800,12 @@ class TestPrefillPlanReuse(CustomTestCase):
     Simulates a multi-layer forward: each layer calls ``msa_ppu_forward_extend``
     with the same forward batch but a freshly allocated ``cu_seqlens`` (what
     ``MiniMaxSparseAttnBackend.forward_extend`` does). Only the indexer chunk
-    plans and the whole-batch attend plan may run ``fmha_sm100_plan`` — once
+    plans and the whole-batch attend plan may run ``fmha_sail_plan`` — once
     per forward, never per layer.
     """
 
-    def test_fmha_sm100_plan_runs_once_per_forward_not_per_layer(self):
-        import fmha_sm100
+    def test_fmha_sail_plan_runs_once_per_forward_not_per_layer(self):
+        import msa_for_sail
 
         device = torch.device("cuda")
         h_idx, h_q, h_kv, topk = 4, 8, 4, 16
@@ -852,9 +852,9 @@ class TestPrefillPlanReuse(CustomTestCase):
         run_mock = mock.MagicMock(return_value=(None, None))
         select_mock = mock.MagicMock(return_value=None)
         with (
-            mock.patch.object(fmha_sm100, "fmha_sm100_plan", plan_mock),
-            mock.patch.object(fmha_sm100, "fmha_sm100", run_mock),
-            mock.patch.object(fmha_sm100, "sparse_topk_select", select_mock),
+            mock.patch.object(msa_for_sail, "fmha_sail_plan", plan_mock),
+            mock.patch.object(msa_for_sail, "fmha_sail", run_mock),
+            mock.patch.object(msa_for_sail, "sparse_topk_select", select_mock),
         ):
             for layer_id in range(3):
                 # The backend allocates cu_seqlens inside forward_extend, so
@@ -901,9 +901,9 @@ class TestPrefillPlanReuse(CustomTestCase):
         k_cache_fp8 = k_cache.to(torch.float8_e4m3fn)
         v_cache_fp8 = v_cache.to(torch.float8_e4m3fn)
         with (
-            mock.patch.object(fmha_sm100, "fmha_sm100_plan", plan_mock),
-            mock.patch.object(fmha_sm100, "fmha_sm100", run_mock),
-            mock.patch.object(fmha_sm100, "sparse_topk_select", select_mock),
+            mock.patch.object(msa_for_sail, "fmha_sail_plan", plan_mock),
+            mock.patch.object(msa_for_sail, "fmha_sail", run_mock),
+            mock.patch.object(msa_for_sail, "sparse_topk_select", select_mock),
         ):
             cu_seqlens = torch.tensor([0, total_q], dtype=torch.int32, device=device)
             msa_ppu_forward_extend(
