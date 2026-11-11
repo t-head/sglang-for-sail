@@ -1047,6 +1047,12 @@ def shard_range(
     )
 
 
+def _scale_region_bytes(rows: int, dim: int) -> int:
+    """Scale region: block-32 e8m0 scales, or one f32 per row for per-channel."""
+    nbytes = max(rows * (dim // FP8_BLOCK_SIZE), rows * 4)
+    return -(-nbytes // 4) * 4
+
+
 def _table_dtype(mxfp4: bool) -> torch.dtype:
     # torch has no 4-bit dtype: MXFP4 rows are raw bytes.
     return torch.uint8 if mxfp4 else torch.float8_e4m3fn
@@ -1063,8 +1069,9 @@ def _table_views(
     scales, laid out back to back at the start of the byte buffer `raw`."""
     row_bytes = _table_row_bytes(dim, mxfp4)
     n_scales = dim // FP8_BLOCK_SIZE
-    w_bytes = rows * row_bytes
-    weight = raw[:w_bytes].view(_table_dtype(mxfp4)).view(rows, row_bytes)
+    payload_bytes = rows * row_bytes
+    w_bytes = (payload_bytes + 3) // 4 * 4
+    weight = raw[:payload_bytes].view(_table_dtype(mxfp4)).view(rows, row_bytes)
     scale = (
         raw[w_bytes : w_bytes + rows * n_scales]
         .view(torch.float8_e8m0fnu)
@@ -1120,6 +1127,9 @@ class EngramEmbedding(nn.Module):
         self._sort_host_reads = False
         self.staged_by_scheduler = False
         self.peer: Optional[_PeerShards] = None
+        self._per_channel_scale = False
+        self._int8_payload = False
+        self._scale_f32: Optional[torch.Tensor] = None
         config = resolve_engram_config(len(column_bounds) - 1)
         self.lookup = config.lookup
         self._cols_per_rank = cols_per_rank(len(column_bounds) - 1, self.tp_size)
@@ -1137,12 +1147,16 @@ class EngramEmbedding(nn.Module):
                 torch.empty(self.rows, self.row_bytes, dtype=_table_dtype(mxfp4)),
                 requires_grad=False,
             )
+            scale_bytes = torch.empty(
+                _scale_region_bytes(self.rows, dim), dtype=torch.uint8
+            )
             self.scale = nn.Parameter(
-                torch.empty(
-                    self.rows, dim // FP8_BLOCK_SIZE, dtype=torch.float8_e8m0fnu
-                ),
+                scale_bytes[: self.rows * (dim // FP8_BLOCK_SIZE)]
+                .view(torch.float8_e8m0fnu)
+                .view(self.rows, dim // FP8_BLOCK_SIZE),
                 requires_grad=False,
             )
+            self._scale_f32 = scale_bytes.view(torch.float32)[: self.rows]
         self.weight.weight_loader = self._load_rows
         self.scale.weight_loader = self._load_rows
 
@@ -1151,8 +1165,8 @@ class EngramEmbedding(nn.Module):
     ):
         per_node = replication == EngramReplication.PER_NODE
         n = num_embeddings if per_node else self.rows
-        w_bytes = n * self.row_bytes
-        s_bytes = n * (dim // FP8_BLOCK_SIZE)
+        w_bytes = (n * self.row_bytes + 3) // 4 * 4
+        s_bytes = _scale_region_bytes(n, dim)
         self.host_table = _HostTable(
             replication,
             max(1, w_bytes + s_bytes),  # mmap requires storage even for an empty shard.
@@ -1162,6 +1176,9 @@ class EngramEmbedding(nn.Module):
         weight, scale = _table_views(self.host_table.bytes, n, dim, self.mxfp4)
         self.weight = nn.Parameter(weight, requires_grad=False)
         self.scale = nn.Parameter(scale, requires_grad=False)
+        self._scale_f32 = self.host_table.bytes[w_bytes : w_bytes + s_bytes].view(
+            torch.float32
+        )[:n]
         device_ptr = self.host_table.device_ptr
         self._host_table_ptrs = (device_ptr, device_ptr + w_bytes)
         self._sort_host_reads = _sorted_host_reads(torch.cuda.current_device())
@@ -1193,16 +1210,52 @@ class EngramEmbedding(nn.Module):
         rows = slice(self.row_start, self.row_start + self.rows)
         dst = param.data[rows] if self._shared else param.data
         src = loaded_weight[rows]
-        # uint8 on either side is an MXFP4 table.
-        src_mxfp4, dst_mxfp4 = src.dtype == torch.uint8, dst.dtype == torch.uint8
-        assert src.shape == dst.shape and src_mxfp4 == dst_mxfp4, (
-            f"checkpoint engram tensor {src.dtype} {tuple(src.shape)} does not fit "
-            f"{dst.dtype} {tuple(dst.shape)}; an MXFP4 table needs "
-            "quantization_config.engram_embed_quant = 'mxfp4'"
-        )
-        dst.copy_(src)
+        if param is self.weight:
+            self._load_payload_rows(dst, src)
+        else:
+            self._load_scale_rows(dst, src, rows)
         if self.host_table is not None:
             self.host_table.dirty = True
+
+    def _load_payload_rows(self, dst: torch.Tensor, src: torch.Tensor):
+        if src.shape == dst.shape and src.dtype == dst.dtype:
+            dst.copy_(src)
+            self._int8_payload = False
+        elif src.shape == dst.shape and src.dtype == torch.int8 and not self.mxfp4:
+            if getattr(self, "peer", None) is not None:
+                raise ValueError(
+                    "int8 engram payloads are not supported with "
+                    "Engram peer_read lookup; repack the table as e4m3"
+                )
+            # Keep the bytes; the lookup decodes them as int8 instead of e4m3.
+            dst.view(torch.int8).copy_(src)
+            self._int8_payload = True
+        else:
+            raise ValueError(
+                f"engram weight expects {tuple(dst.shape)} {dst.dtype} or the same "
+                f"shape as int8, got {tuple(src.shape)} {src.dtype}"
+            )
+
+    def _load_scale_rows(self, dst: torch.Tensor, src: torch.Tensor, rows: slice):
+        if src.shape == dst.shape and src.dtype == dst.dtype:
+            dst.copy_(src)
+            self._per_channel_scale = False
+        elif src.numel() == dst.shape[0] and src.is_floating_point():
+            if getattr(self, "_scale_f32", None) is None:
+                raise ValueError(
+                    "per-channel engram scales are not supported with "
+                    "Engram peer_read lookup; repack the table with "
+                    "block-32 e8m0 scales"
+                )
+            # Per-channel scale: one f32 per row, applied by the lookup.
+            scale = self._scale_f32[rows] if self._shared else self._scale_f32
+            scale.copy_(src.reshape(scale.shape).float())
+            self._per_channel_scale = True
+        else:
+            raise ValueError(
+                f"engram scale expects {tuple(dst.shape)} {dst.dtype} or one float "
+                f"per row, got {tuple(src.shape)} {src.dtype}"
+            )
 
     def finish_load(self, label: str):
         """Collective in the shared layout and with peer shards: every rank calls
@@ -1211,6 +1264,14 @@ class EngramEmbedding(nn.Module):
             self.peer.connect(self.row_start, label)
         if self.host_table is not None:
             self.host_table.finish_load(label)
+        logger.info(
+            "engram table %s: %s scales, %s payload",
+            label,
+            "per-channel f32"
+            if self._per_channel_scale
+            else f"block-{FP8_BLOCK_SIZE} e8m0",
+            "mxfp4" if self.mxfp4 else "int8" if self._int8_payload else "e4m3",
+        )
 
     def forward(
         self,
@@ -1236,6 +1297,8 @@ class EngramEmbedding(nn.Module):
                 FP8_BLOCK_SIZE,
                 sort_ids=self._sort_host_reads,
                 mxfp4=self.mxfp4,
+                per_row_scale=self._per_channel_scale,
+                int8_payload=self._int8_payload,
             )
             return out
         if cp_all_tokens and self.tp_size > 1:
@@ -1252,6 +1315,13 @@ class EngramEmbedding(nn.Module):
         if self.tp_size > 1 and get_parallel().attn_dp_size > 1:
             return self._dp_sharded_lookup(indices, forward_batch)
         return self._lookup(indices)
+
+    def staging_views(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Byte rows in the checkpoint's current format, including after reload."""
+        scales = (
+            self._scale_f32.view(-1, 1) if self._per_channel_scale else self.scale.data
+        )
+        return self.weight.data.view(torch.uint8), scales.view(torch.uint8)
 
     def dequant_staged(
         self,
@@ -1280,6 +1350,8 @@ class EngramEmbedding(nn.Module):
             FP8_BLOCK_SIZE,
             row_hi=rows.shape[0],
             mxfp4=self.mxfp4,
+            per_row_scale=self._per_channel_scale,
+            int8_payload=self._int8_payload,
         )
         return out
 
@@ -1316,11 +1388,20 @@ class EngramEmbedding(nn.Module):
             local = indices - self.row_start
             owned = (local >= 0) & (local < self.rows)
             local = local.masked_fill(~owned, 0)
-            rows = self.weight[local]
+            weight = (
+                self.weight.data.view(torch.int8)
+                if self._int8_payload
+                else self.weight.data
+            )
+            values = weight[local]
             if self.mxfp4:
-                rows = unpack_mxfp4_rows(rows)
-            rows = rows.float().unflatten(-1, (-1, FP8_BLOCK_SIZE))
-            values = (rows * self.scale[local].float().unsqueeze(-1)).flatten(-2)
+                values = unpack_mxfp4_rows(values)
+            values = values.float()
+            if self._per_channel_scale:
+                values = values * self._scale_f32[local].float().unsqueeze(-1)
+            else:
+                blocks = values.unflatten(-1, (-1, FP8_BLOCK_SIZE))
+                values = (blocks * self.scale[local].float().unsqueeze(-1)).flatten(-2)
             return values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
         out = self.new_rows(indices)
         engram_gather(
@@ -1333,6 +1414,8 @@ class EngramEmbedding(nn.Module):
             row_hi=self.row_start + self.rows,
             sort_ids=self._sort_host_reads,
             mxfp4=self.mxfp4,
+            per_row_scale=self._per_channel_scale,
+            int8_payload=self._int8_payload,
         )
         return out
 

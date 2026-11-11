@@ -44,11 +44,17 @@ def _dequant_rows(
     E8M0_ZERO: tl.constexpr,
     MXFP4: tl.constexpr,
     DECODE_E4M3_BYTES: tl.constexpr,
+    PER_ROW_SCALE: tl.constexpr = False,
+    INT8_PAYLOAD: tl.constexpr = False,
 ):
     # Dequantized fp32 values at columns `offs` of table rows `row`, whose payload
     # and e8m0 scales start at byte addresses `w_base` and `s_base`. MXFP4 rows
     # hold two E2M1 values per byte, the even column in the low nibble.
-    if MXFP4:
+    if INT8_PAYLOAD:
+        vals = tl.load(
+            w_base.to(tl.pointer_type(tl.int8)) + row * DIM + offs, mask=mask, other=0
+        ).to(tl.float32)
+    elif MXFP4:
         byte = tl.load(
             w_base.to(tl.pointer_type(tl.uint8)) + row * (DIM // 2) + offs // 2,
             mask=mask,
@@ -75,6 +81,11 @@ def _dequant_rows(
             mask=mask,
             other=0.0,
         ).to(tl.float32)
+    if PER_ROW_SCALE:
+        scale = tl.load(
+            s_base.to(tl.pointer_type(tl.float32)) + row, mask=mask, other=0.0
+        )
+        return vals * scale
     exps = tl.load(
         s_base.to(tl.pointer_type(tl.uint8)) + row * (DIM // BLK) + offs // BLK,
         mask=mask,
@@ -112,6 +123,8 @@ def _engram_gather_kernel(
     HAS_DST: tl.constexpr,
     MXFP4: tl.constexpr,
     DECODE_E4M3_BYTES: tl.constexpr,
+    PER_ROW_SCALE: tl.constexpr,
+    INT8_PAYLOAD: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     idx = tl.load(ids_ptr + row).to(tl.int64)
@@ -132,6 +145,8 @@ def _engram_gather_kernel(
         E8M0_ZERO,
         MXFP4,
         DECODE_E4M3_BYTES,
+        PER_ROW_SCALE,
+        INT8_PAYLOAD,
     )
     out = tl.where(owned, vals, 0.0)
     tl.store(out_ptr + dst * DIM + offs, out.to(tl.bfloat16))
@@ -148,6 +163,8 @@ def engram_gather(
     row_hi: int = 2**62,
     sort_ids: bool = False,
     mxfp4: bool = False,
+    per_row_scale: bool = False,
+    int8_payload: bool = False,
 ) -> torch.Tensor:
     """Gather rows ``ids`` ([N] int) into ``out`` ([N, dim] bf16, contiguous).
 
@@ -161,6 +178,7 @@ def engram_gather(
     position. Random rows of a host table larger than the GPU's translation reach
     miss on nearly every row; sorted, neighbouring programs share a page.
     """
+    assert not (mxfp4 and int8_payload), "MXFP4 and INT8 payloads are distinct formats"
     assert dim > 0 and dim & (dim - 1) == 0 and block_size > 0, (dim, block_size)
     assert dim % block_size == 0, (dim, block_size)
     assert (
@@ -187,6 +205,8 @@ def engram_gather(
             HAS_DST=dst is not None,
             MXFP4=mxfp4,
             DECODE_E4M3_BYTES=is_sail() and get_device_sm() < 89,
+            PER_ROW_SCALE=per_row_scale,
+            INT8_PAYLOAD=int8_payload,
         )
     return out
 
