@@ -213,8 +213,9 @@ def step5_paged_scores(
             weight_scale = 1.0
         launch(
             # Pass the E4M3 bytes as uint8: the kernel bitcasts them straight
-            # into fp8e4b15 MMA operands (``tl.float8e4nv`` needs sm89+), so no
-            # per-element software decode is needed on the PPU path.
+            # into fp8 MMA operands (fp8e4nv from sm89 up, fp8e4b15 below it),
+            # so no per-element software decode is needed on the PPU path. With
+            # SGLANG_SAIL_STEP5_FP8_INDEXER off it decodes them to BF16 instead.
             q.to(torch.float8_e4m3fn).view(torch.uint8),
             weights,
             compressed_index_keys,

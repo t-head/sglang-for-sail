@@ -702,10 +702,14 @@ class Envs:
     # Opt in to loading-time FP8 quantization of checkpoint BF16 MoE experts.
     # Step5-Preview keeps its last three routed-expert layers in BF16.
     SGLANG_STEP5_QUANTIZE_BF16_MOE = EnvBool(False)
-    # PPU region-scoring fast path: feed the E4M3 bytes straight to fp8e4b15
-    # MMA and group rows that share a request onto one key-tile gather. Set
-    # false to fall back to the portable per-row/per-group Triton schedule.
+    # PPU region-scoring fast path: feed the E4M3 bytes straight to the fp8 MMA
+    # and group rows that share a request onto one key-tile gather. Set false to
+    # fall back to the portable per-row/per-group Triton schedule.
     SGLANG_STEP5_SCORING_REGION_OPT = EnvBool(True)
+    # PPU region-scoring indexer operands: feed the E4M3 key/query bytes straight
+    # to the fp8 MMA. Set false to decode them to BF16 and dot in BF16 instead,
+    # which reproduces the portable path's math for accuracy A/B comparisons.
+    SGLANG_SAIL_STEP5_FP8_INDEXER = EnvBool(True)
     # PPU region-selection fast path: rank the history with the SAIL JIT radix
     # selector instead of FlashInfer ragged top-k. Set false to fall back.
     SGLANG_SAIL_STEP5_SELECTION_RADIX = EnvBool(True)
