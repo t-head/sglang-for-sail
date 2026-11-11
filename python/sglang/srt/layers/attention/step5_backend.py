@@ -9,6 +9,7 @@ import torch
 
 from sglang.kernels.ops.attention.step5.decode_ppu import (
     STEP5_PPU_DECODE_REGIONS,
+    allocate_step5_decode_native_partial,
     allocate_step5_ppu_decode_workspace,
     can_allocate_step5_ppu_decode,
 )
@@ -71,6 +72,14 @@ def _allocate_attention_buffers(
             (work, heads, head_dim), dtype=torch.float32, device=device
         )
         partial_lse = torch.empty((work, heads), dtype=torch.float32, device=device)
+    elif decode:
+        # The native build merges its splits on device, so its scratch is a
+        # four-dimensional block sized by the split capacity rather than by the
+        # scheduled work rows. A refused build leaves both entries None and the
+        # paged decode workspace below takes over.
+        partial, partial_lse = allocate_step5_decode_native_partial(
+            rows, heads, head_dim, device
+        )
     if not decode:
         capacity = min(16 * 513, region_bins)
         sm100_buffers = {}
@@ -113,11 +122,14 @@ def _allocate_attention_buffers(
                 (groups, (region_bins + 31) // 32), dtype=torch.int32, device=device
             ),
         )
-    # Decode scratch for the SAIL AOT paged kernel; absent on devices and head
-    # layouts that keep the portable schedule.
+    # Decode scratch for the SAIL paged kernel; absent on devices and head
+    # layouts that keep the portable schedule, and skipped when the native
+    # kernel already took the partial block above.
     ppu_decode = None
-    if decode and can_allocate_step5_ppu_decode(
-        heads=heads, kv_heads=1, device=device
+    if (
+        decode
+        and partial is None
+        and can_allocate_step5_ppu_decode(heads=heads, kv_heads=1, device=device)
     ):
         ppu_decode = allocate_step5_ppu_decode_workspace(
             rows=rows,

@@ -6,6 +6,7 @@ import math
 
 import torch
 
+from sglang.kernels.jit.utils.common import is_sail_runtime
 from sglang.kernels.ops.attention.step5 import options as step5_options
 from sglang.kernels.ops.attention.step5.prefill_ppu import (
     can_use_step5_prefill_ppu,
@@ -30,6 +31,7 @@ def _can_use_sparse_prefill_cute(device: torch.device) -> bool:
     return (
         device.type == "cuda"
         and torch.version.hip is None
+        and not is_sail_runtime()
         and torch.cuda.get_device_capability(device)[0] in (9, 10)
     )
 
@@ -231,7 +233,10 @@ def step5_sparse_prefill_selected(
     stays on, the whole chunk runs in that one launch instead: every row walks its
     own selection, so the union is skipped and only the two int32 planes are
     filled. The kernel covers the eight- and sixteen-head layouts on PPU parts
-    and leaves everything else on the portable schedule.
+    and leaves everything else on the portable schedule. ``prefill_ppu`` picks
+    between its two builds there; the native one unions a sixteen-row window
+    inside the launch, so it reuses ``physical_regions`` and ``logical_starts``
+    as scratch and borrows ``membership`` as the per-tile region counts.
     """
     if (
         query_positions is not None
@@ -253,6 +258,9 @@ def step5_sparse_prefill_selected(
             out=out,
             lse=lse,
             scale=scale,
+            group_start=group_query_start,
+            group_end=group_query_end,
+            tile_counts=membership,
         )
         return
 
