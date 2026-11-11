@@ -36,8 +36,10 @@ from sglang.srt.layers.attention.dsa.dsa_dcp import (
     dcp_split_rows,
 )
 from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import (
+    dcp_all_visible,
     dcp_gather_request_rows,
     dcp_local_topk,
+    dcp_localize_compact,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
     BaseIndexerMetadata,
@@ -2118,7 +2120,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             if batch_size == 0:
                 return torch.empty((0, max_len), dtype=torch.float32, device=q.device)
             if batch_size <= self.sm_count or (
-                dcp_size > 1
+                envs.SGLANG_DSA_FULL_BATCH_MQA.get()
+                and dcp_size > 1
                 and chunk_next_n <= 8
                 and batch_size <= 1024
                 and get_platform().is_sm100
@@ -3004,14 +3007,25 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # MLA: use dummy logits with topk kernel's fast path to generate indices
         # When length <= 2048, naive_topk_cuda directly generates [0,1,...,length-1,-1,...]
         seq_lens_expanded = metadata.get_seqlens_expanded()
-        # TODO(dark): replace the stupid transform with 1 kernel launch here
-        dummy_logits = torch.zeros(
-            seq_lens_expanded.shape[0],
-            self.index_topk,
-            dtype=torch.float32,
-            device=x_meta.device,
-        )
-        raw_topk_result = metadata.topk_transform(dummy_logits, self.index_topk)
+        if dsa_shards_index_k() and forward_batch.forward_mode.is_decode_or_idle():
+            slots = dcp_all_visible(
+                seq_lens_expanded,
+                metadata.get_page_table_64(),
+                self.index_topk,
+                get_token_to_kv_pool().page_size,
+            )
+            out_len = metadata.attn_metadata.dcp_topk_length
+            assert out_len is not None
+            raw_topk_result, _ = dcp_localize_compact(slots, out_len[: slots.shape[0]])
+        else:
+            # TODO(dark): replace the stupid transform with 1 kernel launch here
+            dummy_logits = torch.zeros(
+                seq_lens_expanded.shape[0],
+                self.index_topk,
+                dtype=torch.float32,
+                device=x_meta.device,
+            )
+            raw_topk_result = metadata.topk_transform(dummy_logits, self.index_topk)
         if topk_result is not None:
             # PCG/BCG: fill the valid prefix of the padded static buffer and
             # leave padded rows at the -1 sentinel.
