@@ -224,8 +224,6 @@ __device__ __forceinline__ int equal_count_higher_equal(
 // Phase 3: All bin-owning threads combine the warp exclusive offset with
 //          their intra-warp prefix to obtain the per-bin exclusive prefix
 //          sum, then search for the threshold in parallel.
-//
-// Only two __syncthreads (vs 2*log2(n_bins) in the tree-based original).
 template <int n_bins, typename SharedStorage>
 __device__ __forceinline__ void choose_threshold_parallel(
     SharedStorage& storage, int thread) {
@@ -253,6 +251,7 @@ __device__ __forceinline__ void choose_threshold_parallel(
     orig[0] = owns_bin ? storage.histogram[thread] : 0;
     local_sum = orig[0];
   }
+  __syncthreads();
 
   // Step 2: Warp-level inclusive prefix sum via __shfl_up_sync.
   int warp_inc = local_sum;
@@ -363,6 +362,23 @@ __global__ void dsa_radix_selector_kernel(
     storage.selected_base = 0;
   }
   __syncthreads();
+
+  // 历史全部保留时不读取 scores，允许打分阶段跳过这些行。
+  if (current <= topk) {
+    for (int region = thread; region < current; region += kThreads) {
+      store_region(region, region, request, head, heads, output_width,
+                   block_table, block_table_stride, block_table_length,
+                   page_size / region_block, region_block, packed,
+                   region_output, start_output);
+    }
+    if (thread == 0) {
+      store_region(current, topk, request, head, heads, output_width,
+                   block_table, block_table_stride, block_table_length,
+                   page_size / region_block, region_block, packed,
+                   region_output, start_output);
+    }
+    return;
+  }
 
   // Layer 1: hybrid score cache for small contexts.
   // Split the 8192-element cache between registers (2048 floats) and shared
@@ -556,8 +572,12 @@ __global__ void dsa_radix_selector_kernel(
   } else {
     int const begin = int((int64_t(current) * thread) / kThreads);
     int const end = int((int64_t(current) * (thread + 1)) / kThreads);
-    for (int region = begin; region < end; ++region) {
-      process_region_for_scatter(region, score_src[region], true);
+    int const iterations = (current + kThreads - 1) / kThreads;
+    for (int iter = 0; iter < iterations; ++iter) {
+      int const region = begin + iter;
+      bool const valid = region < end;
+      float const raw = valid ? score_src[region] : 0.0f;
+      process_region_for_scatter(region, raw, valid);
     }
   }
 
@@ -658,6 +678,8 @@ __global__ void dsa_radix_chunk_kernel(
   for (int slot = thread; slot < topk; slot += kThreads) {
     output_row[slot] = -1;
   }
+  // 短历史由 merge 直接生成，空 chunk 也无需扫描或执行 radix 同步。
+  if (current <= topk || valid_length == 0) return;
   if (thread == 0) {
     storage.prefix_value = 0;
     storage.prefix_mask = 0;
@@ -814,6 +836,23 @@ __global__ void dsa_radix_merge_kernel(
     storage.selected_base = 0;
   }
   __syncthreads();
+
+  // 容量超过 16384 也可能是短历史，不能读取未计算的 scores 或候选。
+  if (current <= topk) {
+    for (int region = thread; region < current; region += kThreads) {
+      store_region(region, region, request, head, heads, output_width,
+                   block_table, block_table_stride, block_table_length,
+                   page_size / region_block, region_block, packed,
+                   region_output, start_output);
+    }
+    if (thread == 0) {
+      store_region(current, topk, request, head, heads, output_width,
+                   block_table, block_table_stride, block_table_length,
+                   page_size / region_block, region_block, packed,
+                   region_output, start_output);
+    }
+    return;
+  }
 
   // Rounds 0-2: score bits [11, 11, 10]; Round 3: region bits [10].
   constexpr int kMergeRounds = 4;

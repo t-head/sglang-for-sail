@@ -61,6 +61,19 @@ class Step5PrefillWorkspace(msgspec.Struct, frozen=True, kw_only=True):
     sm100_token_limits: torch.Tensor | None = None
 
 
+class Step5CompactScoringWorkspace(msgspec.Struct, frozen=True, kw_only=True):
+    """Span IDs are independent of pool slots; K is refreshed per layer and replay."""
+
+    keys: torch.Tensor
+    request_last_rows: torch.Tensor
+    span_start: torch.Tensor
+    span_end: torch.Tensor
+    span_requests: torch.Tensor
+    rows: int
+    group_rows: int
+    fp8: bool
+
+
 class Step5SelectionWorkspace(msgspec.Struct, frozen=True, kw_only=True):
     """Per-layer scoring/selection outputs, not immutable query layout.
 
@@ -86,6 +99,7 @@ class Step5SelectionWorkspace(msgspec.Struct, frozen=True, kw_only=True):
     # (start, end, rows) spans cut from the per-request packed lengths; indexing
     # the score tile per span beats the divisibility-based row grouping.
     score_groups: tuple[torch.Tensor, torch.Tensor, int] | None = None
+    compact_scoring: Step5CompactScoringWorkspace | None = None
     # SAIL AOT radix selector scratch; None keeps the portable selection path.
     ppu_selector: object | None = None
 

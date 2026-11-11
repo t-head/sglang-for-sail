@@ -2,6 +2,8 @@
 """Paged Step5 scoring over existing SW128 E4M3 compressed_index_keys.
 """
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
@@ -39,13 +41,23 @@ def _decode_e4m3(bits, NATIVE_FP8: tl.constexpr):
     return _e4m3_to_bf16(bits)
 
 
-def _native_fp8_decode(device: torch.device) -> bool:
-    """sm89+ widens E4M3 in hardware; sm80 PPU keeps the integer decoder."""
+@functools.cache
+def _native_fp8(device: torch.device) -> bool:
+    """Whether this core has E4M3 hardware: the native cvt and the E4M3 MMA.
+
+    ppu0015 (890P, 8.9) has both; ppu0010 (ZW810E, 8.0) has neither and takes the
+    integer decoder plus the fp8e4b15 reading with its 2^16 rescale.
+    """
     return (
         device.type == "cuda"
         and torch.version.hip is None
         and torch.cuda.get_device_capability(device) >= (8, 9)
     )
+
+
+def _fp8_indexer() -> bool:
+    """Indexer operands: raw bytes for the fp8 MMA, decoded BF16 when off."""
+    return envs.SGLANG_SAIL_STEP5_FP8_INDEXER.get()
 
 
 @triton.jit
@@ -114,7 +126,9 @@ def _score_regions(
         if (request > 0) & (tile * BLOCK_R < position // 8):
             valid = regions < position // 8
             token = tl.load(
-                ReqToToken + request * MAP_STRIDE + regions * 8,
+                ReqToToken
+                + request.to(tl.int64) * MAP_STRIDE
+                + regions.to(tl.int64) * 8,
                 valid,
                 other=0,
             ).to(tl.int64)
@@ -138,19 +152,28 @@ def _score_regions(
         tl.store(Out + row * REGIONS + regions, _plus_zero(score), regions < REGIONS)
 
 
-# E4M3FN has exponent bias 7 while fp8e4b15, which this backend supports
-# natively, has bias 15: the same byte read as b15 is exactly 2^-8 of its E4M3FN
-# value (identical exponent field, 3-bit mantissa, denormal convention). So the
-# raw bytes can be bitcast to fp8e4b15 and fed to the MMA, and the accumulator is
-# rescaled by 2^16 to restore the value. The map is a power of two, hence exact,
-# and it removes ~7 FP32 decode instructions per element.
+# E4M3FN has exponent bias 7 while fp8e4b15 has bias 15: the same byte read as
+# b15 is exactly 2^-8 of its E4M3FN value (identical exponent field, 3-bit
+# mantissa, denormal convention). ppu0010 (ZW810E, cap 8.0) has no E4M3 MMA, so it
+# reads the bytes as b15 and rescales the accumulator by 2^16; the map is a power
+# of two, hence exact. ppu0015 (890P, cap 8.9) only emits the E4M3 MMA, where the
+# bytes already are E4M3FN and the rescale is the identity.
 FP8_RESCALE = tl.constexpr(65536.0)
 
 
 @triton.jit
-def _e4m3_bytes_to_fp8(bits):
-    """E4M3FN raw bytes, read as fp8e4b15 worth 2^-8 of the original value."""
-    return bits.to(tl.float8e4b15, bitcast=True)
+def _e4m3_bytes_to_fp8(bits, NATIVE_FP8: tl.constexpr):
+    """E4M3FN raw bytes as the fp8 operand type this core's MMA accepts.
+
+    Only used while ``FP8_INDEXER`` is on; the off path decodes to BF16 instead.
+    """
+    # One return: Triton records the taken static-if branch *and* any trailing
+    # return, then rejects the two fp8 types when it unifies them.
+    if NATIVE_FP8:
+        operand = bits.to(tl.float8e4nv, bitcast=True)
+    else:
+        operand = bits.to(tl.float8e4b15, bitcast=True)
+    return operand
 
 
 @triton.jit
@@ -174,8 +197,13 @@ def _load_keys_tile(
     MMA itself is 2.5% of the 235us this takes at rows=32 / 16384 live regions.
     The 3-D form reaches 57 bytes per sector and a 1.91x wavefront.
     """
+    # req_to_token can hold >2^31 elements (2049 slots x 1M capacity), so the
+    # slot stride must be int64 or a high slot wraps in int32. Page and slot
+    # stay int32: the compressed payload is far below 2^31 bytes.
     token = tl.load(
-        ReqToToken + request * MAP_STRIDE + regions * 8, valid, other=0
+        ReqToToken + request.to(tl.int64) * MAP_STRIDE + regions.to(tl.int64) * 8,
+        valid,
+        other=0,
     ).to(tl.int32)
     page, slot = token >> 6, (token & 63) >> 3
     # Each page contains two 128-byte channel atoms, each with eight swizzled
@@ -249,12 +277,15 @@ def _score_regions_ppu_opt(
     HEAD_BLOCK: tl.constexpr,
     MIXED: tl.constexpr,
     HAS_SPANS: tl.constexpr,
+    NATIVE_FP8: tl.constexpr,
+    FP8_INDEXER: tl.constexpr,
 ):
     """Score GROUP_ROWS rows together so they share one key-tile gather.
 
     Four differences from the original ``_score_regions``:
     1. key/query bytes go straight into the fp8 MMA instead of an element-wise
-       software E4M3 decode (half of the instructions on the old path);
+       software E4M3 decode (half of the instructions on the old path), unless
+       ``FP8_INDEXER`` is off, which swaps in decoded BF16 operands;
     2. M = GROUP_ROWS * HEAD_BLOCK is filled with adjacent rows of the same
        request, so the key tile is reused inside the group and the gather count
        drops to 1/GROUP_ROWS;
@@ -273,6 +304,12 @@ def _score_regions_ppu_opt(
     result in registers: doing so evicts the hot-path fp8 query tile and was
     measured to push the capture case from 5.9us to over 20us.
     """
+    # b15 stands for 2^-8 of the E4M3 value it encodes; e4nv and BF16 carry the
+    # value itself, so they need no correction.
+    fp8_rescale = 1.0
+    if FP8_INDEXER:
+        if not NATIVE_FP8:
+            fp8_rescale = FP8_RESCALE
     group = tl.program_id(0).to(tl.int64)
     first_tile = tl.program_id(1)
     row_index = tl.arange(0, GROUP_ROWS)
@@ -286,8 +323,10 @@ def _score_regions_ppu_opt(
         row_limit = ROWS
     rows = row_base + row_index
     row_valid = rows < row_limit
-    request = tl.load(RowToReq + rows, row_valid, other=0)
-    position = tl.load(Positions + rows, row_valid, other=0)
+    # Keep padded lanes' addresses in bounds; the masks still zero their values.
+    rows_safe = tl.minimum(rows, ROWS - 1)
+    request = tl.load(RowToReq + rows_safe, row_valid, other=0)
+    position = tl.load(Positions + rows_safe, row_valid, other=0)
     base_request = tl.max(request, axis=0)
     # Padding rows carry request slot zero, so they neither gather keys nor write
     # a live score; only the owned rows have to agree for the hot path.
@@ -310,20 +349,29 @@ def _score_regions_ppu_opt(
     matrix_row = tl.arange(0, GROUP_ROWS * HEAD_BLOCK)
     channel = tl.arange(0, 256)
     head_index = tl.arange(0, HEAD_BLOCK)
+    head_index_safe = tl.where(head_index < HEADS, head_index, 0)
     query_row = row_base + matrix_row // HEAD_BLOCK
     head = matrix_row % HEAD_BLOCK
-    query = _e4m3_bytes_to_fp8(
-        tl.load(
-            Q + (query_row[:, None] * HEADS + head[:, None]) * 256 + channel[None, :],
-            (query_row[:, None] < row_limit) & (head[:, None] < HEADS),
-            other=0,
-        )
+    # Head lanes past HEADS would address the next row (and past the tensor for
+    # the last row), so clamp them; the mask below still zeroes their values.
+    query_row_safe = tl.minimum(query_row, ROWS - 1)
+    head_safe = tl.where(head < HEADS, head, 0)
+    q_bits = tl.load(
+        Q
+        + (query_row_safe[:, None] * HEADS + head_safe[:, None]) * 256
+        + channel[None, :],
+        (query_row[:, None] < row_limit) & (head[:, None] < HEADS),
+        other=0,
     )
+    if FP8_INDEXER:
+        query = _e4m3_bytes_to_fp8(q_bits, NATIVE_FP8)
+    else:
+        query = _decode_e4m3(q_bits, NATIVE_FP8)
     weights = (
         tl.load(
-            W + rows[:, None] * HEADS + tl.arange(0, HEAD_BLOCK)[None, :],
+            W + rows_safe[:, None] * HEADS + head_index_safe[None, :],
             row_valid[:, None]
-            & (tl.arange(0, HEAD_BLOCK)[None, :] < HEADS)
+            & (head_index[None, :] < HEADS)
             & (request[:, None] > 0),
             other=0.0,
         ).to(tl.float32)
@@ -350,7 +398,12 @@ def _score_regions_ppu_opt(
         else:
             row_tiles = tl.minimum(tl.cdiv(live, BLOCK_R), tl.cdiv(REGIONS, BLOCK_R))
             row_tiles = tl.where(live <= 512, 0, row_tiles)
-            written = regions[None, :] < (row_tiles * BLOCK_R)[:, None]
+            # row_tiles is clamped by the tile count, so its right edge passes
+            # REGIONS whenever the score width is not a multiple of BLOCK_R; those
+            # -inf lanes would land on the next row's leading columns.
+            written = in_range[None, :] & (
+                regions[None, :] < (row_tiles * BLOCK_R)[:, None]
+            )
         if uniform & (base_request > 0) & (tile * BLOCK_R < max_live):
             packed = _load_keys_tile(
                 CompressedIndexKeys,
@@ -361,14 +414,18 @@ def _score_regions_ppu_opt(
                 MAP_STRIDE,
                 BLOCK_R,
             )
-            products = tl.dot(query, _e4m3_bytes_to_fp8(packed)) * FP8_RESCALE
+            if FP8_INDEXER:
+                keys = _e4m3_bytes_to_fp8(packed, NATIVE_FP8)
+            else:
+                keys = _decode_e4m3(packed, NATIVE_FP8)
+            products = tl.dot(query, keys) * fp8_rescale
             weighted = tl.maximum(products, 0.0) * tl.reshape(
                 weights, (GROUP_ROWS * HEAD_BLOCK, 1)
             )
             score = tl.sum(tl.reshape(weighted, (GROUP_ROWS, HEAD_BLOCK, BLOCK_R)), axis=1)
             score = tl.where(regions[None, :] < live[:, None], score, -float("inf"))
             tl.store(
-                Out + rows[:, None] * REGIONS + regions[None, :],
+                Out + rows_safe[:, None] * REGIONS + regions[None, :],
                 _plus_zero(score),
                 row_valid[:, None] & written,
             )
@@ -382,8 +439,9 @@ def _score_regions_ppu_opt(
             for r in tl.range(0, GROUP_ROWS, loop_unroll_factor=1):
                 row = row_base + r
                 row_ok = row < row_limit
-                request_r = tl.load(RowToReq + row, row_ok, other=0)
-                position_r = tl.load(Positions + row, row_ok, other=0)
+                row_safe = tl.minimum(row, ROWS - 1)
+                request_r = tl.load(RowToReq + row_safe, row_ok, other=0)
+                position_r = tl.load(Positions + row_safe, row_ok, other=0)
                 live_r = tl.maximum(position_r // 8, 0)
                 if CLEAR_FUTURE:
                     row_written = in_range
@@ -391,21 +449,25 @@ def _score_regions_ppu_opt(
                     row_tiles_r = tl.minimum(
                         tl.cdiv(live_r, BLOCK_R), tl.cdiv(REGIONS, BLOCK_R)
                     )
-                    row_written = (
+                    row_written = in_range & (
                         regions < tl.where(live_r <= 512, 0, row_tiles_r) * BLOCK_R
                     )
                 score_r = tl.full((BLOCK_R,), -float("inf"), tl.float32)
                 if (request_r > 0) & (tile * BLOCK_R < live_r):
-                    query_r = _e4m3_bytes_to_fp8(
-                        tl.load(
-                            Q + (row * HEADS + head_index[:, None]) * 256 + channel[None, :],
-                            row_ok & (head_index[:, None] < HEADS),
-                            other=0,
-                        )
+                    q_bits_r = tl.load(
+                        Q
+                        + (row_safe * HEADS + head_index_safe[:, None]) * 256
+                        + channel[None, :],
+                        row_ok & (head_index[:, None] < HEADS),
+                        other=0,
                     )
+                    if FP8_INDEXER:
+                        query_r = _e4m3_bytes_to_fp8(q_bits_r, NATIVE_FP8)
+                    else:
+                        query_r = _decode_e4m3(q_bits_r, NATIVE_FP8)
                     weight_r = (
                         tl.load(
-                            W + row * HEADS + head_index,
+                            W + row_safe * HEADS + head_index_safe,
                             row_ok & (head_index < HEADS),
                             other=0.0,
                         )
@@ -420,11 +482,15 @@ def _score_regions_ppu_opt(
                         MAP_STRIDE,
                         BLOCK_R,
                     )
-                    products_r = tl.dot(query_r, _e4m3_bytes_to_fp8(packed_r)) * FP8_RESCALE
+                    if FP8_INDEXER:
+                        keys_r = _e4m3_bytes_to_fp8(packed_r, NATIVE_FP8)
+                    else:
+                        keys_r = _decode_e4m3(packed_r, NATIVE_FP8)
+                    products_r = tl.dot(query_r, keys_r) * fp8_rescale
                     score_r = tl.sum(tl.maximum(products_r, 0.0) * weight_r[:, None], axis=0)
                     score_r = tl.where(regions < live_r, score_r, -float("inf"))
                 tl.store(
-                    Out + row * REGIONS + regions,
+                    Out + row_safe * REGIONS + regions,
                     _plus_zero(score_r),
                     row_ok & row_written,
                 )
@@ -432,7 +498,7 @@ def _score_regions_ppu_opt(
             score = tl.zeros((GROUP_ROWS, BLOCK_R), tl.float32)
             score = tl.where(regions[None, :] < live[:, None], score, -float("inf"))
             tl.store(
-                Out + rows[:, None] * REGIONS + regions[None, :],
+                Out + rows_safe[:, None] * REGIONS + regions[None, :],
                 _plus_zero(score),
                 row_valid[:, None] & written,
             )
@@ -499,7 +565,9 @@ def _score_four_rows_per_request(
         regions = tile * BLOCK_R + tl.arange(0, BLOCK_R)
         valid = regions < max_live
         token = tl.load(
-            ReqToToken + base_request * MAP_STRIDE + regions * 8,
+            ReqToToken
+            + base_request.to(tl.int64) * MAP_STRIDE
+            + regions.to(tl.int64) * 8,
             valid & (base_request > 0),
             other=0,
         ).to(tl.int64)
@@ -585,7 +653,9 @@ def _score_thirty_two_rows_per_request(
             regions = tile * BLOCK_R + tl.arange(0, BLOCK_R)
             valid = regions < max_live
             token = tl.load(
-                ReqToToken + base_request * MAP_STRIDE + regions * 8,
+                ReqToToken
+                + base_request.to(tl.int64) * MAP_STRIDE
+                + regions.to(tl.int64) * 8,
                 valid & (base_request > 0),
                 other=0,
             ).to(tl.int64)
@@ -707,7 +777,7 @@ def _launch_reference(
     # reduces that pressure and gives small batches more independent CTAs.
     block_regions = 32
     grid_tiles = min(triton.cdiv(out.shape[1], block_regions), 128)
-    native_fp8 = _native_fp8_decode(q.device)
+    native_fp8 = _native_fp8(q.device)
     if group_rows == 32 and not clear_future:
         _score_thirty_two_rows_per_request[(triton.cdiv(q.shape[0], 32), grid_tiles)](
             q,
@@ -822,6 +892,8 @@ def _launch_spans(
         max(4, heads + (-heads % 4)),
         True,
         True,
+        _native_fp8(q.device),
+        _fp8_indexer(),
         num_warps=2,
     )
 
@@ -914,5 +986,7 @@ def launch(
         head_block,
         True,
         False,
+        _native_fp8(q.device),
+        _fp8_indexer(),
         num_warps=num_warps,
     )
