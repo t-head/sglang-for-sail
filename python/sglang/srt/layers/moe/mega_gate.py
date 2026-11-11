@@ -18,7 +18,13 @@ from sglang.srt.layers.moe.topk import (
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
+from sglang.srt.utils.device import is_sail
+from sglang.srt.utils.log_utils import print_info_once
 
+_is_sail = is_sail()
+_FALLBACK_MSG = "MegaGate fallback: the regular router keeps routing"
+# DeepGEMM bf16_mega_gate scores one token block per launch.
+_MEGA_GATE_MAX_ROWS = 2048
 # Per-forward cache of the gate's row masks, installed by mega_gate_forward_scope.
 _ROW_MASKS_ATTR = "_mega_gate_row_masks"
 
@@ -30,9 +36,53 @@ class MegaGateRouting(NamedTuple):
     in_buffer: bool
 
 
+@functools.lru_cache(maxsize=1)
+def _sail_mega_gate_available() -> bool:
+    # The checked PPU kernels dispatch architecture major 8; other SAIL devices
+    # retain the regular router until their library exposes a verified path.
+    if _device_sm < 89 or _device_sm // 10 != 8:
+        return False
+    try:
+        import deep_gemm
+    except ImportError:
+        return False
+    fn = getattr(deep_gemm, "bf16_mega_gate", None)
+    if not callable(fn):
+        return False
+    # The target facade always forwards its physical-routing and output kwargs,
+    # even when their values are None. Older same-name PPU APIs reject them.
+    import inspect
+    import re
+
+    required = {
+        "use_shared_as_routed",
+        "num_shared_experts",
+        "routed_scaling_factor",
+        "ep_rank",
+        "scoring_func",
+        "mask",
+        "bias",
+        "image_bias",
+        "image_token_mask",
+        "fix_routing_mask",
+        "unmapped_topk_idx",
+        "to_physical_map",
+        "logical_count",
+        "out",
+    }
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        doc = fn.__doc__ or ""
+        return all(re.search(r"\b" + name + r"\b", doc) for name in required)
+    return required <= params.keys() or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
 def mega_gate_supported(moe) -> bool:
     if (
-        _device_sm // 10 != 10
+        (not _sail_mega_gate_available() if _is_sail else _device_sm // 10 != 10)
         or moe.config.model_type != "deepseek_v41"
         or moe.topk.enable_waterfill
         or moe.num_fused_shared_experts
@@ -80,20 +130,34 @@ def mega_gate_supported(moe) -> bool:
 
 
 def should_use_mega_gate(moe, hidden_states: torch.Tensor, forward_batch) -> bool:
-    if not envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.get() or forward_batch is None:
+    if not envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.get():
+        return False
+    if forward_batch is None:
+        print_info_once(_FALLBACK_MSG)
         return False
     # Prefill, decode and verify; draft extend keeps the regular router.
     mode = forward_batch.forward_mode
-    # The routing and the Mega-mHC input go to MegaMoE's buffer, sized to its token cap.
+    if mode.is_idle():
+        return False
     max_rows = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
-    return (
-        (mode.is_decode() or mode.is_extend())
+    if _is_sail:
+        max_rows = min(max_rows, _MEGA_GATE_MAX_ROWS)
+    supported_mode = (
+        (mode.is_decode() or mode.is_target_verify())
+        if _is_sail
+        else (mode.is_decode() or mode.is_extend())
+    )
+    use_mega_gate = (
+        supported_mode
         and moe.mega_gate_supported
         and 0 < hidden_states.shape[0] <= max_rows
         and not get_forward().sp_active
         and hidden_states.dtype == torch.bfloat16
         and hidden_states.is_contiguous()
     )
+    if not use_mega_gate:
+        print_info_once(_FALLBACK_MSG)
+    return use_mega_gate
 
 
 def _captures_routed_experts(moe) -> bool:
@@ -177,8 +241,10 @@ def run_mega_gate(
         "lp",
         "fake",
     ):
+        print_info_once(_FALLBACK_MSG)
         return None
     if moe.is_hash and input_ids is None:
+        print_info_once(_FALLBACK_MSG)
         return None
     num_tokens = hidden_states.shape[0]
     use_image = (
