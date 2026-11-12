@@ -16,7 +16,7 @@ from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
     QwenSparseAttnBackend,
     QwenSparseAttnMetadata,
 )
-from sglang.srt.utils import get_device_sm, is_ppu
+from sglang.srt.utils import get_device_sm, is_sail
 
 
 @pytest.fixture(autouse=True)
@@ -34,7 +34,7 @@ def clear_resolvers():
 def test_avg_logits_rejects_unvalidated_devices(monkeypatch, sm, ppu):
     import sglang.srt.utils as utils
 
-    monkeypatch.setattr(utils, "is_ppu", lambda: ppu)
+    monkeypatch.setattr(utils, "is_sail", lambda: ppu)
     monkeypatch.setattr(utils, "get_device_sm", lambda: sm)
     assert mqa._resolve_fp8_avg_mqa_logits() is None
 
@@ -42,7 +42,7 @@ def test_avg_logits_rejects_unvalidated_devices(monkeypatch, sm, ppu):
 def test_missing_avg_logits_falls_back(monkeypatch):
     import sglang.srt.utils as utils
 
-    monkeypatch.setattr(utils, "is_ppu", lambda: True)
+    monkeypatch.setattr(utils, "is_sail", lambda: True)
     monkeypatch.setattr(utils, "get_device_sm", lambda: 89)
     monkeypatch.setitem(sys.modules, "deep_gemm", ModuleType("deep_gemm"))
     assert mqa._resolve_fp8_avg_mqa_logits() is None
@@ -50,7 +50,7 @@ def test_missing_avg_logits_falls_back(monkeypatch):
 
 def test_fa3_resolver_does_not_import_second_valid_wrapper(monkeypatch):
     """Do not replace custom-op registrations behind a retained first handle."""
-    monkeypatch.setattr(backend_module, "is_ppu", lambda: True)
+    monkeypatch.setattr(backend_module, "is_sail", lambda: True)
 
     def native(*args, qsa_allow_aiu=False, **kwargs):
         return None
@@ -92,7 +92,7 @@ def test_unsupported_avg_logits_uses_original_scoring(monkeypatch, heads, dim, s
 
 
 def _require_890p():
-    if not is_ppu() or get_device_sm() != 89:
+    if not is_sail() or get_device_sm() != 89:
         pytest.skip("requires a PPU-890P")
 
 
@@ -239,7 +239,7 @@ def test_fa3_slot_mapping_handles_metadata_and_padding(monkeypatch, per_query):
 
 def test_fa3_quantized_cache_uses_original_backend(monkeypatch):
     monkeypatch.setenv("SGLANG_SAIL_QSA_FA3_SPARSE_ATTN", "1")
-    monkeypatch.setattr(backend_module, "is_ppu", lambda: True)
+    monkeypatch.setattr(backend_module, "is_sail", lambda: True)
     q = torch.zeros(1, 4, 256, dtype=torch.bfloat16)
     kv = torch.empty(2, 1, 256, dtype=torch.float8_e4m3fn)
     assert not QwenSparseAttnBackend()._fa3_qsa_supported(

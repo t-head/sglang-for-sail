@@ -137,11 +137,11 @@ _FP8_AVG_HEAD_DIMS = (64, 128)
 @functools.lru_cache(maxsize=1)
 def _resolve_fp8_avg_mqa_logits():
     """SAIL DeepGEMM fp8_mqa_avg_logits kernel; None when unavailable."""
-    from sglang.srt.utils import get_device_sm, is_ppu
+    from sglang.srt.utils import get_device_sm, is_sail
 
     # Only enable the PPU0015 FP8 MMA implementation validated on 890P.
     # Other PPU generations and upstream CUDA DeepGEMM are separate targets.
-    if not is_ppu() or get_device_sm() != 89:
+    if not is_sail() or get_device_sm() != 89:
         print_warning_once(
             "SGLANG_SAIL_QSA_INDEXER_FP8_AVG_LOGITS requires PPU SM89 (890P); "
             "falling back to the TileLang/torch QSA indexer scoring."

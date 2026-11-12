@@ -1,5 +1,21 @@
 # PPU QSA backends: compatibility and validation
 
+## v0.5.23 port status
+
+This branch ports the three v0.5.21 implementation commits onto
+`ywj/v0.5.23` at `c6d7a44accc666e634140be45899c942ed0b4d88`.
+It uses the target's `is_sail()` platform helper, preserves its relative
+TileLang scoring and CP paths, and reuses `max_row_keys` for the native output
+bound. Existing block-index expansion remains ahead of FA3 decode dispatch;
+already-FP8 scorer inputs retain the original relative fallback.
+
+The numerical, serving, GSM8K and LongBench results below are **historical
+v0.5.21 measurements**, not measurements of this v0.5.23 port. Only syntax,
+static integration and repository formatting checks have been performed on the
+port. Runtime correctness and performance require separate validation with the
+target SDK and native libraries; historical numerical failures remain recorded.
+
+
 The optional QSA ports provide two independent switches:
 
 - `SGLANG_SAIL_QSA_INDEXER_FP8_AVG_LOGITS=1`: use the PPU DeepGEMM FP8 AVG

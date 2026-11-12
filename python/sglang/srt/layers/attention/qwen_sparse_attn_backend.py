@@ -57,7 +57,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_spec, get_stream
 from sglang.srt.utils import (
     is_hip,
-    is_ppu,
+    is_sail,
     is_sm100_supported,
     is_sm120,
     print_warning_once,
@@ -83,7 +83,7 @@ def _resolve_ppu_fa3_qsa_with_kvcache():
     import importlib
     import inspect
 
-    if not is_ppu():
+    if not is_sail():
         return None
     # Both packages can register the same flash_attn_3_ops custom operators.
     # Importing the second wrapper before returning the first can invalidate
@@ -1530,7 +1530,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         """Shape/capability gate for the SAIL FA3 QSA sparse-attention path."""
         if not envs.SGLANG_SAIL_QSA_FA3_SPARSE_ATTN.get():
             return False
-        if not is_ppu():
+        if not is_sail():
             return False
         if (
             q.dtype not in (torch.bfloat16, torch.float16)

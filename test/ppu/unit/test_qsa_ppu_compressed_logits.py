@@ -13,14 +13,14 @@ import torch
 from sglang.srt.layers.attention.qsa import mqa
 from sglang.srt.layers.attention.qsa import qsa_indexer as indexer_module
 from sglang.srt.layers.attention.qsa.kernel import qsa_fast_topk
-from sglang.srt.utils import get_device_sm, is_ppu
+from sglang.srt.utils import get_device_sm, is_sail
 
 
 @pytest.mark.parametrize("legacy", [False, True])
 def test_resolver_checks_native_schema(monkeypatch, legacy):
     import sglang.srt.utils as utils
 
-    monkeypatch.setattr(utils, "is_ppu", lambda: True)
+    monkeypatch.setattr(utils, "is_sail", lambda: True)
     monkeypatch.setattr(utils, "get_device_sm", lambda: 89)
     native = lambda: None
     native.__doc__ = (
@@ -115,9 +115,87 @@ def test_selector_preserves_request_local_indices_and_accounts_for_stride(monkey
     torch.testing.assert_close(actual, expected)
 
 
+@pytest.mark.parametrize(
+    "native_requested,dtype,expected_backend",
+    [
+        (False, torch.bfloat16, "relative"),
+        (True, torch.bfloat16, "native"),
+        (True, torch.float8_e4m3fn, "relative"),
+    ],
+)
+def test_selector_reuses_host_bound_and_keeps_relative_fallback(
+    monkeypatch, native_requested, dtype, expected_backend
+):
+    # Model only the CUDA tensor protocol at the selector boundary. All scoring
+    # is mocked, so this dispatch regression needs no accelerator or native op.
+    data = torch.empty(2, 4, 128, dtype=dtype)
+
+    class Query:
+        is_cuda = True
+        shape = data.shape
+        device = data.device
+
+        def __init__(self):
+            self.dtype = data.dtype
+
+        def __getitem__(self, selection):
+            return data[selection]
+
+    q = Query()
+    k = torch.empty(14, 1, 128, dtype=dtype)
+    starts = torch.tensor([0, 7], dtype=torch.int32)
+    ends = torch.tensor([3, 14], dtype=torch.int32)
+    indexer = SimpleNamespace(block_topk=512, token_topk=2048, compress_ratio=4)
+    calls = []
+
+    def native(query, keys, ks, ke, *, max_seqlen_k):
+        calls.append(("native", max_seqlen_k))
+        return torch.zeros(query.shape[0], max_seqlen_k)
+
+    def relative(query, keys, ks, ke, max_row_keys):
+        calls.append(("relative", max_row_keys))
+        return torch.zeros(query.shape[0], max_row_keys)
+
+    def topk(logits, ks, ke, *, topk):
+        assert ks.tolist() == [0, 0]
+        assert ke.tolist() == [3, 7]
+        return torch.full((logits.shape[0], topk), -1, dtype=torch.int32)
+
+    def reject_global(*args, **kwargs):
+        pytest.fail("the original relative fallback must keep its host bound")
+
+    monkeypatch.setattr(indexer_module, "HAS_TILELANG", True)
+    monkeypatch.setattr(
+        indexer_module, "can_use_deep_gemm_fp8_avg_mqa", lambda _: native_requested
+    )
+    monkeypatch.setattr(indexer_module, "deep_gemm_fp8_avg_mqa_prefill", native)
+    monkeypatch.setattr(indexer_module, "qsa_mqa_prefill_relative", relative)
+    monkeypatch.setattr(indexer_module, "qsa_mqa_prefill", reject_global)
+    monkeypatch.setattr(indexer_module, "qsa_fast_topk", topk)
+    monkeypatch.setattr(
+        indexer_module,
+        "expand_qsa_block_indices",
+        lambda blocks, *args, **kwargs: torch.zeros(
+            blocks.shape[0], 2051, dtype=torch.int32
+        ),
+    )
+    output = indexer_module.QSAIndexer.select_prefill_tokens(
+        indexer,
+        q,
+        k,
+        starts,
+        ends,
+        torch.tensor([11, 27]),
+        torch.tensor([28, 28]),
+        max_row_keys=7,
+    )
+    assert calls == [(expected_backend, 7)]
+    assert output.shape == (2, 2051)
+
+
 @pytest.mark.parametrize("rows,keys,dim", [(3, 7, 128), (17, 1100, 128), (7, 777, 64)])
 def test_native_compressed_logits_and_poisoned_padding(rows, keys, dim, tmp_path):
-    if not is_ppu() or get_device_sm() != 89:
+    if not is_sail() or get_device_sm() != 89:
         pytest.skip("requires PPU-890P")
     assert mqa._resolve_fp8_avg_mqa_logits() is not None
     torch.manual_seed(93)
