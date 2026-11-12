@@ -1372,19 +1372,11 @@ class DeepseekSparseAttnBackend(
     def _build_paged_mqa_schedule_metadata(
         self,
         seqlens_32_2d: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Optional[torch.Tensor]:
+        if _is_sail and not envs.SGLANG_SAIL_BF16_INDEXER.get():
+            # Build PPU schedules at indexer compute with the actual Q, owners, and SM count.
+            return None
         extra = {}
-        if _is_sail and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
-            # Weighted PPU logits use one query per row; next_n > 1 is AVG-only.
-            seqlens_32_2d = seqlens_32_2d.contiguous().view(-1, 1)
-            extra["metadata_extra"] = self._paged_mqa_schedule_metadata_extra()
-            if self.token_to_kv_pool.use_fp4_indexer:
-                # Distinct request labels disable reuse safely for expanded rows.
-                extra["indices"] = torch.arange(
-                    seqlens_32_2d.shape[0],
-                    device=seqlens_32_2d.device,
-                    dtype=torch.int32,
-                )
         return resolve_paged_mqa_logits_metadata_fn()(
             seqlens_32_2d, 64, resolve_num_sms(), **extra
         )
@@ -5310,7 +5302,7 @@ class DeepseekSparseAttnBackend(
             num_heads_q=num_heads_q,
             is_fp8_kvcache=self._flashmla_decode_compute_fp8,
             topk=self.dsa_index_topk,
-            # [迁移自 v0.5.18_rel feat/glm-5.3-flash B1 6dd5c0cc6e]
+            # [Ported from v0.5.18_rel feat/glm-5.3-flash B1 6dd5c0cc6e]
             topk_length=topk_length,
         )
 

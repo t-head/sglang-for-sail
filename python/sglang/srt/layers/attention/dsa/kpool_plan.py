@@ -19,7 +19,7 @@ from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.model_executor.forward_context import get_req_to_token_pool
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils import is_cuda, is_hip, is_npu, is_sail
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
@@ -680,6 +680,8 @@ def _compute_pool_schedule_metadata(
     index_page_size: int,
     schedule_builder: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> Optional[torch.Tensor]:
+    if is_sail():
+        return None
     if schedule_builder is not None:
         return schedule_builder(pool_seqlens.contiguous().view(-1, 1).clamp(min=1))
     if not is_cuda():
