@@ -1566,6 +1566,29 @@ def _deterministic_aiter_prefill_page_size(view: Any) -> dict:
 
 
 @register_post_process
+def _ppu_flashmla_fp8_kv_cache_fallback(view: Any) -> dict:
+    # [fp8-kv-cache fallback] On PPU only the dense FlashMLA path lacks an
+    # fp8_e4m3 kv-cache kernel; keep the fallback for it and leave every other
+    # backend untouched. In particular --dsa-prefill-backend flashmla_sparse is
+    # supported: the pool stores fp8 (quantize_k_cache on write) and the
+    # framework dequantizes the prefix KV (dequantize_k_cache_paged) before the
+    # bf16 sparse kernel, so forcing bf16 here would only lose the memory win.
+    from sglang.srt.utils.device import is_sail
+
+    if not (is_sail() and view.kv_cache_dtype == "fp8_e4m3"):
+        return {}
+    if view.decode_attention_backend != "flashmla":
+        return {}
+
+    logger.warning(
+        "On PPU, --decode-attention-backend flashmla does not support "
+        "--kv-cache-dtype fp8_e4m3. Disabling FP8 KV cache "
+        "(falling back to --kv-cache-dtype auto)."
+    )
+    return {"kv_cache_dtype": "auto"}
+
+
+@register_post_process
 def _page_size_default(view: Any) -> dict:
     if view.page_size is not None:
         return {}
