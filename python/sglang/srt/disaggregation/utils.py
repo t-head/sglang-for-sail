@@ -179,6 +179,13 @@ def supports_dsa_cp_prefix_cache() -> bool:
     return (
         get_disagg().disaggregation_mode != "null"
         and parallel.enable_prefill_cp
+        # A CP width of one computes no CP shards at all, and the runtime
+        # alignment guard keys off that same width (dsa/utils.py:
+        # is_dsa_enable_prefill_cp returns False for attn_cp_size <= 1).
+        # Un-bypassing without it would keep the radix cache on while the
+        # alignment guard is inert, so the feature marker would not imply
+        # the protection it documents.
+        and parallel.attn_cp_size > 1
         and parallel.cp_strategy == "interleave"
     )
 
