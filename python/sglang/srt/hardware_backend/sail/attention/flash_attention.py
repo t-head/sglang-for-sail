@@ -12,6 +12,7 @@ import torch
 from sgl_kernel.debug_utils import maybe_wrap_debug_kernel
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa_nvtx import in_sparse_range
 from sglang.srt.runtime_context import get_buffer
 
 try:
@@ -192,7 +193,7 @@ def flash_attn_with_kvcache(
 
     attention_chunk = 0 if attention_chunk is None else int(attention_chunk)
 
-    if SGLANG_PROFILE_NVTX:
+    if SGLANG_PROFILE_NVTX and not in_sparse_range():
         if cu_seqlens_q is not None:
             batch_size = len(cu_seqlens_q) - 1
         else:
@@ -273,7 +274,7 @@ def flash_attn_with_kvcache(
             ) from e
         raise
 
-    if SGLANG_PROFILE_NVTX:
+    if SGLANG_PROFILE_NVTX and not in_sparse_range():
         th_nvtx_range_pop()
 
     return result
@@ -332,7 +333,7 @@ def flash_attn_varlen_func(
 
     attention_chunk = 0 if attention_chunk is None else int(attention_chunk)
 
-    if SGLANG_PROFILE_NVTX:
+    if SGLANG_PROFILE_NVTX and not in_sparse_range():
         if torch.cuda.is_current_stream_capturing():
             nvtx_message = f"[FW_FMHA] --format=flash_attn_{ver},Forward,type:D,seqlen_q:{max_seqlen_q},head_dim:{q.shape[-1]},head_dim_value:{v.shape[-1]},num_heads_k:{k.shape[-2]},num_heads:{q.shape[-2]},batch_size:{len(cu_seqlens_q) - 1},seqlen_k:{max_seqlen_k},data_type:{q.dtype},window_size_left:{window_size[0]},window_size_right:{window_size[1]},softcap:{softcap}"
         else:
@@ -378,7 +379,7 @@ def flash_attn_varlen_func(
         s_aux=sinks,
     )
 
-    if SGLANG_PROFILE_NVTX:
+    if SGLANG_PROFILE_NVTX and not in_sparse_range():
         th_nvtx_range_pop()
 
     return result
