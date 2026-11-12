@@ -1118,7 +1118,10 @@ class DeepseekSparseAttnBackend(
     def _build_paged_mqa_schedule_metadata(
         self,
         seqlens_32_2d: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Optional[torch.Tensor]:
+        if _is_sail and not envs.SGLANG_SAIL_BF16_INDEXER.get():
+            # Build PPU schedules at indexer compute with the actual Q, owners, and SM count.
+            return None
         return resolve_paged_mqa_logits_metadata_fn()(
             seqlens_32_2d,
             64,
@@ -4742,7 +4745,7 @@ class DeepseekSparseAttnBackend(
             num_heads_q=num_heads_q,
             is_fp8_kvcache=self._flashmla_decode_compute_fp8,
             topk=self.dsa_index_topk,
-            # [迁移自 v0.5.18_rel feat/glm-5.3-flash B1 6dd5c0cc6e]
+            # [Ported from v0.5.18_rel feat/glm-5.3-flash B1 6dd5c0cc6e]
             topk_length=topk_length,
         )
 

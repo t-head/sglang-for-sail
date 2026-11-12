@@ -67,6 +67,11 @@ class DeepGEMMDecodeData(msgspec.Struct, frozen=True):
         q_fp4, q_sf = self.q_fp4[rows], self.q_sf[rows]
         lens = metadata.compressed_seq_lens[rows]
         table = metadata.page_table[rows]
+        if is_sail():
+            owners = metadata.request_indices
+            if owners is None:
+                raise ValueError("PPU MXFP4 metadata is missing query request owners")
+            return (q_fp4, q_sf), lens, table, owners[rows]
         indices = metadata.deep_gemm_indices
         if indices is not None:
             return (q_fp4, q_sf), lens, table, indices[: lens.shape[0]]
@@ -729,8 +734,8 @@ def decode_score_chunks(
 
     def score_rows(rows, plan):
         if indexer.use_int8:
-            # Weighted PPU kernels consume each MTP row independently.
-            group = metadata.rows_per_request
+            # Weighted PPU schedules use one query per row, so chunks may split
+            # an MTP request; the adapter rebuilds metadata for each row chunk.
             return int8_paged_index_logits(
                 q[rows],
                 weights[rows],
@@ -740,7 +745,7 @@ def decode_score_chunks(
                 plan,
                 metadata.max_compressed_seq_len,
                 metadata.compressed_page_size,
-                rows_per_request=group,
+                rows_per_request=metadata.rows_per_request,
             )[:, :lmax]
         return deep_gemm_fp4_paged_mqa_logits(
             (q_fp4[rows].unsqueeze(1), q_sf[rows].unsqueeze(1)),
@@ -750,6 +755,7 @@ def decode_score_chunks(
             metadata.page_table[rows],
             plan,
             metadata.max_compressed_seq_len,
+            indices=req[rows],
         )[:, :lmax]
 
     for rows, plan in metadata.row_chunks():

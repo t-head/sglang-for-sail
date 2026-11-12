@@ -10,6 +10,10 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
+from sglang.srt.layers.attention.mqa_logits_utils import (
+    mqa_logits_row_bytes,
+    sail_paged_mqa_logits,
+)
 
 
 def quantize_query(q, weights):
@@ -60,11 +64,7 @@ def gather_int8_index_k(cache, slots, page_size):
 
 
 def int8_logits_rows_per_chunk(width, max_logits_bytes):
-    # PPU DeepGEMM mqa_logits_common allocates Q rounded to 4 rows and
-    # K rounded to 4 columns after a 256-column guard tile. Budget storage,
-    # not just the logical [rows, width] view returned by that function.
-    stride = (width + 256 + 3) // 4 * 4
-    return max(1, (max_logits_bytes // (stride * 4) // 4) * 4)
+    return max(1, (max_logits_bytes // mqa_logits_row_bytes(width) // 4) * 4)
 
 
 def int8_index_logits(q, weights, kv, lens):
@@ -85,23 +85,21 @@ def int8_index_logits(q, weights, kv, lens):
         starts,
         ends,
         clean_logits=False,
-        logits_dtype=torch.float32,
     )
 
 
 def int8_paged_index_logits(
     q, weights, cache, lens, page_table, plan, width, page_size, rows_per_request=1
 ):
-    """Weighted paged logits keep one query per row, even for multi-row MTP.
+    """Paged INT8 logits for flattened query rows, including multi-row MTP.
 
-    Current PPU DeepGEMM requires next_n=1 for weighted logits. The grouping
-    hint describes callers' flattened rows; it must not merge their lengths.
+    Weighted PPU kernels require next_n=1: each query keeps its own context
+    length and block-table row. rows_per_request remains a caller hint, not
+    a kernel grouping; the adapter rebuilds the schedule for the actual rows.
     """
-    from deep_gemm import int8_paged_mqa_logits
-
     assert q.shape[-1] == 128 and cache.shape[1] == page_size * 132
     q_int8, w = quantize_query(q, weights)
-    return int8_paged_mqa_logits(
+    return sail_paged_mqa_logits(
         q_int8.unsqueeze(1),
         cache.view(cache.shape[0], page_size, 1, 132),
         w.contiguous(),
@@ -109,5 +107,4 @@ def int8_paged_index_logits(
         page_table,
         plan,
         width,
-        clean_logits=False,
     ).float()
