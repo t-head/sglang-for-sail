@@ -35,7 +35,10 @@ from sglang.srt.configs.hybrid_arch import (
     mamba2_config,
 )
 from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
-from sglang.srt.disaggregation.utils import should_bypass_dsa_cp_prefix_cache
+from sglang.srt.disaggregation.utils import (
+    dsa_cp_prefix_cache_enabled,
+    should_bypass_dsa_cp_prefix_cache,
+)
 from sglang.srt.environ import envs
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
@@ -364,6 +367,28 @@ def build_kv_cache(
     retraction_backup = resolve_decode_retraction_backup(tp_worker=tp_worker)
 
     bypass_dsa_cp_prefix_cache = should_bypass_dsa_cp_prefix_cache(is_dsa=is_dsa)
+    if (
+        is_dsa
+        and dsa_cp_prefix_cache_enabled()
+        and get_disagg().disaggregation_mode == "prefill"
+        and parallel.enable_prefill_cp
+        and parallel.cp_strategy == "interleave"
+    ):
+        # Experimental un-bypass for DSA prefill CP: it relies on the CP KV
+        # pool keeping a full logical-order copy on every rank, and on the
+        # 64-token page geometry used by the DSA indexer page tables and the
+        # kpool alignment invariant (prefix_len % index_kpool == 0).
+        if page_size != 64:
+            raise ValueError(
+                "SGLANG_DSA_CP_PREFIX_CACHE=1 requires page_size == 64 for DSA "
+                f"prefill CP; got page_size={page_size}."
+            )
+        # Printed once per worker process (this builder runs once at startup), so
+        # it is the low-frequency feature-hit marker for the switch.
+        logger.info(
+            "DSA prefill CP prefix cache is ENABLED (experimental): the radix "
+            "cache stays on for this PD prefill worker."
+        )
     disable_radix_cache = (
         get_memory().disable_radix_cache
         or (model_config.is_multimodal and uses_transformers_backend)

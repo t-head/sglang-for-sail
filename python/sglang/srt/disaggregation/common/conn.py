@@ -524,14 +524,28 @@ class CommonKVManager(BaseKVManager):
         exception because each CP rank owns different state layers. Page-sharded
         DSA indexer state likewise needs every owner; Mooncake filters its page
         lists before transfer instead of suppressing whole ranks.
+
+        Rank0-only sending is valid only because interleave CP keeps a full
+        replica on every rank; any other strategy shards state and would lose
+        the non-rank0 shards if this returned True. Only the experimental DSA
+        prefill-CP prefix cache relies on that invariant, so the check is gated
+        on its switch: other PD CP models keep the previous behaviour.
         """
-        return (
+        if (
             self.attn_cp_size > 1
             and self.attn_cp_rank != 0
             and not get_parallel().enable_dsa_cache_layer_split
             and not get_parallel().enable_cp_tp_group_sharing
             and getattr(self, "kv_shard_size", 1) <= 1
-        )
+        ):
+            if envs.SGLANG_DSA_CP_PREFIX_CACHE.get():
+                cp_strategy = get_parallel().cp_strategy
+                assert cp_strategy == "interleave", (
+                    "rank0-only CP state transfer assumes interleave CP keeps a "
+                    f"full replica on every rank; got cp_strategy={cp_strategy}"
+                )
+            return True
+        return False
 
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
         if self.dcp_size == dst_dcp_size:
