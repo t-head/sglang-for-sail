@@ -130,6 +130,7 @@ def adapter_namespace():
         "envs": ENV_NS["envs"],
         "ENABLE_JIT_DEEPGEMM": True,
         "get_device_sm": lambda: 89,
+        "get_device_name": lambda: "T-HEAD M890",
         "_is_sail": True,
         "is_cuda": lambda: True,
     }
@@ -182,15 +183,15 @@ class MegaMHCFixture:
 
 
 class TestMegaMHCDispatch(MegaMHCFixture, CustomTestCase):
-    def test_sail_sm89_and_newer_and_nvidia_sm10x(self):
+    def test_sail_sm89_m890_and_nvidia_sm10x(self):
         with self.env.override(True):
             for sail, sm, expected in [
                 (True, 80, False),
                 (True, 88, False),
                 (True, 89, True),
-                (True, 90, True),
-                (True, 100, True),
-                (True, 120, True),
+                (True, 90, False),
+                (True, 100, False),
+                (True, 120, False),
                 (False, 89, False),
                 (False, 90, False),
                 (False, 100, True),
@@ -204,6 +205,26 @@ class TestMegaMHCDispatch(MegaMHCFixture, CustomTestCase):
                     self.assertEqual(
                         self.ns["can_use_mega_mhc_prefill"](self.batch), expected
                     )
+
+    def test_decode_verify_modes_and_m890_name_guard(self):
+        env = self.ns["envs"].SGLANG_OPT_DSV41_MEGA_MHC_DECODE
+        with env.override(True):
+            for decode, verify, expected in (
+                (False, False, False),
+                (True, False, True),
+                (False, True, True),
+            ):
+                self.batch.forward_mode.is_decode = lambda: decode
+                self.batch.forward_mode.is_target_verify = lambda: verify
+                self.assertEqual(
+                    self.ns["can_use_mega_mhc_decode"](self.batch), expected
+                )
+            self.ns["get_device_name"] = lambda: "another SM89 device"
+            self.assertFalse(self.ns["can_use_mega_mhc_decode"](self.batch))
+            self.assertFalse(self.ns["can_use_mega_mhc_prefill"](self.batch))
+        self.ns["get_device_name"] = lambda: "T-HEAD M890"
+        with env.override(False):
+            self.assertFalse(self.ns["can_use_mega_mhc_decode"](self.batch))
 
     def test_env_default_is_sail_only_and_overridable(self):
         env = ENV_NS["envs"].SGLANG_OPT_DSV41_MEGA_MHC_PREFILL
@@ -564,6 +585,25 @@ class TestMegaMHCState(MegaMHCFixture, CustomTestCase):
             self.assertIs(state.input.rows, normalized)
             self.assertIsNone(state.stats)
         self.backend.mega_mhc.assert_not_called()
+
+    def test_decode_verify_boundaries_reuse_carried_pre_and_next_stats(self):
+        env = self.ns["envs"].SGLANG_OPT_DSV41_MEGA_MHC_DECODE
+        self.batch.forward_mode.is_extend_without_speculative = lambda: False
+        with env.override(True):
+            for verify in (False, True):
+                self.batch.forward_mode.is_decode = lambda: not verify
+                self.batch.forward_mode.is_target_verify = lambda: verify
+                args = inputs(rows=3)
+                state = self.boundary(args)
+                self.assertIs(state.pre, args[2])
+                self.assertIsInstance(state.input, self.ns["HcNormed"])
+                self.assertIsNotNone(state.stats)
+                self.assertIs(
+                    self.backend.mega_mhc.call_args.kwargs["shifted_prev_mix"].source,
+                    args[2],
+                )
+        self.assertEqual(self.backend.mega_mhc.call_count, 2)
+        self.kernels.mhc_post.assert_not_called()
 
     def test_missing_api_and_decode_keep_original_state_chain(self):
         args = inputs()
