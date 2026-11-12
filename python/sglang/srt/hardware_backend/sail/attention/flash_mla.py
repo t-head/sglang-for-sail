@@ -216,3 +216,97 @@ def flash_mla_sparse_fwd(
         attn_sink=attn_sink,
         topk_length=topk_length,
     )
+
+
+# PPU emits one FP32 scale per token / WV group, not packed per-32 UE8M0.
+_SAIL_MEGA_FIXED_PARAMS = dict(
+    is_rope_neox_style=False,
+    rope_dim=64,
+    num_per_channels=4096,
+    use_tma_aligned_col_major_sf=False,
+    round_sf=False,
+    use_packed_ue8m0=False,
+)
+
+
+def _load_mega():
+    try:
+        from flash_mla import fused_norm_rope_attn_rope_cast
+    except ImportError as error:
+        raise ImportError(
+            "SAIL FlashMLA MegaAttention requires a wheel providing "
+            "fused_norm_rope_attn_rope_cast."
+        ) from error
+    return fused_norm_rope_attn_rope_cast
+
+
+def flash_mla_mega_prefill(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    softmax_scale: float,
+    *,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    enable_q_norm: bool = False,
+    rms_norm_eps: float = 0.0,
+    use_legacy: bool = True,
+) -> Tuple[torch.Tensor, ...]:
+    """MegaAttention prefill over a bf16 ``kv``: (out_fp8, out_sf, max_logits, lse)."""
+    _mega = _load_mega()
+    # The SAIL wheel has one interleaved-cache kernel set, no use_legacy kwarg.
+    return _mega.prefill(
+        token_positions=positions,
+        cos_sin_cache=cos_sin_cache,
+        n_wv_group=q.shape[1] // 8,
+        q=q,
+        kv=kv,
+        indices=indices,
+        sm_scale=softmax_scale,
+        attn_sink=attn_sink,
+        topk_length=topk_length,
+        enable_q_norm=enable_q_norm,
+        rms_norm_eps=rms_norm_eps,
+        **_SAIL_MEGA_FIXED_PARAMS,
+    )
+
+
+def flash_mla_mega_decode(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    softmax_scale: float,
+    *,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    extra_kv: Optional[torch.Tensor] = None,
+    extra_indices: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
+    enable_q_norm: bool = False,
+    rms_norm_eps: float = 0.0,
+    use_legacy: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """MegaAttention decode over a paged cache: (out_fp8, out_sf, lse)."""
+    _mega = _load_mega()
+    # The SAIL wheel has one interleaved-cache kernel set, no use_legacy kwarg.
+    return _mega.decode(
+        token_positions=positions,
+        cos_sin_cache=cos_sin_cache,
+        n_wv_group=q.shape[1] // 8,
+        q=q,
+        k_cache=kv,
+        indices_in_kvcache=indices,
+        sm_scale=softmax_scale,
+        attn_sink=attn_sink,
+        topk_length=topk_length,
+        extra_k_cache=extra_kv,
+        extra_indices_in_kvcache=extra_indices,
+        extra_topk_length=extra_topk_length,
+        enable_q_norm=enable_q_norm,
+        rms_norm_eps=rms_norm_eps,
+        **_SAIL_MEGA_FIXED_PARAMS,
+    )
