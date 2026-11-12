@@ -136,16 +136,25 @@ class TestBypassPredicates(unittest.TestCase):
     def _enter(self, mode="prefill", enable_cp=True, strategy="interleave", switch=False):
         stack = ExitStack()
         self.addCleanup(stack.close)
+        # Production reads these two through the runtime-context *accessors*
+        # (get_parallel() / get_disagg()), so a stub must be a callable that
+        # returns the bag, not the bag itself.
         stack.enter_context(
             unittest.mock.patch.object(
-                dutils, "get_disagg", SimpleNamespace(disaggregation_mode=mode)
+                dutils,
+                "get_disagg",
+                unittest.mock.Mock(return_value=SimpleNamespace(disaggregation_mode=mode)),
             )
         )
         stack.enter_context(
             unittest.mock.patch.object(
                 dutils,
                 "get_parallel",
-                SimpleNamespace(enable_prefill_cp=enable_cp, cp_strategy=strategy),
+                unittest.mock.Mock(
+                    return_value=SimpleNamespace(
+                        enable_prefill_cp=enable_cp, cp_strategy=strategy
+                    )
+                ),
             )
         )
         stack.enter_context(
@@ -157,8 +166,10 @@ class TestBypassPredicates(unittest.TestCase):
         )
 
     def _bypass(self, **kwargs):
+        # is_dsa is an argument of the predicate under test, not of _enter.
+        is_dsa = kwargs.pop("is_dsa", True)
         self._enter(**kwargs)
-        return dutils.should_bypass_dsa_cp_prefix_cache(is_dsa=kwargs.pop("is_dsa", True))
+        return dutils.should_bypass_dsa_cp_prefix_cache(is_dsa=is_dsa)
 
     def test_interleave_is_supported(self):
         self._enter()
@@ -194,6 +205,11 @@ class _ZeroingTreeCache:
     """Minimal cache stub for ``zero_match_result`` / rollback paths."""
 
     def __init__(self, allocator=None):
+        # ``_GateTreeCache.match_prefix`` stages a slot through the same
+        # allocator the production rollback reads back
+        # (``tree_cache.req_to_token_pool.mamba_allocator``); keep a direct
+        # handle too so the stub is internally consistent.
+        self.allocator = allocator
         self.req_to_token_pool = SimpleNamespace(mamba_allocator=allocator)
         self.root = object()
 
