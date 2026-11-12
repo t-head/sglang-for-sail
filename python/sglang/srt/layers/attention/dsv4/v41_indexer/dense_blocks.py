@@ -394,6 +394,7 @@ def _publish_prefill_blocks(
                 topk_blocks=topk_blocks,
                 block_size=block_size,
             )
+        # Publishing leaves the causal tail untouched; token selection remains length-aware.
         topk_ragged(
             logits,
             data.compress_lens[tile],
@@ -444,10 +445,8 @@ def _publish_tile_blocks(
     for rows, lc in _requests_in_tile(data, tile):
         aligned_lc = -(-lc // block_size) * block_size
         scores = logits[rows, :aligned_lc]
-        scores.masked_fill_(
-            torch.arange(aligned_lc, device=logits.device)[None, :] >= lens[rows, None],
-            -torch.inf,
-        )
+        # Block selection excludes the causal tail after block-max. Keep this
+        # aligned view unmodified; the following ragged token top-k uses lens.
         ids = select_candidate_block_ids(
             logits=scores,
             compress_lens=lens[rows, None],
