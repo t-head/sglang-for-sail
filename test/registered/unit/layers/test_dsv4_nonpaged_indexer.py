@@ -43,6 +43,14 @@ _ISSUE_ALIGNED_COLS = 93184
 
 
 class TestDSV4PagedIndexerMetadata(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        platform = patch(
+            "sglang.srt.layers.attention.dsv4.metadata.is_sail", return_value=False
+        )
+        platform.start()
+        self.addCleanup(platform.stop)
+
     def test_sm120_fp4_forces_deep_gemm_metadata(self):
         expected = torch.tensor([[0, 0], [1, 0]], dtype=torch.int32)
         deep_gemm = SimpleNamespace(
@@ -1019,6 +1027,15 @@ class TestChunkedPagedDecode(CustomTestCase):
     num_rows, width = 5, 16
     chunks = [slice(0, 2), slice(2, 4), slice(4, 5)]
 
+    def setUp(self):
+        super().setUp()
+        platform = patch(
+            "sglang.srt.layers.attention.dsv4.v41_indexer.scoring.is_sail",
+            return_value=False,
+        )
+        platform.start()
+        self.addCleanup(platform.stop)
+
     def _inputs(self):
         from sglang.srt.layers.attention.dsv4.v41_indexer import DecodeInputs
         from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (
@@ -1164,6 +1181,15 @@ class TestChunkedPagedDecode(CustomTestCase):
 
 class TestGroupedVerifyRows(CustomTestCase):
     """Static verify rows reach the paged logits kernel as one request per block."""
+
+    def setUp(self):
+        super().setUp()
+        platform = patch(
+            "sglang.srt.layers.attention.dsv4.v41_indexer.scoring.is_sail",
+            return_value=False,
+        )
+        platform.start()
+        self.addCleanup(platform.stop)
 
     def _args(self, rows_per_request, rows=slice(None), indices=None):
         from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (

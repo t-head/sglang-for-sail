@@ -798,7 +798,7 @@ class TestCandidateScores(CustomTestCase):
             lens=lens[tok],
             slots=torch.arange(129, device="cuda"),
         )
-        indexer = Mock()
+        indexer = Mock(use_int8=False)
         indexer.scores.side_effect = AssertionError("full scoring was used")
         budget = 2 * q.shape[1] * blocks.shape[1] * CANDIDATE_BLOCK_SIZE * 2
         with patch.object(scoring, "_TORCH_SCORE_BUDGET_BYTES", budget):
@@ -841,7 +841,7 @@ class TestCandidateScores(CustomTestCase):
             s = torch.einsum("bhd,nd->bhn", q, k)
             return (s.relu() * weights.unsqueeze(-1)).sum(1).float()
 
-        indexer = Mock()
+        indexer = Mock(use_int8=False)
         indexer.scores.side_effect = full_scores
         too_wide = blocks.repeat(1, 4)
         with patch.object(
