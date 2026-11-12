@@ -4079,6 +4079,17 @@ class DeepseekSparseAttnBackend(
                 eager_bufs[target] = buf
         return buf[:rows]
 
+    @property
+    def _flashmla_decode_compute_fp8(self) -> bool:
+        # The kernel must be told the storage dtype: when the pool already holds
+        # fp8 (dsa_kv_cache_store_fp8) the env flag alone is not enough -- on PPU
+        # it defaults to False, which would make the kernel read fp8 data as
+        # bf16. Keep it OR'ed with the actual store dtype.
+        return (
+            envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.get()
+            or self.dsa_kv_cache_store_fp8
+        )
+
     def _forward_flashmla_kv(
         self,
         q_all: torch.Tensor,
@@ -4181,7 +4192,7 @@ class DeepseekSparseAttnBackend(
             block_table=torch.empty(
                 (q_input.shape[0], 0), dtype=torch.int32, device=q_all.device
             ),
-            is_fp8_kvcache=envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.get(),
+            is_fp8_kvcache=self._flashmla_decode_compute_fp8,
             kv_format=self.flashmla_kv_format,
         )
         if target_q_heads != num_q_heads:
@@ -5201,6 +5212,11 @@ class DeepseekSparseAttnBackend(
         # Set MLA implementation only if not using MHA
         if not self.use_mha and self.enable_auto_select_prefill_impl:
             if self.dsa_kv_cache_store_fp8:
+                if _is_sail:
+                    # PPU has no dense fp8 FlashMLA kernel; the sparse prefill
+                    # path is the only fp8-capable one (framework dequant).
+                    self.dsa_prefill_impl = "flashmla_sparse"
+                    return
                 if (
                     is_blackwell()
                     and forward_batch is not None
@@ -5289,7 +5305,7 @@ class DeepseekSparseAttnBackend(
             num_q_tokens_per_head_k=seq_len_q * num_heads_q // 1,
             num_heads_k=1,
             num_heads_q=num_heads_q,
-            is_fp8_kvcache=envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.get(),
+            is_fp8_kvcache=self._flashmla_decode_compute_fp8,
             topk=self.dsa_index_topk,
             # [迁移自 v0.5.18_rel feat/glm-5.3-flash B1 6dd5c0cc6e]
             topk_length=topk_length,
