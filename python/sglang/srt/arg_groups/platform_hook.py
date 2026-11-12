@@ -398,8 +398,20 @@ def _sail_flashmla_fp8_kv_cache_fallback(view: Any) -> dict:
         incompatible.append("flashmla")
     if view.speculative_draft_attention_backend == "flashmla":
         incompatible.append("draft flashmla")
-    if view.dsa_prefill_backend == "flashmla_sparse":
-        incompatible.append("flashmla_sparse")
+    dsa_flashmla = ("flashmla_sparse", "flashmla_kv", "flashmla_auto")
+    if "dsa" in (prefill_backend, decode_backend) and (
+        view.dsa_prefill_backend in dsa_flashmla
+        or view.dsa_decode_backend in dsa_flashmla
+    ):
+        # Only the validated sparse pair reads stored E4M3 directly. Other
+        # combinations retain compute-dtype KV until their prefix paths adapt.
+        supported = (
+            get_platform().device_sm >= 89
+            and view.kv_cache_dtype == "fp8_e4m3"
+            and view.dsa_prefill_backend == view.dsa_decode_backend == "flashmla_kv"
+        )
+        if not supported:
+            incompatible.append("DSA FlashMLA backend combination")
     if not incompatible:
         return {}
 

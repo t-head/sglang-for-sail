@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention import graph_utils
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.attention.dsa_backend import (
@@ -32,6 +33,48 @@ def _routed(pool):
 
 
 class TestDSABackendDPPadding(CustomTestCase):
+    def test_flashmla_metadata_uses_actual_fp8_store(self):
+        for stored in (False, True):
+            for compute in (False, True):
+                with envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.override(
+                    compute
+                ):
+                    backend = SimpleNamespace(dsa_kv_cache_store_fp8=stored)
+                    self.assertIs(
+                        DeepseekSparseAttnBackend._flashmla_decode_compute_fp8.fget(
+                            backend
+                        ),
+                        stored or compute,
+                    )
+
+    def test_sail_fp8_fallback_preserves_only_validated_sparse_pair(self):
+        from sglang.srt.arg_groups import platform_hook
+
+        view = SimpleNamespace(
+            kv_cache_dtype="fp8_e4m3",
+            speculative_draft_attention_backend=None,
+            dsa_decode_backend="flashmla_kv",
+            dsa_prefill_backend="flashmla_kv",
+        )
+        with (
+            patch.object(
+                platform_hook,
+                "get_platform",
+                return_value=SimpleNamespace(is_sail=True, device_sm=89),
+            ),
+            patch.object(
+                platform_hook, "attention_backends_of", return_value=("dsa", "dsa")
+            ),
+        ):
+            self.assertEqual(
+                platform_hook._sail_flashmla_fp8_kv_cache_fallback(view), {}
+            )
+            view.dsa_prefill_backend = "flashmla_sparse"
+            self.assertEqual(
+                platform_hook._sail_flashmla_fp8_kv_cache_fallback(view),
+                {"kv_cache_dtype": "auto"},
+            )
+
     def test_occupied_uneven_decode_with_idle_rank_selects_max_len(self):
         with (
             patch(
