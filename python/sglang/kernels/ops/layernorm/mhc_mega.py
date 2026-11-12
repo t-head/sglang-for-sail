@@ -3,7 +3,7 @@
 Credit: DeepSeek's DeepGEMM project provides the fused MegaMHC kernel.
 https://github.com/deepseek-ai/DeepGEMM
 
-SAIL SM89+ needs a compatible vendor DeepGEMM build; the upstream SM10x kernel
+SAIL SM89 M890 needs a compatible vendor DeepGEMM build; the upstream SM10x kernel
 alone does not support SAIL. Unsupported inputs/APIs leave the existing path intact.
 """
 
@@ -16,7 +16,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
-from sglang.srt.utils.device import get_device_sm, is_cuda, is_sail
+from sglang.srt.utils.device import get_device_name, get_device_sm, is_cuda, is_sail
 
 logger = logging.getLogger(__name__)
 _is_sail = is_sail()
@@ -40,14 +40,31 @@ def _mega_mhc_kernel():
 
 
 def can_use_mega_mhc_prefill(forward_batch) -> bool:
-    if (
-        not envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.get()
-        or not ENABLE_JIT_DEEPGEMM
-        or not forward_batch.forward_mode.is_extend_without_speculative()
-    ):
+    return (
+        envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.get()
+        and forward_batch.forward_mode.is_extend_without_speculative()
+        and _mega_mhc_supported()
+    )
+
+
+def can_use_mega_mhc_decode(forward_batch) -> bool:
+    mode = forward_batch.forward_mode
+    return (
+        envs.SGLANG_OPT_DSV41_MEGA_MHC_DECODE.get()
+        and (mode.is_decode() or mode.is_target_verify())
+        and _mega_mhc_supported()
+    )
+
+
+def _mega_mhc_supported() -> bool:
+    if not ENABLE_JIT_DEEPGEMM:
         return False
     sm = get_device_sm()
-    if not (sm >= 89 if _is_sail else is_cuda() and 100 <= sm < 110):
+    if _is_sail:
+        # The inspected vendor mega_mhc.hpp explicitly asserts both fields.
+        if sm != 89 or "M890" not in get_device_name():
+            return False
+    elif not (is_cuda() and 100 <= sm < 110):
         return False
     from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 
@@ -178,7 +195,7 @@ def try_mhc_mega_boundary(
         for tensor, shape, dtype in tensors
     ):
         return None
-    if _mega_mhc_kernel() is None:
+    if not _mega_mhc_supported():
         return None
     return mhc_mega_boundary(
         x,
