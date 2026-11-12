@@ -17,6 +17,7 @@ import torch
 from flash_mla.flash_mla_interface import FlashMLASchedMeta
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa_nvtx import flashmla_kv_leaf_nvtx, in_sparse_range
 
 SGLANG_PROFILE_NVTX = envs.SGLANG_PROFILE_NVTX.get()
 SGLANG_PROFILE_NVTX_PRINT_SEQLEN = envs.SGLANG_PROFILE_NVTX_PRINT_SEQLEN.get()
@@ -102,6 +103,7 @@ def get_mla_metadata(
     )
 
 
+@flashmla_kv_leaf_nvtx
 def flash_mla_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -161,7 +163,7 @@ def flash_mla_with_kvcache(
             and k_cache.shape[-1] == _V32_NO_ROPE_BYTES_PER_TOKEN
         ):
             kv_format = "V32_NO_ROPE"
-    if SGLANG_PROFILE_NVTX:
+    if SGLANG_PROFILE_NVTX and not in_sparse_range():
         mode = "D" if torch.cuda.is_current_stream_capturing() else "P"
         message = (
             f"[FW_FMHA] --format=MLA,Forward,type:{mode},"
@@ -198,7 +200,7 @@ def flash_mla_with_kvcache(
             **extra,
         )
     finally:
-        if SGLANG_PROFILE_NVTX:
+        if SGLANG_PROFILE_NVTX and not in_sparse_range():
             th_nvtx_range_pop()
 
 

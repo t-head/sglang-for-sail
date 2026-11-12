@@ -17,6 +17,7 @@ from typing import Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa_nvtx import flashmla_kv_leaf_nvtx
 
 try:
     import flash_mla as _flashmla
@@ -88,6 +89,7 @@ def get_mla_metadata(
     )
 
 
+@flashmla_kv_leaf_nvtx
 def flash_mla_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
