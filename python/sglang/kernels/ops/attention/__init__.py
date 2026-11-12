@@ -697,3 +697,12 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+
+register_kernel(
+    KernelSpec(
+        op="attention.qsa_fp8_avg_mqa_prefill",
+        backend=KernelBackend.DEEPGEMM,
+        target="sglang.kernels.ops.attention.qsa.deep_gemm_avg:deep_gemm_fp8_avg_mqa_prefill",
+        capabilities=CUDA_ONLY,
+    )
+)
