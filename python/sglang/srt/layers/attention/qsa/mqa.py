@@ -1,5 +1,5 @@
-"""Weight-free TileLang MQA operators for the simple QSA indexer;
-the torch implementations are the fallback and the reference."""
+"""Weight-free QSA MQA scoring: TileLang, optional SAIL DeepGEMM FP8,
+and torch fallback/reference implementations."""
 
 import functools
 import math
@@ -10,6 +10,7 @@ import torch
 from sglang.srt.utils.device import is_hip, is_npu
 
 _is_npu = is_npu()
+from sglang.srt.utils.log_utils import print_info_once, print_warning_once
 
 try:
     import flashinfer.comm  # noqa: F401
@@ -638,6 +639,7 @@ def qsa_mqa_prefill(
     row_ends: torch.Tensor,
     score_scale: Optional[float] = None,
 ) -> torch.Tensor:
+    """Global-column, masked baseline scorer (TileLang or torch reference)."""
     if _is_npu:
         if score_scale is not None:
             raise ValueError("Custom MQA scale is outside the model contract")
@@ -645,7 +647,10 @@ def qsa_mqa_prefill(
 
         return qsa_mqa_packed(q, k, row_starts, row_ends)
     if q.is_cuda and HAS_TILELANG:
+        print_info_once("Using TileLang for QSA prefill scoring.")
         return tilelang_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
+    if q.is_cuda:
+        print_warning_once("Using torch fallback for QSA prefill scoring.")
     return torch_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
 
 
