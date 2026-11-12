@@ -186,6 +186,35 @@ def is_mega_moe_experts_ready(experts) -> bool:
     return _device_sm // 10 == 10
 
 
+_MEGA_HIT_LOGGER = logging.getLogger("mega_moe")
+
+
+# One-shot feature marker: the first batch the MegaMoE gate admits is the startup
+# warmup batch, so a single line proves the accelerated path is actually live.
+def _mega_moe_hit_state():
+    from sglang.srt.runtime_context import get_buffer
+
+    return get_buffer("mega_moe.hit_marker", lambda: {"logged": False})
+
+
+def _log_mega_moe_hit(moe) -> None:
+    # Only the summary of what is already on the object is reported (no extra
+    # lookups), and after the first hit the cost is a module-flag read.
+    state = _mega_moe_hit_state()
+    if state["logged"]:
+        return
+    state["logged"] = True
+    experts = moe.experts
+    _MEGA_HIT_LOGGER.warning(
+        "MEGA_MOE_HIT MegaMoE path is live (one-shot marker, per rank): "
+        "first_hit_layer=%s experts=%s mma=%s n_shared_experts=%s",
+        getattr(moe, "prefix", "?"),
+        getattr(experts, "num_experts", "?"),
+        _mega_moe_mma_type(experts),
+        getattr(moe, "n_shared_experts", "?"),
+    )
+
+
 def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool:
     if _use_amd_flydsl_mega_moe():
         from sglang.srt.layers.moe.mega_moe_flydsl import (
@@ -208,6 +237,7 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
         max_tokens_per_rank = hidden_states.shape[0]
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
     if max_tokens_per_rank <= cap:
+        _log_mega_moe_hit(moe)
         return True
     assert not getattr(moe.experts, "_mega_moe_weights_localized", False), (
         f"mega MoE: {max_tokens_per_rank} tokens per rank exceed "
