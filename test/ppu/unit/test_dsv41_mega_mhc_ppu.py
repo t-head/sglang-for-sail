@@ -19,10 +19,10 @@ class TestMegaMHCPPU(CustomTestCase):
             raise unittest.SkipTest("torch is not installed")
         if not torch.cuda.is_available():
             raise unittest.SkipTest("PPU is required")
-        from sglang.srt.utils import get_device_sm, is_sail
+        from sglang.srt.utils.device import get_device_sm, is_sail
 
         if not is_sail() or get_device_sm() < 89:
-            raise unittest.SkipTest("SAIL SM89+ is required")
+            raise unittest.SkipTest("SAIL SM89 M890 is required")
         from sglang.kernels.ops.layernorm.mhc_mega import can_use_mega_mhc_prefill
         from sglang.srt.environ import envs
         from sglang.srt.models import deepseek_v4_mhc as mhc
