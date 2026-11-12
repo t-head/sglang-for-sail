@@ -706,6 +706,8 @@ class Envs:
     # and group rows that share a request onto one key-tile gather. Set false to
     # fall back to the portable per-row/per-group Triton schedule.
     SGLANG_STEP5_SCORING_REGION_OPT = EnvBool(True)
+    # Pack contiguous K per layer for eligible 890P prefill; False restores legacy scoring.
+    SGLANG_SAIL_STEP5_SCORING_COMPACT = EnvBool(True)
     # PPU region-scoring indexer operands: feed the E4M3 key/query bytes straight
     # to the fp8 MMA. Set false to decode them to BF16 and dot in BF16 instead,
     # which reproduces the portable path's math for accuracy A/B comparisons.

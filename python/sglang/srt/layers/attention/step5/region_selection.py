@@ -6,6 +6,7 @@ import torch
 from sglang.kernels.ops.attention.step5 import options as step5_options
 from sglang.kernels.ops.attention.step5.scoring import (
     STEP5_SCORE_SPAN_ROWS,
+    can_use_step5_scoring_compact,
     can_use_step5_scoring_cute,
     step5_paged_scores,
 )
@@ -31,6 +32,7 @@ from sglang.kernels.ops.attention.step5.selection_deepselect import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.step5.metadata import (
     STEP5_SCORE_WORKSPACE_ELEMENTS,
+    Step5CompactScoringWorkspace,
     Step5SelectionWorkspace,
     query_group_spans,
     selection_tile_rows,
@@ -63,6 +65,50 @@ def _score_group_spans(rows, lengths, device):
     )
 
 
+STEP5_COMPACT_KEY_BYTES = 128 * 1024 * 1024
+
+
+def _allocate_compact_scoring(*, rows, score_width, lengths, device):
+    if (
+        lengths is None
+        or rows < 256
+        or score_width <= 512
+        or not can_use_step5_scoring_compact(device)
+    ):
+        return None
+    lengths = np.asarray(lengths, dtype=np.int64).reshape(-1)
+    if not lengths.size or np.any(lengths < 0) or int(lengths.sum()) != rows:
+        return None
+    fp8 = envs.SGLANG_SAIL_STEP5_FP8_INDEXER.get()
+    group_rows = 16 if fp8 else 8
+    if int(lengths.max()) < group_rows:
+        return None
+    # Empty spans need no K scratch; each span's last row must hold its maximum position.
+    lengths = lengths[lengths > 0]
+    scratch_bytes = lengths.size * score_width * 256 * (1 if fp8 else 2)
+    if scratch_bytes > STEP5_COMPACT_KEY_BYTES:
+        return None
+    starts, ends, boundaries = query_group_spans(lengths, group_rows)
+    groups = (lengths + group_rows - 1) // group_rows
+    requests = np.repeat(np.arange(lengths.size), groups)
+    return Step5CompactScoringWorkspace(
+        keys=torch.empty(
+            (lengths.size, score_width, 256),
+            dtype=torch.uint8 if fp8 else torch.bfloat16,
+            device=device,
+        ),
+        request_last_rows=async_h2d(
+            (boundaries[1:] - 1).astype(np.int32), dtype=torch.int32, device=device
+        ),
+        span_start=async_h2d(starts.astype(np.int32), dtype=torch.int32, device=device),
+        span_end=async_h2d(ends.astype(np.int32), dtype=torch.int32, device=device),
+        span_requests=async_h2d(requests.astype(np.int32), dtype=torch.int32, device=device),
+        rows=rows,
+        group_rows=group_rows,
+        fp8=fp8,
+    )
+
+
 def allocate_selection_workspace(
     *,
     rows,
@@ -73,6 +119,7 @@ def allocate_selection_workspace(
     max_score_width=None,
     prefill_spans=None,
     score_lengths=None,
+    compact_allowed=True,
     req_to_token=None,
     row_to_req=None,
     positions=None,
@@ -125,6 +172,20 @@ def allocate_selection_workspace(
         and envs.SGLANG_STEP5_SCORING_REGION_OPT.get()
     ):
         score_groups = _score_group_spans(rows, score_lengths, region_scores.device)
+    compact_scoring = None
+    if (
+        compact_allowed
+        and prefill
+        and capacity == rows
+        and score_groups is not None
+        and not scoring_cute
+        and not use_cute
+        and not use_deepselect
+    ):
+        compact_scoring = _allocate_compact_scoring(
+            rows=rows, score_width=score_width, lengths=score_lengths,
+            device=region_scores.device,
+        )
     topk_lengths, topk_lengths_ready = None, False
     if use_deepselect:
         topk_lengths = torch.empty(rows, dtype=torch.int32, device=device)
@@ -188,6 +249,7 @@ def allocate_selection_workspace(
         use_deepselect=use_deepselect,
         prefill_scoring=prefill_scoring,
         score_groups=score_groups,
+        compact_scoring=compact_scoring,
         topk_lengths=topk_lengths,
         topk_lengths_ready=topk_lengths_ready,
         topk_ids=(
@@ -281,6 +343,7 @@ def select_step5_regions(
                 clear_future=not workspace.use_cute,
                 group_rows=score_group_rows,
                 workspace=workspace.scoring_workspace,
+                compact_workspace=workspace.compact_scoring,
                 weight_scale=scoring_weight_scale,
                 # Tiled rows are sliced before scoring, so spans only describe the
                 # whole layout when one tile covers every row.

@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Step5 region-score entry; all state and output storage belong to callers."""
 
+import functools
+
 import torch
 
 from sglang.kernels.ops.attention.step5 import options as step5_options
+from sglang.srt.environ import envs
 
 # Rows per scoring tile, from the narrowest span that still groups to the widest
 # the grouped Triton kernel compiles for.
@@ -17,6 +20,24 @@ def can_use_step5_scoring_cute(device: torch.device) -> bool:
         and device.type == "cuda"
         and torch.version.hip is None
         and torch.cuda.get_device_capability(device)[0] == 10
+    )
+
+
+@functools.cache
+def _compact_device_supported(device: torch.device) -> bool:
+    return (
+        device.type == "cuda"
+        and torch.version.hip is None
+        and "ZW" in torch.cuda.get_device_name(device)
+        and torch.cuda.get_device_capability(device) == (8, 9)
+    )
+
+
+def can_use_step5_scoring_compact(device: torch.device) -> bool:
+    return (
+        envs.SGLANG_SAIL_STEP5_SCORING_COMPACT.get()
+        and envs.SGLANG_STEP5_SCORING_REGION_OPT.get()
+        and _compact_device_supported(device)
     )
 
 
@@ -58,6 +79,7 @@ def step5_paged_scores(
     workspace=None,
     weight_scale: float | None = None,
     score_groups: tuple[torch.Tensor, torch.Tensor, int] | None = None,
+    compact_workspace=None,
 ) -> torch.Tensor:
     """Score completed historical regions for flattened ragged query rows.
 
@@ -211,6 +233,35 @@ def step5_paged_scores(
         if explicit_weight_scale:
             weights = weights.float() * weight_scale
             weight_scale = 1.0
+        if (
+            compact_workspace is not None
+            and heads == 4
+            and clear_future
+            and score_groups is not None
+            and tokens >= 256
+            and out.shape[1] > 512
+            and compact_workspace.rows == tokens
+            and compact_workspace.keys.shape[1:] == (out.shape[1], 256)
+            and compact_workspace.keys.device == q.device
+            and compact_workspace.fp8 == envs.SGLANG_SAIL_STEP5_FP8_INDEXER.get()
+            and can_use_step5_scoring_compact(q.device)
+        ):
+            from sglang.kernels.ops.attention.step5.scoring_compact import (
+                launch as launch_compact,
+            )
+
+            launch_compact(
+                q.to(torch.float8_e4m3fn).view(torch.uint8),
+                weights,
+                compressed_index_keys,
+                req_to_token,
+                row_to_req,
+                positions,
+                out,
+                workspace=compact_workspace,
+                weight_scale=weight_scale,
+            )
+            return out
         launch(
             # Pass the E4M3 bytes as uint8: the kernel bitcasts them straight
             # into fp8 MMA operands (fp8e4nv from sm89 up, fp8e4b15 below it),

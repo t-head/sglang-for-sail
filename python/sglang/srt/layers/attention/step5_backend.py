@@ -214,6 +214,7 @@ def _build_attention_metadata(
                 max_score_width=req_to_token.shape[1] // 8,
                 prefill_spans=prefill_spans,
                 score_lengths=score_lengths,
+                compact_allowed=cp_local is None,
                 req_to_token=req_to_token,
                 row_to_req=row_to_req,
                 positions=positions,

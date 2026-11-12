@@ -224,8 +224,6 @@ __device__ __forceinline__ int equal_count_higher_equal(
 // Phase 3: All bin-owning threads combine the warp exclusive offset with
 //          their intra-warp prefix to obtain the per-bin exclusive prefix
 //          sum, then search for the threshold in parallel.
-//
-// Only two __syncthreads (vs 2*log2(n_bins) in the tree-based original).
 template <int n_bins, typename SharedStorage>
 __device__ __forceinline__ void choose_threshold_parallel(
     SharedStorage& storage, int thread) {
@@ -253,6 +251,7 @@ __device__ __forceinline__ void choose_threshold_parallel(
     orig[0] = owns_bin ? storage.histogram[thread] : 0;
     local_sum = orig[0];
   }
+  __syncthreads();
 
   // Step 2: Warp-level inclusive prefix sum via __shfl_up_sync.
   int warp_inc = local_sum;
@@ -556,8 +555,12 @@ __global__ void dsa_radix_selector_kernel(
   } else {
     int const begin = int((int64_t(current) * thread) / kThreads);
     int const end = int((int64_t(current) * (thread + 1)) / kThreads);
-    for (int region = begin; region < end; ++region) {
-      process_region_for_scatter(region, score_src[region], true);
+    int const iterations = (current + kThreads - 1) / kThreads;
+    for (int iter = 0; iter < iterations; ++iter) {
+      int const region = begin + iter;
+      bool const valid = region < end;
+      float const raw = valid ? score_src[region] : 0.0f;
+      process_region_for_scatter(region, raw, valid);
     }
   }
 
