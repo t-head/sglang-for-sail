@@ -38,9 +38,10 @@ except ImportError:
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import (
     checkCudaErrors,
 )
-from sglang.srt.utils import get_device_module, is_hip, is_xpu
+from sglang.srt.utils import get_device_module, is_hip, is_sail, is_xpu
 
 _is_xpu = is_xpu()
+_is_sail = is_sail()
 
 __all__ = [
     "eager_on_graph",
@@ -85,6 +86,18 @@ def _capture_status(stream_ptr: int) -> "rt.cudaStreamCaptureStatus":
     return status
 
 
+def _is_stream_capturing_driver(stream: torch.Stream) -> bool:
+    # PPU (SAIL): cuda-python's runtime layer reports driver version 0, so
+    # cudaStreamGetCaptureInfo fails with cudaErrorInsufficientDriver. The
+    # driver API answers correctly there.
+    from cuda.bindings import driver as drv
+
+    err, status, *_ = drv.cuStreamGetCaptureInfo(drv.CUstream(stream.cuda_stream))
+    if err != drv.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"cuStreamGetCaptureInfo failed: {err}")
+    return status == drv.CUstreamCaptureStatus.CU_STREAM_CAPTURE_STATUS_ACTIVE
+
+
 def _is_stream_capturing(stream: torch.Stream) -> bool:
     # On ROCm/HIP and XPU, cuda-python is unavailable, so use the portable torch
     # API (which maps to the HIP / XPU runtime). On NVIDIA, keep querying the
@@ -93,6 +106,8 @@ def _is_stream_capturing(stream: torch.Stream) -> bool:
     if is_hip() or _is_xpu:
         with get_device_module().stream(stream):
             return get_device_module().is_current_stream_capturing()
+    if _is_sail:
+        return _is_stream_capturing_driver(stream)
     return (
         _capture_status(stream.cuda_stream)
         == rt.cudaStreamCaptureStatus.cudaStreamCaptureStatusActive

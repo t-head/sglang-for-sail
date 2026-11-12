@@ -158,7 +158,20 @@ def pcg_dsa_indexer_prefill_split(
         enable_dual_stream=False,
         forward_batch=forward_batch,
     )
-    if (
+    if indexer.use_fp4:
+        # MXFP4 indexer (PPU): Q travels as (q_packed, q_sf) with per-block
+        # scales, so the head gate takes no q_scale. Mirrors the eager path.
+        from sglang.kernels.ops.attention.dsa.triton_kernel import (
+            downcast_to_mxfp4_indexer,
+        )
+
+        q_fp8 = downcast_to_mxfp4_indexer(query, -1)
+        weights = (
+            indexer._scale_head_gates_no_q_scale(weights_raw)
+            if indexer.use_dsa_indexer_fusion
+            else indexer._get_logits_head_gate_no_q_scale(x)
+        )
+    elif (
         _is_cuda
         and indexer.bf16_head_gate
         and indexer.skip_rope
@@ -196,11 +209,15 @@ def pcg_dsa_indexer_prefill_split(
     )
     if not return_indices:
         return
+    if isinstance(q_fp8, tuple):
+        q_fp8 = tuple(part[:query_tokens] for part in q_fp8)
+    else:
+        q_fp8 = q_fp8[:query_tokens]
     indexer._get_topk_ragged(
         False,
         forward_batch,
         layer_id,
-        q_fp8[:query_tokens],
+        q_fp8,
         weights,
         metadata,
         topk_result,
