@@ -81,6 +81,8 @@ MEGA_MOE_NO_FALLBACK_ARCHS = frozenset(
     {
         "DeepseekV4ForCausalLM",
         "KimiK31ForConditionalGeneration",
+        "GlmMoeDsaForCausalLM",
+        "Glm5NextForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "MellumForCausalLM",
         "Qwen2MoeForCausalLM",
