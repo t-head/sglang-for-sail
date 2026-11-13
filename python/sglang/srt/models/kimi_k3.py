@@ -930,9 +930,9 @@ class KimiK3MoE(nn.Module):
         with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
             if is_sail():
                 mega_moe_kernel = {
-                    "mxf4xmxf4": deep_gemm.fp4_fp4_mega_moe,
-                    "fp8xmxfp4": deep_gemm.fp8_fp4_mega_moe,
-                    "bf16xmxfp4": deep_gemm.bf16_fp4_mega_moe,
+                    "fp4xfp4": deep_gemm.fp4_fp4_mega_moe,
+                    "fp8xfp4": deep_gemm.fp8_fp4_mega_moe,
+                    "bf16xfp4": deep_gemm.bf16_fp4_mega_moe,
                 }[mma_type]
             else:
                 mega_moe_kernel = deep_gemm.fp8_fp4_mega_moe
@@ -946,7 +946,7 @@ class KimiK3MoE(nn.Module):
                 if is_sail()
                 else {}
             )
-            if not is_sail() or mma_type == "mxf4xmxf4":
+            if not is_sail() or mma_type == "fp4xfp4":
                 situ_kwargs["recipe"] = (1, 1, 32)
             mega_moe_kernel(
                 y,
