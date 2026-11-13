@@ -2052,6 +2052,11 @@ class Envs:
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBool(False)
+    # Experimental: keep the radix (prefix) cache enabled under DSA prefill
+    # context parallelism on PD prefill workers instead of bypassing it.
+    # Default OFF keeps today's behavior; enabling it is only valid for
+    # interleave CP with page_size == 64 (checked in the KV cache builder).
+    SGLANG_DSA_CP_PREFIX_CACHE = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     # Requires a DeepGEMM paged-MQA scheduler supporting batches > SM count
     # (0.2.3 does); set to 0 for an older DeepGEMM.
