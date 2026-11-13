@@ -651,11 +651,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
             if w4a8_enabled and w4a16_enabled:
                 raise ValueError("PPU MegaMoE W4A8 and W4A16 are mutually exclusive.")
-            self._mega_moe_mma_type = "mxf4xmxf4"
+            self._mega_moe_mma_type = "fp4xfp4"
             if w4a8_enabled:
-                self._mega_moe_mma_type = "fp8xmxfp4"
+                self._mega_moe_mma_type = "fp8xfp4"
             elif w4a16_enabled:
-                self._mega_moe_mma_type = "bf16xmxfp4"
+                self._mega_moe_mma_type = "bf16xfp4"
         else:
             valu_enabled = envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16.get()
             mma_enabled = envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16_MMA.get()
@@ -1155,9 +1155,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
                     mma_type = self._mega_moe_mma_type
                     transform = deep_gemm.transform_weights_for_mega_moe
-                    if mma_type == "fp8xmxfp4":
+                    if mma_type == "fp8xfp4":
                         transform = deep_gemm.transform_weights_for_w4a8_mega_moe
-                    elif mma_type == "bf16xmxfp4":
+                    elif mma_type == "bf16xfp4":
                         transform = deep_gemm.transform_weights_for_w4a16_mega_moe
 
                     # PPU MegaMoE consumes raw uint8 scales, before preprocessing.
