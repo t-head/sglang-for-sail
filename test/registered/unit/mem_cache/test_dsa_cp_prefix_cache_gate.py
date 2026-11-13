@@ -45,6 +45,7 @@ from sglang.srt.disaggregation import utils as dutils
 from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
+    dsa_cp_prefix_cache_alignment,
     drop_misaligned_dsa_cp_prefix_reuse,
     dsa_cp_prefix_reuse_length,
     enforce_dsa_cp_prefix_cache_alignment,
@@ -52,6 +53,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     rollback_matched_mamba_state,
 )
 from sglang.srt.mem_cache.common import match_kv_cache
+from sglang.srt.mem_cache.kv_cache_builder import require_dsa_cp_page_size
 
 _ALIGNMENT_SYMBOL = "sglang.srt.mem_cache.base_prefix_cache.dsa_cp_prefix_cache_alignment"
 
@@ -499,6 +501,74 @@ class TestCollectDeferredMambaState(unittest.TestCase):
 
         with self.assertRaises(AssertionError):
             ScheduleBatch._collect_deferred_mamba_cow_and_clear(batch, [req])
+
+
+class TestPageSizePrecondition(unittest.TestCase):
+    """The startup precondition must follow the platform's ``64 * index_kpool``
+    page derivation (0.5.22+), not the 0.5.21 literal 64. These cases exercise
+    the real rejection logic in ``require_dsa_cp_page_size``, which is what the
+    prefill worker calls before printing the feature-hit marker.
+    """
+
+    def test_kpool_one_still_requires_64(self):
+        self.assertEqual(require_dsa_cp_page_size(64, 1), 64)
+
+    def test_kpool_four_requires_256(self):
+        # GLM5.3 on 0.5.23: index_kpool=4 -> derived logical page 256.
+        self.assertEqual(require_dsa_cp_page_size(256, 4), 256)
+
+    def test_page_size_128_with_kpool_four_is_rejected(self):
+        # 128 // 4 == 32 would break the 64-token index-page requirement.
+        with self.assertRaises(ValueError) as ctx:
+            require_dsa_cp_page_size(128, 4)
+        message = str(ctx.exception)
+        for needle in ("page_size=128", "index_kpool=4", "expected=256"):
+            self.assertIn(needle, message)
+
+    def test_legacy_literal_64_with_kpool_four_is_rejected(self):
+        # The pre-migration precondition is now itself the counterexample.
+        with self.assertRaises(ValueError):
+            require_dsa_cp_page_size(64, 4)
+
+    def test_alignment_guard_agrees_with_expected_page_size(self):
+        # Inputs are mocked only: the cached alignment helper must compute 256
+        # itself and agree with the startup precondition.
+        dsa_cp_prefix_cache_alignment.cache_clear()
+        try:
+            with ExitStack() as stack:
+                patch = unittest.mock.patch
+                stack.enter_context(
+                    patch(
+                        "sglang.srt.environ.envs.SGLANG_DSA_CP_PREFIX_CACHE.get",
+                        return_value=True,
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        "sglang.srt.layers.attention.dsa.utils."
+                        "is_dsa_prefill_cp_interleave",
+                        return_value=True,
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        "sglang.srt.runtime_context.get_schedule",
+                        return_value=SimpleNamespace(page_size=256),
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        "sglang.srt.runtime_context.process_model_config",
+                        return_value=SimpleNamespace(
+                            hf_config=SimpleNamespace(index_kpool=4)
+                        ),
+                    )
+                )
+                alignment = dsa_cp_prefix_cache_alignment()
+        finally:
+            dsa_cp_prefix_cache_alignment.cache_clear()
+        self.assertEqual(alignment, 256)
+        self.assertEqual(alignment, require_dsa_cp_page_size(256, 4))
 
 
 if __name__ == "__main__":

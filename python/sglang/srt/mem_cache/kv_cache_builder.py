@@ -24,6 +24,35 @@ class KVCacheBuildResult:
     tree_cache: object
 
 
+def require_dsa_cp_page_size(page_size: int, index_kpool: int) -> int:
+    """Return the page geometry the DSA prefill-CP prefix cache requires.
+
+    Two layers must agree: the CP KV pool keeps a full logical-order copy on
+    every rank, and the DSA index pool needs 64-token *index* pages -- the pool
+    derives ``index_page_size = page_size // index_kpool``. So the *logical*
+    page must be ``64 * index_kpool`` (0.5.22+ derives it that way; 0.5.21
+    pinned the literal 64, which is why the old precondition went stale after
+    the migration).
+
+    Applicability: this is equivalent to ``index_page_size == 64`` only while
+    the platform's ``dcp_replicated`` shrink of index_page_size does not apply.
+    ``deepseek_v2.py`` rejects ``index_kpool > 1`` together with ``dcp_size > 1``,
+    which covers every kpool deployment; ``index_kpool == 1`` with ``dcp_size >
+    1`` is outside what has been established here. That ``64 % index_kpool == 0``
+    must hold is guarded platform-side (indexer and kpool plan), not by this
+    check.
+    """
+    expected_page_size = 64 * max(1, index_kpool)
+    if page_size != expected_page_size:
+        raise ValueError(
+            "SGLANG_DSA_CP_PREFIX_CACHE=1 requires page_size == 64 * index_kpool "
+            "(i.e. index_page_size == 64) for DSA prefill CP; got "
+            f"page_size={page_size}, index_kpool={index_kpool}, "
+            f"expected={expected_page_size}."
+        )
+    return expected_page_size
+
+
 from typing import TYPE_CHECKING
 
 from sglang.srt.configs.hybrid_arch import (
@@ -34,7 +63,11 @@ from sglang.srt.configs.hybrid_arch import (
     linear_attn_model_spec,
     mamba2_config,
 )
-from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
+from sglang.srt.configs.model_config import (
+    ModelImpl,
+    get_dsa_index_kpool,
+    is_deepseek_dsa,
+)
 from sglang.srt.disaggregation.utils import (
     dsa_cp_prefix_cache_enabled,
     should_bypass_dsa_cp_prefix_cache,
@@ -377,15 +410,14 @@ def build_kv_cache(
         # disagree about whether this is a real DSA prefill-CP deployment.
         and supports_dsa_cp_prefix_cache()
     ):
-        # Experimental un-bypass for DSA prefill CP: it relies on the CP KV
-        # pool keeping a full logical-order copy on every rank, and on the
-        # 64-token page geometry used by the DSA indexer page tables and the
-        # kpool alignment invariant (prefix_len % index_kpool == 0).
-        if page_size != 64:
-            raise ValueError(
-                "SGLANG_DSA_CP_PREFIX_CACHE=1 requires page_size == 64 for DSA "
-                f"prefill CP; got page_size={page_size}."
-            )
+        # Experimental un-bypass for DSA prefill CP: it relies on the CP KV pool
+        # keeping a full logical-order copy on every rank, and on the index-page
+        # geometry (logical page == 64 * index_kpool, i.e. index_page_size == 64)
+        # plus the runtime alignment invariant prefix_len % lcm(page_size,
+        # index_kpool) == 0 enforced in base_prefix_cache.
+        require_dsa_cp_page_size(
+            page_size, int(get_dsa_index_kpool(model_config.hf_config))
+        )
         # Printed once per worker process (this builder runs once at startup), so
         # it is the low-frequency feature-hit marker for the switch.
         logger.info(
