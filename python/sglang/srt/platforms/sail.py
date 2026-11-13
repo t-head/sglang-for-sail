@@ -53,6 +53,7 @@ class SailSRTPlatform(SailDeviceMixin, SRTPlatform):
 
 if is_sail_available():
     import sglang.srt.hardware_backend.sail.attention.ops_hooks  # noqa: F401
+    import sglang.srt.hardware_backend.sail.attention.ppu_deep_select_hooks  # noqa: F401
     import sglang.srt.hardware_backend.sail.attention.ppu_mhc_prenorm_hooks  # noqa: F401
     import sglang.srt.hardware_backend.sail.attention.ppu_msa_hook  # noqa: F401
     import sglang.srt.hardware_backend.sail.moe.deepep_hooks  # noqa: F401
