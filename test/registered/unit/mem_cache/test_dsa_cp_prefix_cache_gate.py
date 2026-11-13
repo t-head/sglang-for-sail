@@ -133,7 +133,14 @@ class TestRollbackMatchedMambaState(unittest.TestCase):
 class TestBypassPredicates(unittest.TestCase):
     """Only an interleave PD prefill-CP worker may keep the radix cache on."""
 
-    def _enter(self, mode="prefill", enable_cp=True, strategy="interleave", switch=False):
+    def _enter(
+        self,
+        mode="prefill",
+        enable_cp=True,
+        strategy="interleave",
+        switch=False,
+        cp_size=8,
+    ):
         stack = ExitStack()
         self.addCleanup(stack.close)
         # Production reads these two through the runtime-context *accessors*
@@ -152,7 +159,9 @@ class TestBypassPredicates(unittest.TestCase):
                 "get_parallel",
                 unittest.mock.Mock(
                     return_value=SimpleNamespace(
-                        enable_prefill_cp=enable_cp, cp_strategy=strategy
+                        enable_prefill_cp=enable_cp,
+                        cp_strategy=strategy,
+                        attn_cp_size=cp_size,
                     )
                 ),
             )
@@ -199,6 +208,18 @@ class TestBypassPredicates(unittest.TestCase):
 
     def test_non_dsa_never_bypasses(self):
         self.assertFalse(self._bypass(is_dsa=False))
+
+    def test_cp_width_one_is_not_a_supported_deployment(self):
+        self._enter(cp_size=1)
+        self.assertFalse(dutils.supports_dsa_cp_prefix_cache())
+
+    def test_cp_width_one_keeps_bypass_even_with_switch_on(self):
+        # The platform can silently drop the CP width to one (the DSA-family
+        # override recomputes it from tp_size). Without a real CP shard the
+        # runtime alignment guard is inert, so the switch must stay inert too
+        # rather than keep the radix cache on behind a marker that promises
+        # protection that is not there.
+        self.assertTrue(self._bypass(switch=True, cp_size=1))
 
 
 class _ZeroingTreeCache:

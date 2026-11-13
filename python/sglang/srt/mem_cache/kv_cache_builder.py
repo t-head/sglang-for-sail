@@ -38,6 +38,7 @@ from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
 from sglang.srt.disaggregation.utils import (
     dsa_cp_prefix_cache_enabled,
     should_bypass_dsa_cp_prefix_cache,
+    supports_dsa_cp_prefix_cache,
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
@@ -371,8 +372,10 @@ def build_kv_cache(
         is_dsa
         and dsa_cp_prefix_cache_enabled()
         and get_disagg().disaggregation_mode == "prefill"
-        and parallel.enable_prefill_cp
-        and parallel.cp_strategy == "interleave"
+        # The same predicate the bypass decision above uses, so the startup
+        # rejection, the ENABLED marker and the runtime alignment guard cannot
+        # disagree about whether this is a real DSA prefill-CP deployment.
+        and supports_dsa_cp_prefix_cache()
     ):
         # Experimental un-bypass for DSA prefill CP: it relies on the CP KV
         # pool keeping a full logical-order copy on every rank, and on the
