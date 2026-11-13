@@ -5,7 +5,7 @@ a selection back into pool slots."""
 from __future__ import annotations
 
 import itertools
-from typing import TYPE_CHECKING, Generator, Iterator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Generator, Iterator, List, Optional, Tuple, Union
 
 import msgspec
 import torch
@@ -549,7 +549,7 @@ def _score_chunks(
     indexer: DeepseekV41Indexer,
     q: torch.Tensor,
     weights: torch.Tensor,
-    index_k: torch.Tensor,
+    index_k: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     request: RequestScores,
     candidate_blocks: Optional[torch.Tensor] = None,
     candidate_block_size: int = CANDIDATE_BLOCK_SIZE,
@@ -563,17 +563,6 @@ def _score_chunks(
     candidate_only = not getattr(
         indexer, "use_int8", False
     ) and can_use_candidate_scores(q, index_k, weights, candidate_width, lc)
-    score_width = (
-        candidate_width
-        if candidate_only
-        else (
-            index_k[0].shape[0]
-            if getattr(indexer, "use_int8", False)
-            else index_k.shape[0]
-        )
-    )
-    # Chunk rows so the [rows, heads, score_width] BF16 scores stay under budget.
-    rows_per_chunk = max(1, _TORCH_SCORE_BUDGET_BYTES // (q.shape[1] * score_width * 2))
     if getattr(indexer, "use_int8", False):
         from sglang.kernels.ops.attention.dsv4.int8_indexer import (
             int8_index_logits,
@@ -585,6 +574,13 @@ def _score_chunks(
         if max_logits_mb <= 0:
             raise ValueError("SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB must be positive")
         rows_per_chunk = int8_logits_rows_per_chunk(lc, max_logits_mb * 1024 * 1024)
+    else:
+        # Only the BF16 path has a tensor K. INT8 uses (K, scales), and its
+        # separate logits budget above depends on the visible request width.
+        score_width = candidate_width if candidate_only else index_k.shape[0]
+        rows_per_chunk = max(
+            1, _TORCH_SCORE_BUDGET_BYTES // (q.shape[1] * score_width * 2)
+        )
     for start in range(0, request.tok.numel(), rows_per_chunk):
         rows = slice(start, start + rows_per_chunk)
         tok_c, lens_c = request.tok[rows], request.lens[rows]
