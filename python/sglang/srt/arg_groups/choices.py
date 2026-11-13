@@ -46,6 +46,7 @@ QUANTIZATION_CHOICES = [
     "modelopt_mixed",
     "petit_nvfp4",
     "w8a8_int8",  # mentioned in quantization.md documentation, supporting compressed-tensors quant_method.
+    "w4a8_int8",
     "w8a8_fp8",  # mentioned in quantization.md documentation, supporting compressed-tensors quant_method.
     "moe_wna16",  # custom loading logic for gptq/awq checkpoints (likely untested/unused)
     "w4afp8",

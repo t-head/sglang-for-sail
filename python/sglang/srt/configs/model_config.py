@@ -2106,6 +2106,7 @@ class ModelConfig:
             "minimax_m3_nvfp4": ["mxfp8"],
             "petit_nvfp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
+            "w4a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
             "auto-round-int8": ["compressed-tensors", "compressed_tensors"],
         }
