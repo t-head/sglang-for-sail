@@ -163,13 +163,46 @@ def get_qsa_pending_state_indices(req: Req) -> np.ndarray:
     return np.array([int(req_pool_idx)], dtype=np.int32)
 
 
+def dsa_cp_prefix_cache_enabled() -> bool:
+    """Experimental switch: keep the radix cache on under PD DSA prefill CP."""
+    return envs.SGLANG_DSA_CP_PREFIX_CACHE.get()
+
+
+def supports_dsa_cp_prefix_cache() -> bool:
+    """Whether the deployment is the supported DSA prefill-CP scenario.
+
+    Only interleave CP is supported: the CP KV/indexer pools then hold a full
+    logical-order copy on every rank, so prefix pages are readable by the
+    existing DSA indexer/attention paths and no CP-aware resharding is needed.
+    """
+    parallel = get_parallel()
+    return (
+        get_disagg().disaggregation_mode != "null"
+        and parallel.enable_prefill_cp
+        # A CP width of one computes no CP shards at all, and the runtime
+        # alignment guard keys off that same width (dsa/utils.py:
+        # is_dsa_enable_prefill_cp returns False for attn_cp_size <= 1).
+        # Un-bypassing without it would keep the radix cache on while the
+        # alignment guard is inert, so the feature marker would not imply
+        # the protection it documents.
+        and parallel.attn_cp_size > 1
+        and parallel.cp_strategy == "interleave"
+    )
+
+
 def should_bypass_dsa_cp_prefix_cache(*, is_dsa: bool = True) -> bool:
     """Whether PD DSA prefill CP must bypass the legacy radix cache."""
-    return (
-        is_dsa
-        and get_disagg().disaggregation_mode != "null"
-        and get_parallel().enable_prefill_cp
-    )
+    if not is_dsa:
+        return False
+    parallel = get_parallel()
+    if get_disagg().disaggregation_mode == "null" or not parallel.enable_prefill_cp:
+        # Not the PD prefill-CP scenario at all: today's behavior (no bypass).
+        return False
+    if dsa_cp_prefix_cache_enabled() and supports_dsa_cp_prefix_cache():
+        # Experimental un-bypass. Everything else (e.g. a non-interleave
+        # strategy) keeps bypassing the radix cache.
+        return False
+    return True
 
 
 class DisaggregationMode(Enum):
