@@ -384,10 +384,11 @@ def _run_mega_routed(
     if should_use_mega_gate(moe, hidden_states, forward_batch):
         import deep_gemm
 
-        # Only the fp8xfp4 pre-dispatch can skip its top-k copy (kCopyTopk).
+        # CUDA fp8xfp4 can skip the top-k copy (kCopyTopk); PPU pre-dispatch
+        # still requires explicit top-k tensors.
         buf = (
             _mega_moe_buffer(moe)
-            if _mega_moe_mma_type(moe.experts) == "fp8xfp4"
+            if not _is_sail and _mega_moe_mma_type(moe.experts) == "fp8xfp4"
             else None
         )
         with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
@@ -539,7 +540,7 @@ def run_mega_routed_experts(
             group_size=32,
             mma_type=mma_type,
         )
-        if mma_type != "mxf4xmxf4":
+        if mma_type != "fp4xfp4":
             mega_kwargs = {}
     elif mma_type == "nvfp4xnvfp4":
         # Per-token outer scales go to buf.x_scales; the kernel folds them with
@@ -635,9 +636,9 @@ def run_mega_routed_experts(
     with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
         if _is_sail:
             mega_moe_kernel = {
-                "mxf4xmxf4": deep_gemm.fp4_fp4_mega_moe,
-                "fp8xmxfp4": deep_gemm.fp8_fp4_mega_moe,
-                "bf16xmxfp4": deep_gemm.bf16_fp4_mega_moe,
+                "fp4xfp4": deep_gemm.fp4_fp4_mega_moe,
+                "fp8xfp4": deep_gemm.fp8_fp4_mega_moe,
+                "bf16xfp4": deep_gemm.bf16_fp4_mega_moe,
             }[mma_type]
         else:
             mega_moe_kernel = deep_gemm.fp8_fp4_mega_moe
