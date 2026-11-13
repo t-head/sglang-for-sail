@@ -703,6 +703,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
 
         with (
             patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch.object(mega_moe, "_is_sail", False),
             patch.object(mega_moe, "_device_sm", 100),
             patch.object(mega_moe, "_mega_moe_mma_type", return_value="fp8xfp4"),
             patch.object(mega_moe, "mega_moe_pre_dispatch") as pre_dispatch,

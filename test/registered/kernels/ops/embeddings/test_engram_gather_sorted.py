@@ -149,3 +149,7 @@ def test_empty_batch_is_a_no_op():
 
     assert _gather(weight, block_scales, ids).shape == (0, DIM)
     assert _gather(weight, block_scales, ids, sort_ids=True).shape == (0, DIM)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
