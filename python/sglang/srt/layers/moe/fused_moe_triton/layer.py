@@ -75,6 +75,7 @@ from sglang.srt.layers.quantization.minimax_m3_nvfp4 import MiniMaxM3Nvfp4MoE
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+from sglang.srt.layers.quantization.w4a8_int8 import W4A8Int8MoEMethod
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8FP8MoEMethod
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8MoEMethod
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -745,7 +746,7 @@ class FusedMoE(torch.nn.Module):
             )
         ):
             quant_config_dict["dispatcher_output_dtype"] = "fp8"
-        elif isinstance(self.quant_method, W8A8Int8MoEMethod):
+        elif isinstance(self.quant_method, (W8A8Int8MoEMethod, W4A8Int8MoEMethod)):
             quant_config_dict["dispatcher_output_dtype"] = "int8"
         elif isinstance(self.quant_method, Mxfp4MoEMethod):
             if getattr(self.quant_method, "use_deepgemm_mxfp4_w4a8", False):
@@ -771,7 +772,7 @@ class FusedMoE(torch.nn.Module):
             ):
                 is_channel_quant = True
 
-        if isinstance(self.quant_method, W8A8Int8MoEMethod):
+        if isinstance(self.quant_method, (W8A8Int8MoEMethod, W4A8Int8MoEMethod)):
             is_channel_quant = True
         if isinstance(self.quant_method, Mxfp4MoEMethod) and getattr(
             self.quant_method, "use_deepgemm_mxfp4_w4a8", False

@@ -114,6 +114,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     view_aiter_fused_rms_transposed_fp8_scale,
 )
 from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
+from sglang.srt.layers.quantization.w4a8_int8 import W4A8Int8Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
 from sglang.srt.layers.quantization.w8a8_int8 import (
     W8A8Int8Config,
@@ -300,7 +301,7 @@ def wo_a_fp8_gemm_enabled(quant_config: Optional[QuantizationConfig]) -> bool:
     """
     if not _FP8_WO_A_GEMM:
         return False
-    if _is_sail and isinstance(quant_config, W8A8Int8Config):
+    if _is_sail and isinstance(quant_config, (W8A8Int8Config, W4A8Int8Config)):
         return True
     return isinstance(quant_config, Fp8Config) and quant_config.weight_block_size == [
         128,
