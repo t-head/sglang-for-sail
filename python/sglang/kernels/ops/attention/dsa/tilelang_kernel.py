@@ -8,7 +8,7 @@ import torch
 
 from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
-from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_sail
 
 tilelang.set_log_level("WARNING")
 
@@ -140,6 +140,10 @@ def sparse_attention_fwd_kernel_v1(
 
     H_per_block = padded_H if REPLICATE_H == 1 else 64
 
+    # Keep GEMM and per-head softmax fragment layouts compatible on PPU.
+    # Select once at specialization time and use it for QK, tail QK, and PV.
+    gemm_policy = T.GemmWarpPolicy.FullRow if is_sail() else T.GemmWarpPolicy.FullCol
+
     @T.prim_func
     def main(
         Q: T.Tensor(q_shape, dtype),  # type: ignore
@@ -212,7 +216,7 @@ def sparse_attention_fwd_kernel_v1(
                     KV_shared,
                     acc_s,
                     transpose_B=True,
-                    policy=T.GemmWarpPolicy.FullCol,
+                    policy=gemm_policy,
                 )
                 if has_tail:
                     T.gemm(
@@ -220,7 +224,7 @@ def sparse_attention_fwd_kernel_v1(
                         K_tail_shared,
                         acc_s,
                         transpose_B=True,
-                        policy=T.GemmWarpPolicy.FullCol,
+                        policy=gemm_policy,
                     )
                 T.copy(m_i, m_i_prev)
                 T.reduce_max(acc_s, m_i, dim=1, clear=False)
@@ -237,7 +241,7 @@ def sparse_attention_fwd_kernel_v1(
                     acc_o[h_i, d_i] = acc_o[h_i, d_i] * alpha[h_i]
 
                 T.copy(acc_s, S_shared)
-                T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullCol)
+                T.gemm(S_shared, KV_shared, acc_o, policy=gemm_policy)
 
             # Rescale
             for h_i, d_i in T.Parallel(H_per_block, D):
