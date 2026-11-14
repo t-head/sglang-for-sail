@@ -121,6 +121,7 @@ from sglang.srt.runtime_context import (
     get_platform,
     get_stream,
 )
+from sglang.srt.utils.device import is_sail
 
 
 class Step5MLP(nn.Module):
@@ -948,7 +949,12 @@ class Step5Attention(nn.Module):
         if (
             weight.is_cuda
             and torch.version.hip is None
-            and torch.cuda.get_device_capability(weight.device)[0] == 10
+            and (
+                torch.cuda.get_device_capability(weight.device)[0] == 10
+                # PPU: the gate rows fit in the QKV GEMM's last tile, and the
+                # Triton qknorm port splits the gate out of the packed row.
+                or (is_sail() and supports_fused_qknorm_rope(weight.device))
+            )
             and weight.shape in ((1920, 4096), (3456, 4096))
             and not get_lora().enable_lora
             and get_model().weight_cache_mode == "off"
