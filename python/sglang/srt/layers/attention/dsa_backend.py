@@ -1524,7 +1524,10 @@ class DeepseekSparseAttnBackend(
             return dsa_backend_hip.dcp_gather_kv_cache(
                 self, kv_cache, forward_batch, metadata
             )
-        rows = kv_cache.view(torch.uint8).view(-1, self.kv_cache_dim)
+        if _is_sail:
+            rows = kv_cache.view(-1, self.kv_cache_dim).view(torch.uint8)
+        else:
+            rows = kv_cache.view(torch.uint8).view(-1, self.kv_cache_dim)
         gathered = dcp_gather_request_rows(
             rows[metadata.dcp_local_kv_rows], forward_batch.seq_lens_cpu
         )
@@ -3088,9 +3091,14 @@ class DeepseekSparseAttnBackend(
                             dtype=page_table_1_flattened.dtype,
                             device=page_table_1_flattened.device,
                         )
-                    kv_cache = dequantize_k_cache_paged_dsa(
-                        kv_cache, page_table_1_flattened
-                    )
+                    if _is_sail and not self.dsa_kv_cache_store_fp8:
+                        kv_cache = kv_cache.view(-1, 1, self.kv_cache_dim).index_select(
+                            0, page_table_1_flattened.long()
+                        )
+                    else:
+                        kv_cache = dequantize_k_cache_paged_dsa(
+                            kv_cache, page_table_1_flattened
+                        )
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)
 
