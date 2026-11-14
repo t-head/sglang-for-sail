@@ -118,6 +118,31 @@ class TestGlm53SailGate(CustomTestCase):
         self.assertEqual(args[0].device, self.hidden.device)
         self.assertEqual(kwargs["scoring_func"], "sigmoid")
 
+    def test_forced_torch_worker_starts_without_megagate_binding(self):
+        """Forcing Torch must not require the unused sigmoid binding at startup."""
+        from sglang.srt.layers.moe.utils import MoeA2ABackend
+        from sglang.srt.model_executor.model_runner_components import moe_ep_setup
+
+        model = SimpleNamespace(modules=lambda: iter([]))
+        config = SimpleNamespace(
+            hf_text_config=SimpleNamespace(model_type="glm_moe_dsa")
+        )
+        glm53_sail_gate._check_sigmoid_binding.cache_clear()
+        self.addCleanup(glm53_sail_gate._check_sigmoid_binding.cache_clear)
+        with (
+            self.hidden.fake_mode,
+            envs.SGLANG_FORCE_FUSED_OP_BACKEND.override("torch"),
+            patch.object(fused_op, "_forced_backend", fused_op._UNRESOLVED),
+            patch.object(torch.cuda, "is_available", return_value=True),
+            patch.object(torch.cuda, "current_device", return_value=0),
+            patch.object(moe_ep_setup, "get_moe_a2a_backend") as backend,
+            patch.dict(sys.modules, {"deep_gemm": None}),
+        ):
+            for requested in (MoeA2ABackend.DEEPEP, MoeA2ABackend.MEGAMOE):
+                with self.subTest(backend=requested):
+                    backend.return_value = requested
+                    moe_ep_setup.prepare_moe_topk(model=model, model_config=config)
+
     def test_worker_startup_reports_missing_or_incompatible_binding(self):
         glm53_sail_gate._check_sigmoid_binding.cache_clear()
         self.addCleanup(glm53_sail_gate._check_sigmoid_binding.cache_clear)

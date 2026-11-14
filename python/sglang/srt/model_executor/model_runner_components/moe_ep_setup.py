@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels import get_fused_op_backend
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.eplb.lplb_solver import (
@@ -32,8 +33,10 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 
 def prepare_moe_topk(*, model, model_config: ModelConfig) -> None:
+    # A forced fused-op backend bypasses GLM MegaGate at forward time as well.
     if (
         envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.get()
+        and get_fused_op_backend() is None
         and model_config.hf_text_config.model_type == "glm_moe_dsa"
         and get_moe_a2a_backend() in (MoeA2ABackend.DEEPEP, MoeA2ABackend.MEGAMOE)
     ):
