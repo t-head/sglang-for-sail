@@ -26,7 +26,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.quantization.unquant import bf16_gemm_dispatch
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.runtime_context import get_exec, get_lora, get_model
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_sail
 
 
 @lru_cache(maxsize=None)
@@ -135,12 +135,21 @@ class Step5Indexer(nn.Module):
             and self.num_heads == 4
             and tp_size in (4, 8)
         )
+        # PPU packs Q/K/Z only; the other B300 fusions stay off.
+        use_ppu_qkz = (
+            weight.is_cuda
+            and torch.version.hip is None
+            and is_sail()
+            and weight.dtype == torch.bfloat16
+            and index_head_dim == 256
+            and self.num_heads == 4
+        )
         self.register_buffer("qkz_weight", None, persistent=False)
         # Inspect the requested backend: auto has already resolved to CuTe at
         # this point. Packed shapes are measured against that actual dispatcher,
         # including its M=256 Q projection.
         if (
-            use_b300_fusions
+            (use_b300_fusions or use_ppu_qkz)
             and get_exec().kernel.bf16_gemm_backend in ("auto", "torch")
             and not get_exec().deterministic.enable_deterministic_inference
             and not get_lora().enable_lora
@@ -150,12 +159,16 @@ class Step5Indexer(nn.Module):
             and get_exec().offload.cpu_offload_gb == 0
             and get_exec().offload.offload_group_size <= 0
         ):
-            self.use_cutedsl_qkz = tp_size == 4
-            self.qkz_tokens = (
-                (4, 256)
-                if tp_size == 8 or get_exec().kernel.bf16_gemm_backend == "auto"
-                else (256,)
-            )
+            if use_b300_fusions:
+                self.use_cutedsl_qkz = tp_size == 4
+                self.qkz_tokens = (
+                    (4, 256)
+                    if tp_size == 8 or get_exec().kernel.bf16_gemm_backend == "auto"
+                    else (256,)
+                )
+            else:
+                # PPU: one packed GEMM at every token count, prefill included.
+                self.qkz_tokens = None
             self.qkz_weight = torch.empty(
                 1536, hidden_size, dtype=weight.dtype, device=weight.device
             )
@@ -262,7 +275,7 @@ class Step5Indexer(nn.Module):
         if (
             getattr(self, "qkz_weight", None) is not None
             and hidden_states.dtype == torch.bfloat16
-            and tokens in self.qkz_tokens
+            and (self.qkz_tokens is None or tokens in self.qkz_tokens)
             and get_exec().kernel.bf16_gemm_backend in ("auto", "torch")
             and not any(p._forward_hooks or p._forward_pre_hooks for p in projections)
         ):
