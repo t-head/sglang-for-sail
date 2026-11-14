@@ -4355,48 +4355,263 @@ class TestKimiK31DsaBackends(CustomTestCase):
                 {},
             )
 
-    def test_ppu_sparse_prefill_preserves_fp8_kv_cache(self):
+    def test_ppu_dsa_flashmla_kv_cache_dtype(self):
+        """ZW890P keeps FP8 only when both DSA phases use the KV backend."""
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,
             _ppu_flashmla_fp8_kv_cache_fallback,
         )
 
-        def view(arch, decode="flashmla_kv", dcp_size=1):
+        def view(arch, prefill, decode, dcp_size):
             return ResolvedView(
                 SimpleNamespace(
                     _model_config=SimpleNamespace(
                         hf_config=SimpleNamespace(architectures=[arch], index_topk=2048)
                     ),
                     kv_cache_dtype="fp8_e4m3",
+                    attention_backend="dsa",
+                    prefill_attention_backend=None,
                     decode_attention_backend=None,
-                    dsa_prefill_backend="flashmla_sparse",
+                    dsa_prefill_backend=prefill,
                     dsa_decode_backend=decode,
                     dcp_size=dcp_size,
                 )
             )
 
-        with patch("sglang.srt.utils.common.is_sail", return_value=True):
-            self.assertEqual(
-                _ppu_flashmla_fp8_kv_cache_fallback(
-                    view("KimiK31ForConditionalGeneration")
-                ),
-                {},
-            )
-            self.assertEqual(
-                _ppu_flashmla_fp8_kv_cache_fallback(
-                    view("KimiK31ForConditionalGeneration", dcp_size=2)
-                ),
-                {},
-            )
-            for cfg in (
-                view("KimiK31ForConditionalGeneration", decode="trtllm"),
-                view("KimiK31ForConditionalGeneration", decode="flashmla_sparse"),
-                view("GlmMoeDsaForCausalLM"),
+        fallback = {"kv_cache_dtype": "auto"}
+        for sm in (80, 89):
+            for prefill, decode, sm89_result in (
+                ("flashmla_kv", "flashmla_kv", {}),
+                ("flashmla_sparse", "flashmla_sparse", fallback),
+                ("flashmla_sparse", "flashmla_kv", fallback),
+                ("flashmla_kv", "flashmla_sparse", fallback),
+                ("flashmla_kv", "trtllm", fallback),
+                ("trtllm", "flashmla_kv", fallback),
+                ("flashmla_sparse", "trtllm", fallback),
+                ("trtllm", "flashmla_sparse", fallback),
             ):
-                self.assertEqual(
-                    _ppu_flashmla_fp8_kv_cache_fallback(cfg),
-                    {},
+                for arch, dcp_size in (
+                    ("KimiK31ForConditionalGeneration", 1),
+                    ("KimiK31ForConditionalGeneration", 2),
+                    ("GlmMoeDsaForCausalLM", 1),
+                ):
+                    with (
+                        self.subTest(
+                            sm=sm,
+                            prefill=prefill,
+                            decode=decode,
+                            arch=arch,
+                            dcp_size=dcp_size,
+                        ),
+                        patch("sglang.srt.utils.common.is_sail", return_value=True),
+                        override_platform(device_sm=sm),
+                    ):
+                        self.assertEqual(
+                            _ppu_flashmla_fp8_kv_cache_fallback(
+                                view(arch, prefill, decode, dcp_size)
+                            ),
+                            fallback if sm == 80 else sm89_result,
+                        )
+
+    def test_ppu_kimi_kv_cache_resolution_from_user_input(self):
+        """Kimi's auto-to-FP8 default must reach the later PPU fallback."""
+        from sglang.srt.arg_groups.overrides import (
+            _dsa_kv_cache_dtype_default,
+            _dsa_split_backend_resolution,
+            _ppu_flashmla_fp8_kv_cache_fallback,
+            run_post_process_pass,
+        )
+        from sglang.srt.server_args import ServerArgs
+
+        for sm in (80, 89):
+            for initial in ("auto", "fp8_e4m3"):
+                for prefill, decode in (
+                    (None, None),
+                    ("flashmla_kv", "flashmla_kv"),
+                    ("flashmla_sparse", "flashmla_kv"),
+                    ("flashmla_sparse", "flashmla_sparse"),
+                ):
+                    args = ServerArgs(
+                        model_path="dummy",
+                        attention_backend="dsa",
+                        prefill_attention_backend=None,
+                        decode_attention_backend=None,
+                        kv_cache_dtype=initial,
+                        dsa_prefill_backend=prefill,
+                        dsa_decode_backend=decode,
+                        enable_hisparse=False,
+                        tp_size=2,
+                        dcp_size=2,
+                    )
+                    args._model_config = SimpleNamespace(
+                        hf_config=SimpleNamespace(
+                            architectures=["KimiK31ForConditionalGeneration"],
+                            index_topk=2048,
+                        )
+                    )
+                    with (
+                        self.subTest(
+                            sm=sm, initial=initial, prefill=prefill, decode=decode
+                        ),
+                        override_platform(
+                            is_npu=False, is_xpu=False, is_hip=False, device_sm=sm
+                        ),
+                        patch(
+                            "torch.cuda.get_device_capability",
+                            return_value=divmod(sm, 10),
+                        ),
+                        patch("sglang.srt.utils.common.is_sail", return_value=True),
+                        patch(
+                            "sglang.srt.arg_groups.overrides.is_sail", return_value=True
+                        ),
+                        patch(
+                            "sglang.srt.arg_groups.overrides._KIMI_K31_DSA_BACKENDS",
+                            ("flashmla_kv", "trtllm", "flashmla_sparse"),
+                        ),
+                    ):
+                        for fn in (
+                            _dsa_kv_cache_dtype_default,
+                            _dsa_split_backend_resolution,
+                            _ppu_flashmla_fp8_kv_cache_fallback,
+                        ):
+                            run_post_process_pass(args, fn)
+                        expected_prefill = prefill or "flashmla_kv"
+                        expected_decode = decode or "flashmla_kv"
+                        expected_dtype = (
+                            "fp8_e4m3"
+                            if sm == 89
+                            and expected_prefill == expected_decode == "flashmla_kv"
+                            else "auto"
+                        )
+                        self.assertEqual(
+                            resolution_result(args, "kv_cache_dtype"), expected_dtype
+                        )
+                        self.assertEqual(
+                            resolution_result(args, "dsa_prefill_backend"),
+                            expected_prefill,
+                        )
+                        self.assertEqual(
+                            resolution_result(args, "dsa_decode_backend"),
+                            expected_decode,
+                        )
+                        self.assertEqual(args.kv_cache_dtype, initial)
+                        self.assertEqual(
+                            (args.dsa_prefill_backend, args.dsa_decode_backend),
+                            (prefill, decode),
+                        )
+
+    def test_ppu_flashmla_auto_prefill_falls_back(self):
+        """Non-Kimi automatic prefill must not bypass the FlashMLA KV policy."""
+        from sglang.srt.arg_groups.overrides import (
+            _dsa_split_backend_resolution,
+            _ppu_flashmla_fp8_kv_cache_fallback,
+            run_post_process_pass,
+        )
+
+        for sm in (80, 89):
+            for decode in ("flashmla_kv", "trtllm"):
+                args = SimpleNamespace(
+                    _model_config=SimpleNamespace(
+                        hf_config=SimpleNamespace(
+                            architectures=["GlmMoeDsaForCausalLM"],
+                            index_topk=2048,
+                        )
+                    ),
+                    attention_backend="dsa",
+                    prefill_attention_backend=None,
+                    decode_attention_backend=None,
+                    kv_cache_dtype="fp8_e4m3",
+                    dsa_prefill_backend="flashmla_auto",
+                    dsa_decode_backend=decode,
+                    enable_hisparse=False,
+                    dcp_size=1,
                 )
+                with (
+                    self.subTest(sm=sm, decode=decode),
+                    override_platform(
+                        is_npu=False, is_xpu=False, is_hip=False, device_sm=sm
+                    ),
+                    patch(
+                        "torch.cuda.get_device_capability", return_value=divmod(sm, 10)
+                    ),
+                    patch("sglang.srt.utils.common.is_sail", return_value=True),
+                    self.assertLogs(
+                        "sglang.srt.arg_groups.overrides", level="WARNING"
+                    ) as logs,
+                ):
+                    run_post_process_pass(args, _dsa_split_backend_resolution)
+                    run_post_process_pass(args, _ppu_flashmla_fp8_kv_cache_fallback)
+                self.assertEqual(resolution_result(args, "kv_cache_dtype"), "auto")
+                self.assertIn(
+                    "--dsa-prefill-backend flashmla_auto", "\n".join(logs.output)
+                )
+
+    def test_ppu_unused_dsa_flags_preserve_fp8(self):
+        """Unused DSA options must not change a Triton deployment's KV dtype."""
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _ppu_flashmla_fp8_kv_cache_fallback,
+        )
+
+        for sm in (80, 89):
+            for prefill, decode, expected in (
+                (None, None, {}),
+                ("dsa", None, {"kv_cache_dtype": "auto"}),
+                (None, "dsa", {"kv_cache_dtype": "auto"}),
+            ):
+                cfg = ResolvedView(
+                    SimpleNamespace(
+                        attention_backend="triton",
+                        prefill_attention_backend=prefill,
+                        decode_attention_backend=decode,
+                        dsa_prefill_backend="flashmla_sparse",
+                        dsa_decode_backend="flashmla_kv",
+                        kv_cache_dtype="fp8_e4m3",
+                    )
+                )
+                with (
+                    self.subTest(sm=sm, prefill=prefill, decode=decode),
+                    override_platform(device_sm=sm),
+                    patch("sglang.srt.utils.common.is_sail", return_value=True),
+                ):
+                    self.assertEqual(_ppu_flashmla_fp8_kv_cache_fallback(cfg), expected)
+
+    def test_ppu_fp8_kv_cache_fallback_boundaries(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _ppu_flashmla_fp8_kv_cache_fallback,
+        )
+
+        for sail, dtype, prefill, decode, expected in (
+            (True, "fp8_e4m3", None, "flashmla", {"kv_cache_dtype": "auto"}),
+            (
+                True,
+                "fp8_e4m3",
+                "flashmla_sparse",
+                "flashmla",
+                {"kv_cache_dtype": "auto"},
+            ),
+            (True, "fp8_e4m3", "trtllm", None, {}),
+            (True, "bfloat16", "flashmla_sparse", "flashmla", {}),
+            (True, "auto", "flashmla_sparse", "flashmla", {}),
+            (False, "fp8_e4m3", "flashmla_sparse", "flashmla", {}),
+        ):
+            with (
+                self.subTest(sail=sail, dtype=dtype, prefill=prefill, decode=decode),
+                patch("sglang.srt.utils.common.is_sail", return_value=sail),
+                override_platform(device_sm=89),
+            ):
+                cfg = ResolvedView(
+                    SimpleNamespace(
+                        kv_cache_dtype=dtype,
+                        attention_backend="dsa",
+                        prefill_attention_backend=None,
+                        decode_attention_backend=decode,
+                        dsa_prefill_backend=prefill,
+                        dsa_decode_backend="trtllm",
+                    )
+                )
+                self.assertEqual(_ppu_flashmla_fp8_kv_cache_fallback(cfg), expected)
 
     def test_sparse_prefill_rejected_off_ppu(self):
         with patch(
