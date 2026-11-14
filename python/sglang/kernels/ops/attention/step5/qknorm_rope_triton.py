@@ -2,60 +2,105 @@
 """Step5 Q/K norm + half-split RoPE in portable Triton (CuTe replacement).
 
 Mirrors ``cute/qknorm_rope.py`` ``FusedQKNormRope`` for devices that cannot run
-the CuTe DSL kernel (e.g. sm80 PPU). Each program normalizes one 192-wide head
-row with the zero-centered GemmaRMSNorm (``weight + 1``), materializes BF16 --
-matching the CuTe smem round -- then applies the half-split NeoX RoPE straight
-from the model's merged ``[cos | sin]`` table.
+the CuTe DSL kernel (e.g. sm80 PPU). Each 192-wide head row is normalized with
+the zero-centered GemmaRMSNorm (``weight + 1``), materialized as BF16 --
+matching the CuTe smem round -- then rotated with the half-split NeoX RoPE
+straight from the model's merged ``[cos | sin]`` table.
 
-Q heads and the single K/V lane share one launch, ``grid = (tokens, heads +
-1)``: lane ``heads`` carries K, the V copy, the head gate and the optional paged
-KV-cache scatter (``loc < 0`` rows are skipped), while lanes ``[0, heads)`` are
-standard Q heads. A separate K launch would repeat the whole grid prologue for
-16 rows of work. RoPE and tail columns are assembled in registers and written
-with a single masked store per row, so the rotated ``[0, 2*rd)`` segment and the
-passthrough ``[2*rd, 192)`` tail never race on overlapping addresses.
+Each program owns a tile of rows instead of a single row: a one-row program
+spent most of its time in the grid prologue and in the cross-thread
+``tl.gather`` that built the RoPE partner. A row is instead loaded as its two
+rotary halves ``[0, rd)`` / ``[rd, 2*rd)`` plus the passthrough tail
+``[2*rd, 192)``, so the partner of one half is simply the other half and every
+segment is stored once to a disjoint address range.
+
+Q rows and K/V tokens share one launch over a flat grid: the leading programs
+cover ``tokens * heads`` Q rows, the trailing ones cover token tiles that carry
+K, the V copy, the head gate and the optional paged KV-cache scatter (``loc <
+0`` rows are skipped).
 """
 
 import torch
 import triton
 import triton.language as tl
 
+# Rows per Q program and tokens per K/V program; 16 rows of 192 BF16 keep a
+# program at ~6 KiB of traffic, enough to amortize its prologue.
+_BLOCK_Q = 16
+_BLOCK_KV = 16
+
 
 @triton.jit
-def _norm_rope_row(
+def _norm_rope_rows(
     X,
     W,
     COS,
     SIN,
-    row_off,
+    x_off,
     pos,
+    row_mask,
+    OUT,
+    out_off,
+    OUT2,
+    out2_off,
+    out2_mask,
     RD: tl.constexpr,
+    RD_P: tl.constexpr,
+    TAIL: tl.constexpr,
+    TAIL_P: tl.constexpr,
     EPS: tl.constexpr,
+    HAS_OUT2: tl.constexpr,
 ):
-    """RMSNorm(192, zero-centered) -> BF16 -> half-split RoPE. Returns BF16[256].
+    """RMSNorm(192, zero-centered) -> BF16 -> half-split RoPE for a row tile.
 
-    ``row_off`` is the element offset of this head's 192-wide row inside ``X``;
-    ``pos`` is the token's rotary table row. ``COS``/``SIN`` are the split views
-    of the merged table, so each has a row stride of ``2 * RD``.
+    ``x_off`` / ``out_off`` / ``out2_off`` are per-row element offsets of the
+    192-wide row; ``pos`` is each row's rotary table row. ``COS``/``SIN`` are
+    the split views of the merged table, so each has a row stride of ``2 * RD``.
+    ``OUT2`` is an optional second destination (the paged cache) masked by
+    ``out2_mask``.
     """
-    channel = tl.arange(0, 256)
-    mask = channel < 192
-    x = tl.load(X + row_off + channel, mask=mask, other=0.0).to(tl.float32)
-    w = tl.load(W + channel, mask=mask, other=0.0)
-    inverse_rms = tl.rsqrt(tl.sum(x * x, 0) / 192 + EPS)
+    c = tl.arange(0, RD_P)
+    cmask = c < RD
+    m = row_mask[:, None] & cmask[None, :]
+    x_lo = X + x_off[:, None] + c[None, :]
+    x1 = tl.load(x_lo, mask=m, other=0.0).to(tl.float32)
+    x2 = tl.load(x_lo + RD, mask=m, other=0.0).to(tl.float32)
+    ss = tl.sum(x1 * x1, 1) + tl.sum(x2 * x2, 1)
+    if TAIL > 0:
+        t = tl.arange(0, TAIL_P)
+        tmask = t < TAIL
+        mt = row_mask[:, None] & tmask[None, :]
+        xt = tl.load(X + x_off[:, None] + 2 * RD + t[None, :], mask=mt, other=0.0)
+        xt = xt.to(tl.float32)
+        ss += tl.sum(xt * xt, 1)
+    inverse_rms = tl.rsqrt(ss / 192 + EPS)[:, None]
+
+    w1 = tl.load(W + c, mask=cmask, other=0.0)[None, :]
+    w2 = tl.load(W + RD + c, mask=cmask, other=0.0)[None, :]
     # Norm has its own BF16 boundary before RoPE, matching the CuTe smem round.
-    norm = (x * inverse_rms * (w + 1.0)).to(tl.bfloat16).to(tl.float32)
-    # Half-split partner: [0,rd) <-> [rd,2rd); the tail partners with itself and
-    # is discarded by the final select.
-    rot = channel < 2 * RD
-    partner = tl.where(rot, tl.where(channel < RD, channel + RD, channel - RD), channel)
-    cos_idx = tl.where(rot, tl.where(channel < RD, channel, channel - RD), 0)
-    pair = tl.gather(norm, partner, axis=0)
-    cos = tl.load(COS + pos * (2 * RD) + cos_idx, mask=mask, other=0.0).to(tl.float32)
-    sin = tl.load(SIN + pos * (2 * RD) + cos_idx, mask=mask, other=0.0).to(tl.float32)
-    sign = tl.where(channel < RD, -1.0, 1.0)
-    roped = norm * cos + sign * pair * sin
-    return tl.where(rot, roped, norm).to(tl.bfloat16)
+    n1 = (x1 * inverse_rms * (w1 + 1.0)).to(tl.bfloat16).to(tl.float32)
+    n2 = (x2 * inverse_rms * (w2 + 1.0)).to(tl.bfloat16).to(tl.float32)
+    table = pos[:, None] * (2 * RD) + c[None, :]
+    cos = tl.load(COS + table, mask=m, other=0.0).to(tl.float32)
+    sin = tl.load(SIN + table, mask=m, other=0.0).to(tl.float32)
+    o1 = (n1 * cos - n2 * sin).to(tl.bfloat16)
+    o2 = (n2 * cos + n1 * sin).to(tl.bfloat16)
+
+    o_lo = OUT + out_off[:, None] + c[None, :]
+    tl.store(o_lo, o1, mask=m)
+    tl.store(o_lo + RD, o2, mask=m)
+    if HAS_OUT2:
+        m2 = out2_mask[:, None] & cmask[None, :]
+        o2_lo = OUT2 + out2_off[:, None] + c[None, :]
+        tl.store(o2_lo, o1, mask=m2)
+        tl.store(o2_lo + RD, o2, mask=m2)
+    if TAIL > 0:
+        wt = tl.load(W + 2 * RD + t, mask=tmask, other=0.0)[None, :]
+        nt = (xt * inverse_rms * (wt + 1.0)).to(tl.bfloat16)
+        tl.store(OUT + out_off[:, None] + 2 * RD + t[None, :], nt, mask=mt)
+        if HAS_OUT2:
+            mt2 = out2_mask[:, None] & tmask[None, :]
+            tl.store(OUT2 + out2_off[:, None] + 2 * RD + t[None, :], nt, mask=mt2)
 
 
 @triton.jit
@@ -73,52 +118,110 @@ def _qknorm_rope(
     KCACHE,
     VCACHE,
     LOC,
+    tokens,
+    q_programs,
     ROW_WIDTH: tl.constexpr,
     HEADS: tl.constexpr,
     RD: tl.constexpr,
+    RD_P: tl.constexpr,
+    TAIL: tl.constexpr,
+    TAIL_P: tl.constexpr,
     EPS: tl.constexpr,
     GATED: tl.constexpr,
     STORE_CACHE: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
 ):
-    token = tl.program_id(0).to(tl.int64)
-    head = tl.program_id(1).to(tl.int64)
-    pos = tl.load(POS + token).to(tl.int64)
-    channel = tl.arange(0, 256)
-    mask = channel < 192
-    if head < HEADS:
-        out = _norm_rope_row(
-            QKV, QW, COS, SIN, token * ROW_WIDTH + head * 192, pos, RD, EPS
+    pid = tl.program_id(0)
+    if pid < q_programs:
+        # Q rows: flat row ``r`` is head ``r % HEADS`` of token ``r // HEADS``,
+        # and Q is contiguous [T, HEADS * 192], so its output row is ``r``.
+        r = pid.to(tl.int64) * BLOCK_Q + tl.arange(0, BLOCK_Q)
+        rmask = r < tokens * HEADS
+        token = r // HEADS
+        head = r % HEADS
+        pos = tl.load(POS + token, mask=rmask, other=0).to(tl.int64)
+        _norm_rope_rows(
+            QKV,
+            QW,
+            COS,
+            SIN,
+            token * ROW_WIDTH + head * 192,
+            pos,
+            rmask,
+            Q,
+            r * 192,
+            Q,
+            r * 192,
+            rmask,
+            RD,
+            RD_P,
+            TAIL,
+            TAIL_P,
+            EPS,
+            False,
         )
-        tl.store(Q + token * (HEADS * 192) + head * 192 + channel, out, mask=mask)
     else:
-        # K head: norm + RoPE, written to the [T,192] K output and (optionally)
-        # cache. The gate and cache pointers are placeholders unless their
+        # K/V tokens. The gate and cache pointers are placeholders unless their
         # constexpr guards hold, so only the specialization touches them.
-        k_out = _norm_rope_row(
-            QKV, KW, COS, SIN, token * ROW_WIDTH + HEADS * 192, pos, RD, EPS
+        token = (pid - q_programs).to(tl.int64) * BLOCK_KV + tl.arange(0, BLOCK_KV)
+        tmask = token < tokens
+        pos = tl.load(POS + token, mask=tmask, other=0).to(tl.int64)
+        row = token * ROW_WIDTH
+        if STORE_CACHE:
+            loc = tl.load(LOC + token, mask=tmask, other=-1).to(tl.int64)
+            cache_mask = tmask & (loc >= 0)
+            cache_off = loc * 192
+        else:
+            cache_mask = tmask
+            cache_off = token * 192
+        # K head: norm + RoPE, written to the [T,192] K output and (optionally)
+        # cache.
+        _norm_rope_rows(
+            QKV,
+            KW,
+            COS,
+            SIN,
+            row + HEADS * 192,
+            pos,
+            tmask,
+            K,
+            token * 192,
+            KCACHE,
+            cache_off,
+            cache_mask,
+            RD,
+            RD_P,
+            TAIL,
+            TAIL_P,
+            EPS,
+            STORE_CACHE,
         )
-        tl.store(K + token * 192 + channel, k_out, mask=mask)
         # V head: plain copy, no norm and no RoPE.
+        channel = tl.arange(0, 256)
+        cmask = channel < 192
+        vm = tmask[:, None] & cmask[None, :]
         v_raw = tl.load(
-            QKV + token * ROW_WIDTH + (HEADS + 1) * 192 + channel,
-            mask=mask,
+            QKV + (row + (HEADS + 1) * 192)[:, None] + channel[None, :],
+            mask=vm,
             other=0.0,
         )
-        tl.store(V + token * 192 + channel, v_raw, mask=mask)
+        tl.store(V + (token * 192)[:, None] + channel[None, :], v_raw, mask=vm)
+        if STORE_CACHE:
+            tl.store(
+                VCACHE + cache_off[:, None] + channel[None, :],
+                v_raw,
+                mask=cache_mask[:, None] & cmask[None, :],
+            )
         if GATED:
             g = tl.arange(0, 16)
-            gmask = g < HEADS
+            gm = tmask[:, None] & (g < HEADS)[None, :]
             gate_val = tl.load(
-                QKV + token * ROW_WIDTH + (HEADS + 2) * 192 + g,
-                mask=gmask,
+                QKV + (row + (HEADS + 2) * 192)[:, None] + g[None, :],
+                mask=gm,
                 other=0.0,
             )
-            tl.store(GATE + token * HEADS + g, gate_val, mask=gmask)
-        if STORE_CACHE:
-            loc = tl.load(LOC + token).to(tl.int64)
-            if loc >= 0:
-                tl.store(KCACHE + loc * 192 + channel, k_out, mask=mask)
-                tl.store(VCACHE + loc * 192 + channel, v_raw, mask=mask)
+            tl.store(GATE + (token * HEADS)[:, None] + g[None, :], gate_val, mask=gm)
 
 
 def launch(
@@ -141,7 +244,7 @@ def launch(
     store_cache: bool,
     eps: float,
 ) -> None:
-    """Run the Q heads and the K/V/gate/cache lane in one launch, in place.
+    """Run the Q rows and the K/V/gate/cache tokens in one launch, in place.
 
     Argument order mirrors the CuTe compiled callable so ``_qknorm_rope`` can
     pick a backend without reshaping its call site. ``cos``/``sin`` are the
@@ -153,7 +256,10 @@ def launch(
     tokens = qkv.shape[0]
     row_width = qkv.shape[1]
     rd = cos.shape[1]
-    _qknorm_rope[(tokens, heads + 1)](
+    tail = 192 - 2 * rd
+    q_programs = triton.cdiv(tokens * heads, _BLOCK_Q)
+    kv_programs = triton.cdiv(tokens, _BLOCK_KV)
+    _qknorm_rope[(q_programs + kv_programs,)](
         qkv,
         q_weight,
         k_weight,
@@ -167,12 +273,19 @@ def launch(
         k_cache if store_cache else qkv,
         v_cache if store_cache else qkv,
         loc if store_cache else positions,
+        tokens,
+        q_programs,
         row_width,
         heads,
         rd,
+        triton.next_power_of_2(rd),
+        tail,
+        triton.next_power_of_2(tail) if tail > 0 else 1,
         eps,
         gated,
         store_cache,
+        _BLOCK_Q,
+        _BLOCK_KV,
         num_warps=4,
         enable_fp_fusion=False,
     )
