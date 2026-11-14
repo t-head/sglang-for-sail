@@ -688,6 +688,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     )
                 if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
                     raise RuntimeError("PPU MXFP4 W4A8 requires DeepGEMM.")
+                if moe_a2a_backend.is_deepep():
+                    output_dtype = get_exec().moe.deepep_dispatcher_output_dtype
+                    if output_dtype == "auto":
+                        output_dtype = (
+                            "bf16" if envs.SGLANG_DEEPEP_BF16_DISPATCH.get() else "fp8"
+                        )
+                    if output_dtype != "fp8":
+                        raise ValueError(
+                            "PPU MXFP4 W4A8 requires FP8 DeepEP dispatch; "
+                            f"effective dtype is {output_dtype}. "
+                            "Set --deepep-dispatcher-output-dtype fp8."
+                        )
         self.flashinfer_mxfp4_moe_precision = (
             get_exec().moe.flashinfer_mxfp4_moe_precision
         )
@@ -1060,12 +1072,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 getattr(layer, weight_name).data = weight
                 getattr(layer, scale_name).data = scale
                 setattr(layer, f"{weight_name}_inv_scale", inv_scale)
-            if get_moe_a2a_backend().is_deepep():
-                # Both dispatcher implementations retain this dictionary via
-                # set_quant_config; normal folds here, LL compensates on receipt.
-                config = dict(layer.dispatcher.quant_config)
-                config["w4a8_scale_multiplier"] = layer.w13_weight_inv_scale
-                layer.dispatcher.set_quant_config(config)
             torch.cuda.empty_cache()
             return
 
