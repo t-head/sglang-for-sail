@@ -143,6 +143,12 @@ sgl_kernel_cuda_flags = [
     "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
     "--expt-relaxed-constexpr",
     "--expt-extended-lambda",
+    # CUDAExtension injects CUDA-named guards even with the SAIL toolchain.
+    # Keep conversions available in both SDK header naming styles.
+    "-U__CUDA_NO_HALF_OPERATORS__",
+    "-U__CUDA_NO_HALF_CONVERSIONS__",
+    "-U__CUDA_NO_HALF2_OPERATORS__",
+    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
     "-U__HGGC_NO_HALF_OPERATORS__",
     "-U__HGGC_NO_HALF_CONVERSIONS__",
     "-U__HGGC_NO_HALF2_OPERATORS__",
