@@ -5137,6 +5137,76 @@ class TestKimiK31DsaBackends(CustomTestCase):
                 platform_hook._sail_flashmla_fp8_kv_cache_fallback(cfg), {}
             )
 
+    def test_sail_fp8_flashmla_policy_matrix(self):
+        from sglang.srt.arg_groups import platform_hook
+
+        for sail in (False, True):
+            for sm in (80, 89):
+                for dtype in ("auto", "bfloat16", "fp8_e4m3", "fp8_e5m2", "fp8_ds_mla"):
+                    for attention in ("dsa", "triton", "flashmla"):
+                        for prefill, decode in (
+                            ("flashmla_kv", "flashmla_kv"),
+                            ("flashmla_sparse", "flashmla_kv"),
+                            ("flashmla_kv", "flashmla_sparse"),
+                            ("flashmla_auto", "trtllm"),
+                            ("trtllm", "flashmla_kv"),
+                            ("trtllm", "trtllm"),
+                        ):
+                            cfg = SimpleNamespace(
+                                kv_cache_dtype=dtype,
+                                speculative_draft_attention_backend=None,
+                                dsa_prefill_backend=prefill,
+                                dsa_decode_backend=decode,
+                            )
+                            uses_flashmla = any(
+                                x.startswith("flashmla") for x in (prefill, decode)
+                            )
+                            supported = (
+                                sm >= 89
+                                and dtype == "fp8_e4m3"
+                                and prefill == decode == "flashmla_kv"
+                            )
+                            fallback = (
+                                sail
+                                and dtype in ("fp8_e4m3", "fp8_e5m2")
+                                and (
+                                    attention == "flashmla"
+                                    or (
+                                        attention == "dsa"
+                                        and uses_flashmla
+                                        and not supported
+                                    )
+                                )
+                            )
+                            with (
+                                self.subTest(
+                                    sail=sail,
+                                    sm=sm,
+                                    dtype=dtype,
+                                    attention=attention,
+                                    prefill=prefill,
+                                    decode=decode,
+                                ),
+                                patch.object(
+                                    platform_hook,
+                                    "get_platform",
+                                    return_value=SimpleNamespace(
+                                        is_sail=sail, device_sm=sm
+                                    ),
+                                ),
+                                patch.object(
+                                    platform_hook,
+                                    "attention_backends_of",
+                                    return_value=(attention, attention),
+                                ),
+                            ):
+                                self.assertEqual(
+                                    platform_hook._sail_flashmla_fp8_kv_cache_fallback(
+                                        cfg
+                                    ),
+                                    {"kv_cache_dtype": "auto"} if fallback else {},
+                                )
+
     def test_sparse_prefill_rejected_off_ppu(self):
         with patch(
             "sglang.srt.arg_groups.overrides._KIMI_K31_DSA_BACKENDS",
