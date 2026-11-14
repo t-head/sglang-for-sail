@@ -30,7 +30,6 @@ from sglang.srt.utils import (
     is_musa,
     is_xpu,
 )
-from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 _is_hip = is_hip()
@@ -496,7 +495,6 @@ def sglang_per_token_group_quant_fp8(
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
-    scale_multiplier: float = 1.0,
     *,
     output_q: Optional[torch.Tensor] = None,
     output_s: Optional[torch.Tensor] = None,
@@ -516,7 +514,6 @@ def sglang_per_token_group_quant_fp8(
         # kernel (same [T, 1] scale shape) instead of a group kernel that
         # would need arbitrary group sizes.
         if output_q is not None and output_q.dtype != fp8_dtype:
-            assert scale_multiplier == 1.0
             return _per_token_group_quant_8bit_raw(
                 x,
                 group_size,
@@ -526,12 +523,9 @@ def sglang_per_token_group_quant_fp8(
             )
         return sglang_per_token_quant_fp8(
             x,
-            scale_multiplier=scale_multiplier,
             output_q=output_q,
             output_s=output_s,
         )
-
-    assert scale_multiplier == 1.0, "Scale folding requires whole-row FP8 quantization"
 
     out_shape = (*x.shape[:-1], x.shape[-1] // (2 if fuse_silu_and_mul else 1))
 
@@ -632,24 +626,9 @@ def sglang_per_token_group_quant_fp8_row_padded(
     return x_q, x_s
 
 
-@register_custom_op(mutates_args=["output_q", "output_s"])
-def _per_token_quant_fp8_scaled_aot(
-    input: torch.Tensor,
-    output_q: torch.Tensor,
-    output_s: torch.Tensor,
-    scale_multiplier: float,
-) -> None:
-    # Only the new scaled path uses AOT; its custom-op boundary supplies the
-    # fake implementation without reviving the retired default AOT route.
-    from sgl_kernel import sgl_per_token_quant_fp8 as quantize
-
-    quantize(input, output_q, output_s, scale_multiplier)
-
-
 def sglang_per_token_quant_fp8(
     x: torch.Tensor,
     dtype: torch.dtype = fp8_dtype,
-    scale_multiplier: float = 1.0,
     *,
     output_q: Optional[torch.Tensor] = None,
     output_s: Optional[torch.Tensor] = None,
@@ -672,10 +651,7 @@ def sglang_per_token_quant_fp8(
         )
     )
 
-    if scale_multiplier == 1.0:
-        sgl_per_token_quant_fp8(x, x_q, x_s)
-    else:
-        sgl_per_token_quant_fp8(x, x_q, x_s, scale_multiplier)
+    sgl_per_token_quant_fp8(x, x_q, x_s)
 
     return x_q, x_s
 

@@ -741,7 +741,9 @@ def grouped_gemm_nt_f4f4bf16_nopad(
         )
 
 
-def grouped_gemm_nt_f8f4bf16_nopad(lhs, rhs, out, m_indices, m_rows=None):
+def grouped_gemm_nt_f8f4bf16_nopad(
+    lhs, rhs, out, m_indices, m_rows=None, inv_scale=1.0
+):
     assert _is_sail and get_device_sm() >= 89, "W4A8 requires SAIL SM89+"
     m, k = lhs[0].shape
     e, n, _ = rhs[0].shape
@@ -753,10 +755,12 @@ def grouped_gemm_nt_f8f4bf16_nopad(lhs, rhs, out, m_indices, m_rows=None):
         compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F4BF16_NOPAD,
         use_m_rows=m_rows is not None,
     ):
-        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(lhs, rhs, out, m_indices, m_rows)
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(
+            lhs, rhs, out, m_indices, m_rows, inv_scale=inv_scale
+        )
 
 
-def grouped_gemm_nt_f8f4bf16_masked(lhs, rhs, out, masked_m, expected_m):
+def grouped_gemm_nt_f8f4bf16_masked(lhs, rhs, out, masked_m, expected_m, inv_scale=1.0):
     assert _is_sail and get_device_sm() >= 89, "W4A8 requires SAIL SM89+"
     e, capacity, k = lhs[0].shape
     _, n, _ = rhs[0].shape
@@ -769,7 +773,7 @@ def grouped_gemm_nt_f8f4bf16_masked(lhs, rhs, out, masked_m, expected_m):
         masked_capacity=capacity,
     ):
         deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_masked(
-            lhs, rhs, out, masked_m, expected_m
+            lhs, rhs, out, masked_m, expected_m, inv_scale=inv_scale
         )
 
 
@@ -782,6 +786,7 @@ def grouped_gemm_nt_f8f4bf16_fused(
     sorted_token_ids,
     aligned_num_m_blocks,
     configs,
+    inv_scale=1.0,
 ):
     assert _is_sail and get_device_sm() >= 89, "W4A8 requires SAIL SM89+"
     m, k = lhs[0].shape
@@ -803,6 +808,7 @@ def grouped_gemm_nt_f8f4bf16_fused(
             sorted_token_ids,
             aligned_num_m_blocks,
             configs,
+            inv_scale=inv_scale,
         )
 
 
