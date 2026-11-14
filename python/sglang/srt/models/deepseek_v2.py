@@ -106,6 +106,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
+    glm53_sail_gate,
     post_experts_all_reduce,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
@@ -1578,7 +1579,15 @@ class DeepseekV2MoE(nn.Module):
 
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
-            router_logits = self.gate(hidden_states, forward_batch=forward_batch)
+            topk_output = None
+            if (
+                envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.get()
+                and get_moe_a2a_backend().is_deepep()
+                and not use_vision_topk
+            ):
+                topk_output = glm53_sail_gate.try_route(self, hidden_states)
+            if topk_output is None:
+                router_logits = self.gate(hidden_states, forward_batch=forward_batch)
             if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
                 if self.alt_stream is not None:
                     self.alt_stream.wait_stream(torch.cuda.current_stream())
@@ -1595,25 +1604,26 @@ class DeepseekV2MoE(nn.Module):
                         torch.cuda.current_stream().wait_event(shared_event)
                 else:
                     shared_output = self._forward_shared_experts(hidden_states)
-            topk_kwargs = (
-                {"input_ids": input_ids_global}
-                if getattr(self, "is_hash", False)
-                else {}
-            )
-            if use_vision_topk:
-                # IDs follow the same local row order as hidden_states, including
-                # CP sharding and the attention-TP scatter before DeepEP.
-                topk_output = vision_topk(
-                    self,
-                    router_logits,
-                    input_ids_global,
+            if topk_output is None:
+                topk_kwargs = (
+                    {"input_ids": input_ids_global}
+                    if getattr(self, "is_hash", False)
+                    else {}
                 )
-            else:
-                topk_output = self.topk(
-                    hidden_states,
-                    router_logits,
-                    **topk_kwargs,
-                )
+                if use_vision_topk:
+                    # IDs follow the same local row order as hidden_states, including
+                    # CP sharding and the attention-TP scatter before DeepEP.
+                    topk_output = vision_topk(
+                        self,
+                        router_logits,
+                        input_ids_global,
+                    )
+                else:
+                    topk_output = self.topk(
+                        hidden_states,
+                        router_logits,
+                        **topk_kwargs,
+                    )
         else:
             topk_output = self.topk.empty_topk_output(
                 hidden_states.device,
