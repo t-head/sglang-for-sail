@@ -21,6 +21,130 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestDSABackendDPPadding(CustomTestCase):
+    def test_dcp_gather_preserves_complete_token_rows(self):
+        """BF16 DCP rows must not be split in half by the byte transport."""
+        for sail, dtype in (
+            (True, torch.bfloat16),
+            (True, torch.float8_e4m3fn),
+            (False, torch.float8_e4m3fn),
+        ):
+            with self.subTest(sail=sail, dtype=dtype):
+                cache = torch.arange(24, dtype=torch.float32).view(6, 1, 4).to(dtype)
+                rows = torch.tensor([1, 3, 5])
+                backend = SimpleNamespace(kv_cache_dim=4, physical_page_size=4)
+                with (
+                    patch("sglang.srt.layers.attention.dsa_backend._is_sail", sail),
+                    patch(
+                        "sglang.srt.layers.attention.dsa_backend.dcp_gather_request_rows",
+                        side_effect=lambda values, lengths: values,
+                    ),
+                ):
+                    actual = DeepseekSparseAttnBackend.dcp_gather_kv_cache(
+                        backend,
+                        cache,
+                        SimpleNamespace(seq_lens_cpu=torch.tensor([3])),
+                        SimpleNamespace(dcp_local_kv_rows=rows),
+                    )
+                expected = torch.cat(
+                    (cache.float()[rows].view(3, 4), torch.zeros(1, 4))
+                )
+                self.assertEqual(actual.dtype, dtype)
+                torch.testing.assert_close(actual.float(), expected)
+
+    def test_dcp_sparse_prefill_with_compute_dtype_kv(self):
+        """A BF16 prefix must use the gathered rows without FP8 dequantization."""
+        kernel = ModuleType("sglang.kernels.ops.attention.flash_mla_interface")
+
+        def attention(query, keys, indices):
+            indices = indices.squeeze(1) if indices.ndim == 3 else indices
+            selected = keys.view(-1, 4).float()[indices.clamp_min(0).long()]
+            scores = torch.einsum("qhd,qkd->qhk", query.float(), selected)
+            scores.masked_fill_(indices[:, None, :] < 0, float("-inf"))
+            return torch.einsum("qhk,qkd->qhd", scores.softmax(-1), selected).to(
+                query.dtype
+            )
+
+        kernel.flash_mla_sparse_fwd = lambda q, kv, indices, **kwargs: (
+            attention(q, kv, indices),
+            None,
+            None,
+        )
+        for has_prefix in (False, True):
+            with self.subTest(has_prefix=has_prefix):
+                total = 4 if has_prefix else 2
+                keys = (
+                    torch.arange(total * 4, dtype=torch.float32).view(total, 1, 4) / 16
+                ).bfloat16()
+                query = (
+                    torch.arange(2 * 64 * 4, dtype=torch.float32).view(2, 64, 4) / 512
+                ).bfloat16()
+                indices = torch.tensor(
+                    [[0, 1, 2], [1, 2, 3]] if has_prefix else [[0, -1, -1], [0, 1, -1]],
+                    dtype=torch.int32,
+                )
+                backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+                backend.dsa_prefill_impl = "flashmla_sparse"
+                backend.dsa_decode_impl = "flashmla_kv"
+                backend.dsa_kv_cache_store_fp8 = False
+                backend.kv_cache_dim = 4
+                backend.physical_page_size = 2
+                backend.attn_dcp_size = 2
+                backend.dsa_index_kpool = 1
+                backend.kimi_k31 = True
+                backend.device_sm_major = 8
+                backend.use_mha = False
+                backend.use_fused_topk = False
+                backend.hisparse_coordinator = None
+                backend.token_to_kv_pool = SimpleNamespace(
+                    get_key_buffer=lambda _: torch.full(
+                        (6, 1, 4), 99, dtype=torch.bfloat16
+                    )
+                )
+                backend.forward_metadata = SimpleNamespace(
+                    dcp_local_kv_rows=torch.tensor([1, 3] if has_prefix else [1]),
+                    page_table_1_flattened=torch.tensor([5, 2, 4, 1][:total]),
+                    topk_indices_offset=torch.zeros(2, dtype=torch.int32),
+                    dsa_cache_seqlens_int32=torch.tensor(
+                        [3, 3] if has_prefix else [1, 2]
+                    ),
+                )
+                layer = SimpleNamespace(
+                    layer_id=0,
+                    is_cross_attention=False,
+                    tp_q_head_num=64,
+                    head_dim=4,
+                    v_head_dim=4,
+                    scaling=1.0,
+                )
+                batch = SimpleNamespace(
+                    forward_mode=ForwardMode.EXTEND,
+                    seq_lens_cpu=torch.tensor([total]),
+                    extend_prefix_lens_cpu=[2 if has_prefix else 0],
+                )
+                with (
+                    patch.dict("sys.modules", {kernel.__name__: kernel}),
+                    patch("sglang.srt.layers.attention.dsa_backend._is_sail", True),
+                    patch(
+                        "sglang.srt.layers.attention.dsa_backend.dcp_gather_request_rows",
+                        return_value=keys.view(torch.uint8).view(total, -1),
+                    ),
+                    patch(
+                        "sglang.srt.layers.attention.dsa_backend._compiled_cat",
+                        side_effect=lambda values, dim: torch.cat(values, dim=dim),
+                    ),
+                ):
+                    actual = backend.forward_extend(
+                        query,
+                        keys[-2:],
+                        keys[-2:],
+                        layer,
+                        batch,
+                        save_kv_cache=False,
+                        k_rope=torch.empty(2, 1, 0, dtype=torch.bfloat16),
+                        topk_indices=indices,
+                    )
+                torch.testing.assert_close(actual, attention(query, keys, indices))
+
     def test_occupied_uneven_decode_with_idle_rank_selects_max_len(self):
         with (
             patch(

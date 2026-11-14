@@ -1495,22 +1495,37 @@ def _ppu_fa3_flashmla_qv_fallback(view: Any) -> dict:
 
 @register_post_process
 def _ppu_flashmla_fp8_kv_cache_fallback(view: Any) -> dict:
-    # [fp8-kv-cache fallback] On PPU only the dense FlashMLA path lacks an
-    # fp8_e4m3 kv-cache kernel; keep the fallback for it and leave every other
-    # backend untouched. In particular --dsa-prefill-backend flashmla_sparse is
-    # supported: the pool stores fp8 (quantize_k_cache on write) and the
-    # framework dequantizes the prefix KV (dequantize_k_cache_paged) before the
-    # bf16 sparse kernel, so forcing bf16 here would only lose the memory win.
+    # DSA FlashMLA can keep FP8 on PPU SM89+ with flashmla_kv in both phases.
+    # Dense FlashMLA retains its compute-dtype KV fallback.
     from sglang.srt.utils.common import is_sail
 
     if not (is_sail() and view.kv_cache_dtype == "fp8_e4m3"):
         return {}
+    dsa_flashmla_backends = ("flashmla_sparse", "flashmla_kv", "flashmla_auto")
     if view.decode_attention_backend != "flashmla":
-        return {}
+        if "dsa" not in attention_backends_of(view):
+            return {}
+        if not (
+            view.dsa_prefill_backend in dsa_flashmla_backends
+            or view.dsa_decode_backend in dsa_flashmla_backends
+        ):
+            return {}
+        if (
+            get_platform().device_sm >= 89
+            and view.dsa_prefill_backend == view.dsa_decode_backend == "flashmla_kv"
+        ):
+            return {}
 
+    incompatible = []
+    if view.decode_attention_backend == "flashmla":
+        incompatible.append("--decode-attention-backend flashmla")
+    if view.dsa_prefill_backend in dsa_flashmla_backends:
+        incompatible.append(f"--dsa-prefill-backend {view.dsa_prefill_backend}")
+    if view.dsa_decode_backend in dsa_flashmla_backends:
+        incompatible.append(f"--dsa-decode-backend {view.dsa_decode_backend}")
     logger.warning(
-        "On PPU, --decode-attention-backend flashmla does not support "
-        "--kv-cache-dtype fp8_e4m3. Disabling FP8 KV cache "
+        f"On PPU, {' and '.join(incompatible)} requires compute-dtype KV "
+        "for this device/backend combination. Disabling FP8 KV cache "
         "(falling back to --kv-cache-dtype auto)."
     )
     return {"kv_cache_dtype": "auto"}
