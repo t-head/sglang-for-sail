@@ -57,6 +57,15 @@ def _use_amd_flydsl_mega_moe() -> bool:
     return _is_hip and get_moe_a2a_backend().is_megamoe()
 
 
+def _ppu_mega_moe_mma_type(mma_type: str) -> str:
+    """Translate per-layer precision labels to the PPU DeepGEMM API."""
+    return {
+        "mxf4xmxf4": "fp4xfp4",
+        "fp8xmxfp4": "fp8xfp4",
+        "bf16xmxfp4": "bf16xfp4",
+    }.get(mma_type, mma_type)
+
+
 def _mega_moe_mma_type(experts) -> str:
     if experts._mega_moe_nvfp4:
         return "nvfp4xnvfp4"
@@ -144,6 +153,9 @@ def _get_mega_moe_symm_buffer(
     activation: str = "swiglu",
 ) -> SymmBuffer:
     import deep_gemm
+
+    if _is_sail:
+        mma_type = _ppu_mega_moe_mma_type(mma_type)
 
     with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
         key = (
@@ -622,7 +634,7 @@ def run_mega_routed_experts(
             buf.topk_weights,
             num_tokens=num_tokens,
             group_size=32,
-            mma_type=mma_type,
+            mma_type=_ppu_mega_moe_mma_type(mma_type),
         )
         if mma_type != "mxf4xmxf4":
             mega_kwargs = {}

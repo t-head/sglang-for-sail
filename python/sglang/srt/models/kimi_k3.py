@@ -915,6 +915,7 @@ class KimiK3MoE(nn.Module):
         from sglang.srt.layers.moe.mega_moe import (
             _configure_mega_moe_deep_gemm_num_sms,
             _mega_moe_mma_type,
+            _ppu_mega_moe_mma_type,
         )
 
         if not is_sail():
@@ -977,7 +978,7 @@ class KimiK3MoE(nn.Module):
                 *dispatch_args,
                 num_tokens=num_tokens,
                 group_size=32,
-                mma_type=mma_type,
+                mma_type=_ppu_mega_moe_mma_type(mma_type),
             )
         elif mma_type == "mxf4xmxf4":
             # The SGLang dispatcher writes FP8; packed E2M1 uses DeepGEMM.
