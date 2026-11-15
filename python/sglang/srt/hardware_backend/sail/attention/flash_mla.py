@@ -124,7 +124,9 @@ def flash_mla_with_kvcache(
     if _import_error is not None:
         raise _IMPORT_ERROR from _import_error
 
-    if kv_format not in (None, "V32"):
+    # The framework uses V32_NO_ROPE for zero-RoPE KV. The PPU library
+    # derives its supported layout from the tensors, not this framework hint.
+    if kv_format not in (None, "V32", "V32_NO_ROPE"):
         raise NotImplementedError(
             f"SAIL FlashMLA does not support explicit KV layout {kv_format!r}."
         )
