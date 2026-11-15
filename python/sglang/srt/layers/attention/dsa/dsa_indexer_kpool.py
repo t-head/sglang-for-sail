@@ -1192,7 +1192,9 @@ class IndexerKPool(MultiPlatformOp):
                     weights=weights[rows].contiguous(),
                     starts=logits_starts[rows],
                     ends=logits_ends[rows],
-                    clean_logits=True,
+                    # PPU weighted logits reject kernel-side cleaning;
+                    # the framework applies the row window mask below.
+                    clean_logits=not is_sail(),
                 )
             topk_chunk = self._topk_from_kpool_logits(
                 logits=logits,
