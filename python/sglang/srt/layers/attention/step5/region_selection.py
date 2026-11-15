@@ -340,7 +340,10 @@ def select_step5_regions(
                 row_to_req=row_to_req[start:end],
                 positions=positions[start:end],
                 out=tile_scores,
-                clear_future=not workspace.use_cute,
+                # 已分配的 PPU radix 只读取有效历史，短历史直接保留全部。
+                clear_future=not (
+                    workspace.use_cute or workspace.ppu_selector is not None
+                ),
                 group_rows=score_group_rows,
                 workspace=workspace.scoring_workspace,
                 compact_workspace=workspace.compact_scoring,

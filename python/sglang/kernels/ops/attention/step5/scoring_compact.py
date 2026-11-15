@@ -65,6 +65,7 @@ def _score_compact(
     HEADS: tl.constexpr, REGIONS: tl.constexpr, BLOCK_R: tl.constexpr,
     GRID_TILES: tl.constexpr, GROUP_ROWS: tl.constexpr,
     EARLY_EXIT: tl.constexpr, FP8_INDEXER: tl.constexpr, WEIGHT_SCALE: tl.constexpr,
+    CLEAR_FUTURE: tl.constexpr,
 ):
     group = tl.program_id(0)
     first_tile = tl.program_id(1)
@@ -78,9 +79,10 @@ def _score_compact(
     base_request = tl.max(request, axis=0)
     mixed = (request != base_request) & (request != 0) & row_valid
     uniform = tl.sum(mixed.to(tl.int32), axis=0) == 0
-    if EARLY_EXIT:
+    if EARLY_EXIT or not CLEAR_FUTURE:
+        # 短历史整组在加载 Q / 发起 MMA 前退出，边界混合组仍共用同一 MMA。
         live, max_live, last_tile = _live_extent(
-            position, row_valid, request, BLOCK_R, REGIONS, True,
+            position, row_valid, request, BLOCK_R, REGIONS, CLEAR_FUTURE,
         )
         if first_tile >= last_tile:
             return
@@ -101,9 +103,9 @@ def _score_compact(
         row_valid[:, None] & (tl.arange(0, 4)[None, :] < HEADS)
         & (request[:, None] > 0), other=0.0,
     ).to(tl.float32) * WEIGHT_SCALE
-    if not EARLY_EXIT:
+    if not EARLY_EXIT and CLEAR_FUTURE:
         live, max_live, last_tile = _live_extent(
-            position, row_valid, request, BLOCK_R, REGIONS, True,
+            position, row_valid, request, BLOCK_R, REGIONS, CLEAR_FUTURE,
         )
     for tile in range(first_tile, last_tile, GRID_TILES):
         regions = tile * BLOCK_R + tl.arange(0, BLOCK_R)
@@ -120,20 +122,26 @@ def _score_compact(
                 tl.reshape(weighted, (GROUP_ROWS, 4, BLOCK_R)), axis=1,
             )
             score = tl.where(regions[None, :] < live[:, None], score, -float("inf"))
+            written = row_valid[:, None] & in_range[None, :]
+            if not CLEAR_FUTURE:
+                written = (
+                    written & (live[:, None] > 512) & (regions[None, :] < live[:, None])
+                )
             tl.store(
                 Out + rows[:, None] * REGIONS + regions[None, :],
-                _plus_zero(score), row_valid[:, None] & in_range[None, :],
+                _plus_zero(score), written,
             )
 
 
 def launch(
     q, weights, compressed_index_keys, req_to_token, row_to_req, positions, out,
-    *, workspace, weight_scale,
+    *, workspace, weight_scale, clear_future=True,
 ):
     regions = out.shape[1]
     block_regions = 32
     grid_tiles = min(triton.cdiv(regions, block_regions), 32)
-    _wipe_region_scores(out)
+    if clear_future:
+        _wipe_region_scores(out)
     # CSA has published this layer's K; keep packing inside the layer loop and graph.
     _pack_keys[(workspace.keys.shape[0], triton.cdiv(regions, block_regions))](
         compressed_index_keys, req_to_token, row_to_req, positions,
@@ -145,5 +153,5 @@ def launch(
         workspace.span_start, workspace.span_end, workspace.span_requests,
         q.shape[1], regions, block_regions, grid_tiles, workspace.group_rows,
         _early_exit_worthwhile(q.shape[0], block_regions, grid_tiles),
-        workspace.fp8, weight_scale, num_warps=2,
+        workspace.fp8, weight_scale, clear_future, num_warps=2,
     )

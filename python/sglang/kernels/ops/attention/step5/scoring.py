@@ -101,8 +101,8 @@ def step5_paged_scores(
     Zeros are written as +0.0, never -0.0: ``step5_select_regions`` hands the
     values to a radix top-k, which orders by bit pattern and would rank -0.0
     below +0.0, breaking the small-region-id tie-break.
-    The SM10x live-length selector may set it false because it never reads those
-    columns. Inputs are immutable; output must not share storage with them.
+    SM10x / PPU radix 的有效长度 selector 可设为 false：未来列及无需排名的
+    短历史行可以保留旧值，消费者不得读取它们。输入不变，输出不得与输入共享存储。
     Warm up before Graph capture.
     """
     if q.device.type != "cuda" or torch.version.hip is not None:
@@ -236,7 +236,6 @@ def step5_paged_scores(
         if (
             compact_workspace is not None
             and heads == 4
-            and clear_future
             and score_groups is not None
             and tokens >= 256
             and out.shape[1] > 512
@@ -260,6 +259,7 @@ def step5_paged_scores(
                 out,
                 workspace=compact_workspace,
                 weight_scale=weight_scale,
+                clear_future=clear_future,
             )
             return out
         launch(

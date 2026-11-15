@@ -363,6 +363,23 @@ __global__ void dsa_radix_selector_kernel(
   }
   __syncthreads();
 
+  // 历史全部保留时不读取 scores，允许打分阶段跳过这些行。
+  if (current <= topk) {
+    for (int region = thread; region < current; region += kThreads) {
+      store_region(region, region, request, head, heads, output_width,
+                   block_table, block_table_stride, block_table_length,
+                   page_size / region_block, region_block, packed,
+                   region_output, start_output);
+    }
+    if (thread == 0) {
+      store_region(current, topk, request, head, heads, output_width,
+                   block_table, block_table_stride, block_table_length,
+                   page_size / region_block, region_block, packed,
+                   region_output, start_output);
+    }
+    return;
+  }
+
   // Layer 1: hybrid score cache for small contexts.
   // Split the 8192-element cache between registers (2048 floats) and shared
   // memory (6144 floats) to reduce smem footprint while retaining the benefits
@@ -661,6 +678,8 @@ __global__ void dsa_radix_chunk_kernel(
   for (int slot = thread; slot < topk; slot += kThreads) {
     output_row[slot] = -1;
   }
+  // 短历史由 merge 直接生成，空 chunk 也无需扫描或执行 radix 同步。
+  if (current <= topk || valid_length == 0) return;
   if (thread == 0) {
     storage.prefix_value = 0;
     storage.prefix_mask = 0;
@@ -817,6 +836,23 @@ __global__ void dsa_radix_merge_kernel(
     storage.selected_base = 0;
   }
   __syncthreads();
+
+  // 容量超过 16384 也可能是短历史，不能读取未计算的 scores 或候选。
+  if (current <= topk) {
+    for (int region = thread; region < current; region += kThreads) {
+      store_region(region, region, request, head, heads, output_width,
+                   block_table, block_table_stride, block_table_length,
+                   page_size / region_block, region_block, packed,
+                   region_output, start_output);
+    }
+    if (thread == 0) {
+      store_region(current, topk, request, head, heads, output_width,
+                   block_table, block_table_stride, block_table_length,
+                   page_size / region_block, region_block, packed,
+                   region_output, start_output);
+    }
+    return;
+  }
 
   // Rounds 0-2: score bits [11, 11, 10]; Round 3: region bits [10].
   constexpr int kMergeRounds = 4;
