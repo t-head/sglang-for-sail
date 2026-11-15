@@ -59,22 +59,22 @@ def _build_tf32_parts(layer) -> None:
     "refresh_mhc_norm_weight_cache",
     type=HookType.AROUND,
 )
-def _ppu_build_tf32_parts(original_fn, layer):
-    original_fn(layer)
+def _ppu_build_tf32_parts(original_fn, self):
+    original_fn(self)
     from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 
     if (
         not _sail_prenorm_supported()
-        or not layer.hc_pre_from_prev_sublayer
-        or layer.hc_attn_fn.shape != _HC_WEIGHT_SHAPE
+        or not self.hc_pre_from_prev_sublayer
+        or self.hc_attn_fn.shape != _HC_WEIGHT_SHAPE
         or not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
-        or getattr(layer.config, "model_type", None) != "deepseek_v41"
+        or getattr(self.config, "model_type", None) != "deepseek_v41"
         or is_batch_invariant_mode_enabled()
     ):
         return
-    _build_tf32_parts(layer)
-    if layer._hc_attn_tf32_parts is not None:
-        layer._init_hyper_connections()
+    _build_tf32_parts(self)
+    if self._hc_attn_tf32_parts is not None:
+        self._init_hyper_connections()
 
 
 @plugin_hook(

@@ -167,6 +167,7 @@ def candidate_block_ids(
     """
     from .topk import topk_transform_ragged_v2
 
+    assert block_size == CANDIDATE_BLOCK_SIZE, "amax8 requires 8-column blocks"
     rows, width = logits.shape
     # keys past a row's block count stay unset; the top-k reads a row up to its
     # block count only (v2 wants the stride a multiple of 4)

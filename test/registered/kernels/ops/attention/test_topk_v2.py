@@ -1243,7 +1243,7 @@ def _candidate_scores(lengths: list[int]) -> torch.Tensor:
     return scores
 
 
-@pytest.mark.parametrize("k,topk_blocks", [(512, 1024), (1024, 2048), (1024, 1024)])
+@pytest.mark.parametrize("k,topk_blocks", [(512, 1024), (1024, 2048), (1024, 1025)])
 @pytest.mark.parametrize("name,lengths", CANDIDATE_CONFIGS)
 @torch.inference_mode()
 def test_topk_v2_candidates(
@@ -1338,3 +1338,14 @@ if __name__ == "__main__":
         _mode_check()
         sys.exit(0)
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_candidate_window_equal_to_topk_is_rejected():
+    scores = torch.zeros(1, 16)
+    lens = torch.tensor([16], dtype=torch.int32)
+    blocks = torch.zeros(1, 2, dtype=torch.int32)
+    out = torch.empty(1, 2, dtype=torch.int32)
+    with pytest.raises(ValueError, match="candidate block count must exceed"):
+        topk_transform_candidates(
+            scores, lens, blocks, out_offsets=torch.zeros_like(lens), out_indices=out
+        )
