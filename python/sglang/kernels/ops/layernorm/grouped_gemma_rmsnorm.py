@@ -73,5 +73,8 @@ def grouped_gemma_rmsnorm(
         out = out.reshape(-1, hidden_size)
 
     module = _jit_grouped_gemma_rmsnorm_module(group_size, input.dtype)
+    # Idle DP ranks have no (token, group) chunks to launch.
+    if x.shape[0] == 0:
+        return out.reshape(input.shape)
     module.grouped_gemma_rmsnorm(x, weight, out, eps)
     return out.reshape(input.shape)

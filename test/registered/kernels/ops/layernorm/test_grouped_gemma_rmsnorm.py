@@ -36,6 +36,7 @@ _TOLERANCES = {
 @pytest.mark.parametrize(
     "num_tokens,hidden_size,group_size",
     [
+        (0, 10240, 2560),  # idle DP rank in the PLE forward path
         (1, 10240, 2560),  # production shape (HC 4 x 2560)
         (7, 10240, 2560),
         (128, 10240, 2560),
@@ -60,8 +61,9 @@ def test_grouped_gemma_rmsnorm_correctness(
     torch.testing.assert_close(out, expected, **_TOLERANCES[dtype])
 
 
-def test_grouped_gemma_rmsnorm_out_param():
-    x = torch.randn(64, 10240, dtype=torch.bfloat16, device="cuda")
+@pytest.mark.parametrize("num_tokens", [0, 64])
+def test_grouped_gemma_rmsnorm_out_param(num_tokens):
+    x = torch.randn(num_tokens, 10240, dtype=torch.bfloat16, device="cuda")
     weight = torch.randn(10240, dtype=torch.bfloat16, device="cuda") * 0.2
     out = torch.empty_like(x)
 
