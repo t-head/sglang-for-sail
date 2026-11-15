@@ -1208,13 +1208,13 @@ def _candidate_scores(lengths: list[int]) -> torch.Tensor:
     return scores
 
 
-@pytest.mark.parametrize("k,topk_blocks", [(512, 1024), (1024, 2048), (1024, 1024)])
+@pytest.mark.parametrize("k,topk_blocks", [(512, 1024), (1024, 2048), (1024, 1025)])
 @pytest.mark.parametrize("name,lengths", CANDIDATE_CONFIGS)
 @torch.inference_mode()
 def test_topk_v2_candidates(
     name: str, lengths: list[int], k: int, topk_blocks: int
 ) -> None:
-    """The two-level selection equals the full-width top-k when k <= topk_blocks."""
+    """The two-level selection equals the full-width top-k when k < topk_blocks (the newest block is forced)."""
     torch.manual_seed(len(lengths) * 104729 + k + topk_blocks)
     device = "cuda"
     scores = _candidate_scores(lengths)

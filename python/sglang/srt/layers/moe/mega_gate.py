@@ -46,7 +46,38 @@ def _sail_mega_gate_available() -> bool:
         import deep_gemm
     except ImportError:
         return False
-    return callable(getattr(deep_gemm, "bf16_mega_gate", None))
+    fn = getattr(deep_gemm, "bf16_mega_gate", None)
+    if not callable(fn):
+        return False
+    # The target facade always forwards its physical-routing and output kwargs,
+    # even when their values are None. Older same-name PPU APIs reject them.
+    import inspect
+    import re
+
+    required = {
+        "use_shared_as_routed",
+        "num_shared_experts",
+        "routed_scaling_factor",
+        "ep_rank",
+        "scoring_func",
+        "mask",
+        "bias",
+        "image_bias",
+        "image_token_mask",
+        "fix_routing_mask",
+        "unmapped_topk_idx",
+        "to_physical_map",
+        "logical_count",
+        "out",
+    }
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        doc = fn.__doc__ or ""
+        return all(re.search(r"\b" + name + r"\b", doc) for name in required)
+    return required <= params.keys() or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
 
 
 def mega_gate_supported(moe) -> bool:

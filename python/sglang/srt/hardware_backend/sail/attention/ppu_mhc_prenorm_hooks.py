@@ -6,7 +6,7 @@ the DeepGEMM tf32 prenorm projection, without modifying the community source.
 
 Registered hooks:
 
-1. ``DeepseekV4DecoderLayer.refresh_mhc_norm_weight_cache`` (AROUND) — the
+1. ``DeepseekV4DecoderLayerBase.refresh_mhc_norm_weight_cache`` (AROUND) — the
    community gate only builds the tf32/bf16 weight split on SM90/SM100, so PPU
    keeps the plain Triton projection. The hook builds the tf32 split there and
    rebinds the hyper-connections; the bf16x3 compensated Triton projection is
@@ -55,26 +55,26 @@ def _build_tf32_parts(layer) -> None:
 
 
 @plugin_hook(
-    "sglang.srt.models.deepseek_v4.DeepseekV4DecoderLayer."
+    "sglang.srt.models.deepseek_v4.DeepseekV4DecoderLayerBase."
     "refresh_mhc_norm_weight_cache",
     type=HookType.AROUND,
 )
-def _ppu_build_tf32_parts(original_fn, layer):
-    original_fn(layer)
+def _ppu_build_tf32_parts(original_fn, self):
+    original_fn(self)
     from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 
     if (
         not _sail_prenorm_supported()
-        or not layer.hc_pre_from_prev_sublayer
-        or layer.hc_attn_fn.shape != _HC_WEIGHT_SHAPE
+        or not self.hc_pre_from_prev_sublayer
+        or self.hc_attn_fn.shape != _HC_WEIGHT_SHAPE
         or not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
-        or getattr(layer.config, "model_type", None) != "deepseek_v41"
+        or getattr(self.config, "model_type", None) != "deepseek_v41"
         or is_batch_invariant_mode_enabled()
     ):
         return
-    _build_tf32_parts(layer)
-    if layer._hc_attn_tf32_parts is not None:
-        layer._init_hyper_connections()
+    _build_tf32_parts(self)
+    if self._hc_attn_tf32_parts is not None:
+        self._init_hyper_connections()
 
 
 @plugin_hook(

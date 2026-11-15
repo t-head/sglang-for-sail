@@ -682,6 +682,20 @@ class TestDensePrefillTopkTwoLevel(CustomTestCase):
                     )
                 del inputs, data
 
+    def test_low_scoring_newest_block_does_not_evict_kth_token(self):
+        logits = torch.full((1, 32), -100.0, device="cuda")
+        logits[0, 0], logits[0, 8], logits[0, 16] = 10.0, 9.0, 8.0
+        data = Mock(
+            request_starts=torch.zeros(1, dtype=torch.int32, device="cuda"),
+            compress_lens=torch.tensor([32], dtype=torch.int32, device="cuda"),
+        )
+        out = torch.empty((1, 2), dtype=torch.int32, device="cuda")
+        with patch.object(
+            scoring, "score_tiles", return_value=iter([(slice(None), logits)])
+        ):
+            scoring.dense_prefill_topk(data, None, out=out, two_level=True)
+        self.assertEqual(set(out[0].tolist()), {0, 8})
+
 
 if __name__ == "__main__":
     unittest.main()
