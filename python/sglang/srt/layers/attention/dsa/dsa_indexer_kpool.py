@@ -1198,7 +1198,12 @@ class IndexerKPool(MultiPlatformOp):
                     weights=weights[rows].contiguous(),
                     starts=logits_starts[rows],
                     ends=logits_ends[rows],
-                    clean_logits=True,
+                    # PPU (DeepGEMM-for-sail) rejects clean_logits=True at the host
+                    # boundary of both fp8_mqa_logits and int8_mqa_logits. This is the
+                    # only literal True in the file; the int8 branch inherits the flag,
+                    # so one site covers both PPU variants. is_sail() is False on
+                    # CUDA/ROCm, so those keep passing True unchanged.
+                    clean_logits=not is_sail(),
                 )
             topk_chunk = self._topk_from_kpool_logits(
                 logits=logits,
