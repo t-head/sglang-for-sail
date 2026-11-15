@@ -124,7 +124,22 @@ def flash_mla_with_kvcache(
     if _import_error is not None:
         raise _IMPORT_ERROR from _import_error
 
-    if kv_format not in (None, "V32"):
+    # sglang started passing kv_format="V32_NO_ROPE" for every zero-rope model
+    # (dsa_backend.py:671 and the decode call site :3812), but the PPU FlashMLA
+    # library does not accept any layout hint yet (grep of the wheel's
+    # interface and .so: kv_format appears 0 times), and this wrapper drops
+    # kv_format before delegating to _flashmla.flash_mla_with_kvcache
+    # regardless of its value.  Therefore the hint alone must not block serve
+    # startup:
+    #   - bf16/legacy zero-rope KV: the library distinguishes 512-element rows
+    #     by dtype/shape and served fine in releases that never passed
+    #     kv_format at all; accepting V32_NO_ROPE here restores that.
+    #   - fp8 zero-rope KV: the library's 656 B/token paged contract still
+    #     rejects 528 B rows with its explicit shape RuntimeError (library
+    #     kv_format support pending upstream); accepting the hint does not
+    #     silently misread that layout -- the library validates
+    #     bytes_per_token itself.
+    if kv_format not in (None, "V32", "V32_NO_ROPE"):
         raise NotImplementedError(
             f"PPU FlashMLA does not support explicit KV layout {kv_format!r}."
         )
