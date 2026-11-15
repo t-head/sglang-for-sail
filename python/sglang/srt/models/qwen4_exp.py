@@ -134,6 +134,13 @@ def _breakable_qsa_indexer(layer, hidden_states, positions, output):
     allocates a new bridge when ``output`` is None."""
     # Read the live batch on every replay of this eager break.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
+    if getattr(forward_batch, "global_num_token_non_padded_cpu", None) == 0:
+        # An idle DP rank runs a dummy EXTEND graph for collective participation.
+        # Its attention backend skips metadata init and can retain the preceding
+        # real batch's mapping. No index keys or MTP selections may be updated.
+        assert output is not None, "qsa top-k bridge not allocated before replay"
+        output.zero_()
+        return
     topk = layer._compute_qsa_topk_indices_eager(
         hidden_states=hidden_states,
         positions=positions,
