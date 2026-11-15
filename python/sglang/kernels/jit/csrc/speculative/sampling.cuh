@@ -21,11 +21,42 @@
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 
-#include <sgl_kernel/speculative/sampling.cuh>
-
 #include <flashinfer/sampling.cuh>
 
 #include <numeric>
+
+#if defined(SGL_SAIL)
+namespace flashinfer::sampling {
+
+// PPU FlashInfer can expose the legacy seven-argument interface, which keeps
+// the fallback index in temp_storage. Enable this overload only for that API.
+template <
+    uint32_t VEC_SIZE,
+    uint32_t BLOCK_THREADS,
+    BlockScanAlgorithm SCAN_ALGORITHM,
+    BlockReduceAlgorithm REDUCE_ALGORITHM,
+    bool DETERMINISTIC,
+    typename Predicate>
+__device__ __forceinline__ auto DeviceSamplingFromProb(
+    uint32_t i,
+    uint32_t d,
+    Predicate pred,
+    float u,
+    vec_t<float, VEC_SIZE> prob_vec,
+    float& aggregate,
+    int& last_valid_index,
+    SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>* temp_storage)
+    -> decltype(DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, DETERMINISTIC>(
+        i, d, pred, u, prob_vec, aggregate, temp_storage)) {
+  (void)last_valid_index;
+  DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, DETERMINISTIC>(
+      i, d, pred, u, prob_vec, aggregate, temp_storage);
+}
+
+}  // namespace flashinfer::sampling
+#endif
+
+#include <sgl_kernel/speculative/sampling.cuh>
 
 namespace sglang {
 

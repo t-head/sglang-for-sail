@@ -5,12 +5,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.jit.utils.common import is_sail_runtime
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.dflash_utils import build_speculative_verify_target_probs
 from sglang.srt.speculative.eagle_utils import _apply_joint_top_k_top_p
 from sglang.test.ci.ci_register import register_cuda_ci
 
-if torch.version.cuda is not None:
+if torch.version.cuda is not None or is_sail_runtime():
     from flashinfer.sampling import top_k_renorm_probs, top_p_renorm_probs
 
     from sglang.kernels.ops.speculative.sampling import (
