@@ -132,6 +132,12 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
         ):
             with (
                 self.subTest(attn_tp_size=attn_tp_size, dense_tp_size=dense_tp_size),
+                patch(
+                    "sglang.srt.runtime_context.process_model_config",
+                    return_value=SimpleNamespace(
+                        hf_config=SimpleNamespace(engram_layer_ids=())
+                    ),
+                ),
                 get_parallel().override(
                     tp_size=8,
                     moe_ep_size=1,
@@ -244,6 +250,34 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
             callbacks[0]()
         self.assertEqual(len(layer._qsa_prefill_topk_bridges), 1)
         self.assertEqual(captured.tolist(), [[5, 5]] * 2 + [[0, 0]] * 4)
+
+    def test_qsa_idle_replay_clears_bridge_without_reading_stale_metadata(self):
+        from sglang.srt.models import qwen4_exp
+
+        # DP sync fabricates an EXTEND request for an idle rank. The full-attn
+        # backend intentionally retains the preceding nonempty batch's metadata.
+        layer = SimpleNamespace(_compute_qsa_topk_indices_eager=Mock())
+        for previous_rows in (923, 967):
+            with self.subTest(previous_rows=previous_rows):
+                layer._compute_qsa_topk_indices_eager.side_effect = RuntimeError(
+                    f"positions=48, mapping={previous_rows}"
+                )
+                batch = SimpleNamespace(
+                    forward_mode=ForwardMode.EXTEND,
+                    _original_forward_mode=ForwardMode.IDLE,
+                    global_num_token_non_padded_cpu=0,
+                )
+                bridge = torch.full((48, 8), 7, dtype=torch.int32)
+                with patch.object(
+                    qwen4_exp,
+                    "get_tc_piecewise_forward_context",
+                    return_value=SimpleNamespace(forward_batch=batch),
+                ):
+                    qwen4_exp._breakable_qsa_indexer.run_eager(
+                        layer, torch.empty(48, 4), torch.arange(48), bridge
+                    )
+                self.assertEqual(torch.count_nonzero(bridge).item(), 0)
+        layer._compute_qsa_topk_indices_eager.assert_not_called()
 
     def test_ple_replay_uses_live_request_layout(self):
         from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
