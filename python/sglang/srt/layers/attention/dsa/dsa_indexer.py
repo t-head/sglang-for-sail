@@ -269,12 +269,6 @@ def _check_logits_nan_in_valid_range(
         )
 
 
-if is_sail():
-    print("<SAIL>: skipping dsa indexer optimization, fallback to original path")
-    SKIP_OPT_PATH = True
-else:
-    SKIP_OPT_PATH = False
-
 if _is_cuda:
     from sglang.kernels.ops.attention.dsa.indexer_k import (
         can_use_k_indexer_norm_rope_store_mxfp4,
@@ -1198,6 +1192,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         )
 
     def _should_skip_logits_computation(self, forward_batch: ForwardBatch) -> bool:
+        if self.bf16_indexer:
+            return False
         # topk_transform selects every valid page slot when kv_len <= index_topk;
         # logits are unnecessary in that case.
         fb = forward_batch
@@ -1222,8 +1218,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
                 # No variant means the full indexer path for any context length.
                 return get_capture_attention_variant() == DSA_DENSE
-            # Eager k-only decode skip is validated on ROCm only.
-            if not _is_hip:
+            # Eager k-only decode skip is validated on ROCm and PPU.
+            if not (_is_hip or is_sail()):
                 return False
             if fb.seq_lens_cpu is not None and fb.seq_lens_cpu.numel() > 0:
                 max_kv_len = int(fb.seq_lens_cpu.max().item())
@@ -3457,9 +3453,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             skip_logits_computation = self._should_skip_logits_computation(
                 forward_batch
             )
-
-        if SKIP_OPT_PATH:
-            skip_logits_computation = False
 
         # Optimization: fast path when skipping topk computation
         if skip_logits_computation and (not self.dsa_enable_prefill_cp):
