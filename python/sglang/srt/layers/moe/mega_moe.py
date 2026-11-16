@@ -26,11 +26,10 @@ from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
-from sglang.srt.layers.moe import glm53_sail_gate
 from sglang.srt.layers.moe.mega_gate import (
-    MegaGateRouting,
     run_mega_gate,
     should_use_mega_gate,
+    try_run_mega_gate,
 )
 from sglang.srt.layers.moe.mega_moe_sm90 import (
     is_sm90_fp8_mega_moe_available,
@@ -387,19 +386,8 @@ def _run_mega_routed(
 
     routing = None
     if getattr(moe.config, "model_type", None) == "glm_moe_dsa":
-        if envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.get() and num_tokens:
-            routed = glm53_sail_gate.try_route(moe, hidden_states)
-            if routed is not None:
-                # SAIL pre-dispatch quantizes x and copies IDs/weights into the
-                # symmetric buffer. Pass real tensors for that copy on every dtype.
-                scale = (
-                    1.0
-                    if moe.routed_scaling_factor_fused_in_topk
-                    else float(moe.routed_scaling_factor)
-                )
-                routing = MegaGateRouting(
-                    routed.topk_weights, routed.topk_ids, scale, False
-                )
+        if num_tokens:
+            routing = try_run_mega_gate(moe, hidden_states, forward_batch)
     elif should_use_mega_gate(moe, hidden_states, forward_batch):
         import deep_gemm
 

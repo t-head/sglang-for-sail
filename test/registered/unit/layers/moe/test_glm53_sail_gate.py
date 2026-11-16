@@ -13,7 +13,7 @@ from sglang.kernels import KernelBackend, PlatformInfo, fused_op, select_kernel
 from sglang.kernels.ops.moe.mega_gate import bf16_mega_gate
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe import glm53_sail_gate
+from sglang.srt.layers.moe import glm53_sail_gate, mega_gate
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.runtime_context import get_context, get_model, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -69,6 +69,8 @@ class TestGlm53SailGate(CustomTestCase):
             gate=self.gate,
             topk=topk,
             num_fused_shared_experts=num_shared,
+            routed_scaling_factor=topk.topk_config.routed_scaling_factor,
+            routed_scaling_factor_fused_in_topk=False,
         )
 
     def test_waterfill_keeps_the_shared_expert_slot(self):
@@ -183,6 +185,16 @@ class TestGlm53SailGate(CustomTestCase):
                 self.assertEqual(
                     glm53_sail_gate.can_route(moe, self.hidden, info), eligible
                 )
+                if not eligible:
+                    # The shared entry must honor the per-call override before
+                    # requiring a native library, not just expose a predicate.
+                    with (
+                        patch.object(
+                            moe.topk, "routing_inputs", return_value=(None, info)
+                        ),
+                        patch.dict(sys.modules, {"deep_gemm": None}),
+                    ):
+                        self.assertIsNone(mega_gate.try_run_mega_gate(moe, self.hidden))
 
     def test_hardware_eligibility(self):
         spec = select_kernel("moe.bf16_mega_gate")
@@ -214,15 +226,15 @@ class TestGlm53SailGate(CustomTestCase):
         hidden = self.hidden
 
         def forward(x):
-            if glm53_sail_gate.can_route(moe, hidden, None):
+            if mega_gate.try_run_mega_gate(moe, hidden) is not None:
                 return x + 1
             return x - 1
 
         x = torch.tensor([2.0])
         compiled = torch.compile(forward, backend="eager", fullgraph=True)
-        torch.testing.assert_close(forward(x), x + 1)
+        self.assertTrue(glm53_sail_gate.can_route(moe, hidden, None))
         torch.testing.assert_close(compiled(x), x - 1)
-        torch.testing.assert_close(forward(x), x + 1)
+        self.assertTrue(glm53_sail_gate.can_route(moe, hidden, None))
 
     def test_forced_backend_uses_standard_routing(self):
         moe = self.make_moe(num_shared=0)
@@ -238,6 +250,11 @@ class TestGlm53SailGate(CustomTestCase):
                         glm53_sail_gate.can_route(moe, self.hidden, None),
                         backend is None,
                     )
+                    if backend is not None:
+                        with patch.dict(sys.modules, {"deep_gemm": None}):
+                            self.assertIsNone(
+                                mega_gate.try_run_mega_gate(moe, self.hidden)
+                            )
 
     def test_only_standard_output_can_use_megagate(self):
         moe = self.make_moe(num_shared=0)
@@ -309,9 +326,14 @@ class TestGlm53SailGate(CustomTestCase):
         x = torch.tensor([[1.0], [float("nan")]], dtype=torch.bfloat16)
         weight = torch.arange(9, dtype=torch.bfloat16)[:, None]
         bias = torch.tensor([10.0, *([0.0] * 8)])
-        moe.gate = SimpleNamespace(weight=weight, e_score_correction_bias=bias)
+        moe.gate = SimpleNamespace(
+            weight=weight,
+            e_score_correction_bias=bias,
+            e_score_correction_bias_vl=None,
+        )
         cfg = moe.topk.topk_config
         cfg.routed_scaling_factor = 2.5
+        moe.routed_scaling_factor = 2.5
         bound = torch.tensor([1])
         expert_ids = torch.tensor([0, 8, 7, 6, 5, 4, 3, 2])
         with (
@@ -338,13 +360,49 @@ class TestGlm53SailGate(CustomTestCase):
             torch.testing.assert_close(ids, expected_ids)
             for fuse_scale in (False, True):
                 cfg.apply_routed_scaling_factor_on_output = fuse_scale
-                output = glm53_sail_gate.route(moe, x, bound, dispatch_info=None)
+                moe.routed_scaling_factor_fused_in_topk = fuse_scale
+                buf = SimpleNamespace(
+                    topk_idx=torch.full((2, 8), 99, dtype=torch.int64),
+                    topk_weights=torch.full((2, 8), 99.0),
+                )
+                batch = SimpleNamespace()
+                with mega_gate.mega_gate_forward_scope(batch):
+                    output = mega_gate.run_mega_gate(
+                        moe,
+                        x,
+                        None,
+                        buf=buf,
+                        forward_batch=batch,
+                        routing_inputs=(bound, None),
+                    )
                 expected = expert_ids.float().sigmoid()
                 expected = expected / expected.sum() * (2.5 if fuse_scale else 1.0)
                 torch.testing.assert_close(output.topk_ids[0], expert_ids)
                 torch.testing.assert_close(output.topk_weights[0], expected)
                 self.assertTrue((output.topk_ids[1] == -1).all())
                 self.assertTrue((output.topk_weights[1] == 0).all())
+                self.assertFalse(output.in_buffer)
+                self.assertEqual(
+                    output.routed_scaling_factor, 1.0 if fuse_scale else 2.5
+                )
+                self.assertTrue((buf.topk_idx == 99).all())
+                self.assertTrue((buf.topk_weights == 99).all())
+                # Reusing a batch and bound tensor in the next forward must not
+                # reuse the previous forward's padding mask.
+                bound.fill_(2)
+                x[1].fill_(1)
+                with mega_gate.mega_gate_forward_scope(batch):
+                    next_output = mega_gate.run_mega_gate(
+                        moe,
+                        x,
+                        None,
+                        forward_batch=batch,
+                        routing_inputs=(bound, None),
+                    )
+                torch.testing.assert_close(next_output.topk_ids[1], expert_ids)
+                torch.testing.assert_close(next_output.topk_weights[1], expected)
+                bound.fill_(1)
+                x[1].fill_(float("nan"))
 
 
 if __name__ == "__main__":

@@ -106,7 +106,6 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
-    glm53_sail_gate,
     post_experts_all_reduce,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
@@ -114,12 +113,14 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
+from sglang.srt.layers.moe.mega_gate import try_run_mega_gate
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
     DispatchOutput,
 )
 from sglang.srt.layers.moe.topk import (
+    StandardTopKOutput,
     TopK,
     TopKOutputFormat,
     fused_shared_expert_weight,
@@ -1585,7 +1586,15 @@ class DeepseekV2MoE(nn.Module):
                 and get_moe_a2a_backend().is_deepep()
                 and not use_vision_topk
             ):
-                topk_output = glm53_sail_gate.try_route(self, hidden_states)
+                routing = try_run_mega_gate(self, hidden_states, forward_batch)
+                if routing is not None:
+                    topk_output = StandardTopKOutput(
+                        routing.topk_weights,
+                        routing.topk_ids,
+                        hidden_states.new_empty(
+                            (0, self.gate.weight.shape[0]), dtype=torch.float32
+                        ),
+                    )
             if topk_output is None:
                 router_logits = self.gate(hidden_states, forward_batch=forward_batch)
             if not sbo_enabled_flag and self.num_fused_shared_experts == 0:

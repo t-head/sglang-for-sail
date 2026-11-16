@@ -1,4 +1,4 @@
-"""PPU MegaGate routing for the GLM-5.3 text checkpoint."""
+"""PPU MegaGate admission policy for the GLM-5.3 text checkpoint."""
 
 from __future__ import annotations
 
@@ -9,11 +9,10 @@ import torch
 
 from sglang.kernels import get_fused_op_backend
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-    from sglang.srt.layers.moe.topk import StandardTopKOutput
     from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 
 
@@ -51,21 +50,6 @@ def validate_worker(device: torch.device) -> None:
     # CPU-offloaded gate weights are materialized on this device at forward time.
     if device.type == "cuda" and _is_sail_ppu(device):
         _check_sigmoid_binding(device)
-
-
-def try_route(moe, hidden):
-    """Return standard routed IDs and weights, or None for the regular router."""
-    if (
-        torch.compiler.is_compiling()
-        or not envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.get()
-        or moe.config.model_type != "glm_moe_dsa"
-        or moe.is_hash
-    ):
-        return None
-    bound, dispatch_info = moe.topk.routing_inputs()
-    if not can_route(moe, hidden, dispatch_info):
-        return None
-    return route(moe, hidden, bound, dispatch_info)
 
 
 def can_route(
@@ -130,60 +114,3 @@ def can_route(
         and not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
         and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
     )
-
-
-def route(
-    moe: DeepseekV2MoE,
-    hidden: torch.Tensor,
-    bound: torch.Tensor | None,
-    dispatch_info: ExpertLocationDispatchInfo | None,
-) -> StandardTopKOutput:
-    from sglang.kernels.ops.moe.mega_gate import bf16_mega_gate
-    from sglang.srt.eplb.expert_distribution import (
-        get_global_expert_distribution_recorder,
-    )
-    from sglang.srt.layers.moe.topk import (
-        StandardTopKOutput,
-        _post_process_topk_ids,
-        is_routed_scaling_factor_fused_in_topk,
-    )
-
-    cfg = moe.topk.topk_config
-    scale = (
-        cfg.routed_scaling_factor
-        if is_routed_scaling_factor_fused_in_topk(cfg)
-        else 1.0
-    )
-    valid = (
-        torch.arange(hidden.shape[0], device=hidden.device, dtype=torch.int32)
-        < bound.reshape(-1)[:1]
-        if bound is not None
-        else None
-    )
-    weights, ids = bf16_mega_gate(
-        hidden,
-        moe.gate.weight,
-        cfg.top_k,
-        routed_scaling_factor=scale,
-        ep_rank=get_parallel().moe_ep_rank,
-        scoring_func="sigmoid",
-        bias=moe.gate.e_score_correction_bias,
-        valid_token_mask=valid,
-    )
-    # The standard result carries the expert dimension; this path never materializes logits.
-    router_logits = hidden.new_empty((0, moe.gate.weight.shape[0]), dtype=torch.float32)
-    ids, weights, recorder_ids = _post_process_topk_ids(
-        topk_ids=ids,
-        topk_weights=weights,
-        topk_config=cfg,
-        router_logits=router_logits,
-        layer_id=moe.layer_id,
-        num_token_non_padded=bound,
-        expert_location_dispatch_info=dispatch_info,
-        padded_rows_masked=True,
-    )
-    if recorder_ids is not None:
-        get_global_expert_distribution_recorder().on_select_experts(
-            topk_ids=recorder_ids
-        )
-    return StandardTopKOutput(weights, ids, router_logits)
