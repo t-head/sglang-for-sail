@@ -7,14 +7,13 @@ Preserves sigmoid probabilities from the selected logits, ordered normalization,
 and scale. This leaf uses one fixed launch configuration, not vLLM's optional
 driver-launch cache or autotuner. Public metadata validation owns buffer safety.
 
-One CTA per token row and one warp per CTA, so the kernel is a single serial
-latency chain: eight dependent reductions, each followed by a dependent reload
-of the winning logit. Decode rows are few, so nothing hides that chain -- it is
-what the duration is made of. Each round therefore reduces an int64 key that
-packs the score's order-preserving bit pattern above the inverted expert id, so
-one plain ``tl.max`` yields both the winner and its tie-broken index; the
-``return_indices`` reduction computes the same thing far slower. A single warp
-keeps every round inside a warp shuffle rather than a shared-memory round trip.
+One CTA per token row and one warp per CTA. Each selection round takes a plain
+float max, then finds the smallest expert id among equal scores with an int32
+min reduction. That keeps the left tie-break without an index-returning
+reduction or a 64-bit key. The eight selected logits are loaded together after
+selection, so global-load and sigmoid latency do not extend the dependent
+selection chain. A single warp keeps every round inside warp shuffles rather
+than a shared-memory round trip.
 """
 
 import torch
@@ -44,38 +43,31 @@ def _step5_router_topk_kernel(
     scores = tl.where(valid, probability + correction, -float("inf"))
     has_bad = tl.max((gating != gating).to(tl.int32), axis=0) > 0
 
-    # Order-preserving map from the score's bit pattern to an unsigned rank:
-    # non-negative floats keep their order with the sign bit set, negative ones
-    # are inverted. Adding 0.0 first folds -0.0 into +0.0, which compare equal
-    # but rank differently once packed. The inverted expert id occupies the low
-    # nine bits, so a tie resolves toward the smaller id exactly as the
-    # left-tie-break reduction did, and every real key stays non-negative.
+    # Folding -0.0 into +0.0 lets score equality implement the left tie-break:
+    # the second reduction selects the smallest expert id among equal scores.
     scores = scores + 0.0
-    bits = scores.to(tl.int32, bitcast=True).to(tl.int64) & 0xFFFFFFFF
-    ordered = tl.where(bits >= 0x80000000, bits ^ 0xFFFFFFFF, bits | 0x80000000)
-    key = (ordered << 9) | (511 - expert).to(tl.int64)
 
-    weights = tl.zeros((8,), dtype=tl.float32)
     indices = tl.zeros((8,), dtype=tl.int32)
-    total = 0.0
     slot = tl.arange(0, 8)
     for k in tl.static_range(8):
-        best = tl.max(key, axis=0)
-        index = (511 - (best & 511)).to(tl.int32)
-        # NaN rows are overwritten below, but still execute the reduction. A
-        # masked padding winner must never read outside the logical logits row.
-        selected_logit = tl.load(
-            logits + row * logits_stride + index,
-            mask=(index >= 0) & (index < 352),
-            other=0,
-        ).to(tl.float32)
-        # Bias affects selection only. Subtracting it from the rounded score
-        # can erase small probabilities and change normalized routing weights.
-        selected_probability = tl.sigmoid(selected_logit)
-        weights = tl.where(slot == k, selected_probability, weights)
+        best = tl.max(scores, axis=0)
+        index = tl.min(tl.where(scores == best, expert, 512), axis=0).to(tl.int32)
         indices = tl.where(slot == k, index, indices)
-        total += selected_probability
-        key = tl.where(expert == index, -1, key)
+        scores = tl.where(expert == index, -float("inf"), scores)
+
+    # NaN rows are overwritten below, but still execute the load. A padding
+    # winner must never read outside the logical logits row.
+    selected_logits = tl.load(
+        logits + row * logits_stride + indices,
+        mask=(indices >= 0) & (indices < 352),
+        other=0,
+    ).to(tl.float32)
+    # Bias affects selection only. Subtracting it from the rounded score can
+    # erase small probabilities and change normalized routing weights.
+    weights = tl.sigmoid(selected_logits)
+    total = 0.0
+    for k in tl.static_range(8):
+        total += tl.sum(tl.where(slot == k, weights, 0.0), axis=0)
 
     weights = weights / (total + 1e-20)
     weights = weights * 3.0
@@ -106,5 +98,5 @@ def _step5_router_topk(
         num_token_non_padded,
         HAS_PADDING=num_token_non_padded is not None,
         num_warps=1,
-        num_stages=2,
+        num_stages=1,
     )

@@ -2,10 +2,9 @@
 """Contract and cost tests for the Step5 MoE router top-k.
 
 The leaf runs one CTA per token row on a single warp, so its duration is the
-serial chain of eight dependent reductions, each followed by a dependent reload
-of the winning logit. Every round therefore reduces an int64 key that packs the
-score's order-preserving bit pattern above the inverted expert id; one plain
-``tl.max`` then returns the winner *and* its tie-broken index, where the obvious
+serial chain of eight dependent rounds, each followed by a dependent reload of
+the winning logit. Every round takes a plain float max, then selects the
+smallest expert id among equal scores with an int32 min, where the obvious
 ``return_indices`` reduction computes the same pair far slower. That is a
 "looks equivalent" rewrite, so the cases below pin the three properties a
 further rewrite has to keep:
@@ -52,7 +51,7 @@ def _argmax_reference_kernel(
     num_token_non_padded,
     HAS_PADDING: tl.constexpr,
 ):
-    """The ``return_indices`` formulation the bit-packed key replaced.
+    """The ``return_indices`` formulation the selection rounds replaced.
 
     Kept device-side so the equivalence is checked on the same arithmetic: a
     host reference cannot be bitwise here because torch's sigmoid is not
@@ -147,7 +146,7 @@ def _launch(op, logits, bias, num_token_non_padded=None):
 
 
 def run_bitwise_equal_to_argmax_reference():
-    """The bit-packed key selects and normalises exactly like ``return_indices``."""
+    """The two reductions select and normalise exactly like ``return_indices``."""
     op = Step5RouterTopKOp()
     cases = [("random", {}), ("tied", {"tied": True}), ("nan", {"with_nan": True})]
     for tag, kwargs in cases:
