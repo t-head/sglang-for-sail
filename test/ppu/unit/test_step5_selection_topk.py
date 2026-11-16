@@ -259,6 +259,55 @@ def run_producer_zero_contract():
     print("PASS producer +0.0 contract")
 
 
+def run_write_extent_bound():
+    """A score width off the tile grid must not spill -inf into the next row.
+
+    The write extent is clamped by the tile *count*, so a width of 1000 leaves
+    24 lanes of the last tile (992..1023) past the row's own columns; without
+    an in_range intersect they land on the next row's leading columns. A row
+    that writes nothing -- under 512 live regions the row extent is zero -- is
+    the detector: its whole row must keep the sentinel.
+    """
+    sentinel = 1234.5
+    rows, width = 8, 1000
+    live = [width, 100, width, 100, width, 100, width, 100]
+    cases = {
+        "grouped hot path": [1, 1, 1, 1, 1, 1, 1, 1],
+        # A request boundary inside the group drives the per-row cold path.
+        "mixed cold path": [1, 2, 1, 1, 1, 1, 1, 1],
+    }
+    q = torch.zeros((rows, 4, 256), dtype=torch.bfloat16, device=DEV)
+    weights = torch.ones((rows, 4), dtype=torch.float32, device=DEV)
+    keys = torch.zeros((1, 8, 1, 256), dtype=torch.uint8, device=DEV)
+    req_to_token = torch.zeros((3, 8 * width), dtype=torch.int32, device=DEV)
+    positions = torch.tensor([n * 8 for n in live], dtype=torch.int32, device=DEV)
+    for tag, row_to_req in cases.items():
+        out = torch.full((rows, width), sentinel, dtype=torch.float32, device=DEV)
+        step5_paged_scores(
+            q,
+            weights,
+            compressed_index_keys=keys,
+            req_to_token=req_to_token,
+            row_to_req=torch.tensor(row_to_req, dtype=torch.int32, device=DEV),
+            positions=positions,
+            out=out,
+            clear_future=False,
+            group_rows=4,
+        )
+        torch.cuda.synchronize()
+        for r, n in enumerate(live):
+            if n < width:
+                assert (out[r] == sentinel).all(), (
+                    f"{tag}: row {r} (live={n}) was written; the previous row's "
+                    "tile padding spilled into its leading columns"
+                )
+            else:
+                assert (out[r] == 0).all(), (
+                    f"{tag}: row {r} must score a zero query as exactly 0"
+                )
+        print(f"PASS write extent bound ({tag}, width={width})")
+
+
 def _req_to_token(rows, context):
     """Aligned [rows+1, context] pool view; request slot 0 stays padding."""
     base = torch.arange(rows + 1, dtype=torch.int32, device=DEV).mul_(8 * context)
@@ -457,6 +506,7 @@ def main():
     run_width_narrowing()
     run_fused_packing_equivalence()
     run_producer_zero_contract()
+    run_write_extent_bound()
     print("ALL PASS")
     if "--bench" in sys.argv:
         report_cost()
