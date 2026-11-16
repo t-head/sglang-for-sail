@@ -936,6 +936,20 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         ):
             self.assertTrue(supported(moe))
             self.assertTrue(supported(self._mega_gate_moe(hash_routing=True)))
+            # PPU architecture admission must not preempt DeepGEMM's support.
+            for sm, sail, expected in (
+                (75, True, False),
+                (80, True, True),
+                (89, True, True),
+                (80, False, False),
+                (89, False, False),
+            ):
+                with (
+                    self.subTest(sm=sm, sail=sail),
+                    patch.object(mega_gate_runtime, "_device_sm", sm),
+                    patch.object(mega_gate_runtime, "_is_sail", sail),
+                ):
+                    self.assertEqual(supported(moe), expected)
             with patch.object(moe.topk.topk_config, "scoring_func", "sigmoid"):
                 self.assertFalse(supported(moe))
             with patch.object(moe, "num_fused_shared_experts", 1):

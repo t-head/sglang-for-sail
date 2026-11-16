@@ -190,7 +190,7 @@ class TestGlm53SailGate(CustomTestCase):
         for sm, name, available, sail_route in (
             ((10, 0), "NVIDIA B200", True, False),
             ((8, 9), "ZW-M890P", True, True),
-            ((8, 0), "ZW-810E", False, False),
+            ((8, 0), "PPU-ZW810E", True, True),
             ((8, 9), "NVIDIA L40S", False, False),
             ((8, 0), "NVIDIA A100", False, False),
         ):

@@ -36,6 +36,9 @@ register_kernel(
             {
                 CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9)),
                 CapabilityRequirement.cuda(
+                    min_sm=(8, 0), max_sm=(8, 0), name_contains="ZW"
+                ),
+                CapabilityRequirement.cuda(
                     min_sm=(8, 9), max_sm=(8, 9), name_contains="ZW"
                 ),
             }

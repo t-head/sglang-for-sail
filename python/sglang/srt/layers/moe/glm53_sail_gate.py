@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 def _is_sail_ppu(device: torch.device) -> bool:
     return "ZW" in torch.cuda.get_device_name(
         device
-    ) and torch.cuda.get_device_capability(device) == (8, 9)
+    ) and torch.cuda.get_device_capability(device) in ((8, 0), (8, 9))
 
 
 @functools.lru_cache(maxsize=None)

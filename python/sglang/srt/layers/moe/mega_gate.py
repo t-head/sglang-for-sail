@@ -37,7 +37,7 @@ class MegaGateRouting(NamedTuple):
 
 def mega_gate_supported(moe) -> bool:
     if (
-        (_device_sm < 89 if _is_sail else _device_sm // 10 != 10)
+        (_device_sm < 80 if _is_sail else _device_sm // 10 != 10)
         or moe.config.model_type != "deepseek_v41"
         or moe.topk.enable_waterfill
         or moe.num_fused_shared_experts
