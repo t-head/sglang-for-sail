@@ -3,11 +3,16 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
+from contextlib import nullcontext
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import torch
 from torch import nn
 
 from sglang.srt.layers.engram import EngramEmbedding, _scale_region_bytes
+from sglang.srt.layers.engram_staging import EngramRowStager
+from sglang.test.test_utils import CustomTestCase
 
 DIM = 256
 BLOCK = 32
@@ -190,6 +195,157 @@ class TestEngramLoadRows(unittest.TestCase):
         self.assertTrue(torch.equal(embed.weight.data.view(torch.int8), payload))
         embed._load_rows(embed.weight, torch.zeros(4, DIM, dtype=torch.float8_e4m3fn))
         self.assertFalse(embed._int8_payload)
+
+
+class TestEngramStagedRows(CustomTestCase):
+    def test_staged_rows_follow_format_reload(self):
+        self._check_staged_rows(reload_formats=True)
+
+    def _check_staged_rows(self, *, reload_formats):
+        """Staging preserves scale format and payload signedness across mixed tables;
+        padded rows must remain zero after dequantization.
+        """
+        ids = torch.tensor([3, 1, 3, 0, 2], dtype=torch.int64)
+        formats = [(False, False), (False, True), (True, False), (True, True)]
+        embeds = [_engram(4) for _ in formats]
+
+        def load_formats(active_formats, revision):
+            for embed, (per_row, int8_payload) in zip(embeds, active_formats):
+                if per_row:
+                    scales = torch.tensor([0.25, 0.5, 1.5, 3.5]) + revision
+                else:
+                    exponents = (
+                        torch.arange(32, dtype=torch.uint8).view(4, 8) % 4
+                        + 125
+                        + revision
+                    )
+                    scales = exponents.view(torch.float8_e8m0fnu)
+                embed._load_rows(embed.scale, scales)
+                payload = (torch.arange(4 * DIM).view(4, DIM) + revision) % 31 - 15
+                dtype = torch.int8 if int8_payload else torch.float8_e4m3fn
+                embed._load_rows(embed.weight, payload.to(dtype))
+
+        load_formats(formats, 0)
+
+        buffers = {}
+
+        def gather(
+            weight_ptr,
+            scale_ptr,
+            indices,
+            out,
+            dim,
+            block,
+            *,
+            row_hi,
+            per_row_scale=False,
+            int8_payload=False,
+        ):
+            payload = buffers[weight_ptr]
+            scales = buffers[scale_ptr]
+            values = payload.view(
+                torch.int8 if int8_payload else torch.float8_e4m3fn
+            ).float()
+            if per_row_scale:
+                scale_values = scales.view(torch.float32)
+            else:
+                scale_values = (
+                    scales.view(torch.float8_e8m0fnu)
+                    .float()
+                    .repeat_interleave(block, dim=1)
+                )
+            valid = indices < row_hi
+            out.zero_()
+            out[valid] = (values[indices[valid]] * scale_values[indices[valid]]).to(
+                out.dtype
+            )
+
+        real_empty = torch.empty
+
+        def unpinned_empty(*args, **kwargs):
+            kwargs.pop("pin_memory", None)
+            return real_empty(*args, **kwargs)
+
+        hasher = SimpleNamespace(
+            hash_windows=lambda *_: (
+                ids[:, None, None].expand(-1, len(embeds), 1),
+                None,
+            )
+        )
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_extend_without_speculative=lambda: True)
+        )
+        with (
+            patch("torch.cuda.Stream"),
+            patch("torch.cuda.Event"),
+            patch("torch.cuda.stream", return_value=nullcontext()),
+            patch("torch.cuda.current_stream", return_value=MagicMock()),
+            patch.object(torch.Tensor, "record_stream"),
+            patch("torch.empty", side_effect=unpinned_empty),
+            patch.object(EngramRowStager, "_windows", return_value=(None, None)),
+            patch("sglang.srt.layers.engram.engram_gather", side_effect=gather),
+        ):
+            stager = EngramRowStager(hasher, embeds, torch.device("cpu"))
+            try:
+                rounds = [formats]
+                if reload_formats:
+                    switched = [(not per_row, not int8) for per_row, int8 in formats]
+                    rounds += [switched, switched, formats]
+                for revision, active_formats in enumerate(rounds):
+                    if revision:
+                        load_formats(active_formats, revision)
+                    staged = stager.stage(batch)
+                    for embed, (rows, scales, event), (per_row, int8_payload) in zip(
+                        embeds, staged, active_formats
+                    ):
+                        with self.subTest(
+                            revision=revision,
+                            per_row=per_row,
+                            int8_payload=int8_payload,
+                        ):
+                            self.assertEqual(
+                                scales.shape, (len(ids), 4 if per_row else DIM // BLOCK)
+                            )
+                            buffers[rows.data_ptr()] = rows
+                            buffers[scales.data_ptr()] = scales
+                            out = embed.dequant_staged(
+                                rows, scales, event, torch.Size([len(ids) + 2])
+                            )
+                            torch.testing.assert_close(
+                                out[: len(ids)], embed._owned_rows(ids), rtol=0, atol=0
+                            )
+                            self.assertEqual(out[len(ids) :].count_nonzero().item(), 0)
+            finally:
+                stager.pool.shutdown()
+
+    def test_staged_rows_reject_missing_fp32_scales(self):
+        embed = _engram(4)
+        embed._load_rows(embed.scale, torch.ones(4))
+        hasher = SimpleNamespace(
+            hash_windows=lambda *_: (torch.zeros(1, 1, 1, dtype=torch.int64), None)
+        )
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_extend_without_speculative=lambda: True)
+        )
+        with patch("torch.cuda.Stream"):
+            stager = EngramRowStager(hasher, [embed], torch.device("cpu"))
+        try:
+            embed._scale_f32 = None
+            with (
+                patch.object(stager, "_windows", return_value=(None, None)),
+                patch.object(
+                    stager,
+                    "_gather",
+                    side_effect=AssertionError(
+                        "invalid scales must be rejected before gathering"
+                    ),
+                ) as gather,
+            ):
+                with self.assertRaisesRegex(ValueError, "FP32 scale tensor"):
+                    stager.stage(batch)
+                gather.assert_not_called()
+        finally:
+            stager.pool.shutdown()
 
 
 if __name__ == "__main__":

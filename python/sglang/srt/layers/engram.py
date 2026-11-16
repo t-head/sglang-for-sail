@@ -1240,6 +1240,8 @@ class EngramEmbedding(nn.Module):
             self.dim,
             FP8_BLOCK_SIZE,
             row_hi=rows.shape[0],
+            per_row_scale=self._per_channel_scale,
+            int8_payload=self._int8_payload,
         )
         return out
 
