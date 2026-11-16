@@ -284,6 +284,33 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             # stash on that instead.
             algo.handle_server_args(server_args)
 
+    # CP-TP group sharing under prefill/decode disaggregation accepts no
+    # speculative algorithm but DFLASH, for Glm5Next only: that restriction
+    # lives in the Glm5Next branch of
+    # arg_groups/cp_tp_group_sharing_hook.py, and Qwen4Exp/KimiK31 keep their
+    # own acceptance sets. That hook runs earlier in the pipeline and cannot
+    # see the normalized/aliased value, so the guard is re-applied here, after
+    # every write to speculative_algorithm (upper() above, the NEXTN -> EAGLE
+    # alias, and the per-algorithm handlers just dispatched). Not speculating
+    # stays legal: that is a supported PD configuration, not a speculative one.
+    # The position, not the accessor, is what closes the bypass: cfg is a live
+    # resolving view and reads the same settled value here, while resolved_view
+    # is how the tail of a resolution step reads a field another hook owns.
+    view = resolved_view(server_args)
+    final_algorithm = view.speculative_algorithm
+    if (
+        final_algorithm is not None
+        and final_algorithm.upper() != "DFLASH"
+        and view.enable_cp_tp_group_sharing
+        and cfg.disaggregation_mode != "null"
+        and model_config_of(server_args).hf_config.architectures[0]
+        == "Glm5NextForConditionalGeneration"
+    ):
+        raise ValueError(
+            "--speculative-algorithm != DFLASH is not supported with CP-TP "
+            "group sharing."
+        )
+
 
 def _handle_dflash(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
