@@ -2,28 +2,25 @@
 """Step5 grouped prefill-union construction in portable Triton (CuTe replacement).
 
 Produces the same union as ``cute/prefill_union.py`` for devices that cannot run
-the CuTe DSL kernel (e.g. sm80 PPU). Two launches, one program per group of up
-to 16 packed query rows from a single request.
+the CuTe DSL kernel (e.g. sm80 PPU). The primary path is one launch, one program
+per group of up to 16 packed query rows from a single request.
 
-Primary path (``capacity >= num_region_bins``), a region-indexed membership table
-built in place over the output buffers so no extra workspace is needed:
+For ``capacity >= num_region_bins`` the program builds a region-indexed
+membership table in place over the output buffers, so no extra workspace is
+needed:
 
-1. ``_union_region_fill`` clears the group's membership row, then scans the
-   16x513 selections as ``(16, UNION_WIN_BLOCK)`` tiles. Per selected region
-   (``logical_start // 8``) it ``atomic_or``s the selecting slot's bit into
-   ``membership`` and plain-stores the region's physical id into
-   ``union_physical``. Both writes hit ``region``-indexed scratch inside the
-   outputs; duplicate physical stores carry identical values because one group
-   shares one logical->physical mapping.
-2. ``_union_region_compact`` prefix-counts the nonzero table entries and
-   compacts the table in place into sorted ``rank`` order, emitting
-   ``union_logical`` (= the region id) and ``union_counts``. In-place compaction
-   is safe because ``rank <= region index`` and every source read is separated
-   from the writes by a CTA barrier.
+1. Clear the group's membership row.
+2. Scan the rows in slot order, updating ``membership`` and ``union_physical``
+   with ordinary OR/stores. A CTA barrier separates adjacent slots, so racing
+   lanes within one slot write the same bit or the same group-shared physical
+   id.
+3. Prefix-count the nonzero table entries and compact the table in place into
+   sorted ``rank`` order, emitting ``union_logical`` (= the region id) and
+   ``union_counts``. In-place compaction is safe because ``rank <= region
+   index`` and every source read is separated from the writes by a CTA barrier.
 
-Spreading the atomics over ``num_region_bins`` words instead of concentrating a
-group's whole selection set on 32 bitset words, and dropping the second scan of
-the selections, is worth ~4x end to end.
+Slot ordering removes the per-region atomics and lets fill and compaction share
+one launch and one cached table.
 
 The bitset path is the fallback for ``capacity < num_region_bins``, where the
 outputs cannot hold one entry per region: ``_union_bitset_fill`` clears the
@@ -46,8 +43,7 @@ Q_GROUP = tl.constexpr(16)
 TOPK_WINDOWS = tl.constexpr(513)
 WIN_BLOCK = tl.constexpr(1024)  # next power of two >= TOPK_WINDOWS
 CLEAR_BLOCK = tl.constexpr(1024)
-UNION_WIN_BLOCK = tl.constexpr(256)  # windows per tile of the region-table path
-UNION_TILE = tl.constexpr(16 * 256)  # Q_GROUP * UNION_WIN_BLOCK, flattened
+UNION_WIN_BLOCK = tl.constexpr(512)  # windows per query-slot chunk
 
 
 @triton.jit
@@ -68,13 +64,15 @@ def _popcount(x):
 
 
 @triton.jit
-def _union_region_fill(
+def _union_region_table(
     LOGICAL,
     PHYS,
     COUNTS,
     GSTART,
     GEND,
     UNION_PHYS,
+    UNION_LOGICAL,
+    UNION_COUNTS,
     MEMBERSHIP,
     ROWS,
     SEL_STRIDE: tl.constexpr,
@@ -86,65 +84,52 @@ def _union_region_fill(
     q_base = tl.load(GSTART + group)
     q_end = tl.load(GEND + group)
 
-    slots = tl.arange(0, Q_GROUP)
-    q_rows = q_base + slots
-    row_valid = (q_rows < ROWS) & (q_rows < q_end)
-    counts = tl.minimum(tl.load(COUNTS + q_rows, mask=row_valid, other=0), TOPK_WINDOWS)
-    # One window bound for the whole group: sibling rows differ by a slot or two.
-    bound = tl.cdiv(tl.max(counts, axis=0), UNION_WIN_BLOCK) * UNION_WIN_BLOCK
-
     for off in tl.static_range(0, NUM_REGION_BINS, CLEAR_BLOCK):
         idx = off + tl.arange(0, CLEAR_BLOCK)
         tl.store(MEMBERSHIP + group * CAPACITY + idx, 0, mask=idx < NUM_REGION_BINS)
     tl.debug_barrier()
 
-    for off in range(0, bound, UNION_WIN_BLOCK):
-        win = off + tl.arange(0, UNION_WIN_BLOCK)
-        valid = (
-            row_valid[:, None]
-            & (win[None, :] < counts[:, None])
-            & (win[None, :] < TOPK_WINDOWS)
-        )
-        loff = q_rows[:, None] * ROW_STRIDE + win[None, :] * SEL_STRIDE
-        logical_start = tl.load(LOGICAL + loff, mask=valid, other=0)
-        phys = tl.load(PHYS + loff, mask=valid, other=-1)
-        logical_region = logical_start // 8
-        keep = (
-            valid
-            & (logical_region >= 0)
-            & (logical_region < NUM_REGION_BINS)
-            & (phys >= 0)
-        )
-        flat_region = tl.reshape(logical_region, (UNION_TILE,))
-        flat_keep = tl.reshape(keep, (UNION_TILE,))
-        flat_slot = tl.reshape(slots[:, None].broadcast_to(16, UNION_WIN_BLOCK), (UNION_TILE,))
-        tl.atomic_or(
-            MEMBERSHIP + group * CAPACITY + flat_region, 1 << flat_slot, mask=flat_keep
-        )
-        tl.store(
-            UNION_PHYS + group * CAPACITY + flat_region,
-            tl.reshape(phys, (UNION_TILE,)),
-            mask=flat_keep,
-        )
+    # Slots run serially: lanes within a slot write the same bit for a duplicate
+    # region, and the barrier makes each slot's OR visible before the next one.
+    for q_slot in tl.static_range(Q_GROUP):
+        q_pos = q_base + q_slot
+        row_valid = (q_pos < ROWS) & (q_pos < q_end)
+        count = tl.minimum(tl.load(COUNTS + q_pos, mask=row_valid, other=0), TOPK_WINDOWS)
+        for off in range(0, count, UNION_WIN_BLOCK):
+            win = off + tl.arange(0, UNION_WIN_BLOCK)
+            valid = row_valid & (win < count) & (win < TOPK_WINDOWS)
+            loff = q_pos * ROW_STRIDE + win * SEL_STRIDE
+            logical_start = tl.load(LOGICAL + loff, mask=valid, other=0)
+            phys = tl.load(PHYS + loff, mask=valid, other=-1)
+            logical_region = logical_start // 8
+            keep = (
+                valid
+                & (logical_region >= 0)
+                & (logical_region < NUM_REGION_BINS)
+                & (phys >= 0)
+            )
+            old = tl.load(
+                MEMBERSHIP + group * CAPACITY + logical_region, mask=keep, other=0
+            )
+            tl.store(
+                MEMBERSHIP + group * CAPACITY + logical_region,
+                old | (1 << q_slot),
+                mask=keep,
+            )
+            tl.store(
+                UNION_PHYS + group * CAPACITY + logical_region, phys, mask=keep
+            )
+        tl.debug_barrier()
 
-
-@triton.jit
-def _union_region_compact(
-    UNION_PHYS,
-    UNION_LOGICAL,
-    UNION_COUNTS,
-    MEMBERSHIP,
-    NUM_REGION_BINS: tl.constexpr,
-    CAPACITY: tl.constexpr,
-):
-    group = tl.program_id(0)
     done = tl.zeros((), dtype=tl.int32)
     for off in tl.static_range(0, NUM_REGION_BINS, CLEAR_BLOCK):
         idx = off + tl.arange(0, CLEAR_BLOCK)
         in_range = idx < NUM_REGION_BINS
         members = tl.load(MEMBERSHIP + group * CAPACITY + idx, mask=in_range, other=0)
-        phys = tl.load(UNION_PHYS + group * CAPACITY + idx, mask=in_range, other=-1)
         has = members != 0
+        phys = tl.load(
+            UNION_PHYS + group * CAPACITY + idx, mask=in_range & has, other=-1
+        )
         rank = done + tl.cumsum(has.to(tl.int32), axis=0) - 1
         done += tl.sum(has.to(tl.int32), axis=0)
         # Every source read of this chunk must land before the in-place writes.
@@ -287,7 +272,7 @@ def launch(
     capacity: int,
     selection_stride: int,
 ) -> None:
-    """Run the region-table fill/compact, one program per group.
+    """Run the fused region-table build, one program per group.
 
     Argument order mirrors the CuTe ``run`` closure so ``step5_build_prefill_union``
     can pick a backend without reshaping its call site. ``num_region_bins``,
@@ -298,29 +283,22 @@ def launch(
     """
     row_stride = TOPK_WINDOWS.value * selection_stride
     if capacity >= num_region_bins:
-        _union_region_fill[(groups,)](
+        _union_region_table[(groups,)](
             logical_starts,
             physical_regions,
             counts,
             group_query_start,
             group_query_end,
             union_physical,
+            union_logical,
+            union_counts,
             membership,
             rows,
             selection_stride,
             row_stride,
             num_region_bins,
             capacity,
-            num_warps=4,
-        )
-        _union_region_compact[(groups,)](
-            union_physical,
-            union_logical,
-            union_counts,
-            membership,
-            num_region_bins,
-            capacity,
-            num_warps=4,
+            num_warps=8,
         )
         return
 
