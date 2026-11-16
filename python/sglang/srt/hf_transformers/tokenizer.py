@@ -173,6 +173,39 @@ def _resolve_tokenizer_name(tokenizer_name, kwargs):
     return tokenizer_name
 
 
+def _is_step5_checkpoint(tokenizer_name, revision) -> bool:
+    """Whether the checkpoint is Step-5, whose tokenizer must load directly.
+
+    Step-5 ships a byte-level BPE ``tokenizer.json`` but declares the Llama
+    tokenizer class. Transformers v5's class selection drops the BPE space
+    prefix (``" capital"`` -> ``"capital"``), so prompts lose every space.
+    """
+    try:
+        config_file = _resolve_local_or_cached_file(
+            tokenizer_name, "config.json", revision
+        )
+        with open(config_file) as f:
+            config = json.load(f)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(config, dict):
+        return False
+    text_config = config.get("text_config")
+    return str(config.get("model_type", "")).startswith("step5") or (
+        isinstance(text_config, dict)
+        and str(text_config.get("model_type", "")).startswith("step5")
+    )
+
+
+def _load_step5_tokenizer(tokenizer_name, revision):
+    """Load Step-5's serialized fast tokenizer, bypassing class selection.
+
+    The generic fast loader preserves the ``tokenizer.json`` model,
+    pre-tokenizer and decoder, which is what the checkpoint requires.
+    """
+    return PreTrainedTokenizerFast.from_pretrained(tokenizer_name, revision=revision)
+
+
 def _auto_tokenizer_from_pretrained(tokenizer_name, *args, **common_kwargs):
     """Call ``AutoTokenizer.from_pretrained`` with error handling."""
     try:
@@ -588,15 +621,20 @@ def get_tokenizer(
                 tokenizer_name, revision=tokenizer_revision
             )
         else:
-            tokenizer = _auto_tokenizer_from_pretrained(
-                tokenizer_name, *args, **common_kwargs
-            )
+            step5_tokenizer = _is_step5_checkpoint(tokenizer_name, tokenizer_revision)
+            if step5_tokenizer:
+                tokenizer = _load_step5_tokenizer(tokenizer_name, tokenizer_revision)
+            else:
+                tokenizer = _auto_tokenizer_from_pretrained(
+                    tokenizer_name, *args, **common_kwargs
+                )
 
             # With fastokens, the patched TokenizersBackend.from_pretrained already
             # returned a tokenizer whose backend is a fastokens shim. Re-resolving via
             # the declared class (e.g. Qwen2Tokenizer) would discard that work.
             if (
-                type(tokenizer).__name__ == _TOKENIZERS_BACKEND
+                not step5_tokenizer
+                and type(tokenizer).__name__ == _TOKENIZERS_BACKEND
                 and tokenizer_backend != "fastokens"
             ):
                 tokenizer = _resolve_tokenizers_backend(

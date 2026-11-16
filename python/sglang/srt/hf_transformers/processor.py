@@ -53,6 +53,7 @@ from .tokenizer import (
     _fix_v5_add_bos_eos_token,
     _fix_v5_tokenizer_components,
     _install_tokenizer_warnings_filter,
+    _is_step5_checkpoint,
     _shim_fastokens_backend,
     get_tokenizer,
 )
@@ -426,12 +427,16 @@ def _get_processor(
     tokenizer = get_tokenizer_from_processor(processor)
 
     # AutoProcessor may internally create a TokenizersBackend tokenizer
-    # (same issue as get_tokenizer). Replace it with a properly loaded one.
-    if type(tokenizer).__name__ == _TOKENIZERS_BACKEND:
+    # (same issue as get_tokenizer). Step-5 is worse: class selection rebuilds
+    # its serialized byte-level BPE from the declared Llama class and drops the
+    # space prefix, so the processor path must also reload from tokenizer.json.
+    if type(tokenizer).__name__ == _TOKENIZERS_BACKEND or _is_step5_checkpoint(
+        tokenizer_name, revision
+    ):
         logger.warning(
-            "Processor tokenizer for %s is TokenizersBackend, "
-            "reloading via get_tokenizer",
+            "Processor tokenizer for %s is %s, reloading via get_tokenizer",
             tokenizer_name,
+            type(tokenizer).__name__,
         )
         tokenizer = get_tokenizer(
             tokenizer_name,
