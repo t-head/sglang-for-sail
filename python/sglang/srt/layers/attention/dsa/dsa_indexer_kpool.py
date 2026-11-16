@@ -28,6 +28,7 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_row_bytes,
     mqa_logits_rows_per_chunk,
     mqa_logits_should_chunk,
+    sail_mqa_logits,
     sail_paged_mqa_logits,
 )
 from sglang.srt.layers.layernorm import LayerNorm
@@ -956,6 +957,12 @@ class IndexerKPool(MultiPlatformOp):
         clean_logits: bool,
     ) -> torch.Tensor:
         """Ragged MQA logits: DeepGEMM on CUDA, AITER's Triton kernel on ROCm."""
+        # PPU: the quantized logits have one entry point. ``sail_mqa_logits``
+        # pins ``clean_logits=False`` (DeepGEMM-for-sail rejects True on PPU) and
+        # picks the fp8/int8 kernel from ``q_fp8.dtype``, which is the same
+        # dispatch the ``use_int8`` shim below performs.
+        if is_sail():
+            return sail_mqa_logits(q_fp8, (k_fp8, k_scale), weights, starts, ends)
         # PPU int8: PPU 1.0/1.1 (SM80) cannot run DeepGEMM's fp8 MQA logits; use
         # the int8 shim instead. Instance method now, to read self.use_int8.
         if self.use_int8:
