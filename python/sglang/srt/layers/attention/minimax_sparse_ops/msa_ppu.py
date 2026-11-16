@@ -833,13 +833,21 @@ def _extend_build(
     # Whole-batch packed page table + segment starts (device side): one fused
     # kernel fills the metadata triple and packs the page table. The buffer is
     # capacity-sized because sum_pages is only known on the host after the
-    # kernel runs; the packed layout is dense, so the tail past sum_pages is
-    # never read (plans consume indptr-bounded slices).
+    # kernel runs. Padding tiles can resolve beyond sum_pages, so include the
+    # aligned overshoot and initialize every unused physical page id below.
     kv_lens_dev = torch.empty(bs, dtype=torch.int32, device=device)
     npages = torch.empty(bs, dtype=torch.int32, device=device)
     starts = torch.empty(bs, dtype=torch.int32, device=device)
     max_pages_cap = (backend.max_context_len + _PAGE_SIZE - 1) // _PAGE_SIZE
-    kv_indices = torch.empty(bs * max_pages_cap, dtype=torch.int32, device=device)
+    # Zero-fill: padding tiles may read past sum_pages, and only the last
+    # packed slice can pass the table end, by up to the aligned tile count.
+    # Size for that worst case and resolve the overshoot to physical page 0,
+    # matching the decode path's persistent buffer guarantee.
+    kv_indices = torch.zeros(
+        (bs - 1) * max_pages_cap + _aligned_max_k_tiles(backend.max_context_len),
+        dtype=torch.int32,
+        device=device,
+    )
     _pack_len_meta_into(
         kv_indices,
         backend.req_to_token,
