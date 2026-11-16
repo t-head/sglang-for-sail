@@ -37,7 +37,11 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4.dequant_k_cache import DIM_NOPE, DIM_ROPE
+from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
+    DIM_NOPE,
+    DIM_ROPE,
+    dequantize_k_cache_paged_dsv4,
+)
 from sglang.srt.environ import envs
 from sglang.srt.utils.common import async_h2d
 
@@ -116,6 +120,63 @@ class SparsePrefillKVBuffer:
             )
             self._head_source = None
         return self._buffer[:num_tokens]
+
+
+def should_compact_sparse_prefill_kv(num_rows: int, index_count: int) -> bool:
+    # Keep the ordinary path (including shared-head reuse) for smaller gathers.
+    # Even if no indices repeat, the compact BF16 workspace is at most half as
+    # large. Leave room for the temporary index tensors used by the remap.
+    return (
+        num_rows * WORKSPACE_DIM * 2 >= 4 * (1 << 30) and 2 * index_count <= num_rows
+    )
+
+
+def compact_sparse_prefill_kv(
+    indices: torch.Tensor,
+    lengths: torch.Tensor,
+    compressed_slots: Optional[torch.Tensor],
+    swa_slots: torch.Tensor,
+    compressed_cache: Optional[torch.Tensor],
+    swa_cache: torch.Tensor,
+    compressed_page_size: Optional[int],
+    swa_page_size: int,
+    compressed_layout,
+    swa_layout,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather only referenced BF16 rows, preserving per-query order and repeats."""
+    num_compressed = 0 if compressed_slots is None else compressed_slots.numel()
+    cols = torch.arange(indices.shape[-1], device=indices.device)
+    valid = (indices >= 0) & (cols < lengths.reshape(-1, 1))
+    unique, inverse = torch.unique(
+        indices[valid].long(), sorted=True, return_inverse=True
+    )
+    compressed_count = int((unique < num_compressed).sum().item())
+    workspace = torch.empty(
+        (max(unique.numel(), 1), 1, WORKSPACE_DIM),
+        dtype=torch.bfloat16,
+        device=indices.device,
+    )
+    if compressed_count:
+        dequantize_k_cache_paged_dsv4(
+            compressed_cache,
+            compressed_slots[unique[:compressed_count]],
+            page_size=compressed_page_size,
+            out=workspace[:compressed_count],
+            layout=compressed_layout,
+        )
+    if compressed_count < unique.numel():
+        dequantize_k_cache_paged_dsv4(
+            swa_cache,
+            swa_slots[unique[compressed_count:] - num_compressed],
+            page_size=swa_page_size,
+            out=workspace[compressed_count:],
+            layout=swa_layout,
+        )
+    if not unique.numel():
+        workspace.zero_()
+    remapped = torch.full_like(indices, -1)
+    remapped[valid] = inverse.to(indices.dtype)
+    return workspace, remapped
 
 
 @dataclass
