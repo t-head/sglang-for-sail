@@ -266,6 +266,14 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="moe.situ_and_mul_masked_post_quant_int8",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.kimi_k3_situ_and_mul_quant:situ_and_mul_masked_post_quant_int8",
+        capabilities=CUDA_ONLY,
+    )
+)
 
 # Public entry points inventoried by logical operator group (RFC #29630).
 register_kernel(

@@ -5,6 +5,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch, sentinel
 
 import torch
+
 from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule_packed_decode,
 )
