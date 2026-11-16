@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       run_all_tests:
-        description: "Build and run both sanity files even without PPU path changes"
+        description: "Build and run the PPU Stage A suite even without PPU path changes"
         required: false
         type: boolean
         default: true
@@ -102,6 +102,7 @@ jobs:
               - "python/sglang/kernels/jit/utils/compile/sailify.py"
               - "test/registered/core/test_basic_sanity_eagle3.py"
               - "test/registered/core/test_basic_sanity_dflash.py"
+              - "test/registered/kernels/ops/layernorm/test_ppu_mhc_stats_specialization.py"
 
   pr-gate:
     name: >-

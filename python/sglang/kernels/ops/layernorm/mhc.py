@@ -2298,7 +2298,7 @@ def _mhc_stream_mean_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _hc_mix_stats_partial_kernel(
     x_ptr,
     w_ptr,
@@ -2349,7 +2349,7 @@ def _hc_mix_stats_partial_kernel(
     tl.store(part_sq_ptr + pid_s * M + offs_m, sq, mask=mask_m)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _hc_mix_stats_reduce_kernel(
     part_mix_ptr,
     part_sq_ptr,
