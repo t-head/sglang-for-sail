@@ -246,8 +246,26 @@ def situ_and_mul_masked_post_quant_mxfp4(
     )
 
 
+def situ_and_mul_masked_post_quant_int8(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    beta: float,
+    linear_beta: float,
+    topk: int = 8,
+    expected_m: Optional[int] = None,
+) -> None:
+    from .kimi_k3_situ_and_mul_quant import situ_and_mul_masked_post_quant_int8 as impl
+
+    return impl(
+        input, output, output_scale, masked_m, beta, linear_beta, topk, expected_m
+    )
+
+
 __all__ = [
     "situ_and_mul_masked_post_quant",
+    "situ_and_mul_masked_post_quant_int8",
     "situ_and_mul_post_quant_mxfp4",
     "situ_and_mul_masked_post_quant_mxfp4",
     "moe_align_block_size",
@@ -314,7 +332,7 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
-for _fn in ("situ_and_mul_post_quant_mxfp4", "situ_and_mul_masked_post_quant_mxfp4"):
+for _fn in ("situ_and_mul_post_quant_mxfp4", "situ_and_mul_masked_post_quant_mxfp4", "situ_and_mul_masked_post_quant_int8"):
     register_kernel(
         KernelSpec(
             op=f"moe.{_fn}",

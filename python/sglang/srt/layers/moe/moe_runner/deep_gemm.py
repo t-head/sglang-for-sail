@@ -2176,14 +2176,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
     ) -> torch.Tensor:
         """W4A8-Int8 variant of _run_masked_int8_gemm: int8 activations x
         packed int4 weights -> bf16 output (weights dequantized to int8 in-kernel)."""
-        assert self.config.activation != "situ", (
-            "SiTU activation is not yet supported on the masked W4A8-Int8 path: "
-            "silu_and_mul_masked_post_quant_fwd has no situ variant for int8 "
-            "output quantization. Use --deepep-mode normal instead."
-        )
-        from sglang.kernels.ops.moe.ep_moe_kernels import (
-            silu_and_mul_masked_post_quant_fwd,
-        )
         from sglang.srt.layers import deep_gemm_wrapper
 
         hidden_states = runner_input.hidden_states
@@ -2220,12 +2212,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
-        swiglu_limit_arg: Optional[float] = None
-        if self.swiglu_limit is not None:
-            swiglu_limit_arg = self.swiglu_limit
-
-        # Act
-        scale_block_size = gateup_output.shape[2] // 2
+        # Act + INT8 per-token quant
         down_input = torch.empty(
             (
                 gateup_output.shape[0],
@@ -2233,7 +2220,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 gateup_output.shape[2] // 2,
             ),
             device=gateup_output.device,
-            dtype=hidden_states.dtype,
+            dtype=torch.int8,
         )
         down_input_scale = torch.empty(
             (
@@ -2244,20 +2231,48 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             device=gateup_output.device,
             dtype=torch.float32,
         )
-        silu_and_mul_masked_post_quant_fwd(
-            gateup_output,
-            down_input,
-            down_input_scale,
-            scale_block_size,
-            masked_m,
-            use_fp8=hidden_states.dtype == torch.float8_e4m3fn
-            or hidden_states.dtype == torch.float8_e5m2,
-            use_int8=hidden_states.dtype == torch.int8,
-            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-            swiglu_limit=swiglu_limit_arg,
-            gemm1_alpha=self.config.gemm1_alpha or 0.0,
-            gemm1_clamp_limit=self.config.gemm1_clamp_limit or 0.0,
-        )
+
+        if self.config.activation == "situ":
+            from sglang.kernels.ops.moe import situ_and_mul_masked_post_quant_int8
+
+            beta = (
+                self.config.gemm1_alpha
+                if self.config.gemm1_alpha is not None
+                else 4.0
+            )
+            situ_and_mul_masked_post_quant_int8(
+                gateup_output,
+                down_input,
+                down_input_scale,
+                masked_m,
+                beta,
+                self.config.gemm1_clamp_limit or 0.0,
+                self.config.top_k,
+                expected_m,
+            )
+        else:
+            from sglang.kernels.ops.moe.ep_moe_kernels import (
+                silu_and_mul_masked_post_quant_fwd,
+            )
+
+            swiglu_limit_arg: Optional[float] = None
+            if self.swiglu_limit is not None:
+                swiglu_limit_arg = self.swiglu_limit
+
+            scale_block_size = gateup_output.shape[2] // 2
+            silu_and_mul_masked_post_quant_fwd(
+                gateup_output,
+                down_input,
+                down_input_scale,
+                scale_block_size,
+                masked_m,
+                use_fp8=False,
+                use_int8=True,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                swiglu_limit=swiglu_limit_arg,
+                gemm1_alpha=self.config.gemm1_alpha or 0.0,
+                gemm1_clamp_limit=self.config.gemm1_clamp_limit or 0.0,
+            )
         del gateup_output
 
         # GroupGemm-1
