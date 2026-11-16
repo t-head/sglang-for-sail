@@ -3244,11 +3244,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         clear_tensors = []
         for req in reqs:
             if req.kv.mamba_cow_src_index is not None:
-                cow_src_tensors.append(req.kv.mamba_cow_src_index)
+                # Prefill CP keeps one full mamba replica per rank, so the
+                # deferred COW set must stay 1:1 with held slots; a staged COW
+                # without a destination means the mirror already diverged.
+                # ``mamba_pool_idx`` is 0-dim everywhere it is produced
+                # (``mid[0]`` / ``dst_index[0]``), and ``unsqueeze(0)`` below
+                # relies on that to build a 1-D gather index. The source comes
+                # from the tree component value and is 0-dim on the same paths,
+                # so normalize both sides to 1-D before ``torch.cat`` (a 0-dim
+                # tensor cannot be concatenated).
+                assert req.kv.holds_mamba and req.kv.mamba_pool_idx.ndim == 0, (
+                    "staged mamba COW without a single held slot"
+                )
+                cow_src_tensors.append(req.kv.mamba_cow_src_index.reshape(-1))
                 cow_dst_tensors.append(req.kv.mamba_pool_idx.unsqueeze(0))
                 req.kv.mamba_cow_src_index = None
                 req.kv.mamba_needs_clear = False
             elif req.kv.mamba_needs_clear:
+                assert req.kv.holds_mamba and req.kv.mamba_pool_idx.ndim == 0, (
+                    "staged mamba clear without a single held slot"
+                )
                 clear_tensors.append(req.kv.mamba_pool_idx.unsqueeze(0))
                 req.kv.mamba_needs_clear = False
         self.mamba_cow_src_indices = (

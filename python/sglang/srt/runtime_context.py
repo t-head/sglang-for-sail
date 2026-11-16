@@ -642,6 +642,10 @@ class Resources(_FlagGroupBase):
     # backends (created lazily by model_executor.runner_utils.pool).
     graph_memory_pool: Any = None
     graph_pool_borrow: GraphPoolBorrowState | None = None
+    # DSA prefill-CP alignment guard one-shot warning state, so a context reset
+    # (test teardown / runtime lifecycle reset) re-arms it together with the
+    # other resources instead of leaking it across engines in one process.
+    dsa_cp_misaligned_warned: bool = False
     # EPLB: per-process recorder and the publish-once location metadata
     # (owning accessors live in sglang.srt.eplb).
     expert_distribution_recorder: Any = None
