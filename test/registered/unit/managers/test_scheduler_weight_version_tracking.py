@@ -80,6 +80,7 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
 
 def _runner(result=(True, "ok")):
     runner = Mock()
+    runner.weight_updater.model_owned_update_error.return_value = None
     for method in (
         "update_weights_from_disk",
         "update_weights_from_tensor",

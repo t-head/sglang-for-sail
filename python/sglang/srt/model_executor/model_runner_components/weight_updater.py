@@ -40,6 +40,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _model_owned_update_error(model: Optional[torch.nn.Module]) -> Optional[str]:
+    # Model-owned constraints must be startup-determined and rank-uniform.
+    if model is not None:
+        for module in model.modules():
+            reason = getattr(module, "_derived_weight_cache_error", None)
+            if reason is not None:
+                return reason
+    return None
+
+
 def _unsupported_derived_weight_cache_error(
     model: Optional[torch.nn.Module] = None,
 ) -> Optional[str]:
@@ -66,13 +76,8 @@ def _unsupported_derived_weight_cache_error(
             "online weight updates."
         )
 
-    if model is not None:
-        # Model-owned caches can publish the same rank-uniform constraint
-        # without importing individual model implementations in the updater.
-        for module in model.modules():
-            reason = getattr(module, "_derived_weight_cache_error", None)
-            if reason is not None:
-                return reason
+    if (reason := _model_owned_update_error(model)) is not None:
+        return reason
     from sglang.kernels.ops.gemm.bf16_fp32 import hpc_bf16xfp32_gemm_enabled
 
     if hpc_bf16xfp32_gemm_enabled():
@@ -308,6 +313,9 @@ class WeightUpdater:
             group=self._model_update_group[group_name],
         )
         return bucket.reconstruct_tensors()
+
+    def model_owned_update_error(self) -> Optional[str]:
+        return _model_owned_update_error(self.get_model())
 
     def begin_weight_update(self: WeightUpdater) -> None:
         DefaultModelLoader.restore_weights_before_loading(
