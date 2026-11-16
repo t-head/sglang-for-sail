@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.attention import deepseek_v4_backend
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
     LateLayerTail,
@@ -24,6 +25,47 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+class TestEagerTailRows(CustomTestCase):
+    def test_contiguous_tail_ignores_mlp_sync_padding(self):
+        indices = torch.tensor([4, 5, 6])
+        rows = torch.arange(16).view(8, 2)
+        selected = deepseek_v4_backend._tail_rows(
+            rows, token_indices=indices, contiguous_start=4
+        )
+        torch.testing.assert_close(selected, rows[indices])
+        tail = NS(contiguous_start=4, scatter_indices=None)
+        result = deepseek_v4._scatter_tail_rows(tail, selected, 8)
+        torch.testing.assert_close(result[4:7], selected)
+
+    def test_eager_metadata_uses_real_rows_and_restores_batch(self):
+        batch = NS(
+            forward_mode=ForwardMode.EXTEND,
+            global_num_token_non_padded_cpu=129,
+            positions=torch.arange(132),
+            out_cache_loc=torch.arange(132),
+        )
+        positions, cache = batch.positions, batch.out_cache_loc
+        observed = []
+
+        def build(fb, *, real_num_tokens=None):
+            observed.append((len(fb.positions), len(fb.out_cache_loc), real_num_tokens))
+            return NS(real_num_tokens=real_num_tokens)
+
+        backend = NS(
+            mtp_enabled=False,
+            enable_decoder_swa_bounded_replay=True,
+            _build_forward_metadata=build,
+            init_forward_metadata_in_graph=lambda fb: None,
+            _build_late_layer_tail_metadata=lambda fb: len(fb.positions),
+            _activate_request_window=lambda: None,
+        )
+        DeepseekV4AttnBackend.init_forward_metadata(backend, batch)
+        self.assertEqual(observed, [(129, 129, 129)])
+        self.assertEqual(backend.tail_forward_metadata, 129)
+        self.assertIs(batch.positions, positions)
+        self.assertIs(batch.out_cache_loc, cache)
 
 
 class TestDSV41TailCPRoutingIDs(CustomTestCase):

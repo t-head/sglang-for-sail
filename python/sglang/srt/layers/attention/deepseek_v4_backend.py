@@ -3,6 +3,7 @@ from __future__ import annotations
 import enum
 import functools
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -100,6 +101,7 @@ from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import prefill_k_slots
 from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import (
     SparseTableBackend,
 )
+from sglang.srt.layers.attention.graph_utils import real_rows_scope
 from sglang.srt.layers.attention.graph_variants import DSV41_EARLY_VERIFY_VARIANTS
 from sglang.srt.layers.attention.verify_mask import (
     VerifyMask,
@@ -1024,7 +1026,7 @@ def _tail_rows(
     t: torch.Tensor, *, token_indices: torch.Tensor, contiguous_start: Optional[int]
 ) -> torch.Tensor:
     if contiguous_start is not None:
-        return t[contiguous_start:]
+        return t[contiguous_start : contiguous_start + token_indices.shape[0]]
     return t[token_indices]
 
 
@@ -1133,6 +1135,8 @@ class DSV4Metadata:
     # Captured with the late layers on a tail block (decoder SWA bounded replay
     # inside the prefill CUDA graph); replay rebuilds the tail metadata iff set.
     prefill_graph_tail: bool = False
+    # Eager MLP-sync-padded extends build metadata only for these real rows.
+    real_num_tokens: Optional[int] = None
 
     @property
     def core_metadata(self) -> DSV4AttnMetadata:
@@ -1668,6 +1672,7 @@ class DeepseekV4AttnBackend(
         cp_metadata: Optional[InterleaveContextParallelMetadata] = None,
         dspark_swa_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         build_paged_mqa_logits_metadata: bool = True,
+        real_num_tokens: Optional[int] = None,
     ) -> DSV4Metadata:
         padded_num_tokens = out_cache_loc.shape[0]
         cp_active = forward_batch is not None and is_cp_active(forward_batch)
@@ -1799,6 +1804,7 @@ class DeepseekV4AttnBackend(
             c128_compress_metadata=(
                 create(compress_ratio=128) if self.has_c128 else None
             ),
+            real_num_tokens=real_num_tokens,
         )
         if use_prefill_cuda_graph and self.low_ratio_prefill_graph:
             metadata.low_ratio_req_indices = req_pool_indices_repeated.to(torch.int64)
@@ -2182,15 +2188,24 @@ class DeepseekV4AttnBackend(
         """Write every row's compressed KV for the source layer the tail starts at,
         before enter_late_layer_tail; the layer's own pass inside the tail then
         skips its compressor, also on a rank with no rows to write."""
-        if x.shape[0] > 0:
-            self.forward_low_ratio_sources(
-                layer=layer,
-                x=x,
-                q_lora=None,
-                positions=positions,
-                forward_batch=forward_batch,
-                run_indexer=False,
-            )
+        real_num_tokens = self.forward_metadata.real_num_tokens
+        scope = (
+            real_rows_scope(forward_batch, real_num_tokens)
+            if real_num_tokens is not None
+            else nullcontext()
+        )
+        with scope:
+            if real_num_tokens is not None:
+                x, positions = x[:real_num_tokens], positions[:real_num_tokens]
+            if x.shape[0] > 0:
+                self.forward_low_ratio_sources(
+                    layer=layer,
+                    x=x,
+                    q_lora=None,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    run_indexer=False,
+                )
         self.tail_source_kv_layer_id = layer.layer_id
 
     def enter_late_layer_tail(self, forward_batch: ForwardBatch) -> tuple:
@@ -3003,14 +3018,32 @@ class DeepseekV4AttnBackend(
             self.online_c128_mtp.clear()
             return
 
-        self.forward_metadata = self._build_forward_metadata(forward_batch)
-        self.init_forward_metadata_in_graph(forward_batch)
-        self.tail_forward_metadata = (
-            self._build_late_layer_tail_metadata(forward_batch)
-            if self.enable_decoder_swa_bounded_replay
-            and forward_batch.forward_mode.is_extend_without_speculative()
-            else None
+        real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+        if not (
+            logical_forward_mode.is_prefill()
+            and forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+            and not is_cp_active(forward_batch)
+            and real_num_tokens is not None
+            and 0 < real_num_tokens < forward_batch.positions.shape[0]
+        ):
+            real_num_tokens = None
+        scope = (
+            real_rows_scope(forward_batch, real_num_tokens)
+            if real_num_tokens is not None
+            else nullcontext()
         )
+        with scope:
+            self.forward_metadata = self._build_forward_metadata(
+                forward_batch, real_num_tokens=real_num_tokens
+            )
+            self.init_forward_metadata_in_graph(forward_batch)
+            self.tail_forward_metadata = (
+                self._build_late_layer_tail_metadata(forward_batch)
+                if self.enable_decoder_swa_bounded_replay
+                and forward_batch.forward_mode.is_extend_without_speculative()
+                else None
+            )
 
         self._activate_request_window()
 
@@ -3093,6 +3126,8 @@ class DeepseekV4AttnBackend(
 
         metadata = self.forward_metadata
         assert isinstance(metadata, DSV4Metadata)
+        if metadata.real_num_tokens is not None:
+            num_qo_tokens = metadata.real_num_tokens
         if self._use_sparse_prefill(forward_batch, num_qo_tokens=num_qo_tokens):
             metadata.sparse_prefill_cache = self._build_sparse_prefill_chunk_cache(
                 forward_batch, metadata.core_attn_metadata, num_qo_tokens=num_qo_tokens
@@ -3263,6 +3298,7 @@ class DeepseekV4AttnBackend(
         *,
         max_seq_len_override: Optional[int] = None,
         use_prefill_cuda_graph: bool = False,
+        real_num_tokens: Optional[int] = None,
     ):
         # make_core_attn_metadata reads the fold's window state from here.
         self.encoder_replay = forward_batch.encoder_swa_replay
@@ -3373,6 +3409,7 @@ class DeepseekV4AttnBackend(
                 build_paged_mqa_logits_metadata=not self._use_prefill_logits(
                     forward_batch
                 ),
+                real_num_tokens=real_num_tokens,
             )
             self._snapshot_low_ratio_k_slots(
                 forward_batch, metadata, publish_rows=not use_prefill_cuda_graph
