@@ -1,8 +1,9 @@
-"""CPU checks for DeepGEMM warmup buffers and scale conversion workspace."""
+"""CPU checks for DeepGEMM wrapper and warmup contracts."""
 
 import unittest
-from contextlib import ExitStack
-from unittest.mock import patch
+from contextlib import ExitStack, nullcontext
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -11,7 +12,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.layers.deep_gemm_wrapper import compile_utils
+from sglang.srt.layers.deep_gemm_wrapper import compile_utils, entrypoint
 from sglang.srt.layers.deep_gemm_wrapper.compile_utils import (
     DeepGemmKernelType,
     _BaseWarmupExecutor,
@@ -155,6 +156,38 @@ class TestWarmupMemory(CustomTestCase):
                         self.assertGreaterEqual(budget_gib * (1 << 30), peak_bytes)
                         # Upper bounds include the last row's TMA padding.
                         self.assertLess(budget_gib * (1 << 30) - peak_bytes, 64)
+
+
+class TestInt8Int4Contracts(CustomTestCase):
+    def test_masked_wrapper_returns_overlap_metadata(self):
+        """Dropping the kernel result breaks two-batch overlap metadata handoff."""
+        lhs = (
+            torch.empty((2, 3, 8), dtype=torch.int8),
+            torch.empty((2, 3, 1), dtype=torch.float32),
+        )
+        rhs = (
+            torch.empty((2, 16, 4), dtype=torch.uint8),
+            torch.empty((2, 16, 1), dtype=torch.float32),
+        )
+        out = torch.empty((2, 3, 16), dtype=torch.bfloat16)
+        masked_m = torch.zeros((2,), dtype=torch.int32)
+        kernel = Mock(return_value=(64, 7))
+        fake_deep_gemm = SimpleNamespace(
+            m_grouped_gemm_int8_int4_bf16_nt_masked=kernel
+        )
+
+        with (
+            patch.object(entrypoint, "_is_sail", True),
+            patch.object(entrypoint, "deep_gemm", fake_deep_gemm, create=True),
+            patch.object(
+                compile_utils, "deep_gemm_execution_hook", return_value=nullcontext()
+            ),
+        ):
+            result = entrypoint.grouped_gemm_nt_i8i4bf16_masked(
+                lhs, rhs, out, masked_m, expected_m=3, configs=()
+            )
+
+        self.assertEqual(result, (64, 7))
 
 
 if __name__ == "__main__":

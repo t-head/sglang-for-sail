@@ -7,6 +7,7 @@
 #include <sgl_kernel/utils.h>   // For RuntimeCheck, div_ceil
 
 #include <sgl_kernel/activation.cuh>
+#include <sgl_kernel/cta.cuh>  // For cta::reduce_max
 #include <sgl_kernel/math.cuh>
 #include <sgl_kernel/tile.cuh>
 #include <sgl_kernel/type.cuh>   // For dtype_trait, bf16_t, fp32_t, cast
@@ -654,6 +655,164 @@ struct SituAndMulMaskedPostQuantKernel {
     RuntimeCheck(num_threads >= num_experts);
     const auto kernel = transposed ? kernel_transposed : kernel_normal;
     LaunchKernel(num_tokens * topk, num_threads, device.unwrap())  //
+        .enable_pdl(kUsePDL)(kernel, params);
+  }
+};
+
+// ---------------------------------------------------------------------------
+// INT8 per-token (channel-wise) quantization variant for W4A8-Int8 masked path.
+// Unlike the FP8 variant which quantizes in groups of 128, this computes one
+// scale per entire token row: scale = absmax / 127.
+// ---------------------------------------------------------------------------
+
+struct SituMulQuantInt8VarlenParams {
+  const bf16_t* __restrict__ input;
+  int8_t* __restrict__ output;
+  float* __restrict__ output_scale;  // [E * T] per-token scale
+  const int32_t* __restrict__ masked_m;
+  float beta;
+  float linear_beta;
+  int64_t hidden_dim;
+  uint32_t num_tokens;
+  uint32_t num_experts;
+};
+
+template <bool kUsePDL>
+__global__ __launch_bounds__(1024, 2) void situ_mul_quant_int8_varlen_kernel(
+    const SituMulQuantInt8VarlenParams __grid_constant__ params) {
+  using namespace device;
+
+  constexpr uint32_t kValuesPerThread = 8u;
+  constexpr float kInt8Max = 127.0f;
+  using InputVec = AlignedVector<bf16x2_t, kValuesPerThread / 2>;
+  using OutputVec = AlignedVector<int8_t, kValuesPerThread>;
+
+  __shared__ float s_warp_max[32];  // max 1024 threads / 32 = 32 warps
+
+  const auto expert_id = blockIdx.y;
+  PDLWaitPrimary<kUsePDL>();
+  const auto num_tokens = static_cast<uint32_t>(params.masked_m[expert_id]);
+  if (blockIdx.x >= num_tokens) return;
+
+  const float beta = params.beta;
+  const float linear_beta = params.linear_beta;
+  const float inv_beta = 1.0f / beta;
+  const float inv_linear_beta = 1.0f / linear_beta;
+
+  for (uint32_t token_id = blockIdx.x; token_id < num_tokens; token_id += gridDim.x) {
+    const auto offset = expert_id * params.num_tokens + token_id;
+    const auto input = params.input + offset * params.hidden_dim * 2;
+    const auto output = params.output + offset * params.hidden_dim;
+
+    InputVec gate_vec, up_vec;
+    gate_vec.load(input, threadIdx.x);
+    up_vec.load(input, threadIdx.x + blockDim.x);
+
+    if (token_id == blockIdx.x) PDLTriggerSecondary<kUsePDL>();
+
+    // Compute SiTU activation and track local max
+    float local_max = 0.0f;
+    float results[kValuesPerThread];
+#pragma unroll
+    for (uint32_t i = 0; i < kValuesPerThread / 2; ++i) {
+      const auto [x, y] = situ_and_mul(gate_vec[i], up_vec[i], beta, inv_beta, linear_beta, inv_linear_beta);
+      results[2 * i + 0] = x;
+      results[2 * i + 1] = y;
+      local_max = fmaxf(local_max, fmaxf(fabsf(x), fabsf(y)));
+    }
+
+    // Block-level reduce_max for per-token absmax
+    cta::reduce_max(local_max, s_warp_max);
+    __syncthreads();
+    const float absmax = fmaxf(s_warp_max[0], 1e-10f);
+    const float scale = absmax / kInt8Max;
+    const float inv_scale = kInt8Max / absmax;
+
+    // Quantize to INT8
+    OutputVec out_vec;
+#pragma unroll
+    for (uint32_t i = 0; i < kValuesPerThread; ++i) {
+      float qval = rintf(results[i] * inv_scale);
+      qval = fmaxf(qval, -kInt8Max);
+      qval = fminf(qval, kInt8Max);
+      out_vec[i] = static_cast<int8_t>(qval);
+    }
+
+    out_vec.store(output, threadIdx.x);
+
+    // Thread 0 writes the per-token scale
+    if (threadIdx.x == 0) {
+      params.output_scale[offset] = scale;
+    }
+    __syncthreads();  // ensure s_warp_max is safe to overwrite next iteration
+  }
+}
+
+template <bool kUsePDL>
+struct SituAndMulMaskedPostQuantInt8Kernel {
+  static constexpr auto kernel = situ_mul_quant_int8_varlen_kernel<kUsePDL>;
+
+  static void
+  run(const tvm::ffi::TensorView input,
+      const tvm::ffi::TensorView output,
+      const tvm::ffi::TensorView output_scale,
+      const tvm::ffi::TensorView masked_m,
+      const uint32_t topk,
+      const uint32_t max_masked_m,
+      const double beta,
+      const double linear_beta) {
+    using namespace host;
+
+    auto device = SymbolicDevice{};
+    auto E = SymbolicSize{"num_experts"};
+    auto T = SymbolicSize{"num_tokens_padded"};
+    auto D = SymbolicSize{"hidden_dim x 2"};
+    auto N = SymbolicSize{"hidden_dim"};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({E, T, D})  // input
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(input);
+    TensorMatcher({E, T, N})  // output
+        .with_dtype<int8_t>()
+        .with_device(device)
+        .verify(output);
+    TensorMatcher({E, T, 1})  // output_scale (per-token)
+        .with_dtype<fp32_t>()
+        .with_device(device)
+        .verify(output_scale);
+    TensorMatcher({E})  // masked_m
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(masked_m);
+
+    const auto num_experts = static_cast<uint32_t>(E.unwrap());
+    const auto num_tokens = static_cast<uint32_t>(T.unwrap());
+    const auto hidden_dim = static_cast<uint32_t>(N.unwrap());
+
+    RuntimeCheck(D.unwrap() == 2 * hidden_dim, "invalid dimension");
+    RuntimeCheck(hidden_dim % 256 == 0, "hidden dimension must be divisible by 256 for int8 per-token quant");
+    RuntimeCheck(num_experts <= kMaxExperts, "num_experts exceeds maximum (256)");
+    if (num_tokens == 0) return;
+
+    const auto params = SituMulQuantInt8VarlenParams{
+        .input = static_cast<const bf16_t*>(input.data_ptr()),
+        .output = static_cast<int8_t*>(output.data_ptr()),
+        .output_scale = static_cast<float*>(output_scale.data_ptr()),
+        .masked_m = static_cast<const int32_t*>(masked_m.data_ptr()),
+        .beta = static_cast<float>(beta),
+        .linear_beta = static_cast<float>(linear_beta),
+        .hidden_dim = hidden_dim,
+        .num_tokens = num_tokens,
+        .num_experts = num_experts,
+    };
+
+    const auto num_threads = hidden_dim / 8;
+    RuntimeCheck(num_threads % device::kWarpThreads == 0);
+    RuntimeCheck(num_threads >= num_experts);
+    const auto grid_m = max_masked_m > 0 ? max_masked_m : num_tokens * topk;
+    LaunchKernel(get_masked_grid(num_experts, grid_m), num_threads, device.unwrap())  //
         .enable_pdl(kUsePDL)(kernel, params);
   }
 };
