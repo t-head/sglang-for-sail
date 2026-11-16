@@ -1188,13 +1188,6 @@ __global__ __launch_bounds__(prefill_bf16::kBlockSize, 1) void topk_prefill_bf16
 template <auto* f, size_t kMaxDynamicSMEM>
 void setup_kernel_smem_once_pf(DLDevice device) {
   host::runtime::set_max_dynamic_smem_per_device<f>(device, kMaxDynamicSMEM);
-}) {
-  [[maybe_unused]]
-  static const auto result = [] {
-    const auto fptr = std::bit_cast<const void*>(f);
-    return ::cudaFuncSetAttribute(fptr, ::cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
-  }();
-  host::RuntimeDeviceCheck(result, where);
 }
 
 struct TopKPrefillBF16Kernel {

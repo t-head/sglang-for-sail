@@ -473,13 +473,6 @@ __launch_bounds__(v3::kBlockSize, 2) void topk_512_transform_bf16_v3(const __gri
 template <auto* f, size_t kMaxDynamicSMEM>
 void setup_kernel_smem_once(DLDevice device) {
   host::runtime::set_max_dynamic_smem_per_device<f>(device, kMaxDynamicSMEM);
-}) {
-  [[maybe_unused]]
-  static const auto result = [] {
-    const auto fptr = std::bit_cast<const void*>(f);
-    return ::cudaFuncSetAttribute(fptr, ::cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
-  }();
-  host::RuntimeDeviceCheck(result, where);
 }
 
 template <bool kUsePDL>
