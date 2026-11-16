@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       run_all_tests:
-        description: "Build and run the PPU model sanity suite even without PPU path changes"
+        description: "Build and run PPU sanity and kernel regressions even without PPU path changes"
         required: false
         type: boolean
         default: true
@@ -91,11 +91,15 @@ jobs:
               - "python/sglang/kernels/aot/pyproject_sail.toml"
               - "python/sglang/kernels/aot/csrc/common_extension_sail.cc"
               - "python/sglang/kernels/jit/utils/compile/sailify.py"
+              - "python/sglang/kernels/ops/attention/dsa/tilelang_kernel.py"
               - "test/registered/core/test_basic_sanity_eagle3.py"
               - "test/registered/core/test_basic_sanity_dflash.py"
               - "test/registered/core/test_basic_sanity.py"
               - "test/registered/radix_cache/test_radix_attention.py"
               - "test/registered/ppu/**"
+              - "test/registered/kernels/ops/attention/test_dsa_tilelang_sparse_layout.py"
+              - "test/registered/kernels/ops/attention/test_minimax_m3_msa_ppu_page_table_tail.py"
+              - "test/registered/kernels/ops/activation/test_silu_and_mul_masked_post_per_token_quant_fp8.py"
 
   pr-gate:
     name: pr-gate
@@ -211,7 +215,7 @@ jobs:
           merge-multiple: true
           path: ${{ env.PPU_CI_WHEEL_DIR }}
 
-      - name: Run the PPU model sanity suite in isolated Docker
+      - name: Run PPU sanity and kernel regressions in isolated Docker
         env:
           CONFIG_PPU_CI_DEVICE: ${{ vars.PPU_CI_DEVICE }}
           CONFIG_PPU_CI_TARGET_MODEL_PATH: ${{ vars.PPU_CI_TARGET_MODEL_PATH }}
@@ -244,7 +248,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions: {}
     steps:
-      - name: Require successful native build and both PPU sanity files when requested
+      - name: Require successful native build and all PPU test files when requested
         env:
           NEEDS_JSON: ${{ toJson(needs) }}
           PPU_IN_SCOPE: ${{ needs.check-changes.outputs.ppu }}
@@ -257,10 +261,10 @@ jobs:
           fi
           if [[ "$PPU_IN_SCOPE" == "true" ]]; then
             if [[ "$BUILD_RESULT" != "success" || "$SANITY_RESULT" != "success" ]]; then
-              printf '%s\n' '::error::PPU scope requires a successful native build and both PPU sanity files.'
+              printf '%s\n' '::error::PPU scope requires a successful native build and all PPU test files.'
               exit 1
             fi
-            printf '%s\n' 'Native build and both PPU sanity files passed.'
+            printf '%s\n' 'Native build and all PPU test files passed.'
           else
             printf '%s\n' 'PPU is outside this run scope; no PPU tests were requested.'
           fi
