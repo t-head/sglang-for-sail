@@ -432,9 +432,12 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         )
         translator.bind_own_plan(forward_batch)
 
-        static_batch, _ = runner.load_batch(forward_batch)
-
-        self.assertIs(static_batch.mm_input_embeds, mm_input_embeds)
+        for original_mode in (None, ForwardMode.IDLE, ForwardMode.DECODE):
+            with self.subTest(original_mode=original_mode):
+                forward_batch._original_forward_mode = original_mode
+                static_batch, _ = runner.load_batch(forward_batch)
+                self.assertIs(static_batch.mm_input_embeds, mm_input_embeds)
+                self.assertIs(static_batch._original_forward_mode, original_mode)
 
     def test_eagle_target_full_reaches_graph_construction(self):
         override = get_context().override_server_args(
