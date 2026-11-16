@@ -15,10 +15,15 @@ from sglang.kernels.ops.attention.step5.scoring_triton import (
 )
 
 
-@triton.jit
+# REGIONS is the score width and grows with every prefill chunk; as a constexpr
+# each chunk JIT-compiled a new variant mid-forward and stalled the pipeline.
+@triton.jit(
+    do_not_specialize=("REGIONS",),
+    do_not_specialize_on_alignment=("REGIONS",),
+)
 def _pack_keys(
     Keys, Map, RowToReq, Positions, RequestLastRows, Compact,
-    MAP_STRIDE: tl.constexpr, REGIONS: tl.constexpr, FP8_INDEXER: tl.constexpr,
+    MAP_STRIDE: tl.constexpr, REGIONS, FP8_INDEXER: tl.constexpr,
     BLOCK_R: tl.constexpr,
 ):
     compact_request = tl.program_id(0)
@@ -44,7 +49,7 @@ def _pack_keys(
 @triton.jit
 def _compact_products(
     query, Compact, compact_request, regions, valid,
-    REGIONS: tl.constexpr, BLOCK_R: tl.constexpr, FP8_INDEXER: tl.constexpr,
+    REGIONS, BLOCK_R: tl.constexpr, FP8_INDEXER: tl.constexpr,
 ):
     channel = tl.arange(0, 256)
     values = tl.load(
@@ -59,10 +64,13 @@ def _compact_products(
     return tl.dot(query, keys)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=("REGIONS",),
+    do_not_specialize_on_alignment=("REGIONS",),
+)
 def _score_compact(
     Q, W, Compact, RowToReq, Positions, Out, SpanStart, SpanEnd, SpanRequest,
-    HEADS: tl.constexpr, REGIONS: tl.constexpr, BLOCK_R: tl.constexpr,
+    HEADS: tl.constexpr, REGIONS, BLOCK_R: tl.constexpr,
     GRID_TILES: tl.constexpr, GROUP_ROWS: tl.constexpr,
     EARLY_EXIT: tl.constexpr, FP8_INDEXER: tl.constexpr, WEIGHT_SCALE: tl.constexpr,
     CLEAR_FUTURE: tl.constexpr,
