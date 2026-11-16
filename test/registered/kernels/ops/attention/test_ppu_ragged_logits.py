@@ -34,3 +34,9 @@ def test_restore_and_graph(dtype, strided):
         expected[0, 3 + shift : 7 + shift] = source[0, :4]
         expected[1, shift : 2 + shift] = source[1, :2]
         torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
