@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
 
 from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernels.jit.utils.common import is_sail_runtime
+from sglang.kernels.jit.utils.compile.toolchain import cuda_home
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -20,6 +23,16 @@ def _jit_per_token_quant_fp8_module(dtype: torch.dtype) -> Module:
         )
     use_fast_math = current_arch().is_sm(9, 0)
     math_mode = "fast_math" if use_fast_math else "precise_math"
+    cuda_cflags = ["--use_fast_math"] if use_fast_math else []
+    include_paths = []
+    if is_sail_runtime():
+        cuda_cflags.append("-DSGL_PER_TOKEN_QUANT_SAIL")
+        # Newer SAIL SDKs ship the bulk-copy PTX wrappers under include/cccl.
+        if torch.cuda.get_device_capability()[0] >= 9:
+            cccl = Path(cuda_home()) / "include" / "cccl"
+            if (cccl / "cuda" / "ptx").is_file():
+                cuda_cflags.append("-DSGL_PER_TOKEN_QUANT_SAIL_BULK")
+                include_paths.append(str(cccl))
     args = make_cpp_args(dtype)
     return load_jit(
         "per_token_quant_fp8",
@@ -27,7 +40,8 @@ def _jit_per_token_quant_fp8_module(dtype: torch.dtype) -> Module:
         *args,
         cuda_files=["gemm/per_token_quant_fp8.cuh"],
         cuda_wrappers=[("per_token_quant_fp8", f"per_token_quant_fp8<{args}>")],
-        extra_cuda_cflags=["--use_fast_math"] if use_fast_math else [],
+        extra_cuda_cflags=cuda_cflags,
+        extra_include_paths=include_paths,
     )
 
 
