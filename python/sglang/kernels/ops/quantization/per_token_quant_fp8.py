@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
@@ -10,6 +11,8 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.kernels.jit.utils.common import is_sail_runtime
+from sglang.kernels.jit.utils.compile.toolchain import cuda_home
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -25,6 +28,14 @@ def _jit_per_token_quant_fp8_module(dtype: torch.dtype) -> Module:
     arch = get_jit_cuda_arch()
     use_fast_math = (arch.major, arch.minor) == (9, 0)
     math_mode = "fast_math" if use_fast_math else "precise_math"
+    cuda_cflags = ["--use_fast_math"] if use_fast_math else []
+    include_paths = []
+    if is_sail_runtime():
+        cuda_cflags.append("-DSGL_PER_TOKEN_QUANT_PPU")
+        # PPU SDK 13 installs cuda/ptx below include/cccl.
+        cccl = Path(cuda_home()) / "include" / "cccl"
+        if arch.major >= 9 and cccl.is_dir():
+            include_paths.append(str(cccl))
     args = make_cpp_args(dtype)
     return load_jit(
         "per_token_quant_fp8",
@@ -32,7 +43,8 @@ def _jit_per_token_quant_fp8_module(dtype: torch.dtype) -> Module:
         *args,
         cuda_files=["gemm/per_token_quant_fp8.cuh"],
         cuda_wrappers=[("per_token_quant_fp8", f"per_token_quant_fp8<{args}>")],
-        extra_cuda_cflags=["--use_fast_math"] if use_fast_math else [],
+        extra_cuda_cflags=cuda_cflags,
+        extra_include_paths=include_paths,
     )
 
 
