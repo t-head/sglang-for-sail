@@ -15,7 +15,13 @@ from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import glm53_sail_gate, mega_gate
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
-from sglang.srt.runtime_context import get_context, get_model, get_parallel
+from sglang.srt.runtime_context import (
+    get_context,
+    get_exec,
+    get_flags,
+    get_model,
+    get_parallel,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
 
@@ -82,91 +88,44 @@ class TestGlm53SailGate(CustomTestCase):
             glm53_sail_gate.can_route(moe, self.hidden, dispatch_info=None)
         )
 
-    def test_worker_startup_checks_eligible_layers_once(self):
+    def test_disabled_routing_does_not_require_megagate_binding(self):
+        """Standard-route workers must not probe an unused native gate at startup."""
         from sglang.srt.layers.moe.utils import MoeA2ABackend
         from sglang.srt.model_executor.model_runner_components import moe_ep_setup
-        from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 
-        moe = Mock(spec=DeepseekV2MoE, is_nextn=True, **vars(self.make_moe(0)))
-        model = SimpleNamespace(modules=lambda: iter([moe, moe]))
+        moe = self.make_moe(0)
+        model = SimpleNamespace(modules=lambda: iter([moe.topk]))
         config = SimpleNamespace(hf_text_config=moe.config)
-        glm53_sail_gate._check_sigmoid_binding.cache_clear()
-        self.addCleanup(glm53_sail_gate._check_sigmoid_binding.cache_clear)
-        native = Mock()
         with (
             self.hidden.fake_mode,
             patch.object(torch.cuda, "is_available", return_value=True),
             patch.object(torch.cuda, "current_device", return_value=0),
-            patch.object(moe_ep_setup, "get_moe_a2a_backend") as backend,
-            patch.dict(
-                sys.modules, {"deep_gemm": SimpleNamespace(bf16_mega_gate=native)}
-            ),
-        ):
-            backend.return_value = MoeA2ABackend.DEEPEP
-            with envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.override(False):
-                moe_ep_setup.prepare_moe_topk(model=model, model_config=config)
-            backend.return_value = MoeA2ABackend.NONE
-            moe_ep_setup.prepare_moe_topk(model=model, model_config=config)
-            backend.return_value = MoeA2ABackend.DEEPEP
-            with patch.object(glm53_sail_gate, "_is_sail_ppu", return_value=False):
-                moe_ep_setup.prepare_moe_topk(model=model, model_config=config)
-            native.assert_not_called()
-            for requested in (MoeA2ABackend.MEGAMOE, MoeA2ABackend.DEEPEP):
-                backend.return_value = requested
-                moe_ep_setup.prepare_moe_topk(model=model, model_config=config)
-        native.assert_called_once()
-        args, kwargs = native.call_args
-        self.assertEqual(args[0].shape, (0, 256))
-        self.assertEqual(args[0].device, self.hidden.device)
-        self.assertEqual(kwargs["scoring_func"], "sigmoid")
-
-    def test_forced_torch_worker_starts_without_megagate_binding(self):
-        """Forcing Torch must not require the unused sigmoid binding at startup."""
-        from sglang.srt.layers.moe.utils import MoeA2ABackend
-        from sglang.srt.model_executor.model_runner_components import moe_ep_setup
-
-        model = SimpleNamespace(modules=lambda: iter([]))
-        config = SimpleNamespace(
-            hf_text_config=SimpleNamespace(model_type="glm_moe_dsa")
-        )
-        glm53_sail_gate._check_sigmoid_binding.cache_clear()
-        self.addCleanup(glm53_sail_gate._check_sigmoid_binding.cache_clear)
-        with (
-            self.hidden.fake_mode,
-            envs.SGLANG_FORCE_FUSED_OP_BACKEND.override("torch"),
-            patch.object(fused_op, "_forced_backend", fused_op._UNRESOLVED),
-            patch.object(torch.cuda, "is_available", return_value=True),
-            patch.object(torch.cuda, "current_device", return_value=0),
-            patch.object(moe_ep_setup, "get_moe_a2a_backend") as backend,
             patch.dict(sys.modules, {"deep_gemm": None}),
         ):
             for requested in (MoeA2ABackend.DEEPEP, MoeA2ABackend.MEGAMOE):
-                with self.subTest(backend=requested):
-                    backend.return_value = requested
-                    moe_ep_setup.prepare_moe_topk(model=model, model_config=config)
+                for forced, deterministic in (("torch", False), (None, True)):
+                    with (
+                        self.subTest(backend=requested, forced=forced),
+                        get_flags().moe.override(a2a_backend=requested),
+                        get_exec().deterministic.override(
+                            enable_deterministic_inference=deterministic
+                        ),
+                        envs.SGLANG_FORCE_FUSED_OP_BACKEND.override(forced),
+                        patch.object(fused_op, "_forced_backend", fused_op._UNRESOLVED),
+                    ):
+                        moe_ep_setup.prepare_moe_topk(model=model, model_config=config)
+                        self.assertIsNone(mega_gate.try_run_mega_gate(moe, self.hidden))
 
-    def test_worker_startup_reports_missing_or_incompatible_binding(self):
-        glm53_sail_gate._check_sigmoid_binding.cache_clear()
-        self.addCleanup(glm53_sail_gate._check_sigmoid_binding.cache_clear)
-        for package, reason in (
-            (None, ImportError),
-            (SimpleNamespace(), AttributeError),
-            (
-                SimpleNamespace(
-                    bf16_mega_gate=Mock(side_effect=RuntimeError("sqrtsoftplus only"))
-                ),
-                RuntimeError,
-            ),
-        ):
+            # An admitted call still requires the library; do not turn a
+            # missing native dependency into a silent performance fallback.
+            moe.routed_scaling_factor = 1.0
             with (
-                self.subTest(reason=reason),
-                patch.dict(sys.modules, {"deep_gemm": package}),
+                envs.SGLANG_FORCE_FUSED_OP_BACKEND.override(None),
+                patch.object(fused_op, "_forced_backend", fused_op._UNRESOLVED),
             ):
-                with self.assertRaisesRegex(
-                    RuntimeError, "SGLANG_OPT_DEEPGEMM_MEGA_GATE=0"
-                ) as result:
-                    glm53_sail_gate._check_sigmoid_binding(torch.device("cpu"))
-                self.assertIsInstance(result.exception.__cause__, reason)
+                self.assertTrue(glm53_sail_gate.can_route(moe, self.hidden, None))
+                with self.assertRaises(ImportError):
+                    mega_gate.try_run_mega_gate(moe, self.hidden)
 
     def test_fake_dispatch_is_a_per_call_override(self):
         # A target layer receives fake dispatch_info even with EPLB disabled.

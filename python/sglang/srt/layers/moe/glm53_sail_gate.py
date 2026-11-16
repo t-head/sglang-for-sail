@@ -23,35 +23,6 @@ def _is_sail_ppu(device: torch.device) -> bool:
     ) and torch.cuda.get_device_capability(device) in ((8, 0), (8, 9))
 
 
-@functools.lru_cache(maxsize=None)
-def _check_sigmoid_binding(device: torch.device) -> None:
-    from sglang.kernels.ops.moe.mega_gate import bf16_mega_gate
-
-    # DeepGEMM validates scoring_func before its zero-token return, without a JIT launch.
-    weight = torch.empty((8, 256), device=device, dtype=torch.bfloat16)
-    try:
-        bf16_mega_gate(
-            weight[:0],
-            weight,
-            8,
-            routed_scaling_factor=1.0,
-            ep_rank=0,
-            scoring_func="sigmoid",
-        )
-    except (ImportError, OSError, AttributeError, TypeError, RuntimeError) as exc:
-        raise RuntimeError(
-            "GLM MegaGate startup check failed: the worker needs a DeepGEMM build "
-            "with bf16_mega_gate(scoring_func='sigmoid'). Install a compatible "
-            "build or set SGLANG_OPT_DEEPGEMM_MEGA_GATE=0."
-        ) from exc
-
-
-def validate_worker(device: torch.device) -> None:
-    # CPU-offloaded gate weights are materialized on this device at forward time.
-    if device.type == "cuda" and _is_sail_ppu(device):
-        _check_sigmoid_binding(device)
-
-
 def can_route(
     moe: DeepseekV2MoE,
     hidden: torch.Tensor,
