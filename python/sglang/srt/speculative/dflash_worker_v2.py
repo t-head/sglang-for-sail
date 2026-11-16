@@ -740,9 +740,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "device graph capture.",
                     type(current_platform).__name__,
                 )
-            if target_dp_enabled and capture_decode_cuda_graph:
-                # Keep the eager-draft policy for idle/unequal DP batches.
-                # The narrowed draft scope hides the target's DP flag.
+            if _is_npu and target_dp_enabled and capture_decode_cuda_graph:
+                # Idle DP ranks skip the draft step and cannot join a shared replay;
+                # CUDA avoids this by keying the draft's graphs on the local batch size.
                 capture_decode_cuda_graph = False
                 if self._target_tp_rank == 0:
                     logger.warning(
