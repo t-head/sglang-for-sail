@@ -15,17 +15,20 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
-@cache_once
-def _jit_grouped_gemma_rmsnorm_module(group_size: int, dtype: torch.dtype) -> Module:
-    """Compile and cache the JIT grouped Gemma RMSNorm module."""
-    # Validation sits under `cache_once`: once per (group_size, dtype) specialisation,
-    # not once per call.
+def _validate_grouped_gemma_rmsnorm_args(group_size: int, dtype: torch.dtype) -> None:
     if dtype not in (torch.bfloat16, torch.float16):
         raise RuntimeError(f"Unsupported dtype {dtype}. Supported: bfloat16, float16")
     if group_size <= 0 or group_size % 512 != 0:
         raise RuntimeError(
             f"Unsupported group_size {group_size}. Must be a multiple of 512."
         )
+
+
+@cache_once
+def _jit_grouped_gemma_rmsnorm_module(group_size: int, dtype: torch.dtype) -> Module:
+    """Compile and cache the JIT grouped Gemma RMSNorm module."""
+    # Nonempty calls validate once per cached (group_size, dtype) specialisation.
+    _validate_grouped_gemma_rmsnorm_args(group_size, dtype)
     args = make_cpp_args(group_size, is_arch_support_pdl(), dtype)
     return load_jit(
         "grouped_gemma_rmsnorm",
@@ -72,9 +75,10 @@ def grouped_gemma_rmsnorm(
     else:
         out = out.reshape(-1, hidden_size)
 
-    module = _jit_grouped_gemma_rmsnorm_module(group_size, input.dtype)
-    # Idle DP ranks have no (token, group) chunks to launch.
+    # Idle DP ranks need no JIT module, but unsupported arguments still fail.
     if x.shape[0] == 0:
+        _validate_grouped_gemma_rmsnorm_args(group_size, input.dtype)
         return out.reshape(input.shape)
+    module = _jit_grouped_gemma_rmsnorm_module(group_size, input.dtype)
     module.grouped_gemma_rmsnorm(x, weight, out, eps)
     return out.reshape(input.shape)
