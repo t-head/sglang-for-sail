@@ -85,6 +85,8 @@ from sglang.srt.layers.attention.dsv4.online_c128_mtp import OnlineC128MTPContro
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
     SparsePrefillKVBuffer,
+    compact_sparse_prefill_kv,
+    should_compact_sparse_prefill_kv,
     use_dsv4_q8kv8_sparse_prefill,
 )
 from sglang.srt.layers.attention.dsv4.v41_indexer import (
@@ -132,6 +134,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakab
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
+    is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.model_executor.runner_utils.forked_metadata_prep import (
     join_in_graph_metadata_prep,
@@ -4721,11 +4724,10 @@ class DeepseekV4AttnBackend(
         extra_k_cache = None
         extra_page_size = None
         flat_token_ids = None
+        n_compressed = 0
         if compress_ratio == 0:
-            workspace = self.sparse_prefill_kv_buffer.get(cache.swa_token_ids.shape[0])
             combined_indices = cache.c0_combined_indices
             combined_lens = cache.c0_combined_lens
-            swa_slice = workspace
         else:
             extra_page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
             extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
@@ -4733,15 +4735,70 @@ class DeepseekV4AttnBackend(
                 compress_ratio, core_attn_metadata, extra_page_size
             )
             n_compressed = flat_token_ids.shape[0]
+
+        workspace_rows = n_compressed + cache.swa_token_ids.shape[0]
+        is_ppu = get_platform().is_ppu
+        workspace_used_by_graph = is_ppu and (
+            torch.cuda.is_current_stream_capturing()
+            or _current_capture_var.get() is not None
+            or is_in_tc_piecewise_cuda_graph()
+        )
+        if (
+            # MegaAttention owns the FP8 output and scale contract.
+            cos_sin_cache is None
+            and should_compact_sparse_prefill_kv(
+                workspace_rows, combined_indices.numel()
+            )
+            # The ordinary path needs no new allocation if this buffer fits.
+            # Keep it alive for any captured graph that references it.
+            and not self.sparse_prefill_kv_buffer.can_reuse_bf16(workspace_rows)
+            and is_ppu
+            and not use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend)
+            and not workspace_used_by_graph
+        ):
+            self.sparse_prefill_kv_buffer.release_eager_bf16()
+            kv, indices = compact_sparse_prefill_kv(
+                combined_indices,
+                combined_lens,
+                flat_token_ids,
+                cache.swa_token_ids,
+                extra_k_cache,
+                token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
+                extra_page_size,
+                cache.swa_page_size,
+                (
+                    token_to_kv_pool.get_extra_key_layout(layer_id)
+                    if compress_ratio
+                    else None
+                ),
+                token_to_kv_pool.get_swa_key_layout(),
+            )
+            return flash_mla_sparse_fwd(
+                q=q_flat,
+                kv=kv,
+                indices=indices.unsqueeze(1),
+                sm_scale=self.softmax_scale,
+                d_v=self.head_dim_v,
+                attn_sink=attn_sink,
+                topk_length=combined_lens,
+            )[0]
+
+        if compress_ratio == 0:
+            workspace = self.sparse_prefill_kv_buffer.get(
+                workspace_rows, retain_for_graph=workspace_used_by_graph
+            )
+            swa_slice = workspace
+        else:
             # Layers sharing a kv_source reuse its dequant: no later layer writes
             # that cache, and graph replay keeps the layer order.
             workspace, compressed_filled = self.sparse_prefill_kv_buffer.get_with_head(
-                n_compressed + cache.swa_token_ids.shape[0],
+                workspace_rows,
                 head_source=(
                     extra_k_cache.data_ptr(),
                     flat_token_ids.data_ptr(),
                     n_compressed,
                 ),
+                retain_for_graph=workspace_used_by_graph,
             )
             if not compressed_filled:
                 compressed_slice = workspace[:n_compressed]
