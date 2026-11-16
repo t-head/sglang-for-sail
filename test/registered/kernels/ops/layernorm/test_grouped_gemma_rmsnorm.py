@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 import pytest
 import torch
 
@@ -81,6 +83,52 @@ def test_grouped_gemma_rmsnorm_bad_group_size():
     weight = torch.zeros(10240, dtype=torch.bfloat16, device="cuda")
     with pytest.raises(RuntimeError, match="group_size"):
         grouped_gemma_rmsnorm(x, weight, 1000, 1e-6)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("use_out", [False, True])
+def test_grouped_gemma_rmsnorm_empty_without_jit(dtype, use_out):
+    """Idle input must work even when the JIT compiler is unavailable."""
+    x = torch.empty((0, 10240), dtype=dtype, device="cuda")
+    weight = torch.empty((10240,), dtype=dtype, device="cuda")
+    backing = torch.full((1, 10240), 7, dtype=dtype, device="cuda")
+    out = backing[:0] if use_out else None
+    with patch(
+        "sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm."
+        "_jit_grouped_gemma_rmsnorm_module",
+        side_effect=AssertionError("Empty input must not request a JIT module"),
+    ):
+        result = grouped_gemma_rmsnorm(x, weight, 2560, out=out)
+    assert result.shape == x.shape
+    assert result.dtype == dtype
+    assert result.device == x.device
+    if use_out:
+        assert result.is_set_to(out)
+        torch.testing.assert_close(backing, torch.full_like(backing, 7))
+
+
+@pytest.mark.parametrize(
+    "dtype,group_size,error",
+    [
+        (torch.float32, 2560, "Unsupported dtype"),
+        (torch.bfloat16, 0, "Unsupported group_size"),
+        (torch.bfloat16, -512, "Unsupported group_size"),
+        (torch.bfloat16, 1000, "Unsupported group_size"),
+    ],
+)
+def test_grouped_gemma_rmsnorm_empty_validates_args(dtype, group_size, error):
+    """Skipping compilation must preserve the operator's argument errors."""
+    x = torch.empty((0, 10240), dtype=dtype, device="cuda")
+    weight = torch.empty((10240,), dtype=dtype, device="cuda")
+    with (
+        patch(
+            "sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm."
+            "_jit_grouped_gemma_rmsnorm_module",
+            side_effect=AssertionError("Empty input must not request a JIT module"),
+        ),
+        pytest.raises(RuntimeError, match=error),
+    ):
+        grouped_gemma_rmsnorm(x, weight, group_size)
 
 
 if __name__ == "__main__":
