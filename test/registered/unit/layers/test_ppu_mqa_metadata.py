@@ -32,7 +32,7 @@ def backend(fp4=False):
 
 
 @pytest.mark.parametrize("fp4", [False, True])
-def test_typed_metadata_and_expanded_rows(fp4):
+def test_backend_schedule_is_deferred_until_compute(fp4):
     b = backend(fp4)
     lens = torch.tensor([[64, 65], [128, 129]], dtype=torch.int32)
     with (
@@ -40,27 +40,42 @@ def test_typed_metadata_and_expanded_rows(fp4):
         patch(
             "sglang.srt.layers.attention.dsa_backend.resolve_paged_mqa_logits_metadata_fn"
         ) as resolver,
-        patch(
-            "sglang.srt.layers.attention.dsa_backend.resolve_num_sms", return_value=39
-        ),
-        envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(False),
+        envs.SGLANG_SAIL_BF16_INDEXER.override(False),
     ):
-        DeepseekSparseAttnBackend._build_paged_mqa_schedule_metadata(b, lens)
-    args, kwargs = resolver.return_value.call_args
+        assert (
+            DeepseekSparseAttnBackend._build_paged_mqa_schedule_metadata(b, lens)
+            is None
+        )
+    # The backend does not yet have actual query owners; build at compute time.
+    resolver.assert_not_called()
+
+
+@pytest.mark.parametrize("fp4", [False, True])
+def test_compute_metadata_uses_typed_expanded_rows_and_real_owners(fp4):
+    from unittest.mock import Mock
+
+    from sglang.srt.layers.attention.mqa_logits_utils import sail_paged_mqa_metadata
+
+    lens = torch.tensor([[64, 65], [128, 129]], dtype=torch.int32)
+    owners = torch.tensor([5, 5, 9, 9], dtype=torch.int32) if fp4 else None
+    dtype = torch.int8 if fp4 else torch.float8_e4m3fn
+    marker = object()
+    builder = Mock(return_value=marker)
+    library = SimpleNamespace(
+        get_num_sms=lambda: 39, get_paged_mqa_logits_metadata=builder
+    )
+    with patch.dict("sys.modules", {"deep_gemm": library}):
+        result = sail_paged_mqa_metadata(lens, 64, 32, 128, dtype, owners)
+    assert result is marker
+    args, kwargs = builder.call_args
     assert args[0].shape == (4, 1)
     torch.testing.assert_close(args[0][:, 0], lens.flatten())
-    assert kwargs["metadata_extra"] == (
-        1,
-        32,
-        128,
-        torch.int8 if fp4 else torch.float8_e4m3fn,
-    )
+    assert args[1:] == (64, 39)
+    assert kwargs["metadata_extra"] == (1, 32, 128, dtype)
     if fp4:
-        torch.testing.assert_close(
-            kwargs["indices"], torch.arange(4, dtype=torch.int32)
-        )
+        torch.testing.assert_close(kwargs["indices"], owners)
     else:
-        assert "indices" not in kwargs
+        assert kwargs["indices"] is None
 
 
 def test_indexer_heads_and_dtype():
@@ -71,19 +86,27 @@ def test_indexer_heads_and_dtype():
             ) == (1, 32, 128, torch.int8 if fp4 else torch.float8_e4m3fn)
 
 
-def test_pool_schedule_uses_backend_builder():
+@pytest.mark.parametrize("sail", [False, True])
+def test_pool_schedule_uses_backend_builder(sail):
     seen = []
 
     def builder(lens):
         seen.append(lens)
         return lens
 
-    with patch.object(kpool_plan, "is_cuda", return_value=True):
+    with (
+        patch.object(kpool_plan, "is_cuda", return_value=True),
+        patch.object(kpool_plan, "is_sail", return_value=sail),
+    ):
         actual = kpool_plan._compute_pool_schedule_metadata(
             torch.tensor([0, 4]), index_page_size=64, schedule_builder=builder
         )
-    assert actual is seen[0]
-    torch.testing.assert_close(actual, torch.tensor([[1], [4]]))
+    if sail:
+        assert actual is None
+        assert seen == []
+    else:
+        assert actual is seen[0]
+        torch.testing.assert_close(actual, torch.tensor([[1], [4]]))
 
 
 @pytest.mark.parametrize(
@@ -106,3 +129,9 @@ def test_fallback_metadata_uses_native_logical_format(mode, expected):
         head_dim=128,
     )
     assert Indexer._sail_paged_mqa_metadata_extra(indexer) == (1, 32, 128, expected)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
