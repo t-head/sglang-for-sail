@@ -711,6 +711,7 @@ class CommonKVManager(BaseKVManager):
             max_tokens,
             device_type=get_device().device,
             include_draft=include_draft,
+            deregister_fn=getattr(self, "_deregister_staging_memory", None),
         )
         self._dcp_pack_max_tokens = max_tokens
 
