@@ -525,14 +525,24 @@ class CommonKVManager(BaseKVManager):
         exception because each CP rank owns different state layers. Page-sharded
         DSA indexer state likewise needs every owner; Mooncake filters its page
         lists before transfer instead of suppressing whole ranks.
+
+        The experimental DSA prefill-CP prefix cache is only un-bypassed for
+        interleave PD prefill deployments (disaggregation/utils.py:
+        supports_dsa_cp_prefix_cache), and the bypass decision already routes
+        every other strategy through the pre-feature behaviour of sending
+        state from all ranks. Re-checking the strategy here would only make
+        the transfer path abort for configurations that never asked for this
+        feature (zigzag with the raw environment switch set).
         """
-        return (
+        if (
             self.attn_cp_size > 1
             and self.attn_cp_rank != 0
             and not get_parallel().enable_dsa_cache_layer_split
             and not get_parallel().enable_cp_tp_group_sharing
             and getattr(self, "kv_shard_size", 1) <= 1
-        )
+        ):
+            return True
+        return False
 
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
         if self.dcp_size == dst_dcp_size:
