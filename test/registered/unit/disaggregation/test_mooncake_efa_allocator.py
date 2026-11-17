@@ -1,3 +1,4 @@
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -85,6 +86,18 @@ class TestMooncakeEfaAllocator(unittest.TestCase):
             (False, None),
         )
 
+    def test_forced_tcp_allows_expandable_segments_with_default_rdma_protocol(self):
+        self.assertEqual(
+            self._check(
+                "rdma",
+                allocator_env={
+                    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                    "MC_FORCE_TCP": "1",
+                },
+            ),
+            (False, None),
+        )
+
 
 class TestMooncakeRegistrationFailsLoud(CustomTestCase):
     def _manager(self, engine):
@@ -112,6 +125,32 @@ class TestMooncakeRegistrationFailsLoud(CustomTestCase):
             ),
         ):
             manager.init_engine()
+
+    def test_pack_buffer_failure_rejects_peer_without_escaping(self):
+        manager = object.__new__(MooncakeKVManager)
+        manager.session_lock = threading.Lock()
+        manager.state_layout_rejections = {}
+        manager.kv_args = SimpleNamespace(kv_item_lens=[64], num_draft_entries=0)
+        manager.requires_dcp_relayout = MagicMock(return_value=True)
+        manager.prepare_dcp_token_item_lens = MagicMock(return_value=[64])
+        manager._init_dcp_pack_buffers_once = MagicMock(
+            side_effect=RuntimeError("registration failed")
+        )
+        manager._publish_peer_registration = MagicMock(return_value=None)
+        decode_kv_args = SimpleNamespace(
+            dst_dcp_size=2,
+            dst_dcp_rank=0,
+            dst_kv_item_len=64,
+            dst_draft_rows_dcp_collapsed=False,
+        )
+
+        reason = manager._register_prefill_peer("session", decode_kv_args)
+
+        self.assertIn("registration failed", reason)
+        self.assertEqual(manager.state_layout_rejections["session"], reason)
+        manager._publish_peer_registration.assert_called_once_with(
+            "session", decode_kv_args
+        )
 
     def test_registers_each_deduplicated_region(self):
         engine = MagicMock()
