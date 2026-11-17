@@ -42,7 +42,7 @@ def _validate_mooncake_allocator_compatibility(
 ) -> None:
     """Reject allocator configs the selected Mooncake transport cannot register safely."""
     protocol = envs.MOONCAKE_PROTOCOL.get().lower()
-    if protocol == "rdma":
+    if protocol == "rdma" and os.environ.get("MC_FORCE_TCP") != "1":
         expandable_segments_var = _cuda_expandable_segments_enabled()
         if expandable_segments_var is not None:
             raise ValueError(

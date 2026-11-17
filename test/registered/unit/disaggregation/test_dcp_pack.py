@@ -340,6 +340,37 @@ class TestInitDcpPackBuffers(CustomTestCase):
         self.assertEqual(len(buffers), 2)
         self.assertEqual(staging_buffer.call_args.args[1], "cuda:3")
 
+    def test_registration_failure_rolls_back_registered_buffers(self):
+        buffers = [Mock(), Mock()]
+        for index, buf in enumerate(buffers):
+            buf.get_ptr.return_value = 0x1000 + index * 0x100
+            buf.get_size.return_value = 64
+        register_fn = Mock(side_effect=[None, RuntimeError("registration failed")])
+        deregister_fn = Mock()
+
+        with (
+            patch(
+                "sglang.srt.disaggregation.common.dcp_pack.StagingBuffer",
+                side_effect=buffers,
+            ),
+            patch(
+                "sglang.srt.disaggregation.common.staging_handler._get_custom_mem_pool",
+                return_value=(None, None),
+            ),
+            self.assertRaisesRegex(RuntimeError, "registration failed"),
+        ):
+            init_dcp_pack_buffers(
+                register_fn,
+                self._KV_ARGS,
+                2,
+                4,
+                64,
+                device_type="cuda:0",
+                deregister_fn=deregister_fn,
+            )
+
+        deregister_fn.assert_called_once_with(0x1000)
+
 
 class TestTryDcpPack(CustomTestCase):
     def test_try_pack_uses_requested_region_and_dense_indices(self):
