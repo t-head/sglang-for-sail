@@ -16,6 +16,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.kernels.jit.utils.common import is_sail_runtime
 
 from .fp4_indexer import INDEX_K_SLOT_BYTES
 from .utils import make_name
@@ -44,6 +45,9 @@ def _jit_index_q_module(head_dim: int, rope_dim: int) -> Module:
         make_name("index_q_rope_pack"),
         *args,
         cuda_files=["deepseek_v4/fp4_indexer_rope.cuh"],
+        extra_cuda_cflags=["-DSGL_SAIL_DSV4_INDEX_Q_BUILD"]
+        if is_sail_runtime()
+        else None,
         cuda_wrappers=[
             ("index_q_weights", f"IndexQKernel<{args}>::run_index_q_weights"),
         ],
