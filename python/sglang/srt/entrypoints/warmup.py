@@ -146,9 +146,10 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
         base *= 2
     sizes = sorted(sizes)
 
+    warmup_rng = np.random.RandomState(20261111)
     for size in tqdm.tqdm(sizes, desc="Warmup prefill shapes (up to 32K)"):
         generate_req_input = GenerateReqInput(
-            input_ids=(np.random.randint(2**16, size=[size])).tolist(),
+            input_ids=(warmup_rng.randint(2**16, size=[size])).tolist(),
             sampling_params={
                 "max_new_tokens": 1,
                 "temperature": 0.0,
