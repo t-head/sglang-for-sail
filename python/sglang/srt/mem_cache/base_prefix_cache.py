@@ -406,6 +406,8 @@ def dsa_cp_prefix_cache_alignment() -> int:
     the physical page boundary. Use resolved page geometry, not the pristine
     operator input (whose page_size may be None). This value must follow
     scoped configuration/environment overrides, so it is not process-cached.
+    Pooled index layouts additionally need a complete packed indexer page;
+    startup currently rejects them until prefix-page ownership is supported.
     """
     from sglang.srt.environ import envs
 

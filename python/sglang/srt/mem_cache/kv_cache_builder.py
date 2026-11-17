@@ -34,11 +34,16 @@ from sglang.srt.configs.hybrid_arch import (
     linear_attn_model_spec,
     mamba2_config,
 )
-from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
+from sglang.srt.configs.model_config import (
+    ModelImpl,
+    get_dsa_index_kpool,
+    is_deepseek_dsa,
+)
 from sglang.srt.disaggregation.utils import (
     dsa_cp_prefix_cache_enabled,
     should_bypass_dsa_cp_prefix_cache,
     supports_dsa_cp_prefix_cache,
+    validate_dsa_cp_prefix_cache_geometry,
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
@@ -379,11 +384,17 @@ def build_kv_cache(
         and dsa_cp_prefix_cache_enabled()
         and supports_dsa_cp_prefix_cache()
     ):
-        if page_size != 64:
-            raise ValueError(
-                "SGLANG_DSA_CP_PREFIX_CACHE=1 requires page_size == 64 for DSA "
-                f"prefill CP; got page_size={page_size}."
-            )
+        validate_dsa_cp_prefix_cache_geometry(
+            page_size=page_size,
+            index_kpool=get_dsa_index_kpool(model_config.hf_config),
+            cache_layer_split=get_parallel().enable_dsa_cache_layer_split,
+            hicache_layout=(
+                get_memory().hicache_mem_layout if enable_hierarchical_cache else None
+            ),
+            hicache_io_backend=(
+                get_memory().hicache_io_backend if enable_hierarchical_cache else None
+            ),
+        )
         logger.info("DSA prefill CP prefix cache is enabled (experimental).")
     if disable_radix_cache and not get_memory().disable_radix_cache:
         if bypass_dsa_cp_prefix_cache:
