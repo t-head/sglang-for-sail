@@ -9,6 +9,7 @@ from sglang.srt.disaggregation.mooncake.utils import (
 )
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -85,7 +86,7 @@ class TestMooncakeEfaAllocator(unittest.TestCase):
         )
 
 
-class TestMooncakeRegistrationFailsLoud(unittest.TestCase):
+class TestMooncakeRegistrationFailsLoud(CustomTestCase):
     def _manager(self, engine):
         manager = object.__new__(MooncakeKVManager)
         manager.engine = engine
@@ -98,6 +99,19 @@ class TestMooncakeRegistrationFailsLoud(unittest.TestCase):
             state_data_lens=[[64]],
         )
         return manager
+
+    def test_init_engine_rejects_missing_shared_engine(self):
+        manager = object.__new__(MooncakeKVManager)
+        with (
+            patch(
+                "sglang.srt.disaggregation.mooncake.conn.get_mooncake_transfer_engine",
+                return_value=None,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError, "Mooncake transfer engine is not initialized"
+            ),
+        ):
+            manager.init_engine()
 
     def test_registers_each_deduplicated_region(self):
         engine = MagicMock()
