@@ -368,10 +368,15 @@ def build_kv_cache(
     retraction_backup = resolve_decode_retraction_backup(tp_worker=tp_worker)
 
     bypass_dsa_cp_prefix_cache = should_bypass_dsa_cp_prefix_cache(is_dsa=is_dsa)
+    disable_radix_cache = (
+        get_memory().disable_radix_cache
+        or (model_config.is_multimodal and uses_transformers_backend)
+        or bypass_dsa_cp_prefix_cache
+    )
     if (
         is_dsa
+        and not disable_radix_cache
         and dsa_cp_prefix_cache_enabled()
-        and get_disagg().disaggregation_mode == "prefill"
         and supports_dsa_cp_prefix_cache()
     ):
         if page_size != 64:
@@ -380,11 +385,6 @@ def build_kv_cache(
                 f"prefill CP; got page_size={page_size}."
             )
         logger.info("DSA prefill CP prefix cache is enabled (experimental).")
-    disable_radix_cache = (
-        get_memory().disable_radix_cache
-        or (model_config.is_multimodal and uses_transformers_backend)
-        or bypass_dsa_cp_prefix_cache
-    )
     if disable_radix_cache and not get_memory().disable_radix_cache:
         if bypass_dsa_cp_prefix_cache:
             logger.warning(

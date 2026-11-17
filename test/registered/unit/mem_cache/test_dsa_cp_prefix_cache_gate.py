@@ -27,7 +27,9 @@ from array import array
 from types import SimpleNamespace
 
 import torch
+from transformers import PretrainedConfig
 
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import (
     should_bypass_dsa_cp_prefix_cache,
     supports_dsa_cp_prefix_cache,
@@ -210,7 +212,7 @@ class TestGateInInitNextRoundInput(CustomTestCase):
 
         self.assertIsNotNone(req.kv.mamba_pool_idx)
         self.assertIsNone(req.kv.mamba_cow_src_index)
-        self.assertFalse(req.kv.mamba_needs_clear)
+        self.assertTrue(req.kv.mamba_needs_clear)
         self.assertIsNone(req.mamba_branching_seqlen)
         self.assertEqual(allocator.alloc_calls, 0)
         self.assertEqual(allocator.free_calls, 0)
@@ -360,11 +362,12 @@ class TestDropMisalignedReuse(CustomTestCase):
             dropped = drop_misaligned_dsa_cp_prefix_reuse(
                 _ZeroingTreeCache(allocator),
                 req,
-                _match(device_len=6),
+                _match(device_len=6)._replace(cache_protected_len=6),
                 mamba_held_before_match=False,
             )
 
         self.assertEqual(dropped.device_prefix_len, 0)
+        self.assertEqual(dropped.cache_protected_len, 0)
         self.assertIsNone(dropped.mamba_branching_seqlen)
         self.assertIsNotNone(dropped.last_device_node)
         self.assertIsNone(req.kv.mamba_pool_idx)
@@ -390,6 +393,30 @@ class TestDropMisalignedReuse(CustomTestCase):
         self.assertEqual(allocator.free_calls, 0)
         self.assertIsNotNone(req.kv.mamba_pool_idx)
 
+    def test_retained_session_state_is_cleared_before_recomputation(self):
+        allocator = _TrackingMambaAllocator()
+        req = SimpleNamespace(
+            kv=ReqKvInfo(mamba_pool_idx=torch.tensor(4, dtype=torch.int64)),
+            session=object(),
+        )
+        with unittest.mock.patch(
+            "sglang.srt.mem_cache.base_prefix_cache.dsa_cp_prefix_cache_alignment",
+            return_value=4,
+        ):
+            match = drop_misaligned_dsa_cp_prefix_reuse(
+                _ZeroingTreeCache(allocator),
+                req,
+                _match(device_len=6),
+                mamba_held_before_match=True,
+            )
+
+        batch = SimpleNamespace()
+        ScheduleBatch._collect_deferred_mamba_cow_and_clear(batch, [req])
+        self.assertEqual(match.device_prefix_len, 0)
+        self.assertEqual(allocator.free_calls, 0)
+        self.assertEqual(req.kv.mamba_pool_idx.item(), 4)
+        self.assertEqual(batch.mamba_clear_indices.tolist(), [4])
+
 
 def _pd_args(**overrides):
     from sglang.srt.runtime_context import get_context
@@ -412,6 +439,10 @@ class TestBypassPredicates(CustomTestCase):
 
     def test_zigzag_is_not_supported(self):
         with _pd_args(cp_strategy="zigzag"):
+            self.assertFalse(supports_dsa_cp_prefix_cache())
+
+    def test_decode_is_not_supported(self):
+        with _pd_args(disaggregation_mode="decode"):
             self.assertFalse(supports_dsa_cp_prefix_cache())
 
     def test_unified_deployment_is_not_supported(self):
@@ -480,6 +511,70 @@ class TestWrapperCowMambaGate(CustomTestCase):
         self.assertEqual(req.prefix_len, 4)
         self.assertIsNotNone(req.kv.mamba_pool_idx)
         self.assertEqual(allocator.free_calls, 0)
+
+
+class TestResolvedDsaCpAlignment(CustomTestCase):
+    """The alignment follows resolved config and scoped feature overrides."""
+
+    def setUp(self):
+        super().setUp()
+        from sglang.srt.mem_cache.base_prefix_cache import dsa_cp_prefix_cache_alignment
+
+        # PR224 memoizes this globally. Clear between tests, but deliberately
+        # not between overrides inside a test: that would hide the regression.
+        clear = getattr(dsa_cp_prefix_cache_alignment, "cache_clear", None)
+        if clear:
+            clear()
+            self.addCleanup(clear)
+
+    def _context(self):
+        from sglang.srt.runtime_context import get_context
+
+        model = ModelConfig.__new__(ModelConfig)
+        model.hf_config = PretrainedConfig(
+            architectures=["GlmMoeDsaForCausalLM"],
+            index_topk=2048,
+            index_kpool=1,
+        )
+        return get_context().override_server_args(
+            page_size=None,
+            attn_cp_size=8,
+            cp_strategy="interleave",
+            enable_prefill_cp=True,
+            disaggregation_mode="prefill",
+            _model_config=model,
+        )
+
+    def test_resolved_page_size_replaces_unspecified_input(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.base_prefix_cache import dsa_cp_prefix_cache_alignment
+        from sglang.srt.runtime_context import get_schedule
+
+        with self._context(), envs.SGLANG_DSA_CP_PREFIX_CACHE.override(True):
+            with get_schedule().override(page_size=64):
+                self.assertEqual(dsa_cp_prefix_cache_alignment(), 64)
+
+    def test_alignment_follows_scoped_page_override(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.base_prefix_cache import dsa_cp_prefix_cache_alignment
+        from sglang.srt.runtime_context import get_schedule
+
+        with self._context(), envs.SGLANG_DSA_CP_PREFIX_CACHE.override(True):
+            with get_schedule().override(page_size=64):
+                self.assertEqual(dsa_cp_prefix_cache_alignment(), 64)
+            with get_schedule().override(page_size=128):
+                self.assertEqual(dsa_cp_prefix_cache_alignment(), 128)
+
+    def test_disabled_call_does_not_poison_later_enabled_call(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.base_prefix_cache import dsa_cp_prefix_cache_alignment
+        from sglang.srt.runtime_context import get_schedule
+
+        with self._context(), get_schedule().override(page_size=64):
+            with envs.SGLANG_DSA_CP_PREFIX_CACHE.override(False):
+                self.assertEqual(dsa_cp_prefix_cache_alignment(), 1)
+            with envs.SGLANG_DSA_CP_PREFIX_CACHE.override(True):
+                self.assertEqual(dsa_cp_prefix_cache_alignment(), 64)
 
 
 if __name__ == "__main__":

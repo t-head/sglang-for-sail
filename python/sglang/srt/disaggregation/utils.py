@@ -175,7 +175,7 @@ def supports_dsa_cp_prefix_cache() -> bool:
     pools read their local layers; split pools read an owner broadcast.
     """
     return (
-        get_disagg().disaggregation_mode != "null"
+        get_disagg().disaggregation_mode == "prefill"
         and get_parallel().enable_prefill_cp
         and get_parallel().cp_strategy == "interleave"
     )
