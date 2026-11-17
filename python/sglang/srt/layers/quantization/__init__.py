@@ -44,6 +44,7 @@ from sglang.srt.layers.quantization.nvfp4_online import NvFp4OnlineConfig
 from sglang.srt.layers.quantization.petit import PetitNvFp4Config
 from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 from sglang.srt.layers.quantization.quark_int4fp8_moe import QuarkInt4Fp8Config
+from sglang.srt.layers.quantization.w4a8_int8 import W4A8Int8Config
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
@@ -81,6 +82,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "moe_wna16": MoeWNA16Config,
     "compressed-tensors": CompressedTensorsConfig,
     "w4afp8": W4AFp8Config,
+    "w4a8_int8": W4A8Int8Config,
     "mixed_precision_w4": MixedPrecisionW4Config,
     "petit_nvfp4": PetitNvFp4Config,
     "quark": QuarkConfig,

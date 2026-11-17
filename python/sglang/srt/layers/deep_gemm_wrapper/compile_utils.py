@@ -140,6 +140,10 @@ class DeepGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_I8I8BF16_NOPAD = auto()
     GEMM_NT_I8I8BF16 = auto()
 
+    # W4A8-Int8: INT8 activations x packed INT4 weights -> BF16 output.
+    GROUPED_GEMM_NT_I8I4BF16_MASKED = auto()
+    GROUPED_GEMM_NT_I8I4BF16_NOPAD = auto()
+
     GROUPED_GEMM_NT_BF16_NOPAD = auto()
 
     GROUPED_GEMM_NT_F4F4BF16_MASKED = auto()
@@ -419,6 +423,8 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
             DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_CONTIG: _GroupedContWarmupExecutor_int8,
             DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_NOPAD: _GroupedNopadWarmupExecutor_int8,
             DeepGemmKernelType.GEMM_NT_I8I8BF16: _NormalWarmupExecutor_int8,
+            DeepGemmKernelType.GROUPED_GEMM_NT_I8I4BF16_MASKED: _GroupedMaskedWarmupExecutor_int8_int4,
+            DeepGemmKernelType.GROUPED_GEMM_NT_I8I4BF16_NOPAD: _GroupedNopadWarmupExecutor_int8_int4,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16_NOPAD: _GroupedNopadWarmupExecutor_bf16,
             DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_MASKED: _GroupedMaskedWarmupExecutor_fp4,
             DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_NOPAD: _GroupedNopadWarmupExecutor_fp4,
@@ -561,6 +567,25 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
                 + num_groups * max_m * n * 2
                 + num_groups * (lhs_scales + rhs_scales)
                 + scale_workspace
+            ) / _GB
+        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_I8I4BF16_MASKED:
+            # int8 activations x packed int4 weights -> bf16 output (masked).
+            return (
+                num_groups * max_m * k  # int8 activations
+                + num_groups * n * k // 2  # packed int4 weights (2 values per byte)
+                + num_groups * n  # per-channel weight scales (float32)
+                + num_groups * max_m  # per-token activation scales (float32)
+                + num_groups * 4  # masked_m (int32)
+                + num_groups * max_m * n * 2  # bf16 output
+            ) / _GB
+        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_I8I4BF16_NOPAD:
+            # int8 activations x packed int4 weights -> bf16 output (nopad).
+            return (
+                max_m * k  # int8 activations
+                + num_groups * n * k // 2  # packed int4 weights
+                + num_groups * n  # per-channel weight scales (float32)
+                + max_m  # per-token activation scales (float32)
+                + max_m * n * 2  # bf16 output
             ) / _GB
         elif kernel_type == DeepGemmKernelType.GEMM_NT_BF16BF16F32:
             # bf16 lhs + bf16 rhs + fp32 out
@@ -1096,6 +1121,16 @@ def _empty_block_int8(size):
     )
 
 
+def _empty_block_int4_packed(size):
+    # Packed INT4 weights: uint8 storage, 2 int4 values per byte along K.
+    # Per-channel scale shape: (..., N, 1) float32.
+    *dims, n, k = size
+    return (
+        torch.empty((*dims, n, k // 2), device="cuda", dtype=torch.uint8),
+        torch.empty((*dims, n, 1), device="cuda", dtype=torch.float32),
+    )
+
+
 def _empty_token_fp8_channel(size):
     *dims, k = size
     return (
@@ -1346,6 +1381,53 @@ class _GroupedNopadWarmupExecutor_int8(_BaseWarmupExecutor):
             (self.rhs_q, self.rhs_s),
             self.out[:m],
             m_indices=self.m_indices[:m],
+        )
+
+
+class _GroupedMaskedWarmupExecutor_int8_int4(_BaseWarmupExecutor):
+    """Warmup for W4A8-Int8 masked path: INT8 activations x packed INT4 weights."""
+
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q, self.lhs_s = _empty_token_int8((num_groups, max_m, k))
+        self.rhs_q, self.rhs_s = _empty_block_int4_packed((num_groups, n, k))
+        self.masked_m = torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty(
+            (num_groups, max_m, n), device="cuda", dtype=torch.bfloat16
+        )
+
+    def execute(self, m):
+        deep_gemm.m_grouped_gemm_int8_int4_bf16_nt_masked(
+            (self.lhs_q, self.lhs_s),
+            (self.rhs_q, self.rhs_s),
+            self.out,
+            masked_m=self.masked_m,
+            expected_m=m,
+        )
+
+
+class _GroupedNopadWarmupExecutor_int8_int4(_BaseWarmupExecutor):
+    """Warmup for W4A8-Int8 nopad path: INT8 activations x packed INT4 weights."""
+
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q, self.lhs_s = _empty_token_int8((max_m, k))
+        self.rhs_q, self.rhs_s = _empty_block_int4_packed((num_groups, n, k))
+        self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
+        self.m_rows = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+
+    def execute(self, m):
+        deep_gemm.m_grouped_gemm_int8_int4_bf16_nt_nopad(
+            (self.lhs_q[:m], self.lhs_s[:m]),
+            (self.rhs_q, self.rhs_s),
+            self.out[:m],
+            m_indices=self.m_indices[:m],
+            m_rows=self.m_rows[:m],
         )
 
 
