@@ -527,7 +527,7 @@ class TestPPUCIDocker(CustomTestCase):
             step
             for step in workflow["jobs"]["ppu-sanity"]["steps"]
             if step.get("name")
-            == "Run both speculative sanity files in isolated Docker"
+            == "Run PPU sanity and kernel regressions in isolated Docker"
         )
         env = {
             **self.env,
