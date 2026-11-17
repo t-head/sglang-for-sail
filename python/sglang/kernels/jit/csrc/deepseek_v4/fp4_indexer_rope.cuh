@@ -86,6 +86,21 @@ struct IndexPacked {
   uint32_t exponent[2];  // blocks {0, 1} then {2, 3}, by half of the warp
 };
 
+#if defined(SGL_SAIL_DSV4_INDEX_Q_BUILD) && defined(__HGGCCC__) && SGL_CUDA_ARCH == 890
+#define SGL_DSV4_INDEX_Q_PPU_E2M1
+
+/// Pack two FP32 values with the 890 E2M1 conversion instruction.
+SGL_DEVICE uint32_t index_q_pack_e2m1(fp32x2_t x) {
+  // The software encoder saturates NaNs to signed 6 via fminf(fabsf(x), 6).
+  // Preserve that behavior while passing finite values and infinities through.
+  x.x = isnan(x.x) ? copysignf(6.0f, x.x) : x.x;
+  x.y = isnan(x.y) ? copysignf(6.0f, x.y) : x.y;
+  uint32_t packed;
+  asm("{ .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %2, %1; cvt.u32.u8 %0, t; }" : "=r"(packed) : "f"(x.x), "f"(x.y));
+  return packed;
+}
+#endif
+
 /// \brief The whole shared body of both directions: RoPE tail, both fp4 stages,
 ///        and the indexer's pack.
 ///
@@ -118,7 +133,14 @@ SGL_DEVICE IndexPacked index_rope_quant_pack(fp32x2_t head, fp32x2_t tail, fp32x
   for (uint32_t half = 0; half < 2; ++half) {
     const auto amax = warp::reduce_max<kHalfLanes>(fmaxf(fabsf(data[half * 2]), fabsf(data[half * 2 + 1])));
     const auto [scale, inv_scale] = fp4::block_scale(amax);
-    const auto q = fp4::fake_quant_x2({data[half * 2], data[half * 2 + 1]}, scale, inv_scale);
+    const fp32x2_t pair{data[half * 2], data[half * 2 + 1]};
+#ifdef SGL_DSV4_INDEX_Q_PPU_E2M1
+    const auto code = index_q_pack_e2m1({__fmaf_rn(pair.x, inv_scale, 0.0f), __fmaf_rn(pair.y, inv_scale, 0.0f)});
+    // Decode the nibbles in software on 890.
+    const fp32x2_t q{fp4::e2m1_value(code) * scale, fp4::e2m1_value(code >> 4) * scale};
+#else
+    const auto q = fp4::fake_quant_x2(pair, scale, inv_scale);
+#endif
     data[half * 2 + 0] = q.x;
     data[half * 2 + 1] = q.y;
   }
@@ -133,16 +155,20 @@ SGL_DEVICE IndexPacked index_rope_quant_pack(fp32x2_t head, fp32x2_t tail, fp32x
     // `inv_scale_ue8m0` instead of the reference's division: the scale is a
     // power of two, so both are exact except at the unreachable exponent 254.
     const auto inv_scale = deepseek_v4::fp8::inv_scale_ue8m0(static_cast<int32_t>(out.exponent[half]));
-#ifndef SGL_SOFTWARE_E2M1
-    const auto code = __nv_cvt_float2_to_fp4x2(
-        fp32x2_t{data[half * 2] * inv_scale, data[half * 2 + 1] * inv_scale}, __NV_E2M1, cudaRoundNearest);
+    const fp32x2_t scaled{data[half * 2] * inv_scale, data[half * 2 + 1] * inv_scale};
+#if defined(SGL_DSV4_INDEX_Q_PPU_E2M1)
+    const auto code = index_q_pack_e2m1(scaled);
+#elif defined(SGL_SOFTWARE_E2M1)
+    const auto code = fp4::e2m1x2_code(scaled);
 #else
-    const auto code = fp4::e2m1x2_code(fp32x2_t{data[half * 2] * inv_scale, data[half * 2 + 1] * inv_scale});
+    const auto code = __nv_cvt_float2_to_fp4x2(scaled, __NV_E2M1, cudaRoundNearest);
 #endif
     out.payload[half] = clear_negative_zero(static_cast<uint32_t>(code));
   }
   return out;
 }
+
+#undef SGL_DSV4_INDEX_Q_PPU_E2M1
 
 /// \brief The row's four block exponents, packed little-endian into one word.
 ///
