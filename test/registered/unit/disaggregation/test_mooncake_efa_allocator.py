@@ -100,6 +100,19 @@ class TestMooncakeRegistrationFailsLoud(CustomTestCase):
         )
         return manager
 
+    def test_init_engine_rejects_missing_shared_engine(self):
+        manager = object.__new__(MooncakeKVManager)
+        with (
+            patch(
+                "sglang.srt.disaggregation.mooncake.conn.get_mooncake_transfer_engine",
+                return_value=None,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError, "Mooncake transfer engine is not initialized"
+            ),
+        ):
+            manager.init_engine()
+
     def test_registers_each_deduplicated_region(self):
         engine = MagicMock()
         self._manager(engine).register_buffer_to_engine()
