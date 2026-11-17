@@ -173,6 +173,114 @@ def test_kda_extend_dispatcher_normalizes_kernel_return_contract():
     assert h is None
 
 
+class TestFlashKDAStridedInputs(CustomTestCase):
+    def test_backend_layout_and_state_writeback(self):
+        """Packed projection views must avoid PLA copies but remain valid for
+        the contiguous-only external backend, including output/state writes.
+        """
+        num_tokens, num_heads, head_dim = 64, 2, 128
+        qkv = (
+            torch.arange(num_tokens * 3 * num_heads * head_dim, dtype=torch.float32)
+            .reshape(1, num_tokens, 3 * num_heads, head_dim)
+            .to(torch.bfloat16)
+        )
+        q, k, v = qkv.split(num_heads, dim=2)
+        gate_beta = (
+            torch.arange(num_tokens * num_heads * (head_dim + 1), dtype=torch.float32)
+            .reshape(1, num_tokens, -1)
+            .to(torch.bfloat16)
+        )
+        g = gate_beta[..., : num_heads * head_dim].unflatten(-1, (num_heads, head_dim))
+        beta = gate_beta[..., num_heads * head_dim :]
+        inputs = dict(q=q, k=k, v=v, g=g, beta=beta)
+        for tensor in inputs.values():
+            self.assertFalse(tensor.is_contiguous())
+
+        initial_pool = torch.arange(5, dtype=torch.float32).view(5, 1, 1, 1)
+        initial_pool = initial_pool.expand(5, num_heads, head_dim, head_dim).clone()
+        cache_indices = torch.tensor([3, 1], dtype=torch.int32)
+        expected_states = initial_pool.clone()
+        expected_states[cache_indices] += 1
+        expected_output = q + k + v + g + beta.unsqueeze(-1)
+
+        for use_pla in (True, False):
+            with self.subTest(use_pla=use_pla):
+                states = initial_pool.clone()
+
+                def run_kernel(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    scale,
+                    out,
+                    A_log,
+                    dt_bias,
+                    lower_bound,
+                    *,
+                    initial_state,
+                    final_state,
+                    **kwargs,
+                ):
+                    for name, tensor in dict(q=q, k=k, v=v, g=g, beta=beta).items():
+                        source = inputs[name]
+                        self.assertTrue(torch.equal(tensor.reshape_as(source), source))
+                        if use_pla:
+                            self.assertEqual(tensor.data_ptr(), source.data_ptr())
+                            self.assertEqual(tensor.stride(), source.stride()[1:])
+                        else:
+                            self.assertTrue(tensor.is_contiguous())
+
+                    self.assertTrue(out.is_contiguous())
+                    self.assertTrue(
+                        torch.equal(initial_state, initial_pool[cache_indices])
+                    )
+                    out.copy_(q + k + v + g + beta.unsqueeze(-1))
+                    final_state.copy_(initial_state + 1)
+
+                fwd = Mock(side_effect=run_kernel)
+                pla_module = ModuleType("pla")
+                prefill_module = ModuleType("pla.prefill")
+                flashkda_module = ModuleType("pla.prefill.flashkdapro")
+                pla_module.prefill = prefill_module
+                prefill_module.flashkdapro = flashkda_module
+                flashkda_module.flashkda_fwd = fwd
+
+                with (
+                    patch.object(kda_flashkda, "is_sail", return_value=use_pla),
+                    patch.object(
+                        kda_flashkda,
+                        "_load_flash_kda",
+                        return_value=SimpleNamespace(fwd=fwd),
+                    ),
+                    patch.dict(
+                        sys.modules,
+                        {
+                            "pla": pla_module,
+                            "pla.prefill": prefill_module,
+                            "pla.prefill.flashkdapro": flashkda_module,
+                        },
+                    ),
+                ):
+                    output = kda_flashkda.FlashKDAKernel()._flashkda_extend(
+                        **inputs,
+                        ssm_states=states,
+                        cache_indices=cache_indices,
+                        query_start_loc=torch.tensor([0, 19, 64], dtype=torch.int32),
+                        A_log=torch.zeros(1, 1, num_heads, 1),
+                        dt_bias=torch.zeros(num_heads * head_dim),
+                        lower_bound=-5.0,
+                        beta_is_raw=True,
+                        extend_seq_lens_cpu=[19, 45],
+                    )
+
+                fwd.assert_called_once()
+                self.assertEqual(output.shape, q.shape)
+                self.assertTrue(torch.equal(output, expected_output))
+                self.assertTrue(torch.equal(states, expected_states))
+
+
 @pytest.mark.parametrize(
     "extend_kwargs, device_offsets, expected_raw",
     [
