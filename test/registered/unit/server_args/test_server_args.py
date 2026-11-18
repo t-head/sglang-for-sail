@@ -743,6 +743,56 @@ class TestPrepareServerArgs(CustomTestCase):
             ):
                 validate_mega_moe_token_budget(args, "Qwen3MoeForCausalLM")
 
+    def test_minimax_megamoe_eager_and_prefill_graph_capacity(self):
+        from sglang.srt.arg_groups import mega_moe_hook as hook
+        from sglang.srt.environ import envs
+
+        for architecture in (
+            "MiniMaxM3SparseForCausalLM",
+            "MiniMaxM3SparseForConditionalGeneration",
+        ):
+            cfg = SimpleNamespace(
+                moe_a2a_backend="megamoe",
+                disaggregation_mode="null",
+                cuda_graph_config=SimpleNamespace(
+                    decode=SimpleNamespace(max_bs=16),
+                    prefill=SimpleNamespace(backend="disabled", max_bs=0, bs=[]),
+                ),
+                max_running_requests=None,
+                attn_dp_size=1,
+                tp_size=1,
+                speculative_algorithm=None,
+                speculative_num_draft_tokens=None,
+                pp_size=1,
+                enable_dynamic_chunking=False,
+                chunked_prefill_size=32,
+                enable_prefill_cp=False,
+                attn_cp_size=1,
+            )
+            with (
+                self.subTest(architecture=architecture),
+                patch.object(hook, "resolving_view", return_value=cfg),
+                patch.object(hook, "attn_dp_enabled_of", return_value=False),
+                override_platform(is_hip=False),
+                envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(64),
+            ):
+                with self.assertRaisesRegex(ValueError, "max-running-requests"):
+                    hook.validate_mega_moe_token_budget(None, architecture)
+                cfg.max_running_requests = 65
+                with self.assertRaisesRegex(ValueError, "largest decode"):
+                    hook.validate_mega_moe_token_budget(None, architecture)
+                cfg.max_running_requests = 64
+                hook.validate_mega_moe_token_budget(None, architecture)
+                cfg.max_prefill_tokens = 65
+                with self.assertRaisesRegex(ValueError, "required_per_rank=65"):
+                    hook.validate_mega_moe_token_budget(None, architecture)
+                cfg.max_prefill_tokens = 64
+                cfg.cuda_graph_config.prefill = SimpleNamespace(
+                    backend="full", max_bs=32, bs=[32, 65]
+                )
+                with self.assertRaisesRegex(ValueError, "required_per_rank=65"):
+                    hook.validate_mega_moe_token_budget(None, architecture)
+
     def test_megamoe_token_budget_uses_resolved_dp_chunked_prefill(self):
         from sglang.srt.arg_groups.mega_moe_hook import validate_mega_moe_token_budget
         from sglang.srt.environ import envs
@@ -838,6 +888,8 @@ class TestPrepareServerArgs(CustomTestCase):
             "DeepseekV4ForCausalLM",
             "GlmMoeDsaForCausalLM",
             "Glm5NextForConditionalGeneration",
+            "MiniMaxM3SparseForCausalLM",
+            "MiniMaxM3SparseForConditionalGeneration",
         ):
             self.assertTrue(mega_moe_needs_token_budget(arch, {}, None), arch)
         # MXFP4 DeepSeek-family models keep their runtime fallback.
