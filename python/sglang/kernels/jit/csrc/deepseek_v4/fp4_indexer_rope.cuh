@@ -295,7 +295,7 @@ __global__ __launch_bounds__(kFp4RopeWarpsPerCTA* device::kWarpThreads) void ind
   }
 }
 
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && !defined(__HGGCCC__)
 /// Threads per CTA of `index_q_block_kernel`: 64 (token, head) rows.
 constexpr uint32_t kIndexQBlockThreads = 256;
 
@@ -503,7 +503,7 @@ struct IndexQKernel {
 
   template <typename PosT, bool kWeights>
   static constexpr auto kernel = index_q_kernel<kUsePDL, kHeadDim, kRopeDim, PosT, kWeights>;
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && !defined(__HGGCCC__)
   template <typename PosT, bool kWeights>
   static constexpr auto block_kernel = index_q_block_kernel<kUsePDL, kHeadDim, kRopeDim, PosT, kWeights>;
   /// (token, head) rows from which SM100-family GPUs take `index_q_block_kernel`:
@@ -593,7 +593,7 @@ struct IndexQKernel {
         .heads = static_cast<uint32_t>(H.unwrap()),
     };
     const auto i32 = pos_dtype.is_type<int32_t>();
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && !defined(__HGGCCC__)
     if (num_rows >= kBlockKernelMinRows && runtime::get_cc_major(device_.unwrap().device_id) == 10) {
       // The block kernel moves input and freqs_cis rows in 32-byte vectors and payload
       // rows in 16-byte vectors; a misaligned view fails here instead of faulting.
