@@ -291,6 +291,7 @@ if _is_cuda:
         n_heads_inv_sqrt: float,
         softmax_scale: float,
         q_scale: torch.Tensor,
+        bf16_output: bool = False,
     ) -> torch.Tensor:
         return torch.empty(
             (x.shape[0], weight.shape[0], q_scale.shape[-1]),
@@ -306,8 +307,13 @@ if _is_cuda:
         n_heads_inv_sqrt: float,
         softmax_scale: float,
         q_scale: torch.Tensor,
+        bf16_output: bool = False,
     ) -> torch.Tensor:
-        out = torch.mm(x, weight.t(), out_dtype=torch.float32)
+        out = (
+            torch.mm(x, weight.t())
+            if bf16_output
+            else torch.mm(x, weight.t(), out_dtype=torch.float32)
+        )
         weights = out * n_heads_inv_sqrt
         weights = weights.unsqueeze(-1) * q_scale * softmax_scale
         return weights
@@ -317,10 +323,10 @@ if _is_cuda:
         weight: torch.Tensor,
         n_heads_inv_sqrt: float,
         softmax_scale: float,
-        q_scale: torch.Tensor,
+        bf16_output: bool = False,
     ) -> torch.Tensor:
         return torch.empty(
-            (x.shape[0], weight.shape[0], q_scale.shape[-1]),
+            (x.shape[0], weight.shape[0], 1),
             dtype=torch.float32,
             device=x.device,
         )
@@ -331,11 +337,16 @@ if _is_cuda:
         weight: torch.Tensor,
         n_heads_inv_sqrt: float,
         softmax_scale: float,
+        bf16_output: bool = False,
     ) -> torch.Tensor:
-        out = torch.mm(x, weight.t(), out_dtype=torch.float32)
+        out = (
+            torch.mm(x, weight.t())
+            if bf16_output
+            else torch.mm(x, weight.t(), out_dtype=torch.float32)
+        )
         weights = out * n_heads_inv_sqrt
         weights = weights.unsqueeze(-1) * softmax_scale
-        return weights
+        return weights.to(torch.float32)
 
     @register_custom_op(mutates_args=["topk_indices"])
     @register_split_op()
@@ -483,6 +494,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.use_dsa_indexer_fusion = (
             _is_cuda
             and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
+            and not is_neox_style
+            and not self.skip_rope
+        )
+        self.use_sail_bf16_head_gate = (
+            _is_cuda
+            and is_sail()
+            and not self.use_dsa_indexer_fusion
             and not is_neox_style
             and not self.skip_rope
         )
@@ -857,7 +875,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if _use_aiter and _is_gfx95_supported and isinstance(x, tuple) and len(x) == 3:
             x = x[2]
         if _is_cuda:
-            if self.bf16_head_gate:
+            if self.bf16_head_gate or self.use_sail_bf16_head_gate:
                 return torch.mm(x, self.weights_proj.weight.t())
             return torch.mm(x, self.weights_proj.weight.t(), out_dtype=torch.float32)
 
@@ -877,6 +895,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     def _get_logits_head_gate(
         self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]], q_scale: torch.Tensor
     ):
+        if self.use_sail_bf16_head_gate:
+            weights_raw = self._weights_proj_bf16_in_fp32_out(x)
+            return self._scale_head_gates(weights_raw, q_scale)
         if self.bf16_head_gate:
             return self._bf16_head_gate(x).unsqueeze(-1) * q_scale * self.softmax_scale
         return self._get_logits_head_gate_fp32(x, q_scale)
@@ -904,8 +925,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
 
-    @torch.compile(dynamic=True)
     def _get_logits_head_gate_no_q_scale(
+        self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]]
+    ):
+        if self.use_sail_bf16_head_gate:
+            weights_raw = self._weights_proj_bf16_in_fp32_out(x)
+            return self._scale_head_gates_no_q_scale(weights_raw)
+        return self._get_logits_head_gate_no_q_scale_fp32(x)
+
+    @torch.compile(dynamic=True)
+    def _get_logits_head_gate_no_q_scale_fp32(
         self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]]
     ):
         # FP4 indexer path: per-block Q scales travel alongside Q values, so
@@ -3319,6 +3348,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             if not self.use_dsa_indexer_fusion:
                 if weights_proj_lora:
                     weights = self.weights_proj(x)[0].float() * self.n_heads**-0.5
+                elif self.use_sail_bf16_head_gate:
+                    split_weights_raw = self._weights_proj_bf16_in_fp32_out(x)
                 else:
                     weights = self._project_and_scale_head_gates(x)
             query, key, weights_raw = self._get_q_k_bf16(
@@ -3335,6 +3366,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             current_stream.wait_stream(self.alt_stream)
             if self.use_dsa_indexer_fusion:
                 weights = self._scale_head_gates(weights_raw, q_scale)
+            elif self.use_sail_bf16_head_gate and not weights_proj_lora:
+                weights = self._scale_head_gates(split_weights_raw, q_scale)
             else:
                 weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
         else:
@@ -3461,6 +3494,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                             self.weights_proj.weight,
                             self.n_heads**-0.5,
                             self.softmax_scale,
+                            self.use_sail_bf16_head_gate,
                         )
                 elif self.use_dsa_indexer_fusion:
                     weights = scale_head_gate_graph(
@@ -3478,6 +3512,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                         self.n_heads**-0.5,
                         self.softmax_scale,
                         q_scale,
+                        self.use_sail_bf16_head_gate,
                     )
             elif self.use_fp4:
                 # FP4 path: per-block Q scales travel with Q values, so the

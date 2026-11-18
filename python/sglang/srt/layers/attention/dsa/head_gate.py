@@ -41,6 +41,7 @@ if _is_cuda or _is_hip:
         n_heads_inv_sqrt: float,
         softmax_scale: float,
         q_scale: torch.Tensor,
+        bf16_output: bool = False,
     ) -> torch.Tensor:
         return torch.empty(
             (x.shape[0], weight.shape[0], q_scale.shape[-1]),
@@ -56,8 +57,13 @@ if _is_cuda or _is_hip:
         n_heads_inv_sqrt: float,
         softmax_scale: float,
         q_scale: torch.Tensor,
+        bf16_output: bool = False,
     ) -> torch.Tensor:
-        out = torch.mm(x, weight.t(), out_dtype=torch.float32)
+        out = (
+            torch.mm(x, weight.t())
+            if bf16_output
+            else torch.mm(x, weight.t(), out_dtype=torch.float32)
+        )
         weights = out * n_heads_inv_sqrt
         weights = weights.unsqueeze(-1) * q_scale * softmax_scale
         return weights
