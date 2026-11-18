@@ -656,16 +656,18 @@ def _compute_triplet(
 
 
 def _can_use_mega_mhc(cfg: HcConfig, forward_batch: Optional[ForwardBatch]) -> bool:
-    return (
-        cfg.pre_from_prev
-        and cfg.mult == 4
-        and not cfg.cp_prefill
-        and not get_forward().sp_active
-        and forward_batch is not None
-        and (
-            can_use_mega_mhc_prefill(forward_batch)
-            or can_use_mega_mhc_decode(forward_batch)
-        )
+    if (
+        not cfg.pre_from_prev
+        or cfg.mult != 4
+        or get_forward().sp_active
+        or forward_batch is None
+    ):
+        return False
+    if cfg.cp_prefill:
+        # The PPU CP path only supports this fusion during Prefill.
+        return get_platform().is_ppu and can_use_mega_mhc_prefill(forward_batch)
+    return can_use_mega_mhc_prefill(forward_batch) or can_use_mega_mhc_decode(
+        forward_batch
     )
 
 
@@ -689,7 +691,9 @@ def _post_fusion(
         and next.hc.cfg.pre_from_prev
         and next.hc.cfg.mult == cfg.mult
         and next.hc.cfg.hidden == cfg.hidden
-        and not next.hc.cfg.cp_prefill
+        and (
+            not next.hc.cfg.cp_prefill or _can_use_mega_mhc(next.hc.cfg, forward_batch)
+        )
         and _can_use_mega_mhc(cfg, forward_batch)
         and y.shape[0] > 0
     ):
