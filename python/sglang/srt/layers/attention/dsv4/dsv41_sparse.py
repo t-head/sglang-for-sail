@@ -21,7 +21,7 @@ from sglang.kernels.ops.quantization.fp4_fake_quant import (
 from sglang.srt.layers.attention.dsv4.indexer_quant import use_dsv41_int8_indexer
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.utils import add_prefix, is_gfx95_supported
+from sglang.srt.utils import add_prefix, is_gfx95_supported, is_sail
 
 
 def _fused_dsv41_kernels(x: torch.Tensor) -> bool:
@@ -100,11 +100,13 @@ def rope_tail(
 
 
 def fused_low_ratio_compress_supported() -> bool:
-    """The fused c1 / c2 / index-K decode kernels need sm100+ on CUDA (they pack fp4
-    with `cvt.rn.satfinite.e2m1x2`) or gfx950 on ROCm; the answer also fixes the
+    """The fused c1 / c2 / index-K kernels use software FP4 on PPU sm89,
+    native FP4 on CUDA sm100+, or gfx950 on ROCm; the answer also fixes the
     ratio-2 weight layout (`wkv_gate`, or `wkv` plus `wgate`)."""
     if not torch.cuda.is_available():
         return False
+    if is_sail():
+        return torch.cuda.get_device_capability() == (8, 9)
     if torch.version.hip is not None:
         return is_gfx95_supported()
     return torch.cuda.get_device_capability()[0] >= 10
