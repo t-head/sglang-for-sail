@@ -25,7 +25,7 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.speculative.ragged_verify import ragged_verify_token_rows
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import is_gfx95_supported, is_sail
 
 
 def _fused_dsv41_kernels(x: torch.Tensor) -> bool:
@@ -113,11 +113,13 @@ def rope_tail(
 
 
 def fused_low_ratio_compress_supported() -> bool:
-    """The fused c1 / c2 / index-K decode kernels need sm90+ on CUDA or gfx950 on
-    ROCm; the answer also fixes the ratio-2 weight layout (`wkv_gate`, or `wkv`
-    plus `wgate`)."""
+    """The fused c1 / c2 / index-K kernels support PPU sm89, CUDA sm90+, or
+    gfx950 on ROCm; the answer also fixes the ratio-2 weight layout
+    (`wkv_gate`, or `wkv` plus `wgate`)."""
     if not torch.cuda.is_available():
         return False
+    if is_sail():
+        return torch.cuda.get_device_capability() == (8, 9)
     if torch.version.hip is not None:
         return is_gfx95_supported()
     return torch.cuda.get_device_capability()[0] >= 9
