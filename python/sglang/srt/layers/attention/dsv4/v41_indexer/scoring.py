@@ -151,10 +151,6 @@ def _index_q_and_weights(
     """fp4 index queries ``[rows, heads, 64]`` int8 with ``[rows, heads]`` packed
     ue8m0 scales, and fp32 head weights ``[rows, heads]``."""
     rows, heads = x.shape[0], indexer.n_local_heads
-    if is_sail():
-        q = indexer.queries(q_lora, freqs_cis[positions])
-        q_fp4, q_sf = quantize_index_q(q)
-        return q_fp4, q_sf, indexer.head_weights(x).float()
     q, _ = indexer.wq_b(q_lora)
     q_fp4, q_sf, weights = index_q_rope_pack_weights(
         q.view(rows, heads, indexer.index_head_dim),
