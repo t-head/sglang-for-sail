@@ -88,6 +88,8 @@ MEGA_MOE_NO_FALLBACK_ARCHS = frozenset(
         "KimiK31ForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "MellumForCausalLM",
+        "MiniMaxM3SparseForCausalLM",
+        "MiniMaxM3SparseForConditionalGeneration",
         "Qwen2MoeForCausalLM",
         "Qwen3MoeForCausalLM",
         "Qwen3NextForCausalLM",
@@ -202,13 +204,18 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
     max_tokens_per_rank = (
         envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
     )
+    eager_and_graph_budget_models = [
+        "KimiK31ForConditionalGeneration",
+        "MiniMaxM3SparseForCausalLM",
+        "MiniMaxM3SparseForConditionalGeneration",
+    ]
     if cfg.disaggregation_mode != "prefill":
         decode_tokens = mega_moe_decode_tokens_per_rank(cfg)
-        if model_label == "KimiK31ForConditionalGeneration":
-            # Kimi repacks its experts at load and has no oversized eager fallback.
+        if model_label in eager_and_graph_budget_models:
+            # Repacked experts cannot fall back for oversized eager batches.
             if cfg.max_running_requests is None:
                 raise ValueError(
-                    "Kimi MegaMoE needs --max-running-requests to bound eager decode / verify rows."
+                    f"{model_label} MegaMoE needs --max-running-requests to bound eager decode / verify rows."
                 )
             eager_requests = ceil_align(
                 cfg.max_running_requests // cfg.attn_dp_size,
@@ -248,7 +255,7 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
 
     prefill_tokens = cfg.chunked_prefill_size
     kimi = model_label == "KimiK31ForConditionalGeneration"
-    if kimi:
+    if model_label in eager_and_graph_budget_models:
         prefill_tokens = max(prefill_tokens, getattr(cfg, "max_prefill_tokens", 0) or 0)
         graph = cfg.cuda_graph_config.prefill if cfg.cuda_graph_config else None
         if graph is not None and graph.backend != "disabled":
