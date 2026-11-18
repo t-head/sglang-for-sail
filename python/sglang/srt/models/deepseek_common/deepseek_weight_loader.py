@@ -122,7 +122,7 @@ def _dequant_indexer_shard(
     """Dequantize one indexer shard to bf16, per the scale's granularity."""
     if scale.numel() == weight.shape[0]:
         # per-output-channel scale (w8a8 int8 / channelwise fp8)
-        return (weight.float() * scale.float()).to(torch.bfloat16)
+        return (weight.float() * scale.float().reshape(-1, 1)).to(torch.bfloat16)
     block_size = _get_indexer_weight_block_size(quant_config)
     return block_quant_dequant(weight, scale, block_size, torch.bfloat16)
 
@@ -188,6 +188,49 @@ def _load_fused_indexer_wk(
         pending.pop(fused_name)
         wk_bf16 = _dequant_indexer_shard(entry["weight"], entry["scale"], quant_config)
         fused_param.data[: wk_bf16.shape[0]].copy_(wk_bf16)
+    return True
+
+
+def _load_bf16_indexer_wk(
+    name: str,
+    loaded_weight: torch.Tensor,
+    params_dict: Dict[str, torch.Tensor],
+    pending: Dict[str, Dict[str, torch.Tensor]],
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    """按融合路径的反量化规则加载 PPU 独立 BF16 wk。"""
+    if ".indexer.wk." not in name:
+        return False
+    stem, suffix = name.rsplit(".", 1)
+    if suffix not in ("weight", "weight_scale", "weight_scale_inv"):
+        return False
+    param_name = stem + ".weight"
+    param = params_dict.get(param_name)
+    if (
+        param is None
+        or param.dtype != torch.bfloat16
+        or not getattr(param, "dsa_bf16_wk", False)
+    ):
+        return False
+
+    is_scale = suffix != "weight"
+    if not is_scale and loaded_weight.dtype not in (
+        torch.float8_e4m3fn,
+        torch.int8,
+    ):
+        default_weight_loader(param, loaded_weight)
+        return True
+
+    entry = pending.setdefault(param_name, {})
+    entry["scale" if is_scale else "weight"] = _clone_if_runai_streamed_tensor(
+        loaded_weight
+    )
+    if "weight" in entry and "scale" in entry:
+        weight_bf16 = _dequant_indexer_shard(
+            entry["weight"], entry["scale"], quant_config
+        )
+        default_weight_loader(param, weight_bf16)
+        pending.pop(param_name)
     return True
 
 
@@ -301,6 +344,7 @@ class DeepseekV2WeightLoaderMixin:
         cached_a_proj = {} if fuse_qkv_a_proj else None
 
         pending_indexer_wk: Dict[str, Dict[str, torch.Tensor]] = {}
+        pending_bf16_indexer_wk: Dict[str, Dict[str, torch.Tensor]] = {}
 
         if self.num_fused_shared_experts > 0:
             assert self.num_fused_shared_experts == 1
@@ -383,6 +427,14 @@ class DeepseekV2WeightLoaderMixin:
                     loaded_weight,
                     params_dict,
                     pending_indexer_wk,
+                    self.quant_config,
+                ):
+                    continue
+                if _load_bf16_indexer_wk(
+                    name,
+                    loaded_weight,
+                    params_dict,
+                    pending_bf16_indexer_wk,
                     self.quant_config,
                 ):
                     continue
@@ -571,6 +623,11 @@ class DeepseekV2WeightLoaderMixin:
             for future in concurrent.futures.as_completed(futures):
                 future.result()
 
+        if pending_bf16_indexer_wk:
+            raise ValueError(
+                "PPU BF16 indexer wk 缺少配对的量化权重或 scale: "
+                + ", ".join(sorted(pending_bf16_indexer_wk))
+            )
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
     def _initialize_nextn_conf(self, is_nextn: bool) -> NextNConfig:

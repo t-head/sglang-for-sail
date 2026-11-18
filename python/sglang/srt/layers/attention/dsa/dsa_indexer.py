@@ -533,13 +533,19 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 prefix=add_prefix("wk_weights_proj", prefix),
             )
         else:
+            use_bf16_wk = (
+                _is_cuda and is_sail() and not is_neox_style and not self.skip_rope
+            )
             self.wk = ReplicatedLinear(
                 self.hidden_size,
                 self.head_dim,
                 bias=False,
-                quant_config=quant_config,
+                params_dtype=torch.bfloat16 if use_bf16_wk else None,
+                quant_config=None if use_bf16_wk else quant_config,
                 prefix=add_prefix("wk", prefix),
             )
+            if use_bf16_wk:
+                self.wk.weight.dsa_bf16_wk = True
             self.weights_proj = ReplicatedLinear(
                 self.hidden_size,
                 self.n_heads,
