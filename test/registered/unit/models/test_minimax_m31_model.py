@@ -1,9 +1,10 @@
 """M3.1 config resolution, DSpark draft wiring and the deferred MoE handoff."""
 
 import copy
+import sys
 import unittest
 from functools import partial
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -308,6 +309,144 @@ class CaptureNorm(nn.Module):
 
 
 class TestMiniMaxM31Forward(CustomTestCase):
+    def test_ppu_fp8_megamoe_preserves_oai_routing_and_idle_collective(self):
+        from sglang.srt.layers.moe import mega_moe
+        from sglang.srt.runtime_context import get_context, get_parallel
+
+        mega_moe._MEGA_MOE_SYMM_BUFFER.clear()
+        self.addCleanup(mega_moe._MEGA_MOE_SYMM_BUFFER.clear)
+        deep_gemm = ModuleType("deep_gemm")
+        deep_gemm.get_num_sms = lambda: 132
+        completed = []
+
+        def make_buffer(
+            group,
+            experts,
+            cap,
+            top_k,
+            hidden,
+            intermediate,
+            *,
+            num_shared_experts,
+            mma_type,
+            activation,
+            quantization,
+        ):
+            self.assertEqual(
+                (mma_type, quantization, activation),
+                ("fp8xfp8", "channelwise", "swiglu_oai"),
+            )
+            return SimpleNamespace(
+                x=torch.empty(cap, hidden, dtype=torch.float8_e4m3fn),
+                x_sf=torch.empty(cap, 1),
+                topk_idx=torch.empty(cap, top_k, dtype=torch.int64),
+                topk_weights=torch.empty(cap, top_k),
+            )
+
+        def pre_dispatch(
+            x,
+            ids,
+            weights,
+            buf_x,
+            sf,
+            buf_ids,
+            buf_weights,
+            *,
+            num_tokens,
+            group_size,
+            mma_type,
+        ):
+            self.assertEqual((mma_type, group_size), ("fp8xfp8", 0))
+            self.assertEqual(ids.dtype, torch.int64)
+            self.assertEqual(weights.dtype, torch.float32)
+            self.assertTrue(torch.isfinite(x).all())
+            if batch.num_token_non_padded is not None:
+                valid = int(batch.num_token_non_padded)
+                self.assertTrue(torch.all(ids[valid:] == -1))
+                self.assertTrue(torch.all(weights[valid:] == 0))
+            buf_x[:num_tokens].copy_(x)
+            buf_ids[:num_tokens].copy_(ids)
+            buf_weights[:num_tokens].copy_(weights)
+
+        def fp8_kernel(
+            y, l1, l2, buf, *, activation, activation_clamp, activation_alpha, fast_math
+        ):
+            self.assertEqual(activation, "swiglu_oai")
+            completed.append(y.shape[0])
+            x = buf.x[: y.shape[0]].float()
+            gate = x[:, 0].clamp(max=activation_clamp)
+            up = x[:, 1].clamp(-activation_clamp, activation_clamp)
+            act = gate * torch.sigmoid(activation_alpha * gate) * (up + 1)
+            routed = (
+                buf.topk_weights[: y.shape[0]] * (buf.topk_idx[: y.shape[0]] + 1)
+            ).sum(-1)
+            y.copy_((act * routed)[:, None].expand_as(y))
+
+        deep_gemm.get_symm_buffer_for_mega_moe = make_buffer
+        deep_gemm.mega_moe_pre_dispatch = pre_dispatch
+        deep_gemm.fp8_fp8_mega_moe = fp8_kernel
+        experts = SimpleNamespace(
+            num_experts=2,
+            _mega_moe_weights_built=True,
+            _mega_moe_nvfp4=False,
+            _mega_moe_mma_type="fp8xfp8",
+            _minimax_activation="swigluoai",
+            mega_l1_weights=(),
+            mega_l2_weights=(),
+        )
+        moe = SimpleNamespace(
+            experts=experts,
+            config=SimpleNamespace(
+                hidden_size=4,
+                intermediate_size=8,
+                num_experts_per_tok=2,
+                swiglu_alpha=0.25,
+                swiglu_limit=1.0,
+            ),
+            _forward_shared_experts=lambda x: torch.full_like(x, 3),
+            _compute_router_logits=lambda x: torch.zeros(x.shape[0], 2),
+            topk=lambda x, logits, **kwargs: SimpleNamespace(
+                topk_ids=torch.tensor([[0, 1]]).expand(x.shape[0], -1),
+                topk_weights=torch.tensor([[0.5, 1.5]]).expand(x.shape[0], -1),
+            ),
+            layer_id=0,
+            trtllm_decode_with_mega_moe=False,
+        )
+        batch = SimpleNamespace(num_token_non_padded=None)
+        hidden = torch.tensor([[8, 3, 0, 0], [-2, 0.5, 0, 0]], dtype=torch.bfloat16)
+        with (
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch.object(mega_moe, "_is_sail", True),
+            patch.object(mega_moe, "_device_sm", 89),
+            patch.object(mega_moe, "_mega_moe_max_num_sms", return_value=None),
+            patch.object(
+                mega_moe.envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK,
+                "get",
+                return_value=8,
+            ),
+            get_context().override_server_args(enable_eplb=False),
+            get_parallel().override(
+                moe_ep_group=SimpleNamespace(device_group=object())
+            ),
+        ):
+            result = minimax_m3.MiniMaxM3MoE.forward_mega_moe(moe, hidden, batch)
+            idle = minimax_m3.MiniMaxM3MoE.forward_mega_moe(moe, hidden[:0], batch)
+            batch.num_token_non_padded = torch.tensor(1)
+            padded = torch.cat((hidden[:1], torch.full_like(hidden[:1], float("nan"))))
+            padded_result = minimax_m3.MiniMaxM3MoE.forward_mega_moe(moe, padded, batch)
+            batch.num_token_non_padded.fill_(0)
+            empty_result = minimax_m3.MiniMaxM3MoE.forward_mega_moe(moe, padded, batch)
+        gate = torch.tensor([1.0, -2.0])
+        expected = gate * torch.sigmoid(0.25 * gate) * torch.tensor([2.0, 1.5]) * 3.5
+        torch.testing.assert_close(
+            result, (expected[:, None].expand_as(hidden).bfloat16() + 3)
+        )
+        self.assertEqual(idle.shape, (0, 4))
+        torch.testing.assert_close(padded_result[:1], result[:1])
+        torch.testing.assert_close(padded_result[1:], torch.zeros_like(result[1:]))
+        torch.testing.assert_close(empty_result, torch.zeros_like(result))
+        self.assertEqual(completed, [2, 0, 2, 2])
+
     def test_capture_includes_final_layer_before_output_norm(self):
         model = object.__new__(MiniMaxM3Model)
         nn.Module.__init__(model)

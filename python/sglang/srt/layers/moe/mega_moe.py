@@ -108,13 +108,19 @@ def check_mega_moe_shapes(hidden: int, intermediate: int, mma_type: str) -> None
     # The pinned DeepGEMM FP8/FP4 path copies intermediate scales separately
     # from token TMA loads, so intermediate % 128 suffices, including V4.1
     # Flash's 2304-wide intermediate dimension.
-    # Keep the existing restrictions on the other MMA paths.
+    # PPU channelwise FP8 uses one FP32 SF per token, not grouped SF rows;
+    # its GEMMs require H % 256 == 0 and I % 128 == 0.
     scale_group = 16 if mma_type == "nvfp4xnvfp4" else 32
-    align = 128 if mma_type == "fp8xfp4" else 16 * scale_group
-    hidden_align = 16 * scale_group
-    if hidden % hidden_align != 0 or intermediate % align != 0:
+    align = 128 if mma_type in ("fp8xfp4", "fp8xfp8") else 16 * scale_group
+    hidden_align = 256 if mma_type == "fp8xfp8" else 16 * scale_group
+    if (
+        hidden <= 0
+        or intermediate <= 0
+        or hidden % hidden_align != 0
+        or intermediate % align != 0
+    ):
         raise ValueError(
-            f"DeepGEMM MegaMoE ({mma_type}) needs hidden_size to be a multiple "
+            f"DeepGEMM MegaMoE ({mma_type}) needs positive dimensions, hidden_size to be a multiple "
             f"of {hidden_align} and moe_intermediate_size to be a multiple of "
             f"{align}; got "
             f"hidden_size={hidden}, moe_intermediate_size={intermediate}. "
@@ -152,6 +158,11 @@ def _get_mega_moe_symm_buffer(
         )
         buf = _MEGA_MOE_SYMM_BUFFER.get(key)
         if buf is None:
+            buffer_kwargs = (
+                {"quantization": "channelwise"}
+                if _is_sail and mma_type == "fp8xfp8"
+                else {}
+            )
             buf = deep_gemm.get_symm_buffer_for_mega_moe(
                 group,
                 num_experts,
@@ -162,6 +173,7 @@ def _get_mega_moe_symm_buffer(
                 num_shared_experts=num_shared_experts,
                 mma_type=mma_type,
                 activation=activation,
+                **buffer_kwargs,
             )
             _MEGA_MOE_SYMM_BUFFER[key] = buf
     return buf
@@ -463,6 +475,7 @@ def run_mega_routed_experts(
     activation_clamp: Optional[float] = None,
     routed_scaling_factor: float = 1.0,
     activation: str = "swiglu",
+    activation_alpha: Optional[float] = None,
     num_shared_experts: int = 0,
     shared_l1_weights=None,
     shared_l2_weights=None,
@@ -486,6 +499,8 @@ def run_mega_routed_experts(
     )
 
     mma_type = _mega_moe_mma_type(experts)
+    if _is_sail and activation == "swigluoai":
+        activation = "swiglu_oai"
     buf = _get_mega_moe_symm_buffer(
         ep_group,
         num_experts=num_experts,
@@ -537,7 +552,7 @@ def run_mega_routed_experts(
             buf.topk_idx,
             buf.topk_weights,
             num_tokens=num_tokens,
-            group_size=32,
+            group_size=0 if mma_type == "fp8xfp8" else 32,
             mma_type=mma_type,
         )
         if mma_type != "fp4xfp4":
@@ -629,17 +644,21 @@ def run_mega_routed_experts(
         "fast_math": True,
         **mega_kwargs,
     }
+    if _is_sail and activation_alpha is not None:
+        kernel_kwargs["activation_alpha"] = activation_alpha
     if not _is_sail:
         # PPU's fp4_fp4_mega_moe takes the shared experts outside the kernel.
         kernel_kwargs["shared_l1_weights"] = shared_l1_weights
         kernel_kwargs["shared_l2_weights"] = shared_l2_weights
     with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
         if _is_sail:
-            mega_moe_kernel = {
-                "fp4xfp4": deep_gemm.fp4_fp4_mega_moe,
-                "fp8xfp4": deep_gemm.fp8_fp4_mega_moe,
-                "bf16xfp4": deep_gemm.bf16_fp4_mega_moe,
+            kernel_name = {
+                "fp4xfp4": "fp4_fp4_mega_moe",
+                "fp8xfp4": "fp8_fp4_mega_moe",
+                "bf16xfp4": "bf16_fp4_mega_moe",
+                "fp8xfp8": "fp8_fp8_mega_moe",
             }[mma_type]
+            mega_moe_kernel = getattr(deep_gemm, kernel_name)
         else:
             mega_moe_kernel = deep_gemm.fp8_fp4_mega_moe
         mega_moe_kernel(

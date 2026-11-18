@@ -473,6 +473,8 @@ class TestPrepareServerArgs(CustomTestCase):
             "DeepseekV4ForCausalLM",
             "GlmMoeDsaForCausalLM",
             "Glm5NextForConditionalGeneration",
+            "MiniMaxM3SparseForCausalLM",
+            "MiniMaxM3SparseForConditionalGeneration",
         ):
             self.assertTrue(mega_moe_needs_token_budget(arch, {}, None), arch)
         # MXFP4 DeepSeek-family models keep their runtime fallback.
