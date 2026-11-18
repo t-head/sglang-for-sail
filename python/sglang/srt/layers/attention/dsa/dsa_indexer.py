@@ -1047,6 +1047,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self.use_dsa_indexer_fusion
             or self.use_aiter_fused_fp8_writer
             or not self.apply_hadamard
+            or (
+                _is_cuda and is_sail() and not self.is_neox_style and not self.skip_rope
+            )
         ):
             return x
         return rotate_activation(x)
@@ -1550,7 +1553,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 dummy_q_rope = k_rope
             _, k_rope = self.rotary_emb(positions, dummy_q_rope, k_rope)
             self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
-        if apply_hadamard and self.apply_hadamard:
+        if (
+            apply_hadamard
+            and self.apply_hadamard
+            and not (
+                _is_cuda and is_sail() and not self.is_neox_style and not self.skip_rope
+            )
+        ):
             key = rotate_activation(key)
 
         return key
