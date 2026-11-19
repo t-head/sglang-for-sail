@@ -348,6 +348,8 @@ class ClusterTransportTest(unittest.TestCase):
                     "RUNNER_TEMP": str(root / "runner-temp"),
                     "GITHUB_RUN_ID": "12",
                     "GITHUB_RUN_ATTEMPT": "1",
+                    "PPU_CI_K8S_CONFIG_SHA256": "",
+                    "PPU_CI_K8S_LOADED_CONFIG_SHA256": "",
                     "PPU_CI_PRIVATE_RESULTS_ROOT": str(retained),
                     "PPU_CI_K8S_PRIVATE_WORKER_ROOT": str(retained),
                     "PPU_CI_K8S_STAGE_ROOT": str(staging),
