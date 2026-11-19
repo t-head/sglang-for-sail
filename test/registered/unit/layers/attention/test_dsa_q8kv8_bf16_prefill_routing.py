@@ -86,14 +86,25 @@ def test_capture_keeps_dcp_visible_lengths(monkeypatch, dcp_size, dcp_rank, expe
     )
 
 
-def test_ppu_fp4_verify_refreshes_captured_mqa_schedule(monkeypatch):
-    """A change in padding must refresh the schedule and owners in place."""
-    backend = _make_graph_backend(1, 0, query_rows=4, context_capacity=64)
+@pytest.mark.parametrize(
+    "dcp_size,dcp_rank,capture_lengths,replay_lengths",
+    [
+        (1, 0, [64, 64, 64, 64], ([7, 8, 0, 0], [0, 0, 19, 20])),
+        (8, 0, [1, 1, 2, 2], ([1, 1, 0, 0], [0, 0, 3, 3])),
+        (8, 7, [0, 1, 1, 1], ([0, 1, 0, 0], [0, 0, 2, 2])),
+    ],
+)
+def test_ppu_fp4_verify_graph_mqa_schedule(
+    monkeypatch, dcp_size, dcp_rank, capture_lengths, replay_lengths
+):
+    """The captured DCP schedule must match the shard and stay reusable on replay."""
+    backend = _make_graph_backend(dcp_size, dcp_rank, query_rows=4, context_capacity=64)
     backend.token_to_kv_pool = SimpleNamespace(use_fp4_indexer=True)
     backend.indexer_n_heads = 32
     backend.indexer_head_dim = 128
     monkeypatch.setattr(dsa_backend, "is_cuda", lambda: True)
     monkeypatch.setattr(dsa_backend, "_is_sail", True)
+    monkeypatch.setenv("SGLANG_SAIL_BF16_INDEXER", "0")
     monkeypatch.setattr(
         dsa_backend, "get_platform", lambda: SimpleNamespace(is_sm100=False)
     )
@@ -118,12 +129,17 @@ def test_ppu_fp4_verify_refreshes_captured_mqa_schedule(monkeypatch):
     schedule = metadata.paged_mqa_schedule_metadata
     assert isinstance(schedule, dsa_backend.SailPagedMQAMetadata)
     owners = torch.tensor([0, 0, 1, 1], dtype=torch.int32)
-    torch.testing.assert_close(schedule.indices, owners)
+    dummy_owners = torch.tensor([-1, -2, -3, -4], dtype=torch.int32)
+    capture_ctx = torch.tensor(capture_lengths, dtype=torch.int32)
+    torch.testing.assert_close(schedule.tensor, capture_ctx[:, None])
+    torch.testing.assert_close(metadata.paged_mqa_ctx_lens_2d, capture_ctx[:, None])
+    torch.testing.assert_close(
+        schedule.indices, torch.where(capture_ctx > 0, owners, dummy_owners)
+    )
     addresses = schedule.tensor.data_ptr(), schedule.indices.data_ptr()
 
-    for lengths, expected_owners in (
-        ([7, 8, 0, 0], [0, 0, -3, -4]),
-        ([0, 0, 11, 12], [-1, -2, 1, 1]),
+    for lengths, expected_lengths in zip(
+        ([7, 8, 0, 0], [0, 0, 19, 20]), replay_lengths, strict=True
     ):
         expanded = torch.tensor(lengths, dtype=torch.int32)
         cache_seqlens = expanded[1::2].contiguous()
@@ -131,23 +147,25 @@ def test_ppu_fp4_verify_refreshes_captured_mqa_schedule(monkeypatch):
             cache_seqlens=cache_seqlens,
             cu_seqlens_k=dsa_backend.compute_cu_seqlens(cache_seqlens),
             req_pool_indices=reqs,
-            page_indices=torch.zeros((4, 12), dtype=torch.int32),
+            page_indices=torch.zeros((4, 20), dtype=torch.int32),
             real_page_table=None,
             seqlens_expanded=expanded,
             dsa_cache_seqlens=expanded,
             dsa_cu_seqlens_k=dsa_backend.compute_cu_seqlens(expanded),
             seqlens_expanded_size=4,
-            max_len=12,
-            max_seqlen_k=12,
+            max_len=20,
+            max_seqlen_k=20,
         )
         backend.init_forward_metadata_replay_cuda_graph_from_precomputed(
             2, replay, mode
         )
         assert backend.forward_metadata.paged_mqa_schedule_metadata is schedule
         assert (schedule.tensor.data_ptr(), schedule.indices.data_ptr()) == addresses
-        torch.testing.assert_close(schedule.tensor, expanded[:, None])
+        replay_ctx = torch.tensor(expected_lengths, dtype=torch.int32)
+        torch.testing.assert_close(schedule.tensor, replay_ctx[:, None])
+        torch.testing.assert_close(metadata.paged_mqa_ctx_lens_2d, replay_ctx[:, None])
         torch.testing.assert_close(
-            schedule.indices, torch.tensor(expected_owners, dtype=torch.int32)
+            schedule.indices, torch.where(replay_ctx > 0, owners, dummy_owners)
         )
         torch.testing.assert_close(metadata.token_to_batch_idx, owners)
 

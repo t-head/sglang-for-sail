@@ -2073,11 +2073,19 @@ class DeepseekSparseAttnBackend(
             # replay; per-replay code refreshes the valid prefix in-place.
             if self.attn_dcp_size > 1:
                 # Keep the actual shard lengths for the indexer and local top-k.
-                capacity_ctx_lens_2d = torch.full_like(
-                    paged_mqa_ctx_lens_2d, self.req_to_token.shape[1]
-                )
+                if (
+                    request_indices is not None
+                    and not envs.SGLANG_SAIL_BF16_INDEXER.get()
+                ):
+                    # The grouped FP4 schedule is sized by query rows, and its
+                    # live KV bounds must match the local page table at capture.
+                    schedule_ctx_lens_2d = paged_mqa_ctx_lens_2d
+                else:
+                    schedule_ctx_lens_2d = torch.full_like(
+                        paged_mqa_ctx_lens_2d, self.req_to_token.shape[1]
+                    )
                 paged_mqa_schedule_metadata = self._build_paged_mqa_schedule_metadata(
-                    capacity_ctx_lens_2d, request_indices=request_indices
+                    schedule_ctx_lens_2d, request_indices=request_indices
                 )
             else:
                 paged_mqa_ctx_lens_2d = torch.full_like(
@@ -3744,6 +3752,16 @@ class DeepseekSparseAttnBackend(
                 )
                 self._flashmla_kv_q_pad_eager[target] = buf
         out = buf[:num_tokens]
+        # Skip redundant concat when alt_stream already pre-packed (q_nope, q_rope)
+        # into this in-place padded buffer and passed back zero-copy views of it.
+        if (
+            q_nope.data_ptr() == out.data_ptr()
+            and q_rope.data_ptr()
+            == out.data_ptr() + self.kv_lora_rank * q_nope.element_size()
+            and q_nope.stride() == out.stride()
+            and q_rope.stride() == out.stride()
+        ):
+            return out
         concat_mla_absorb_q_general(q_nope, q_rope, out=out[:, :num_heads])
         return out
 

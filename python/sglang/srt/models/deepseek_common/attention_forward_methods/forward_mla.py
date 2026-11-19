@@ -138,6 +138,24 @@ def _finish_absorb_output(module, attn_bmm_output, attention_output_gate, topk_i
     return output, topk_indices if module.next_skip_topk else None
 
 
+def _resolve_flashmla_kv_q_fn(forward_batch: ForwardBatch):
+    """Return the underlying DSAAttnBackend._flashmla_kv_q helper when an
+    in-place padded Q buffer is active (non-TBO flashmla_kv capture), else None."""
+    if get_exec().kernel.dsa_decode_backend != "flashmla_kv":
+        return None
+    backend = get_attn_backend()
+    if hasattr(backend, "full_attn_backend"):
+        backend = backend.full_attn_backend
+    if hasattr(backend, "_select_backend"):
+        backend = backend._select_backend(forward_batch.forward_mode)
+    if (
+        not getattr(backend, "_flashmla_kv_pad_q_in_place", False)
+        or getattr(backend, "_flashmla_kv_q_pad", None) is None
+    ):
+        return None
+    return getattr(backend, "_flashmla_kv_q", None)
+
+
 class DeepseekMLAForwardMixin:
     # DSA decode capture: run q_b_proj, the absorbed q and the KV write on
     # alt_stream under the indexer instead of only q_b_proj before it.
@@ -512,6 +530,31 @@ class DeepseekMLAForwardMixin:
                     with torch.cuda.stream(self.alt_stream):
                         if _is_sail and self.dsa_decode_absorb_under_indexer:
                             q = self._q_b_proj_maybe_replicated(q, q_replicate_active)
+                            if (
+                                q_replicate_active
+                                and self._decode_absorb_on_alt_stream()
+                            ):
+                                # Overlap full-head W_UK absorb with the indexer on alt_stream.
+                                q_nope, q_pe, k_pe = self._split_q_nope_pe(
+                                    q, latent_cache
+                                )
+                                q_nope_out_alt = torch.bmm(
+                                    q_nope.transpose(0, 1), self.w_kc_qrep
+                                ).transpose(0, 1)
+                                flashmla_kv_q = _resolve_flashmla_kv_q_fn(forward_batch)
+                                # Also hide [nope | rope] concat + head padding on alt_stream
+                                # when q_pe needs no downstream RoPE and an in-place pad buffer
+                                # is active; otherwise fall back to the main-stream concat path.
+                                if (
+                                    self.rotary_emb is None
+                                    and flashmla_kv_q is not None
+                                ):
+                                    q_all = flashmla_kv_q(q_nope_out_alt, q_pe)
+                                    num_heads = q_nope_out_alt.shape[1]
+                                    q_nope_out_alt = q_all[
+                                        :, :num_heads, : self.kv_lora_rank
+                                    ]
+                                    q_pe = q_all[:, :num_heads, self.kv_lora_rank :]
                         else:
                             q = self.q_b_proj_forward(q)
                 current_stream.wait_stream(self.alt_stream)
@@ -953,6 +996,11 @@ class DeepseekMLAForwardMixin:
                             # the push-combine reduce wins at any batch size
                             or dcp_push_combine_fits(
                                 attn_output.shape[0] * self.num_local_heads
+                            )
+                            or (
+                                _is_sail
+                                and dcp_comm_backend == "a2a"
+                                and attn_output.dtype == torch.bfloat16
                             )
                         )
                         and self.w_vc is not None
