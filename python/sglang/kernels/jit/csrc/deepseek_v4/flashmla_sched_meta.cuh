@@ -51,6 +51,171 @@ __device__ __forceinline__ int ceil_to_i(int a, int b) {
   return (a + b - 1) / b * b;
 }
 
+__device__ __forceinline__ int find_state_req(const int* row_start_shared, int b, int x) {
+  int lo = 0, hi = b - 1;  // the last request with row_start_shared[r] <= x
+  while (lo < hi) {
+    const int mid = (lo + hi + 1) >> 1;
+    if (row_start_shared[mid] <= x) {
+      lo = mid;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return lo;
+}
+
+// Exclusive prefix sum of f(0..n-1) into out[0..n], every thread of the block
+// taking part; scratch holds kBlockSize / 32 ints.
+template <typename F>
+__device__ __forceinline__ void block_exclusive_scan(int n, F f, int* out, int* scratch) {
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  int carry = 0;
+  for (int base = 0; base < n; base += kBlockSize) {
+    const int i = base + threadIdx.x;
+    const int v = i < n ? f(i) : 0;
+    int incl = v;
+#pragma unroll
+    for (int offset = 1; offset < 32; offset <<= 1) {
+      const int up = __shfl_up_sync(uint32_t(-1), incl, offset);
+      if (lane >= offset) incl += up;
+    }
+    if (lane == 31) scratch[warp] = incl;
+    __syncthreads();
+    int warp_base = 0;
+    for (int w = 0; w < warp; ++w)
+      warp_base += scratch[w];
+    if (i < n) out[i] = carry + warp_base + incl - v;
+    int chunk = 0;
+    for (int w = 0; w < kBlockSize / 32; ++w)
+      chunk += scratch[w];
+    carry += chunk;
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) out[n] = carry;
+}
+
+// Windowed schedule (sparse only). Not FlashMLA's schedule, but one its kernel
+// consumes the same way, with the same bound on the costliest partition. The
+// requests' costs (blocks plus the per-split overhead) are laid end to end and
+// cut into num_sm_parts equal windows. A cut within a request's first `overhead`
+// positions moves to its start; any other cut splits the request there, except
+// that with snapping a cut leaving at most `overhead` blocks moves to its end.
+// Both cuttings are made and the one whose costliest partition is cheaper is
+// kept (snapping on a tie, as it splits less): snapping is what the greedy walk
+// does for requests about a window long, which the plain cutting would all
+// split, and costs up to an overhead more elsewhere. Every partition follows
+// from the prefix sums on its own, so the schedule takes a few microseconds
+// where the walk over all partitions takes tens.
+__device__ __forceinline__ int sparse_num_blocks(const Params& p, int i) {
+  int cur_s_k = p.topk_length ? __ldg(p.topk_length + i) : p.topk;
+  if (cur_s_k == 0) cur_s_k = 1;  // the main loop must never be empty
+  if (p.extra_topk) {
+    cur_s_k = ceil_to_i(cur_s_k, p.block_size_n);
+    cur_s_k += p.extra_topk_length ? __ldg(p.extra_topk_length + i) : p.extra_topk;
+  }
+  return max(cur_s_k - 1, 0) / p.block_size_n + 1;
+}
+
+template <bool kPpuLayout>
+__global__ void __launch_bounds__(kBlockSize) flashmla_windowed_sched_meta_kernel(__grid_constant__ const Params p) {
+  extern __shared__ int smem[];
+  const int b = p.b;
+  const int parts = p.num_sm_parts;
+  const int overhead = p.fixed_overhead_num_blocks;
+  int* cost_prefix = smem;                     // [b + 1]: the cost of requests [0, r)
+  int* split_prefix = cost_prefix + b + 1;     // [b + 1]: the splits of requests [0, r)
+  int* cut_req = split_prefix + b + 1;         // [2, parts + 1]: plain, snapping
+  int* cut_block = cut_req + 2 * (parts + 1);  // [2, parts + 1]
+  __shared__ int scan_scratch[kBlockSize / 32];
+  __shared__ int max_cost[2];
+
+  block_exclusive_scan(b, [&](int r) { return sparse_num_blocks(p, r) + overhead; }, cost_prefix, scan_scratch);
+  if (threadIdx.x < 2) max_cost[threadIdx.x] = 0;
+  __syncthreads();
+  const int total_cost = cost_prefix[b];
+  const int window = ceil_div_i(total_cost, parts);
+
+  for (int c = threadIdx.x; c < 2 * (parts + 1); c += kBlockSize) {
+    const bool snap = c > parts;
+    const int pos = (snap ? c - parts - 1 : c) * window;
+    int req = b, block = 0;
+    if (pos < total_cost) {
+      req = find_state_req(cost_prefix, b, pos);
+      const int offset = pos - cost_prefix[req];
+      if (snap && cost_prefix[req + 1] - pos <= overhead) {
+        ++req;
+      } else if (offset > overhead) {
+        block = offset - overhead;
+      }
+    }
+    cut_req[c] = req;
+    cut_block[c] = block;
+  }
+  __syncthreads();
+  // A partition costs its positions, plus an overhead when it starts inside a request.
+  auto position = [&](int req, int block) { return cost_prefix[req] + (block > 0 ? overhead + block : 0); };
+  for (int c = threadIdx.x; c < 2 * (parts + 1); c += kBlockSize) {
+    if (c == parts || c == 2 * parts + 1) continue;
+    const int cost = position(cut_req[c + 1], cut_block[c + 1]) - position(cut_req[c], cut_block[c]) +
+                     (cut_block[c] > 0 ? overhead : 0);
+    atomicMax(&max_cost[c > parts], cost);
+  }
+  __syncthreads();
+  const bool snap = max_cost[1] <= max_cost[0];
+  if (snap) {
+    cut_req += parts + 1;
+    cut_block += parts + 1;
+  }
+  // A request splits at every multiple of the window in (its start + overhead,
+  // its end), or (its start + overhead, its end - overhead) when snapping.
+  block_exclusive_scan(
+      b,
+      [&](int r) {
+        const int last = cost_prefix[r + 1] - 1 - (snap ? overhead : 0);
+        return 1 + max(last / window - (cost_prefix[r] + overhead) / window, 0);
+      },
+      split_prefix,
+      scan_scratch);
+  __syncthreads();
+
+  for (int i = threadIdx.x; i < parts; i += kBlockSize) {
+    const int begin_req = cut_req[i], begin_block = cut_block[i];
+    const int end_req = cut_req[i + 1], end_block = cut_block[i + 1];
+    int meta[kMetaInts] = {};
+    if (begin_req == end_req && begin_block == end_block) {
+      // An empty partition: the kernel skips a partition beginning past the batch.
+      meta[0] = b;
+      meta[1] = b - 1;
+    } else {
+      // A partition ending at a request's start ends with the whole request before it.
+      const int last_req = end_block > 0 ? end_req : end_req - 1;
+      meta[0] = begin_req;
+      meta[1] = last_req;
+      meta[2] = begin_block;
+      meta[3] = end_block > 0 ? end_block : cost_prefix[end_req] - cost_prefix[end_req - 1] - overhead;
+      // The cuts inside begin_req up to this one: multiples of the window in (its start + overhead, i * window].
+      meta[4] = begin_block > 0 ? i - (cost_prefix[begin_req] + overhead) / window : 0;
+      if constexpr (!kPpuLayout) {
+        meta[5] = split_prefix[begin_req + 1] - split_prefix[begin_req] > 1;
+        meta[6] = split_prefix[last_req + 1] - split_prefix[last_req] > 1;
+      }
+    }
+    int4* out = reinterpret_cast<int4*>(p.tile_scheduler_metadata + i * kMetaInts);
+    if constexpr (kPpuLayout) {
+      // PPU sparse MLA uses token bounds, clipped to the row's length.
+      const int end_token = meta[0] < b ? min(meta[3] * p.block_size_n, max(p.topk_length[meta[1]], 1)) : 0;
+      out[0] = make_int4(meta[0], meta[2] * p.block_size_n, meta[1], end_token);
+      out[1] = make_int4(meta[4], 0, 0, 0);
+    } else {
+      out[0] = make_int4(meta[0], meta[1], meta[2], meta[3]);
+      out[1] = make_int4(meta[4], meta[5], meta[6], meta[7]);
+    }
+  }
+  for (int i = threadIdx.x; i <= b; i += kBlockSize) {
+    p.num_splits[i] = split_prefix[i];
+  }
+}
+
 __global__ void __launch_bounds__(kBlockSize) flashmla_sched_meta_kernel(__grid_constant__ const Params p) {
   extern __shared__ int smem[];
   const int b = p.b;
@@ -216,7 +381,9 @@ void flashmla_sched_meta(
     int64_t block_size_n,
     int64_t fixed_overhead_num_blocks,
     int64_t topk,
-    int64_t extra_topk) {
+    int64_t extra_topk,
+    bool windowed,
+    bool ppu_layout) {
   using namespace host;
   using namespace flashmla;
 
@@ -267,6 +434,24 @@ void flashmla_sched_meta(
       num_sm_parts,
   };
 
+  if (ppu_layout) {
+    RuntimeCheck(
+        windowed && topk > 0 && extra_topk == 0 && p.topk_length,
+        "PPU scheduling requires a windowed sparse schedule with local lengths and no extra cache");
+  }
+  if (windowed) {
+    RuntimeCheck(topk > 0, "windowed scheduling requires sparse top-k");
+    const std::size_t smem = sizeof(int) * static_cast<std::size_t>(2 * (b + 1) + 4 * (num_sm_parts + 1));
+    RuntimeCheck(smem <= 48 * 1024, "windowed schedule does not fit in shared memory: ", smem, " bytes");
+    if (ppu_layout) {
+      runtime::set_max_dynamic_smem_per_device<flashmla_windowed_sched_meta_kernel<true>>(device_.unwrap(), 48 * 1024);
+      LaunchKernel(1, kBlockSize, device_.unwrap(), smem)(flashmla_windowed_sched_meta_kernel<true>, p);
+    } else {
+      runtime::set_max_dynamic_smem_per_device<flashmla_windowed_sched_meta_kernel<false>>(device_.unwrap(), 48 * 1024);
+      LaunchKernel(1, kBlockSize, device_.unwrap(), smem)(flashmla_windowed_sched_meta_kernel<false>, p);
+    }
+    return;
+  }
   const std::size_t smem = sizeof(int) * static_cast<std::size_t>(b * 5 + 1 + num_sm_parts * kMetaInts);
   RuntimeCheck(smem <= 48 * 1024, "schedule does not fit in shared memory: ", smem, " bytes");
   // The kernel also has static shared memory. Opt in so schedules near

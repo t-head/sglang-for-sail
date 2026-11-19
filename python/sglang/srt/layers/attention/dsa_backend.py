@@ -639,6 +639,13 @@ class DeepseekSparseAttnBackend(
         sharded_dcp = dsa_shards_index_k()
         self.attn_dcp_size = get_parallel().attn_dcp_size if sharded_dcp else 1
         self.attn_dcp_rank = get_parallel().attn_dcp_rank if sharded_dcp else 0
+        self._ppu_dcp_scheduler = None
+        if _is_sail and self.attn_dcp_size > 1:
+            from sglang.srt.hardware_backend.ppu.attention.flash_mla import (
+                DcpWindowedScheduler,
+            )
+
+            self._ppu_dcp_scheduler = DcpWindowedScheduler()
         self.real_page_span = self.physical_page_size * self.attn_dcp_size
         if self.attn_dcp_size > 1 and self.dsa_index_kpool > 1:
             raise ValueError("DSA index kpool does not support --dcp-size > 1.")
@@ -3797,10 +3804,30 @@ class DeepseekSparseAttnBackend(
                 page_table_1.shape[-1] == self.dsa_index_topk
             )  # requirement of FlashMLA decode kernel
         indices = page_table_1.unsqueeze(1)
+        observe_ppu_schedule = False
         if dcp_partial:
             tile_scheduler_metadata = self._dcp_flashmla_sched_meta(
                 q_input, indices, topk_length
             )
+            if (
+                _is_sail
+                and (scheduler := getattr(self, "_ppu_dcp_scheduler", None)) is not None
+            ):
+                topk = indices.shape[-1]
+                ppu_schedule_key = (
+                    q_input.device,
+                    q_input.shape,
+                    q_input.dtype,
+                    kv_cache.shape[1:],
+                    kv_cache.dtype,
+                    v_head_dim,
+                    self._flashmla_decode_compute_fp8,
+                    self.flashmla_kv_format,
+                    topk,
+                )
+                observe_ppu_schedule = scheduler.prepare(
+                    tile_scheduler_metadata, topk_length, ppu_schedule_key, topk
+                )
 
         o, lse = flash_mla_with_kvcache(
             q=q_input,
@@ -3819,6 +3846,10 @@ class DeepseekSparseAttnBackend(
             is_fp8_kvcache=self._flashmla_decode_compute_fp8,
             kv_format=self.flashmla_kv_format,
         )
+        if observe_ppu_schedule:
+            scheduler.observe(
+                tile_scheduler_metadata, q_input.shape[0], ppu_schedule_key
+            )
 
         if target_q_heads != num_q_heads:
             o = o[:, :, :num_q_heads, :]

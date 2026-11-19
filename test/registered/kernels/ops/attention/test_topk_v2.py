@@ -824,14 +824,17 @@ def test_topk_v2_ties_by_index(path: str, seq: int, num_ties: int) -> None:
 @pytest.mark.skipif(is_hip(), reason="CUDA candidate epilogue")
 @pytest.mark.parametrize("seq", [100, 2048, 5000, 12000, 40000])
 @pytest.mark.parametrize("with_row_starts", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @torch.inference_mode()
-def test_topk_v2_candidates_match_ragged(seq: int, with_row_starts: bool) -> None:
+def test_topk_v2_candidates_match_ragged(
+    seq: int, with_row_starts: bool, dtype: torch.dtype
+) -> None:
     """The candidate epilogue selects what the ragged kernel selects and emits
     (score bits, position * world + rank), (0, -1) padded."""
     k, batch, world, rank = 2048, 3, 8, 5
     g = torch.Generator(device="cuda").manual_seed(seq)
     width = seq + 16
-    scores = torch.randn(batch, width, generator=g, device="cuda")
+    scores = torch.randn(batch, width, generator=g, device="cuda").to(dtype)
     scores[:, 7:400] = scores[:, 7:8]  # ties across the window
     seq_lens = torch.tensor(
         [seq, max(seq // 3, 1), 1], dtype=torch.int32, device="cuda"
@@ -843,7 +846,7 @@ def test_topk_v2_candidates_match_ragged(seq: int, with_row_starts: bool) -> Non
     )
     ragged = torch.empty(batch, k, dtype=torch.int32, device="cuda")
     topk_transform_ragged_v2(
-        scores.clone(),
+        scores.to(torch.float32, copy=True),
         seq_lens,
         out_offsets=torch.zeros(batch, dtype=torch.int32, device="cuda"),
         out_indices=ragged,
@@ -869,7 +872,7 @@ def test_topk_v2_candidates_match_ragged(seq: int, with_row_starts: bool) -> Non
         valid = pos >= 0
         assert torch.equal(pos[valid].sort().values, idx * world + rank)
         local = (pos[valid] - rank) // world
-        want_bits = scores[row, start + local].view(torch.int32)
+        want_bits = scores[row, start + local].float().view(torch.int32)
         assert torch.equal(cand[row, valid, 0], want_bits)
         assert bool((cand[row, ~valid, 0] == 0).all())
 

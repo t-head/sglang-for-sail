@@ -153,8 +153,9 @@ struct alignas(8) TieValue {
 // Per-batch problem description + page-table transform sink
 // ---------------------------------------------------------------------------
 
-struct TopKProblem {
-  const float* __restrict__ in;
+template <typename InputT>
+struct TopKProblemT {
+  const InputT* __restrict__ in;
   int32_t* __restrict__ out;  // page_indices [topk]
   uint32_t topk;
   uint32_t seq_len;
@@ -165,6 +166,8 @@ struct TopKProblem {
     out[pos] = static_cast<int32_t>(raw_idx) + bias;
   }
 };
+
+using TopKProblem = TopKProblemT<float>;
 
 // ---------------------------------------------------------------------------
 // Shared configuration + tie handling (exact radix select on the threshold bin)
@@ -216,9 +219,10 @@ struct TopKConfig {
   /// Resolve the threshold bin's ties exactly. `base` is the number of strictly
   /// "above" elements already emitted (final output starts at slot `base`);
   /// `topk` here is the number of remaining slots to fill (== global_topk - base).
+  template <typename InputT>
   SGL_DEVICE static void handle_tie(  //
       const TieValue* tie_buffer,
-      const TopKProblem& problem,
+      const TopKProblemT<InputT>& problem,
       const uint32_t base,
       const uint32_t num_ties,
       const uint32_t topk,
@@ -348,10 +352,10 @@ struct TopKConfig {
   /// kStableTies: then, while they still outnumber the free slots, rounds 4-7
   /// select on the inverted index, so they resolve to the smallest indices (the
   /// `is_greater` order of the small-tie paths).
-  template <uint32_t kItems>
+  template <uint32_t kItems, typename InputT>
   SGL_DEVICE static void radix_tie_select(  //
       const TieValue* tie_buffer,
-      const TopKProblem& problem,
+      const TopKProblemT<InputT>& problem,
       const uint32_t base,
       const uint32_t num_ties,
       const uint32_t topk,
@@ -497,8 +501,52 @@ struct TopKRadixBase : TopKConfig {
 #endif
   }
 
-  template <uint32_t N = 1, typename F>
-  SGL_DEVICE static void for_each_input(const float* __restrict__ in, uint32_t seq_len, F&& fn) {
+  template <typename InputT>
+  static constexpr uint32_t kInputVecSize = sizeof(float) * kVecSize / sizeof(InputT);
+
+  struct ExpandedBF16Vec {
+    float values[kInputVecSize<bf16_t>];
+    SGL_DEVICE float& operator[](uint32_t i) {
+      return values[i];
+    }
+    SGL_DEVICE float operator[](uint32_t i) const {
+      return values[i];
+    }
+  };
+
+  template <typename InputT>
+  using ScoreVecT = std::conditional_t<std::is_same_v<InputT, float>, vec_t, ExpandedBF16Vec>;
+
+  template <typename InputT>
+  SGL_DEVICE static void load_scores(ScoreVecT<InputT>& vec, const InputT* in, uint32_t vi, uint32_t seq_len) {
+    if constexpr (std::is_same_v<InputT, float>) {
+      vec.load(in, vi);
+    } else {
+      constexpr auto kVecSize = kInputVecSize<InputT>;
+      using Packed = AlignedVector<bf16x2_t, kVecSize / 2>;
+      const auto base = vi * kVecSize;
+      if (vi < seq_len / kVecSize && reinterpret_cast<uintptr_t>(in) % alignof(Packed) == 0) {
+        Packed packed;
+        packed.load(in, vi);
+#pragma unroll
+        for (uint32_t j = 0; j < kVecSize / 2; ++j) {
+          const auto [lo, hi] = cast<fp32x2_t>(packed[j]);
+          vec[2 * j] = lo;
+          vec[2 * j + 1] = hi;
+        }
+        return;
+      }
+      // An unaligned row or a partial vector must use bounded scalar loads.
+#pragma unroll
+      for (uint32_t j = 0; j < kVecSize; ++j) {
+        vec[j] = base + j < seq_len ? cast<float>(in[base + j]) : padding_value();
+      }
+    }
+  }
+
+  template <uint32_t N = 1, typename InputT, typename F>
+  SGL_DEVICE static void for_each_input(const InputT* __restrict__ in, uint32_t seq_len, F&& fn) {
+    constexpr auto kVecSize = kInputVecSize<InputT>;
     constexpr auto kStride = N * kBlockSize;
     const auto tx = threadIdx.x;
     const auto num_full = seq_len / kVecSize;  // fully-in-bounds vectors
@@ -506,13 +554,13 @@ struct TopKRadixBase : TopKConfig {
     // lane | rank | warp
     auto vi = N == 1 ? tx : (tx % kChunk) + blockIdx.y * kChunk + (tx / kChunk) * (N * kChunk);
     if (vi < num_full) {
-      vec_t next_vec;
-      next_vec.load(in, vi);
+      ScoreVecT<InputT> next_vec;
+      load_scores(next_vec, in, vi, seq_len);
 #pragma unroll 1
       do {
         const auto cur = next_vec;
         vi += kStride;
-        if (vi < num_full) next_vec.load(in, vi);
+        if (vi < num_full) load_scores(next_vec, in, vi, seq_len);
         const auto base = (vi - kStride) * kVecSize;
 #pragma unroll
         for (uint32_t j = 0; j < kVecSize; ++j) {
@@ -524,8 +572,8 @@ struct TopKRadixBase : TopKConfig {
     if (vi == num_full) {
       const auto base = vi * kVecSize;
       if (base == seq_len) return;
-      vec_t cur;
-      cur.load(in, vi);
+      ScoreVecT<InputT> cur;
+      load_scores(cur, in, vi, seq_len);
 #pragma unroll
       for (uint32_t j = 0; j < kVecSize; ++j) {
         if (base + j < seq_len) fn(cur[j], base + j);
@@ -587,8 +635,9 @@ struct TopKRadixBase : TopKConfig {
   /// Re-stages the tie buffer exactly when the threshold bin overflows it: radix
   /// rounds narrow the bin to one bucket, then a final scan emits what lies above
   /// it and stages the bucket for the caller's handle_tie.
+  template <typename InputT>
   SGL_DEVICE static void refine_ties(  //
-      const TopKProblem& problem,
+      const TopKProblemT<InputT>& problem,
       Smem* smem,
       const float v_lo,
       const float v_hi,
@@ -603,16 +652,17 @@ struct TopKRadixBase : TopKConfig {
     // for_each_input's elements with one copy of `fn` and reversed lanes, so this
     // cold scan shares no load address (hence no registers) with the fast path.
     const auto scan = [&](auto&& fn) {
+      constexpr auto kVecSize = kInputVecSize<InputT>;
       const auto seq_len = problem.seq_len;
       const auto num_vec = (seq_len + kVecSize - 1) / kVecSize;
       uint32_t vi = kBlockSize - 1 - tx;
-      vec_t cur;
-      if (vi < num_vec) cur.load(problem.in, vi);
+      ScoreVecT<InputT> cur;
+      if (vi < num_vec) load_scores(cur, problem.in, vi, seq_len);
 #pragma unroll 1
       while (vi < num_vec) {
         const auto next_vi = vi + kBlockSize;
-        vec_t next;
-        if (next_vi < num_vec) next.load(problem.in, next_vi);
+        ScoreVecT<InputT> next;
+        if (next_vi < num_vec) load_scores(next, problem.in, next_vi, seq_len);
 #pragma unroll
         for (uint32_t j = 0; j < kVecSize; ++j) {
           if (vi * kVecSize + j < seq_len) fn(cur[j], vi * kVecSize + j);
@@ -688,8 +738,10 @@ struct TopKRegister : TopKRadixBase<12> {
   static constexpr uint32_t kMaxSeqLen = kBlockSize * kVecSize * kLocalVecs;
   using Smem = typename TopKRadixBase<12>::Smem;
 
-  template <bool kUsePDL>
-  SGL_DEVICE static void forward(const TopKProblem& problem, void* _smem) {
+  template <bool kUsePDL, typename InputT>
+  SGL_DEVICE static void forward(const TopKProblemT<InputT>& problem, void* _smem) {
+    constexpr auto kVecSize = kInputVecSize<InputT>;
+    constexpr auto kLocalVecs = kMaxSeqLen / (kBlockSize * kVecSize);
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
 
@@ -704,11 +756,11 @@ struct TopKRegister : TopKRadixBase<12> {
     const uint32_t num_full = div_ceil(problem.seq_len, kVecSize);
 
     // Phase 1: load full vectors + build histogram
-    vec_t local_vecs[kLocalVecs];
+    ScoreVecT<InputT> local_vecs[kLocalVecs];
 #pragma unroll
     for (uint32_t i = 0; i < kLocalVecs; ++i) {
       const auto vi = tx + kBlockSize * i;
-      if (vi < num_full) local_vecs[i].load(problem.in, vi);
+      if (vi < num_full) load_scores(local_vecs[i], problem.in, vi, problem.seq_len);
     }
 
     const auto tail_start = (problem.seq_len - 1) % kVecSize + 1;
@@ -910,8 +962,8 @@ struct TopKStreaming : TopKRadixBase<12> {
  public:
   static constexpr uint32_t kMaxSeqLen = std::numeric_limits<uint32_t>::max();
 
-  template <bool kUsePDL>
-  SGL_DEVICE static void forward(TopKProblem problem, void* _smem) {
+  template <bool kUsePDL, typename InputT>
+  SGL_DEVICE static void forward(TopKProblemT<InputT> problem, void* _smem) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
 

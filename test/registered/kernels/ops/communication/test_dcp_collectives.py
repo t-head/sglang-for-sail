@@ -32,6 +32,54 @@ def inputs(batch, rank, dim=512):
     return output, lse
 
 
+def test_q_prepack_on_side_stream_replay():
+    fixture._init_world()
+    group = ps._WORLD
+    main = torch.cuda.current_stream()
+    side = torch.cuda.Stream()
+    rng = torch.Generator(device="cuda").manual_seed(37 + group.rank_in_group)
+    q_nope = torch.empty(12, 120, 512, device="cuda", dtype=torch.bfloat16).transpose(
+        0, 1
+    )
+    q_pe = torch.empty(120, 12, 192, device="cuda", dtype=torch.bfloat16)[..., -64:]
+    w = (
+        torch.randn(12, 512, 512, device="cuda", dtype=torch.bfloat16, generator=rng)
+        / 512**0.5
+    )
+    q_nope.normal_(generator=rng)
+    q_pe.normal_(generator=rng)
+
+    def absorb():
+        return torch.bmm(q_nope.transpose(0, 1), w).transpose(0, 1)
+
+    def run():
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            q = absorb()
+            packed = comm.pack_q_for_mla_decode(q, q_pe)
+        main.wait_stream(side)
+        return comm.all_gather_q_for_mla_decode(q, q_pe, packed_q=packed)
+
+    with (
+        published_topology(tp_size=group.world_size, dcp_size=group.world_size),
+        get_parallel().override(dcp_group=group),
+    ):
+        run()
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        # Capture on the same stream that `run` joins back onto.
+        with torch.cuda.graph(graph, stream=main):
+            actual = run()
+        for _ in range(3):
+            q_nope.normal_(generator=rng)
+            q_pe.normal_(generator=rng)
+            expected = comm.all_gather_q_for_mla_decode(absorb(), q_pe)
+            graph.replay()
+            for got, want in zip(actual, expected):
+                torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("dim", [128, 512])
 def test_peer_exchange_bits_and_replay(dim):
     fixture._init_world()

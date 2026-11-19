@@ -44,6 +44,61 @@ if SGLANG_PROFILE_NVTX:
         SGLANG_PROFILE_NVTX_PRINT_SEQLEN = False
 
 
+class DcpWindowedScheduler:
+    """Reuse the native launch config, never the length-dependent schedule."""
+
+    def __init__(self):
+        self.layouts = {}
+
+    def prepare(self, sched, lengths: torch.Tensor, key: tuple, topk: int) -> bool:
+        """Return True if this call should record the native launch config."""
+        if lengths.numel() == 0:
+            return False
+        layout = self.layouts.get(key)
+        if layout is None:
+            return not torch.cuda.is_current_stream_capturing()
+        from sglang.kernels.ops.attention.dsv4.flashmla_sched_meta import (
+            flashmla_sched_meta,
+        )
+
+        sched.config, shape = layout
+        sched.tile_scheduler_metadata = lengths.new_empty(shape)
+        sched.num_splits = lengths.new_empty((lengths.numel() + 1,))
+        flashmla_sched_meta(
+            sched.tile_scheduler_metadata,
+            sched.num_splits,
+            topk_length=lengths,
+            block_size_n=64,
+            fixed_overhead_num_blocks=5,
+            topk=topk,
+            windowed=True,
+            ppu_layout=True,
+        )
+        # Otherwise the wheel discards the supplied tensors on its first call.
+        sched.have_initialized = True
+        return False
+
+    def observe(self, sched, rows: int, key: tuple) -> None:
+        meta = getattr(sched, "tile_scheduler_metadata", None)
+        splits = getattr(sched, "num_splits", None)
+        if (
+            getattr(sched, "have_initialized", False)
+            and (config := getattr(sched, "config", None)) is not None
+            and meta is not None
+            and meta.ndim == 2
+            and meta.shape[1] == 8
+            and meta.shape[0] > 0
+            and 4 * (2 * (rows + 1) + 4 * (meta.shape[0] + 1)) <= 48 * 1024
+            and meta.dtype == torch.int32
+            and meta.is_contiguous()
+            and splits is not None
+            and splits.shape == (rows + 1,)
+            and splits.dtype == torch.int32
+            and splits.is_contiguous()
+        ):
+            self.layouts[key] = (config, meta.shape)
+
+
 def get_mla_metadata(
     cache_seqlens: Optional[torch.Tensor] = None,
     num_q_tokens_per_head_k: Optional[int] = None,

@@ -26,6 +26,7 @@ from sglang.kernels.ops.attention.dsa.paged_mqa_logits import (
 )
 from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
 from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import (
+    _local_candidates,
     _scatter_candidates_kernel,
     dcp_all_visible,
     dcp_global_topk,
@@ -44,6 +45,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla imp
     is_mla_dcp_lse_base_on_e,
 )
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_sail
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
 
@@ -918,6 +920,56 @@ class TestDSADCPAttention(CustomTestCase):
 
 
 class TestDCPCandidatePrefix(CustomTestCase):
+    def test_ppu_bf16_logits_candidate_graph_replay(self):
+        """PPU BF16 candidates match FP32 on both sides of the local top-k cutoff."""
+        if not is_sail():
+            self.skipTest("PPU BF16 candidate path")
+        # Odd stride exercises aligned vector loads and unaligned fallbacks.
+        valid_lengths = [2051, 643, 0, 8195, 17003, 17003, 0, 0, 17003]
+        rows, width = len(valid_lengths), max(valid_lengths)
+        world, rank = 8, 3
+        logits = torch.empty(rows, width, device="cuda", dtype=torch.bfloat16)
+        fp32_logits = torch.empty(rows, width + 1, device="cuda", dtype=torch.float32)[
+            :, :width
+        ]
+        lengths = torch.tensor(valid_lengths, device="cuda", dtype=torch.int32)
+        rng = torch.Generator(device="cuda").manual_seed(23)
+        with (
+            published_topology(tp_size=world, dcp_size=world),
+            get_parallel().override(attn_dcp_rank=rank),
+        ):
+            logits.normal_(generator=rng)
+            _local_candidates(logits, lengths, TOPK)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                candidates = _local_candidates(logits, lengths, TOPK)
+            for _ in range(2):
+                logits.normal_(generator=rng)
+                fp32_logits.copy_(logits)
+                reference = _local_candidates(fp32_logits, lengths, TOPK)
+                graph.replay()
+                for row, length in enumerate(valid_lengths):
+                    with self.subTest(length=length):
+                        valid = min(length, TOPK)
+                        expected = (
+                            fp32_logits[row, :length]
+                            .argsort(descending=True, stable=True)[:valid]
+                            .sort()
+                            .values
+                        )
+                        for result in (candidates, reference):
+                            positions, perm = result[row, :valid, 1].sort()
+                            self.assertTrue(
+                                torch.equal(positions, expected * world + rank)
+                            )
+                            score_bits = fp32_logits[row, expected].view(torch.int32)
+                            self.assertTrue(
+                                torch.equal(result[row, perm, 0], score_bits)
+                            )
+                            self.assertTrue((result[row, valid:, 1] == -1).all())
+                            self.assertTrue((result[row, valid:, 0] == 0).all())
+
     def test_scatter_ignores_stale_padding_on_replay(self):
         rows, width = 5, 32768
         lens = torch.full((rows,), 8199, device="cuda", dtype=torch.int32)

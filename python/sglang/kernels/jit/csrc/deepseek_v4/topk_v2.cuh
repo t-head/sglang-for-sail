@@ -265,9 +265,9 @@ using RaggedSmem = impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Sm
  * `score[row_start : row_start + seq_len]`: writes each selected column plus
  * `offset` into `out`. The head mask is explained at `topk_ragged_kernel`.
  */
-template <bool kPDL>
+template <bool kPDL, typename InputT>
 SGL_DEVICE void ragged_window_topk(
-    float* score,
+    InputT* score,
     const uint32_t row_start,
     const uint32_t seq_len,
     const uint32_t topk,
@@ -275,18 +275,19 @@ SGL_DEVICE void ragged_window_topk(
     const int32_t offset,
     RaggedSmem* smem) {
   constexpr uint32_t kVecSize = impl::TopKStreaming::kVecSize;
-  const auto rem = row_start % kVecSize;
+  // BF16 loads can start at row_start directly, even for an unaligned window.
+  const auto rem = std::is_same_v<InputT, float> ? row_start % kVecSize : 0u;
   if (rem != 0) {
     // The mask has to land after the indexer has retired
     // Otherwise it may be accidentally overwritten by DG upstream
     device::PDLWaitPrimary<kPDL>();
     static_assert(kVecSize <= kBlockSize, "not enough threads ");
     if (const auto tx = threadIdx.x; tx < rem) {
-      score[row_start - rem + tx] = impl::padding_value();
+      score[row_start - rem + tx] = device::cast<InputT>(impl::padding_value());
     }
   }
   using device::topk::broadcast;
-  const auto problem = TopKProblem{
+  const auto problem = impl::TopKProblemT<InputT>{
       .in = score + (row_start - rem),
       .out = out,
       .topk = topk,
@@ -459,8 +460,9 @@ TOPK_KERNEL void topk_ragged_kpool_kernel(const __grid_constant__ TopKRaggedKpoo
 /// Candidates for a distributed top-k merge (DSA decode context parallel): the
 /// row's top-k as (fp32 score bits, global position) int32 pairs, where local
 /// position l on rank `cand_rank` is global position `l * cand_world + cand_rank`.
+template <typename InputT>
 struct TopKCandidatesParams {
-  float* __restrict__ scores;  // NOTE: may write, as for the ragged layout
+  InputT* __restrict__ scores;  // FP32 may write the ragged head mask
   const int32_t* __restrict__ seq_lens;
   const int32_t* __restrict__ row_starts;  // null => every window starts at 0
   int32_t* __restrict__ candidates;        // [rows, topk, 2]
@@ -478,8 +480,8 @@ struct TopKCandidatesParams {
  * staged in shared memory; the epilogue then reads each selected score and
  * writes (score bits, global position), `(0, -1)` padded.
  */
-template <bool kPDL>
-TOPK_KERNEL void topk_candidates_kernel(const __grid_constant__ TopKCandidatesParams params) {
+template <bool kPDL, typename InputT>
+TOPK_KERNEL void topk_candidates_kernel(const __grid_constant__ TopKCandidatesParams<InputT> params) {
   device::enable_smem_spilling();
   __shared__ RaggedSmem smem;
   __shared__ int32_t s_topk_indices[kMaxTopK];
@@ -491,8 +493,22 @@ TOPK_KERNEL void topk_candidates_kernel(const __grid_constant__ TopKCandidatesPa
   const auto out = reinterpret_cast<int2*>(params.candidates) + bx * static_cast<int64_t>(topk);
   const auto score = params.scores + bx * params.score_stride;
   const auto emit = [&](uint32_t tx, int32_t idx) {
-    out[tx] = idx >= 0 ? make_int2(__float_as_int(score[row_start + idx]), idx * params.cand_world + params.cand_rank)
-                       : make_int2(0, -1);
+    if constexpr (std::is_same_v<InputT, float>) {
+      out[tx] = idx >= 0 ? make_int2(__float_as_int(score[row_start + idx]), idx * params.cand_world + params.cand_rank)
+                         : make_int2(0, -1);
+    } else {
+      if (idx < 0) {
+        out[tx] = make_int2(0, -1);
+        return;
+      }
+      // The merge reads FP32 bits. BF16 already holds their upper 16 bits.
+      const auto value = score[row_start + idx];
+      const auto bits = static_cast<uint32_t>(__bfloat16_as_ushort(value)) << 16;
+      // Keep the backend's NaN representation used by BF16-to-FP32 conversion.
+      const auto score_bits = (bits & 0x7fffffffu) > 0x7f800000u ? __float_as_int(device::cast<float>(value))
+                                                                 : std::bit_cast<int32_t>(bits);
+      out[tx] = make_int2(score_bits, idx * params.cand_world + params.cand_rank);
+    }
   };
 
   if (seq_len <= topk) {
@@ -1799,9 +1815,10 @@ struct TopKKernel {
   /**
    * \brief Ragged top-k emitting distributed-merge candidates: `candidates`
    * [rows, topk, 2] int32 gets (fp32 score bits, `local * world + rank`) for
-   * every selected local position, `(0, -1)` padded. `scores` is written in
-   * place as for `transform_ragged`.
+   * every selected local position, `(0, -1)` padded. FP32 `scores` may be
+   * written in place as for `transform_ragged`.
    */
+  template <typename InputT>
   static void transform_candidates_dcp(
       const tvm::ffi::TensorView scores,
       const tvm::ffi::TensorView seq_lens,
@@ -1819,7 +1836,7 @@ struct TopKKernel {
 
     TensorMatcher({B, L})  // score
         .with_strides({S, 1})
-        .with_dtype<float>()
+        .with_dtype<InputT>()
         .with_device(device_)
         .verify(scores);
     TensorMatcher({B})  // seq_lens
@@ -1839,13 +1856,15 @@ struct TopKKernel {
       row_starts_ptr = static_cast<const int32_t*>(row_starts.value().data_ptr());
     }
 
-    RuntimeCheck(S.unwrap() % 4 == 0, "score_stride must be a multiple of 4 (16-byte vectorized load)");
+    if constexpr (std::is_same_v<InputT, float>) {
+      RuntimeCheck(S.unwrap() % 4 == 0, "score_stride must be a multiple of 4 (16-byte vectorized load)");
+    }
     const auto topk = static_cast<uint32_t>(K.unwrap());
     RuntimeCheck(topk > 0 && topk <= kMaxTopK, "topk must be in (0, 2048]");
     RuntimeCheck(world >= 1 && rank >= 0 && rank < world, "invalid world/rank");
 
-    const auto params = TopKCandidatesParams{
-        .scores = static_cast<float*>(scores.data_ptr()),
+    const auto params = TopKCandidatesParams<InputT>{
+        .scores = static_cast<InputT*>(scores.data_ptr()),
         .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
         .row_starts = row_starts_ptr,
         .candidates = static_cast<int32_t*>(candidates.data_ptr()),
@@ -1856,7 +1875,7 @@ struct TopKKernel {
     };
     LaunchKernel(static_cast<uint32_t>(B.unwrap()), kBlockSize, device_.unwrap())
         .config({.use_pdl = kUsePDL})
-        .launch(topk_candidates_kernel<kUsePDL>, params);
+        .launch(topk_candidates_kernel<kUsePDL, InputT>, params);
   }
 
   /**

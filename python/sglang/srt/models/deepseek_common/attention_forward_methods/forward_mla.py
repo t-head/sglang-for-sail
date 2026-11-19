@@ -29,6 +29,7 @@ from sglang.srt.layers.dcp import (
     dcp_push_combine_fits,
     dcp_push_combine_reduce,
 )
+from sglang.srt.layers.dcp.comm import pack_q_for_mla_decode
 from sglang.srt.layers.dcp.layout import dsa_shards_index_k
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
@@ -401,6 +402,7 @@ class DeepseekMLAForwardMixin:
         q_pe = None
         k_pe = None
         q_nope_out_alt = None
+        packed_dcp_q = None
         fusion_plan: Optional[MlaBmmFusionPlan] = None
         if self.q_lora_rank is not None:
             q, latent_cache = (
@@ -512,6 +514,26 @@ class DeepseekMLAForwardMixin:
                     with torch.cuda.stream(self.alt_stream):
                         if _is_sail and self.dsa_decode_absorb_under_indexer:
                             q = self._q_b_proj_maybe_replicated(q, q_replicate_active)
+                            if (
+                                not q_replicate_active
+                                and self.use_dsa
+                                and dsa_shards_index_k()
+                                and self.is_dcp_mla_decode_phase(forward_batch)
+                                and get_exec().kernel.dsa_decode_backend
+                                == "flashmla_kv"
+                                and self.rotary_emb is None
+                                and self._decode_absorb_on_alt_stream()
+                            ):
+                                q_nope, q_pe, k_pe = self._split_q_nope_pe(
+                                    q, latent_cache
+                                )
+                                q_nope_out_alt = torch.bmm(
+                                    q_nope.transpose(0, 1), self.w_kc
+                                ).transpose(0, 1)
+                                # Keep the collective on the original lane, after candidate AG.
+                                packed_dcp_q = pack_q_for_mla_decode(
+                                    q_nope_out_alt, q_pe
+                                )
                         else:
                             q = self.q_b_proj_forward(q)
                 current_stream.wait_stream(self.alt_stream)
@@ -789,6 +811,7 @@ class DeepseekMLAForwardMixin:
                     q_nope_out, q_pe = all_gather_q_for_mla_decode(
                         q_nope_out=q_nope_out,
                         q_pe=q_pe,
+                        packed_q=packed_dcp_q,
                     )
             elif forward_batch.forward_mode.is_extend():
                 # for extend, gather kv (K3.1's DSA backend gathers its own cache)
@@ -953,6 +976,11 @@ class DeepseekMLAForwardMixin:
                             # the push-combine reduce wins at any batch size
                             or dcp_push_combine_fits(
                                 attn_output.shape[0] * self.num_local_heads
+                            )
+                            or (
+                                _is_sail
+                                and dcp_comm_backend == "a2a"
+                                and attn_output.dtype == torch.bfloat16
                             )
                         )
                         and self.w_vc is not None

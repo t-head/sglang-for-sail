@@ -281,14 +281,24 @@ def all_gather_kv_cache_for_mha_extend(
     return kv_a.contiguous(), k_pe.contiguous()
 
 
-def all_gather_q_for_mla_decode(
+def pack_q_for_mla_decode(
     q_nope_out: torch.Tensor,
     q_pe: torch.Tensor,
-):
+) -> torch.Tensor:
     group = get_parallel().dcp_group
     with use_symmetric_memory(group):
         # transpose q_pe and q_nope_out from [B, H, L] to [H, B, L]
-        combined = torch.cat([q_pe.transpose(0, 1), q_nope_out.transpose(0, 1)], dim=-1)
+        return torch.cat([q_pe.transpose(0, 1), q_nope_out.transpose(0, 1)], dim=-1)
+
+
+def all_gather_q_for_mla_decode(
+    q_nope_out: torch.Tensor,
+    q_pe: torch.Tensor,
+    *,
+    packed_q: Optional[torch.Tensor] = None,
+):
+    group = get_parallel().dcp_group
+    combined = pack_q_for_mla_decode(q_nope_out, q_pe) if packed_q is None else packed_q
     gathered = group.all_gather(combined, dim=0)
     d_pe = q_pe.size(-1)
     d_nope = q_nope_out.size(-1)

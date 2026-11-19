@@ -35,6 +35,8 @@ def flashmla_sched_meta(
     fixed_overhead_num_blocks: int,
     topk: int,
     extra_topk: int = 0,
+    windowed: bool = False,
+    ppu_layout: bool = False,
 ) -> None:
     """Fill FlashMLA's split-KV tile-scheduler metadata in place.
 
@@ -55,6 +57,10 @@ def flashmla_sched_meta(
         fixed_overhead_num_blocks: the implementation's per-request overhead.
         topk: the sparse top-k, or -1 for a dense model.
         extra_topk: the extra cache's top-k, 0 when there is none.
+        windowed: use a parallel windowed partitioning for a sparse schedule.
+            The result can differ from the legacy schedule.
+        ppu_layout: emit token bounds for the PPU sparse FlashMLA ABI.
+            Requires windowed mode, topk_length, and no extra cache.
     """
     _jit_flashmla_sched_meta_module().flashmla_sched_meta(
         tile_scheduler_metadata,
@@ -66,4 +72,6 @@ def flashmla_sched_meta(
         fixed_overhead_num_blocks,
         topk,
         extra_topk,
+        windowed,
+        ppu_layout,
     )

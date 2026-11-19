@@ -54,7 +54,11 @@ def _jit_topk_v2_module(stable_ties: bool = False):
         ("topk_transform_paged", f"{kernel}::transform_paged"),
         ("topk_transform_ragged", f"{kernel}::transform_ragged"),
         ("topk_transform_candidates", f"{kernel}::transform_candidates"),
-        ("topk_transform_candidates_dcp", f"{kernel}::transform_candidates_dcp"),
+        ("topk_transform_candidates_dcp", f"{kernel}::transform_candidates_dcp<float>"),
+        (
+            "topk_transform_candidates_dcp_bf16",
+            f"{kernel}::transform_candidates_dcp<bf16_t>",
+        ),
         ("topk_transform_packed", f"{kernel}::transform_packed"),
         ("topk_plan", f"{kernel}::plan"),
         ("topk_transform_kpool", f"{kernel}::transform_kpool"),
@@ -308,11 +312,15 @@ def topk_transform_candidates_v2(
     padded. Local position ``l`` of rank ``rank`` is global position
     ``l * world + rank`` under decode context parallelism.
 
-    NOTE: ``scores`` is written in place as for the ragged entry point.
+    NOTE: FP32 ``scores`` may be written in place as for the ragged entry point.
     """
-    _topk_v2_module(stable_ties).topk_transform_candidates_dcp(
-        scores, seq_lens, row_starts, out_candidates, world, rank
+    module = _topk_v2_module(stable_ties)
+    transform = (
+        module.topk_transform_candidates_dcp_bf16
+        if scores.dtype == torch.bfloat16
+        else module.topk_transform_candidates_dcp
     )
+    transform(scores, seq_lens, row_starts, out_candidates, world, rank)
 
 
 def topk_transform_paged_v2(
