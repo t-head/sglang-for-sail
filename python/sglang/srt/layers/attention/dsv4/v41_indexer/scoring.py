@@ -644,7 +644,7 @@ def decode_score_chunks(
     def score_rows(rows, plan):
         if indexer.use_int8:
             # Weighted PPU schedules use one query per row, so chunks may split
-            # an MTP request; the adapter rebuilds metadata for each row chunk.
+            # an MTP request; forward metadata supplies the matching chunk plan.
             return int8_paged_index_logits(
                 q[rows],
                 weights[rows],
@@ -659,7 +659,7 @@ def decode_score_chunks(
         return deep_gemm_fp4_paged_mqa_logits(
             (q_fp4[rows].unsqueeze(1), q_sf[rows].unsqueeze(1)),
             k_cache,
-            weights[rows].float(),
+            weights[rows],
             metadata.compressed_seq_lens[rows],
             metadata.page_table[rows],
             plan,
