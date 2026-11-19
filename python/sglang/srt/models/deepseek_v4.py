@@ -113,6 +113,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     Mxfp8DenseGemmBackend,
     view_aiter_fused_rms_transposed_fp8_scale,
 )
+from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
 from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
 from sglang.srt.layers.quantization.w8a8_int8 import (
@@ -206,6 +207,7 @@ from sglang.srt.multimodal.deepseek_v41_image_processing import (
     materialize_image_gpu,
 )
 from sglang.srt.runtime_context import (
+    get_context,
     get_device,
     get_exec,
     get_forward,
@@ -306,6 +308,38 @@ def wo_a_fp8_gemm_enabled(quant_config: Optional[QuantizationConfig]) -> bool:
         128,
         128,
     ]
+
+
+def _ppu_channelwise_wo_a_enabled(
+    quant_config: Optional[QuantizationConfig], prefix: str
+) -> bool:
+    return (
+        _is_sail
+        and _FP8_WO_A_GEMM
+        and isinstance(quant_config, Mxfp4Config)
+        and quant_config.is_fp8_channelwise_layer(prefix)
+        and get_context().is_config_namespace_published("exec")
+        and get_exec().kernel.dsv4_attn_backend != "flashmla_mega"
+    )
+
+
+def _ppu_channelwise_wo_a_update_error(
+    quant_config: Optional[QuantizationConfig], model_prefix: str, num_layers: int
+) -> Optional[str]:
+    # Check global checkpoint names, not the layers on this PP rank. Every
+    # rank must reject together, including ranks that don't build a FP8 wo_a.
+    if any(
+        _ppu_channelwise_wo_a_enabled(
+            quant_config, add_prefix(f"layers.{i}.self_attn.wo_a", model_prefix)
+        )
+        for i in range(num_layers)
+    ):
+        return (
+            "Online weight updates are not supported while PPU per-channel FP8 "
+            "wo_a is enabled: cached projection operands can retain old weights. "
+            "Restart with SGLANG_OPT_FP8_WO_A_GEMM=0 to use online weight updates."
+        )
+    return None
 
 
 _NPU_BF16_WO_A_GEMM = _is_npu and envs.SGLANG_OPT_NPU_BF16_WO_A_GEMM.get()
@@ -1032,6 +1066,7 @@ bcg_deepseek_v4_exit_late_layer_tail = eager_on_graph(True)(
 class MqaAttentionBase(nn.Module):
     # Class-level default for subclasses that read it without running __init__.
     wo_a_fp8: bool = False
+    _ppu_channelwise_wo_a: bool = False
 
     def __init__(
         self,
@@ -1093,6 +1128,16 @@ class MqaAttentionBase(nn.Module):
         fp8: bool = (
             wo_a_fp8_gemm_enabled(quant_config) if wo_a_fp8 is None else wo_a_fp8
         )
+        # Preserve BF16 input for the DSpark draft and MegaAttention setup.
+        self._ppu_channelwise_wo_a = (
+            wo_a_fp8 is None
+            and wo_a_keeps_quant_config is not False
+            and _ppu_channelwise_wo_a_enabled(
+                quant_config,
+                add_prefix("wo_a", prefix),
+            )
+        )
+        fp8 = fp8 or self._ppu_channelwise_wo_a
         reduce_results: bool = (
             (self.attn_tp_size == get_parallel().tp_size and self.attn_tp_size > 1)
             if wo_b_reduce_results is None
@@ -2759,9 +2804,8 @@ class MQALayer(MqaAttentionBase):
         # set recipe[2]=D (contract-block size; channelwise == full row,
         # not the 128 used by block-FP8).
         #
-        # Lazy on first forward (not post_load_weights): the quant hook
-        # may run again after post_load_weights (hot reload, draft copy,
-        # offloader requant), so this is the safest snapshot point.
+        # Build after the quant hook has finalized the loaded representation.
+        # Model-owned update guard protects this snapshot during online updates.
         # .clone() decouples the cache from later in-place writes.
         wo_a = self.wo_a
         cached = getattr(wo_a, "_einsum_args_cache", None)
@@ -5041,9 +5085,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             self.image_start = nn.Parameter(torch.empty(config.hidden_size))
             self.image_end = nn.Parameter(torch.empty(config.hidden_size))
             self.image_newline = nn.Parameter(torch.empty(config.hidden_size))
-        self.model = DeepseekV4Model(
-            config, quant_config, prefix=add_prefix("model", prefix)
+        model_prefix = add_prefix("model", prefix)
+        self._derived_weight_cache_error = _ppu_channelwise_wo_a_update_error(
+            quant_config, model_prefix, config.num_hidden_layers
         )
+        self.model = DeepseekV4Model(config, quant_config, prefix=model_prefix)
         self.pp_group = get_parallel().pp_group
         if self.pp_group.is_last_rank:
             if self.pp_group.world_size == 1 and config.tie_word_embeddings:
@@ -5632,6 +5678,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
+        nextn_layer_prefix = None
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
@@ -5641,6 +5688,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                     if self.config.num_hidden_layers == 1
                     else self.config.num_hidden_layers
                 )
+                nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
@@ -5648,7 +5696,28 @@ class DeepseekV4ForCausalLM(nn.Module):
         # while the layer allocated an FP8 parameter (or vice versa) fails the
         # weight loader's dtype check.
         if not (self.wo_a_fp8 or use_npu_arch35_mxfp8_wo_a(self.quant_config)):
-            weights = _prepare_deepseek_v4_weights(weights, self.quant_config)
+            channelwise_wo_a = {
+                f"{name}.wo_a.weight"
+                for name, module in self.named_modules()
+                if isinstance(module, MQALayer) and module._ppu_channelwise_wo_a
+            }
+
+            def keep_wo_a_quantized(prefix: str) -> bool:
+                name = self.remap_weight_name_to_dpsk_hf_format(
+                    prefix + ".weight",
+                    is_nextn=is_nextn,
+                    num_hidden_layers=self.config.num_hidden_layers,
+                    quant_config=self.quant_config,
+                )
+                if nextn_layer_prefix is not None:
+                    name = _nextn_decoder_weight_name(name, nextn_layer_prefix)
+                return name in channelwise_wo_a
+
+            weights = _prepare_deepseek_v4_weights(
+                weights,
+                self.quant_config,
+                keep_quantized=keep_wo_a_quantized if channelwise_wo_a else None,
+            )
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
 
@@ -5677,7 +5746,6 @@ class DeepseekV4ForCausalLM(nn.Module):
             return getattr(module, "weight_loader", default_weight_loader)
 
         if is_nextn:
-            nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
             nextn_spec_weight_names_out_of_layer = [
                 "shared_head.norm",
                 "shared_head.head",
@@ -5792,7 +5860,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 break
 
                         if in_decoder:
-                            name = name.replace(nextn_layer_prefix, "model.decoder")
+                            name = _nextn_decoder_weight_name(name, nextn_layer_prefix)
 
                     if "rotary_emb.inv_freq" in name:
                         continue
@@ -6085,13 +6153,41 @@ def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def _nextn_decoder_weight_name(name: str, nextn_layer_prefix: str) -> str:
+    prefix = nextn_layer_prefix + "."
+    return (
+        "model.decoder." + name.removeprefix(prefix)
+        if name.startswith(prefix)
+        else name
+    )
+
+
 def _dequant_fp8_wo_a_streaming(
     weights: Iterable[Tuple[str, torch.Tensor]],
+    *,
+    keep_quantized: Optional[Callable[[str], bool]] = None,
 ) -> Iterable[Tuple[str, torch.Tensor]]:
     pending: dict[str, dict[str, torch.Tensor]] = {}
+    preserved_parts: dict[str, set[str]] = {}
+    scale_suffixes = ("scale", "weight_scale", "weight_scale_inv")
     emitted = False
 
     for name, tensor in weights:
+        if keep_quantized is not None and ".wo_a." in name:
+            prefix, _, suffix = name.rpartition(".")
+            if (
+                prefix.endswith(".wo_a")
+                and (suffix == "weight" or suffix in scale_suffixes)
+                and keep_quantized(prefix)
+            ):
+                if suffix == "weight" and tensor.dtype != torch.float8_e4m3fn:
+                    raise ValueError(
+                        f"{name}: expected per-channel FP8 (e4m3fn) weight"
+                    )
+                part = "weight" if suffix == "weight" else "scale"
+                preserved_parts.setdefault(prefix, set()).add(part)
+                yield name, tensor
+                continue
         if name.endswith(".wo_a.weight"):
             prefix = name[: -len(".weight")]
             bucket = pending.setdefault(prefix, {})
@@ -6128,6 +6224,12 @@ def _dequant_fp8_wo_a_streaming(
 
     if emitted:
         logger.info("Finished streaming dequant FP8/INT8 wo_a to BF16")
+    for prefix, parts in preserved_parts.items():
+        missing = {"weight", "scale"} - parts
+        if missing:
+            raise ValueError(
+                f"{prefix}: selected FP8 wo_a is missing its {missing.pop()}"
+            )
     for prefix, bucket in pending.items():
         if "weight" in bucket:
             if bucket["weight"].dtype in (torch.int8, torch.float8_e4m3fn):
@@ -6161,6 +6263,8 @@ def _dequant_fp8_wo_a(
 def _prepare_deepseek_v4_weights(
     weights: Iterable[Tuple[str, torch.Tensor]],
     quant_config: Optional[QuantizationConfig],
+    *,
+    keep_quantized: Optional[Callable[[str], bool]] = None,
 ) -> Iterable[Tuple[str, torch.Tensor]]:
     """Keep Expert Pack GGUF weights on the streaming load path."""
 
@@ -6169,7 +6273,7 @@ def _prepare_deepseek_v4_weights(
         return weights
     if quant_config is not None and quant_config.get_name() == "quark":
         weights = _rename_quark_fp8_block_scales(weights)
-    return _dequant_fp8_wo_a_streaming(weights)
+    return _dequant_fp8_wo_a_streaming(weights, keep_quantized=keep_quantized)
 
 
 def _rename_quark_fp8_block_scales(

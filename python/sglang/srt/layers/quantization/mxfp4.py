@@ -424,6 +424,13 @@ class Mxfp4Config(QuantizationConfig):
                 self.fp8_channelwise_layers
             )
 
+    def is_fp8_channelwise_layer(self, prefix: str) -> bool:
+        return bool(self.fp8_channelwise_layers) and should_ignore_layer(
+            prefix,
+            ignore=self.fp8_channelwise_layers,
+            fused_mapping=self.packed_modules_mapping,
+        )
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
@@ -437,11 +444,7 @@ class Mxfp4Config(QuantizationConfig):
         from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 
         # fp8 channelwise
-        if self.fp8_channelwise_layers and should_ignore_layer(
-            prefix,
-            ignore=self.fp8_channelwise_layers,
-            fused_mapping=self.packed_modules_mapping,
-        ):
+        if self.is_fp8_channelwise_layer(prefix):
             return W8A8Fp8Config(is_checkpoint_fp8_serialized=True).get_quant_method(
                 layer, prefix
             )
