@@ -4303,6 +4303,27 @@ class DeepseekV4Model(nn.Module):
                 bcg_deepseek_v4_engram_hash_ids(self.engram_hasher, input_ids, hash_ids)
             else:
                 hash_ids = self.engram_hasher(input_ids, forward_batch)
+                if envs.SGLANG_OPT_ENGRAM_HOST.get():
+                    # Late-layer tails re-slice hash_ids, so only earlier layers
+                    # can take prefetched rows.
+                    prefetch_end = (
+                        self.end_layer
+                        if self.late_layer_start is None
+                        else min(self.end_layer, self.late_layer_start)
+                    )
+                    engrams = [
+                        self.layers[i].engram
+                        for i in range(self.start_layer, prefetch_end)
+                    ]
+                    if any(
+                        layer is not None and getattr(layer.embed, "_host_opt", None) is not None
+                        for layer in engrams
+                    ):
+                        from sglang.srt.layers.engram_host import (
+                            prefetch_engram_host_rows,
+                        )
+
+                        prefetch_engram_host_rows(engrams, hash_ids, forward_batch)
         tail = None
         if (
             self.late_layer_start is not None
