@@ -26,6 +26,16 @@ if [[ -n "$missing" ]]; then
 fi
 python3 -I -B "$checker" snapshot "$artifact_dir/dependencies-after.json"
 python3 -I -B "$checker" check "$artifact_dir/dependencies-before.json" "$artifact_dir/dependencies-after.json"
+if [[ "${2:-}" == model_sanity && -n "${PPU_CI_EVAL_WHEEL_DIR:-}" ]]; then
+    phase eval_environment
+    (cd "$PPU_CI_EVAL_WHEEL_DIR" && sha256sum -- *.whl | cmp -s SHA256SUMS -)
+    eval_dir=$(mktemp -d)
+    trap 'rm -rf -- "$eval_dir"' EXIT
+    python3 -I -B -m pip install --no-index --ignore-installed --target "$eval_dir" \
+        --find-links "$PPU_CI_EVAL_WHEEL_DIR" 'evalscope==1.15.0'
+    export PPU_CI_EVAL_SITE="$eval_dir"
+    python3 -I -S -B -c 'import sys; sys.path.insert(0, sys.argv[1]); from evalscope import TaskConfig, run_task' "$eval_dir"
+fi
 phase recipe_validation
 python3 -I -B scripts/ci/ppu/ppu_recipe.py validate --all --require-sglang-parser
 if [[ "${1:-}" == validate ]]; then

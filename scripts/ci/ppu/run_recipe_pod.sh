@@ -39,6 +39,7 @@ esac
 [[ -f "$PPU_RECIPE_CONTAINER_MODEL/config.json" && -d /recipe-jit ]]
 if [[ "$TIER" == model_sanity ]]; then
     [[ -d "${PPU_CI_GSM8K_PATH:?}" ]]
+    export PPU_CI_EVAL_WHEEL_DIR="$PWD/evalscope-wheels"
 fi
 cache_key=$(python3 -B scripts/ci/ppu/recipe_bundle.py cache-key "$PPU_CI_WHEEL_DIR" "$PPU_CI_SOURCE_SHA")
 [[ "${PPU_CI_RECIPE_IMAGE_KEY:?}" =~ ^[0-9a-f]{64}$ ]]

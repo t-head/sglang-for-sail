@@ -8,6 +8,7 @@ PHASES = {
     "wheel_verification",
     "image_resolution",
     "runtime_dependencies",
+    "eval_environment",
     "platform_check",
     "recipe_validation",
     "server_startup",

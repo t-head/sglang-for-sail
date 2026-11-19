@@ -9,6 +9,7 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 from urllib.error import URLError
@@ -84,10 +85,14 @@ def probes(cfg, *, fast):
         "seed": cfg.get("seed", 42),
         "max_tokens": cfg["max_tokens"],
     }
+    if not fast:
+        payload["thinking"] = {"type": "disabled"}
     with request(
         "/v1/chat/completions", json.dumps(payload).encode(), timeout=90
     ) as response:
         answer = json.load(response)["choices"][0]
+    if not fast:
+        (RESULTS / "chat-probe-response.json").write_text(json.dumps(answer) + "\n")
     content = answer["message"].get("content")
     if (
         not isinstance(content, str)
@@ -331,6 +336,40 @@ def bench(stage, config, concurrency, requests, label):
         raise ValueError("native benchmark did not complete every request")
 
 
+def run_evaluation(stage, config):
+    eval_site = os.environ.get("PPU_CI_EVAL_SITE")
+    if not eval_site:
+        return evaluate(stage, config)
+    args = [
+        stage,
+        {key: config[key] for key in ("golden_model_key", "hf_model_id", "ppu_count")},
+    ]
+    launcher = (
+        "import runpy, sys; sys.path[:0] = sys.argv[1:3]; del sys.argv[1:3]; "
+        "runpy.run_module('recipe_runner', run_name='__main__')"
+    )
+    phase("gsm8k_eval")
+    with (RESULTS / "evalscope.log").open("wb") as log:
+        subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                "-B",
+                "-c",
+                launcher,
+                eval_site,
+                str(Path(__file__).resolve().parent),
+                "--eval-worker",
+            ],
+            input=json.dumps(args).encode(),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            check=True,
+        )
+    return json.loads((RESULTS / "gsm8k-result.json").read_text())
+
+
 def run(policy_path, tier, queue_s):
     policy = _load_yaml(policy_path)
     recipe = REPO_ROOT / policy["recipe"]
@@ -389,7 +428,7 @@ def run(policy_path, tier, queue_s):
             probes(stages["sanity"]["probe"], fast=False)
             result["sse_verified"] = True
             start = time.monotonic()
-            result.update(evaluate(stages["evalscope"], config))
+            result.update(run_evaluation(stages["evalscope"], config))
             result["eval_s"] = round(time.monotonic() - start, 3)
             stage = stages["bench"]
             if (
@@ -426,6 +465,10 @@ def run(policy_path, tier, queue_s):
 
 
 def main():
+    if sys.argv[1:] == ["--eval-worker"]:
+        result = evaluate(*json.load(sys.stdin))
+        (RESULTS / "gsm8k-result.json").write_text(json.dumps(result) + "\n")
+        return 0
     parser = argparse.ArgumentParser()
     parser.add_argument("policy", type=Path)
     parser.add_argument("tier", choices=("fast_sanity", "model_sanity"))

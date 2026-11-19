@@ -135,6 +135,9 @@ case "$mode" in
         export CONTAINER_OPTIONS='shm_size: "128Gi"'
         phase wheel_verification
         python3 -B scripts/ci/ppu/recipe_bundle.py check wheels "$PPU_CI_SOURCE_SHA"
+        if [[ "$mode" == model_sanity ]]; then
+            (cd evalscope-wheels && sha256sum -- *.whl | cmp -s SHA256SUMS -)
+        fi
         ;;
     legacy)
         [[ "${PPU_CI_BOARD:?}" == ZW-M890P || "$PPU_CI_BOARD" == OAM-810E ]]

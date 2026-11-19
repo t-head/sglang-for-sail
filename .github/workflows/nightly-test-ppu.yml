@@ -190,11 +190,48 @@ jobs:
           path: ${{ env.PPU_CI_WHEEL_DIR }}
           if-no-files-found: error
 
+  evalscope-wheels:
+    needs: plan
+    if: inputs.tier != 'fast_sanity'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      artifact-id: ${{ steps.wheels.outputs.artifact-id }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare the isolated offline EvalScope wheelhouse
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir evalscope-wheels
+          test_env="$RUNNER_TEMP/evalscope-check"
+          if ! {
+            python3 -m pip wheel --index-url https://pypi.org/simple \
+              --wheel-dir evalscope-wheels 'evalscope==1.15.0' &&
+            python3 -m venv "$test_env" &&
+            "$test_env/bin/python" -m pip install --no-index \
+              --find-links evalscope-wheels 'evalscope==1.15.0' &&
+            "$test_env/bin/python" -c 'from evalscope import TaskConfig, run_task'
+          } > "$RUNNER_TEMP/evalscope-wheelhouse.log" 2>&1; then
+            echo "::error::Offline EvalScope wheelhouse validation failed"
+            exit 1
+          fi
+          (cd evalscope-wheels && sha256sum -- *.whl > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        id: wheels
+        with:
+          name: evalscope-wheels-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evalscope-wheels/
+          if-no-files-found: error
+
   recipe-sanity:
     name: ${{ inputs.tier == 'fast_sanity' && 'Fast Sanity' || 'Model Sanity' }} (${{ matrix.model }})
-    needs: [plan, ppu-build]
+    needs: [plan, ppu-build, evalscope-wheels]
     if: >-
       !cancelled() && needs.plan.result == 'success' &&
+      (inputs.tier == 'fast_sanity' || needs.evalscope-wheels.result == 'success') &&
       (needs.ppu-build.result == 'success' ||
        (needs.plan.outputs.input-artifact-id != '' && needs.ppu-build.result == 'skipped'))
     runs-on: k8s-runner-group-cpu-thead
@@ -221,6 +258,13 @@ jobs:
           github-token: ${{ github.token }}
           merge-multiple: true
           path: wheels
+      - name: Fetch the isolated evaluator wheelhouse
+        if: inputs.tier != 'fast_sanity'
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.evalscope-wheels.outputs.artifact-id }}
+          merge-multiple: true
+          path: evalscope-wheels
       - name: Fetch pinned Cluster Run backend
         uses: actions/checkout@v4
         with:
