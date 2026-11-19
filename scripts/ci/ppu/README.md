@@ -8,9 +8,9 @@ The release branch owns the SGLang serving recipes, test policies and 890P accur
 
 For release PRs, use `run-ci` with `run-ci-ppu` for Fast Sanity. Apply `run-ci-ppu-nightly` to an eligible ready PR to trigger Model Sanity. Nightly dispatch and reusable inputs also allow an exact model filter and reuse of a candidate build with `skip_wheel_build` and `wheel_artifact_run_id`.
 
-## Provision the runner
+## Provision the cluster runner
 
-The runner service provides these values privately. The run binds the checkpoints and EvalScope dataset read-only inside the container.
+The `k8s-runner-group-cpu-thead` runner uses the pinned T-Head Cluster Run backend. The scheduler assigns one eight-card 890P Pod for each Recipe job. Each existing single-device test job requests one card on its selected board. The CPU runner passes model and dataset paths privately to the worker from its service environment.
 
 | Setting | Purpose |
 | --- | --- |
@@ -18,10 +18,14 @@ The runner service provides these values privately. The run binds the checkpoint
 | `PPU_CI_DSV4_FLASH_MODEL_PATH` | DeepSeek-V4-Flash MXFP4 checkpoint directory |
 | `PPU_CI_GSM8K_PATH` | Offline EvalScope GSM8K dataset directory |
 | `PPU_CI_JIT_ROOT` | Node-local persistent JIT cache root |
-| `PPU_CI_PRIVATE_RESULTS_ROOT` | Private per-run evidence and checksum manifests |
-| `PPU_CI_HOST_PYTHON` | Python 3.10 or newer when the default `python3` is older |
+| `PPU_CI_K8S_STAGE_ROOT` | Cluster Run's shared source staging directory in the CPU runner view |
+| `PPU_CI_PRIVATE_RESULTS_ROOT` | Private shared results directory in the CPU runner view |
+| `PPU_CI_K8S_PRIVATE_WORKER_ROOT` | The same results directory in the worker view |
+| `PPU_CI_K8S_RUNTIME_DIGEST` | Optional manifest reference for the designated release runtime tag |
+| `PPU_CI_RUNTIME_IMAGE` | Existing single-device test image |
+| `PPU_CI_TARGET_MODEL_PATH`, `PPU_CI_EAGLE3_MODEL_PATH`, `PPU_CI_DFLASH_MODEL_PATH`, `PPU_CI_EVAL_CACHE` | Existing single-device assets in the worker view |
 
-Use a runner configured for reviewed public PR revisions with public-safe runner labels, name and workspace metadata. The host locks all eight devices using the same lock names as the legacy lane. A run publishes a typed result after validation and retains diagnostic output on the runner. The runtime uses no external network.
+Use a runner configured for reviewed public PR revisions with public-safe runner labels, name and workspace metadata. Kubernetes device requests arbitrate card ownership. The CPU runner and worker must share access to the private per-job directory with mode 0700. The launcher captures Cluster Run diagnostics before exposing scheduler and worker results to GitHub. The evidence gate checks the runtime digest reported by Kubernetes and publishes a typed result. JIT caches for a pinned image can be reused across runs.
 
 For local structure checks, install PyYAML and use these commands.
 

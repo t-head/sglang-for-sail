@@ -14,8 +14,6 @@ import unittest
 import uuid
 from pathlib import Path
 
-import yaml
-
 from sglang.test.test_utils import CustomTestCase
 
 if sys.platform == "linux":
@@ -23,7 +21,6 @@ if sys.platform == "linux":
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "scripts/ci/ppu/run_test.sh"
-WORKFLOW = REPO / ".github/workflows/pr-test-ppu.yml"
 # Finish before GitHub's ~7.5s SIGINT + 2.5s SIGTERM force-kill window.
 CANCELLATION_BUDGET = 7.5
 SHA = "a" * 40
@@ -524,13 +521,6 @@ class TestPPUCIDocker(CustomTestCase):
         self.assertEqual(list(self.home.iterdir()), [])
 
     def start_blocked(self, **updates):
-        workflow = yaml.safe_load(WORKFLOW.read_text())
-        step = next(
-            step
-            for step in workflow["jobs"]["ppu-sanity"]["steps"]
-            if step.get("name")
-            == "Run both speculative sanity files with private retention"
-        )
         env = {
             **self.env,
             "BLOCK_TEST": "1",
@@ -539,9 +529,9 @@ class TestPPUCIDocker(CustomTestCase):
             "GITHUB_RUN_ATTEMPT": "1",
             **updates,
         }
-        # Sourcing prevents bash -c's implicit exec from masking the wrapper bug.
+        # Sourcing exercises the explicit exec used by the local Docker wrapper.
         step_script = self.root / "workflow-step.sh"
-        step_script.write_text(step["run"])
+        step_script.write_text("exec bash scripts/ci/ppu/run_legacy_private.sh\n")
         process = subprocess.Popen(
             [
                 "bash",

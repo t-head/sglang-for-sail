@@ -3,6 +3,7 @@
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -224,6 +225,143 @@ class RunEvidenceTest(unittest.TestCase):
                     self.assertNotIn(secret, process.stderr)
                 self.assertFalse(artifact.exists())
                 self.assertFalse(summary.exists())
+
+
+@unittest.skipUnless(
+    all(shutil.which(tool) for tool in ("jq", "sha256sum")),
+    "runner tools are required",
+)
+class ClusterTransportTest(unittest.TestCase):
+    def test_scheduler_streams_stay_private(self):
+        injected = "/" + "nas" + "_aisw/fixture " + ".".join(("10", "4", "5", "6"))
+        result = fast_result()
+        for tampered in (False, True):
+            with self.subTest(tampered=tampered), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                workspace = root / "checkout"
+                staging = root / "staging"
+                retained = root / "retained"
+                tools = root / "bin"
+                backend = workspace / ".ppu-infra/cluster-run/scripts"
+                payloads = workspace / "wheels"
+                for folder in (staging, retained, tools, backend, payloads):
+                    folder.mkdir(parents=True)
+                scripts = workspace / "scripts/ci/ppu"
+                shutil.copytree(REPO_ROOT / "scripts/ci/ppu", scripts)
+                (scripts / "recipe_bundle.py").write_text("# Verified separately\n")
+                (payloads / "recipe-manifest.json").write_text(
+                    json.dumps({"recipe_tree_sha256": result["recipe_tree_sha256"]})
+                )
+                summary = {
+                    "outcome": "pass",
+                    "parser_checked": True,
+                    "sse_verified": True,
+                    "cold_start_s": 3.0,
+                    "queue_s": 0,
+                    "layer_override": 2,
+                    "config_digest": result["config_digest"],
+                }
+                if tampered:
+                    summary["diagnostic"] = injected
+                (workspace / "fixture.json").write_text(json.dumps(summary))
+                (tools / "git").write_text(
+                    '#!/bin/bash\ncase "$1" in -C) echo 96e25147971f5d2a04d828f8ad508cae38a4fa8a;; '
+                    f"*) echo {result['source_sha']};; esac\n"
+                )
+                kube_content = json.dumps(
+                    {
+                        "status": {
+                            "containerStatuses": [
+                                {
+                                    "name": "worker",
+                                    "imageID": "docker-pullable://"
+                                    + result["runtime_image"],
+                                }
+                            ]
+                        }
+                    }
+                )
+                (tools / "kubectl").write_text(
+                    f"#!/bin/bash\nif [[ \"$*\" == *'get pod '* ]]; then echo '{kube_content}'; fi\n"
+                )
+                (tools / "timeout").write_text('#!/bin/bash\nshift\nexec "$@"\n')
+                for tool in tools.iterdir():
+                    tool.chmod(0o700)
+                (backend / "submit.sh").write_text(
+                    'test "$INPUT_NNODES/$INPUT_NPROC_PER_NODE/$INPUT_NODE_SELECTOR" = "0/8/board-type=ZW-M890P" || exit 1\n'
+                    'test -f "$SOURCE_STAGE_DIR" || exit 1\n'
+                    'printf "%s\\n" "$INJECTED_FIXTURE"\n'
+                    'printf "job_status=scheduled\\nstart_time=1\\ndeadline=2\\nqueue_duration_seconds=7\\n" >> "$GITHUB_OUTPUT"\n'
+                )
+                (backend / "monitor.sh").write_text(
+                    'printf "%s\\n" "$INJECTED_FIXTURE" >> "$GITHUB_STEP_SUMMARY"\n'
+                    'mkdir -p "$PPU_CI_WORKER_ARTIFACT_DIR/results"\n'
+                    'cp fixture.json "$PPU_CI_WORKER_ARTIFACT_DIR/results/summary.json"\n'
+                    'echo job_status=succeeded >> "$GITHUB_OUTPUT"\n'
+                )
+                (backend / "cleanup.sh").write_text(
+                    'printf "%s\\n" "$INJECTED_FIXTURE"\n'
+                    'unlink "$SOURCE_STAGE_DIR"\n'
+                    'rmdir "$(dirname "$SOURCE_STAGE_DIR")"\n'
+                )
+                export_env = {
+                    **os.environ,
+                    "PATH": os.pathsep.join(
+                        (
+                            str(tools),
+                            str(Path(sys.executable).parent),
+                            os.environ["PATH"],
+                        )
+                    ),
+                    "TIER": "fast_sanity",
+                    "MODEL_KEY": "glm-5.3",
+                    "GITHUB_OUTPUT": str(root / "gha-output"),
+                    "PPU_PUBLIC_SUMMARY": str(root / "gha-summary"),
+                    "GITHUB_WORKSPACE": str(workspace),
+                    "RUNNER_TEMP": str(root / "runner-temp"),
+                    "GITHUB_RUN_ID": "12",
+                    "GITHUB_RUN_ATTEMPT": "1",
+                    "PPU_CI_PRIVATE_RESULTS_ROOT": str(retained),
+                    "PPU_CI_K8S_PRIVATE_WORKER_ROOT": str(retained),
+                    "PPU_CI_K8S_STAGE_ROOT": str(staging),
+                    "PPU_CI_SOURCE_SHA": result["source_sha"],
+                    "PPU_CI_JIT_ROOT": str(root / "jit"),
+                    "PPU_CI_GLM53_MODEL_PATH": str(root / "model"),
+                    "PPU_CI_RECIPE_RUNTIME_IMAGE": result["runtime_image"],
+                    "INJECTED_FIXTURE": injected,
+                }
+                process = subprocess.run(
+                    ["bash", str(scripts / "run_recipe_cluster.sh")],
+                    cwd=workspace,
+                    env=export_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+                artifact = workspace / "ppu-public/recipe.json"
+                job_summary = root / "gha-summary"
+                self.assertEqual(
+                    process.returncode, int(tampered), process.stdout + process.stderr
+                )
+                self.assertNotIn(injected, process.stdout + process.stderr)
+                self.assertEqual(list(staging.iterdir()), [])
+                if tampered:
+                    self.assertFalse(artifact.exists())
+                    self.assertFalse(job_summary.exists())
+                    self.assertFalse((root / "gha-output").exists())
+                else:
+                    public_record = json.loads(artifact.read_text())
+                    self.assertEqual(public_record, {**result, "queue_s": 7})
+                    self.assertIn(artifact.read_text(), job_summary.read_text())
+                    self.assertIn(artifact.read_text(), process.stdout)
+                    self.assertEqual(
+                        (root / "gha-output").read_text(), "approved=true\n"
+                    )
+                    self.assertNotIn(
+                        injected, artifact.read_text() + job_summary.read_text()
+                    )
+                (original_log,) = retained.glob("cluster.*/launcher.log")
+                self.assertIn(injected, original_log.read_text())
 
 
 if __name__ == "__main__":

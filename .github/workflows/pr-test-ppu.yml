@@ -192,57 +192,51 @@ jobs:
     name: >-
       ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
            github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
-          format('ignored-label-ppu-sanity ({0})', matrix.runner) ||
-          format('ppu-sanity ({0})', matrix.runner) }}
+          format('ignored-label-ppu-sanity ({0})', matrix.board) ||
+          format('ppu-sanity ({0})', matrix.board) }}
     needs: [check-changes, pr-gate, ppu-build]
     if: needs.check-changes.outputs.ppu == 'true'
-    # Both PPU generations reuse the same wheels; each host supplies its own
-    # runtime image and device, while checkpoints come from the shared NAS.
     strategy:
-      # A failure on one generation must not hide the other generation's result.
       fail-fast: false
       matrix:
-        runner: [8-ppu-m890p, 16-ppu-zw810e]
-    runs-on: ${{ matrix.runner }}
+        board: [ZW-M890P, OAM-810E]
+    runs-on: k8s-runner-group-cpu-thead
+    container:
+      image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: 60
     permissions:
       contents: read
       actions: read
     env:
+      TIER: legacy
+      PPU_CI_BOARD: ${{ matrix.board }}
       PPU_CI_SOURCE_SHA: ${{ needs.check-changes.outputs.source-sha }}
     steps:
-      - name: Initialize private runtime directories and Git configuration
-        run: |
-          umask 077
-          work="$(mktemp -d "${RUNNER_TEMP}/ppu-runtime.XXXXXX")"
-          echo "::add-mask::$work"
-          echo "::add-mask::$GITHUB_WORKSPACE"
-          touch "$work/gitconfig"
-          mkdir "$work/wheels" "$work/artifacts"
-          {
-            printf 'GIT_CONFIG_GLOBAL=%s\n' "$work/gitconfig"
-            printf 'PPU_CI_WHEEL_DIR=%s\n' "$work/wheels"
-            printf 'PPU_CI_ARTIFACT_DIR=%s\n' "$work/artifacts"
-          } >> "$GITHUB_ENV"
-
-      # Same ref as check-changes; run_test.sh rejects any HEAD other than
-      # PPU_CI_SOURCE_SHA.
       - name: Checkout the triggering source revision
         timeout-minutes: 10
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          ref: ${{ needs.check-changes.outputs.source-sha }}
           persist-credentials: false
-
       - name: Download the matching PPU wheel artifact
         uses: actions/download-artifact@v4
         with:
           artifact-ids: ${{ needs.ppu-build.outputs.wheel-artifact-id }}
           merge-multiple: true
-          path: ${{ env.PPU_CI_WHEEL_DIR }}
-
-      - name: Run both speculative sanity files with private retention
-        run: exec bash scripts/ci/ppu/run_legacy_private.sh > "$PPU_CI_ARTIFACT_DIR/legacy-launcher.log" 2>&1
+          path: wheels
+      - name: Fetch pinned Cluster Run backend
+        uses: actions/checkout@v4
+        with:
+          repository: t-head/ci-infra
+          ref: 96e25147971f5d2a04d828f8ad508cae38a4fa8a
+          path: .ppu-infra
+          persist-credentials: false
+      - name: Orchestrate PPU Pod with private logs
+        id: cluster
+        shell: bash
+        run: |
+          export PPU_PUBLIC_SUMMARY="$GITHUB_STEP_SUMMARY"
+          exec bash scripts/ci/ppu/run_recipe_cluster.sh
 
   ppu-fast-sanity:
     needs: [check-changes, pr-gate, ppu-build]

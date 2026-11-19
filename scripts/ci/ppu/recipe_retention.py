@@ -13,6 +13,9 @@ from pathlib import Path
 RESULT_FILES = ("results/summary.json", "provenance.json")
 OPTIONAL_FILES = (
     "runtime.log",
+    "scheduler-output",
+    "scheduler-env",
+    "scheduler-summary",
     "ownership.log",
     "image-pull.log",
     "ppu-memory-before.log",

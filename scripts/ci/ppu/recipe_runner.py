@@ -18,7 +18,7 @@ from ppu_recipe import REPO_ROOT, _load_yaml, resolve_recipe
 
 HOST = "http://127.0.0.1:9985"
 MODEL = "recipe-model"
-RESULTS = Path("/artifacts/results")
+RESULTS = Path(os.environ.get("PPU_CI_ARTIFACT_DIR", "/artifacts")) / "results"
 
 
 def phase(name):
@@ -242,7 +242,7 @@ def evaluate(stage, config):
                 "gsm8k": {
                     **dataset_options,
                     "filters": dataset["filters"],
-                    "dataset_id": "/assets/gsm8k",
+                    "dataset_id": os.environ.get("PPU_CI_GSM8K_PATH", "/assets/gsm8k"),
                 }
             },
             generation_config=stage["generation"],
@@ -334,7 +334,7 @@ def bench(stage, config, concurrency, requests, label):
 def run(policy_path, tier, queue_s):
     policy = _load_yaml(policy_path)
     recipe = REPO_ROOT / policy["recipe"]
-    assets = Path("/artifacts/assets.json")
+    assets = RESULTS.parent / "assets.json"
     model_asset = _load_yaml(recipe)["ppu"]["assets"]
     assets.write_text(
         json.dumps(

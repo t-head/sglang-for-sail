@@ -171,7 +171,12 @@ class TestPPUCIWorkflow(CustomTestCase):
                     for step in job["steps"]
                     if step.get("uses", "").startswith("actions/checkout@")
                 )
-                self.assertEqual(checkout["with"]["ref"], expected)
+                self.assertEqual(
+                    checkout["with"]["ref"],
+                    expected
+                    if name == "ppu-build"
+                    else "${{ needs.check-changes.outputs.source-sha }}",
+                )
                 self.assertEqual(
                     job["env"]["PPU_CI_SOURCE_SHA"],
                     "${{ needs.check-changes.outputs.source-sha }}",
@@ -179,17 +184,17 @@ class TestPPUCIWorkflow(CustomTestCase):
 
     def test_sanity_runs_on_every_ppu_generation_with_private_retention(self):
         sanity = self.jobs["ppu-sanity"]
-        self.assertEqual(sanity["runs-on"], "${{ matrix.runner }}")
+        self.assertEqual(sanity["runs-on"], "k8s-runner-group-cpu-thead")
         self.assertIs(sanity["strategy"]["fail-fast"], False)
         self.assertEqual(
-            sanity["strategy"]["matrix"]["runner"], ["8-ppu-m890p", "16-ppu-zw810e"]
+            sanity["strategy"]["matrix"]["board"], ["ZW-M890P", "OAM-810E"]
         )
-        self.assertIn("matrix.runner", sanity["name"])
+        self.assertIn("matrix.board", sanity["name"])
         self.assertFalse(
             any("upload-artifact" in step.get("uses", "") for step in sanity["steps"])
         )
         self.assertIn(
-            "exec bash scripts/ci/ppu/run_legacy_private.sh", sanity["steps"][-1]["run"]
+            "exec bash scripts/ci/ppu/run_recipe_cluster.sh", sanity["steps"][-1]["run"]
         )
 
     def test_finish_requires_successful_build_and_sanity_when_in_scope(self):

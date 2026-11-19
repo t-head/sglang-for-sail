@@ -3,6 +3,8 @@
 
 PHASES = {
     "runner_preflight",
+    "cluster_submit",
+    "cluster_worker",
     "wheel_verification",
     "image_resolution",
     "runtime_dependencies",
