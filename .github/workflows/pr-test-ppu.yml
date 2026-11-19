@@ -263,6 +263,22 @@ jobs:
         run: |
           export PPU_PUBLIC_SUMMARY="$GITHUB_STEP_SUMMARY"
           exec bash scripts/ci/ppu/run_recipe_cluster.sh
+      - name: Approve only the checked single-device evidence file
+        id: evidence
+        if: always() && steps.cluster.outcome != 'skipped'
+        shell: bash
+        run: |
+          if [[ -f ppu-public/legacy.json && ! -L ppu-public/legacy.json ]] &&
+            python3 -B scripts/ci/ppu/recipe_publish.py --verify-only ppu-public/legacy.json >/dev/null 2>&1; then
+            printf 'approved=true\n' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Upload checked single-device evidence
+        if: always() && steps.evidence.outputs.approved == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: legacy-sanity-${{ matrix.board }}-${{ github.run_attempt }}
+          path: ppu-public/legacy.json
+          if-no-files-found: error
 
   ppu-fast-sanity:
     needs: [check-changes, pr-gate, ppu-build, ppu-cluster-config]

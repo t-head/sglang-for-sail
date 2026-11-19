@@ -13,6 +13,11 @@ from recipe_diagnostics import PHASES
 
 REGISTRY = "download.t-head.cn/docker_test/sglang"
 MODELS = {"glm-5.3", "deepseek-v4-flash"}
+LEGACY_SCHEMA = "ppu-legacy-sanity/v1"
+LEGACY_CASES = {
+    "test_basic_sanity_dflash.py": "dflash",
+    "test_basic_sanity_eagle3.py": "eagle3",
+}
 FAST = {"layer_override", "fallback_reason"}
 NIGHTLY = {
     "gsm8k_score",
@@ -38,9 +43,51 @@ BASE = {
 }
 
 
+def validate_legacy(payload):
+    if set(payload) != {
+        "schema",
+        "source_sha",
+        "board",
+        "outcome",
+        "private_retention",
+        "cases",
+    } or (
+        payload["schema"] != LEGACY_SCHEMA
+        or not re.fullmatch(r"[0-9a-f]{40}", payload["source_sha"])
+        or payload["board"] not in {"ZW-M890P", "OAM-810E"}
+        or payload["outcome"] not in {"pass", "fail"}
+        or type(payload["private_retention"]) is not bool
+        or type(payload["cases"]) is not dict
+        or set(payload["cases"]) != set(LEGACY_CASES.values())
+    ):
+        raise ValueError("invalid legacy run identity")
+    for case in payload["cases"].values():
+        if type(case) is not dict or set(case) != {"status", "duration_s"}:
+            raise ValueError("invalid legacy case")
+        status = case["status"]
+        duration = case["duration_s"]
+        if status == "not_run" and duration is None:
+            continue
+        if (
+            status not in {"pass", "fail"}
+            or type(duration) not in (int, float)
+            or not math.isfinite(duration)
+            or not 0 <= duration <= 3600
+        ):
+            raise ValueError("invalid legacy case evidence")
+    if payload["outcome"] == "pass" and (
+        not payload["private_retention"]
+        or any(case["status"] != "pass" for case in payload["cases"].values())
+    ):
+        raise ValueError("legacy pass lacks evidence")
+
+
 def validate(payload):
     if type(payload) is not dict:
         raise ValueError("invalid result")
+    if payload.get("schema") == LEGACY_SCHEMA:
+        validate_legacy(payload)
+        return
     meta = {
         "schema",
         "model",
@@ -158,7 +205,12 @@ def publish(payload, artifact, summary, console):
     with artifact.open("x", encoding="utf-8") as output:
         output.write(canonical + "\n")
     with summary.open("a", encoding="utf-8") as output:
-        output.write("## PPU Recipe Sanity\n\n```json\n" + canonical + "\n```\n")
+        title = (
+            "PPU Single-Device Sanity"
+            if payload["schema"] == LEGACY_SCHEMA
+            else "PPU Recipe Sanity"
+        )
+        output.write(f"## {title}\n\n```json\n" + canonical + "\n```\n")
     print(canonical, file=console)
 
 
@@ -179,6 +231,11 @@ def main():
             validate(record)
             if record["source_sha"] != os.environ["PPU_CI_SOURCE_SHA"]:
                 raise ValueError("unmatched evidence source revision")
+            if (
+                record["schema"] == LEGACY_SCHEMA
+                and record["board"] != os.environ["PPU_CI_BOARD"]
+            ):
+                raise ValueError("unmatched legacy board")
         else:
             publish(record, args.artifact, args.summary, sys.stdout)
     except (ValueError, OSError, KeyError, TypeError, OverflowError, RecursionError):

@@ -78,6 +78,7 @@ finish() {
         fi
     fi
     if [[ "$mode" == legacy ]]; then
+        export PPU_LEGACY_RETAINED=true RECIPE_OUTCOME=failure
         (
             cd "$raw" || exit 1
             find . -type d -exec chmod 700 '{}' +
@@ -85,7 +86,19 @@ finish() {
             sums=$(mktemp)
             find . -type f -print0 | sort -z | xargs -0 -r sha256sum > "$sums"
             mv -- "$sums" SHA256SUMS
-        ) || rc=1
+        ) || { rc=1; export PPU_LEGACY_RETAINED=false; }
+        (( rc == 0 )) && export RECIPE_OUTCOME=success
+        local candidate
+        if ! candidate=$(mktemp 2>/dev/null) ||
+            ! python3 -B scripts/ci/ppu/recipe_report.py "$candidate" 2>/dev/null ||
+            ! python3 -B scripts/ci/ppu/recipe_publish.py "$candidate" \
+                ppu-public/legacy.json "$public_summary" >&3 2>/dev/null; then
+            echo "::error::Single-device evidence could not be published" >&3
+            rc=1
+        fi
+        if [[ -n "$candidate" ]]; then
+            rm -- "$candidate" 2>/dev/null || rc=1
+        fi
         if (( rc != 0 )); then
             echo "::error::Legacy PPU cluster job failed" >&3
         fi

@@ -7,13 +7,51 @@ import sys
 from pathlib import Path
 
 from recipe_diagnostics import failure_reason
+from recipe_publish import LEGACY_CASES, LEGACY_SCHEMA
 from recipe_retention import retain
+
+
+def legacy_result(env, source):
+    cases = {
+        name: {"status": "not_run", "duration_s": None}
+        for name in LEGACY_CASES.values()
+    }
+    metrics = source / "suite-metrics.jsonl"
+    seen = set()
+    if metrics.is_symlink() or (
+        metrics.exists() and (not metrics.is_file() or metrics.stat().st_size > 8192)
+    ):
+        raise ValueError("invalid private suite metrics")
+    if metrics.is_file():
+        for line in metrics.read_text().splitlines():
+            row = json.loads(line)
+            name = LEGACY_CASES[row["test_file"]]
+            if (
+                row["kind"] != "file"
+                or name in seen
+                or row["status"] not in {"pass", "fail"}
+            ):
+                raise ValueError("invalid private suite record")
+            seen.add(name)
+            cases[name] = {"status": row["status"], "duration_s": row["duration"]}
+    return {
+        "schema": LEGACY_SCHEMA,
+        "source_sha": env["PPU_CI_SOURCE_SHA"],
+        "board": env["PPU_CI_BOARD"],
+        "private_retention": env["PPU_LEGACY_RETAINED"] == "true",
+        "outcome": "pass" if env["RECIPE_OUTCOME"] == "success" else "fail",
+        "cases": cases,
+    }
 
 
 def main():
     env = os.environ.copy()
     source = Path(env["PPU_CI_ARTIFACT_DIR"])
     outcome = env["RECIPE_OUTCOME"]
+    if env["TIER"] == "legacy":
+        result = legacy_result(env, source)
+        Path(sys.argv[1]).write_text(json.dumps(result, allow_nan=False) + "\n")
+        return 0
     try:
         retain(env)
         retained = True

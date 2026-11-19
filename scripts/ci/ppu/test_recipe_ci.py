@@ -22,6 +22,7 @@ from ppu_recipe import (
 from recipe_bundle import sha256, wheel_inventory
 from recipe_cluster_diagnostics import diagnostic_codes
 from recipe_publish import publish, validate
+from recipe_report import legacy_result
 from recipe_runner import metrics_zero, read_eval_reviews
 from recipe_select import select
 
@@ -240,6 +241,65 @@ class RunEvidenceTest(unittest.TestCase):
                     self.assertNotIn(secret, process.stderr)
                 self.assertFalse(artifact.exists())
                 self.assertFalse(summary.exists())
+
+    def test_single_device_evidence_excludes_private_diagnostics(self):
+        injected = (
+            "/" + "nas" + "_aisw/example-secret " + ".".join(("10", "1", "2", "3"))
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            metrics = root / "suite-metrics.jsonl"
+            metrics.write_text(
+                json.dumps(
+                    {
+                        "kind": "file",
+                        "test_file": "test_basic_sanity_dflash.py",
+                        "status": "fail",
+                        "duration": 230.2,
+                        "error": injected,
+                    }
+                )
+                + "\n"
+            )
+            result = legacy_result(
+                {
+                    "PPU_CI_SOURCE_SHA": "a" * 40,
+                    "PPU_CI_BOARD": "ZW-M890P",
+                    "PPU_LEGACY_RETAINED": "true",
+                    "RECIPE_OUTCOME": "failure",
+                },
+                root,
+            )
+            self.assertEqual(
+                result["cases"],
+                {
+                    "dflash": {"status": "fail", "duration_s": 230.2},
+                    "eagle3": {"status": "not_run", "duration_s": None},
+                },
+            )
+            with self.assertRaises(ValueError):
+                validate({**result, "outcome": "pass"})
+            console = io.StringIO()
+            artifact, summary = root / "artifact.json", root / "summary"
+            publish(result, artifact, summary, console)
+            self.assertEqual(artifact.read_text(), console.getvalue())
+            self.assertIn(console.getvalue(), summary.read_text())
+            for output in (
+                artifact.read_text(),
+                summary.read_text(),
+                console.getvalue(),
+            ):
+                for secret in injected.split():
+                    self.assertNotIn(secret, output)
+            with self.assertRaises(ValueError):
+                publish(
+                    {**result, "board": injected},
+                    root / "rejected.json",
+                    summary,
+                    console,
+                )
+            self.assertFalse((root / "rejected.json").exists())
+            self.assertEqual(artifact.read_text(), console.getvalue())
 
 
 class ClusterConfigBootstrapTest(unittest.TestCase):
