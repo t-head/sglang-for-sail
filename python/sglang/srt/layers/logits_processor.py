@@ -518,6 +518,8 @@ class LogitsProcessor(nn.Module):
         skip_all_gather: bool = False,
         logit_scale: Optional[float] = None,
         return_full_logits: bool = False,
+        *,
+        enable_multimem_all_gather: bool = True,
     ):
         super().__init__()
         self.config = config
@@ -591,7 +593,11 @@ class LogitsProcessor(nn.Module):
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
                 include_prefill=False, floor=128
             ),
-            enabled=self.do_tensor_parallel_all_gather and not self.use_attn_tp_group,
+            enabled=(
+                enable_multimem_all_gather
+                and self.do_tensor_parallel_all_gather
+                and not self.use_attn_tp_group
+            ),
             skip_entry_sync=True,
         )
 
