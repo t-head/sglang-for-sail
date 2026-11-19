@@ -18,7 +18,7 @@ model:
     - "0.85"
     - --chunked-prefill-size
     - "9984"
-    - --cuda-graph-max-bs
+    - --cuda-graph-max-bs-decode
     - "64"
     - --disable-custom-all-reduce
     - --disable-shared-experts-fusion

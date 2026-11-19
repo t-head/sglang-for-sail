@@ -22,7 +22,7 @@ RESULTS = Path(os.environ.get("PPU_CI_ARTIFACT_DIR", "/artifacts")) / "results"
 
 
 def phase(name):
-    (RESULTS.parent / "recipe-phase.txt").write_text(name + "\n")
+    (RESULTS.parent / "worker-phase.txt").write_text(name + "\n")
 
 
 def request(path, data=None, timeout=15):

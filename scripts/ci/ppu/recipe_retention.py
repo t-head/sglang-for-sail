@@ -35,6 +35,7 @@ OPTIONAL_FILES = (
         for ext in ("log", "jsonl")
     ),
     "recipe-phase.txt",
+    "worker-phase.txt",
     "results/gsm8k_per_question.jsonl",
     "results/sglang_serve_fast_2l.log",
     "results/sglang_serve_fast_full.log",

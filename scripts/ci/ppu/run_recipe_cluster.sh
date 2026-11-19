@@ -123,20 +123,14 @@ case "$mode" in
         [[ "$mode" != fast_sanity ]] || INPUT_TIMEOUT_MINUTES=30
         INPUT_IMAGE=${PPU_CI_RECIPE_RUNTIME_IMAGE:?}
         registry=download.t-head.cn/docker_test/sglang
-        if [[ "$INPUT_IMAGE" == "$registry:release-v0.5.23-20261116-cf244d4" &&
-            -n "${PPU_CI_K8S_RUNTIME_DIGEST:-}" ]]; then
-            INPUT_IMAGE=$PPU_CI_K8S_RUNTIME_DIGEST
-            [[ "$INPUT_IMAGE" == *@sha256:* ]]
+        if [[ "$INPUT_IMAGE" == "$registry:release-v0.5.23-20261116-cf244d4" ]]; then
+            release_digest=bcc10dbf0587c7dfc601d729008620cf923c926463eeac5d99c062d7517b24a5
+            INPUT_IMAGE=${PPU_CI_K8S_RUNTIME_DIGEST:-$registry@sha256:$release_digest}
         fi
-        [[ "$INPUT_IMAGE" == "$registry:release-v0.5.23-20261116-cf244d4" ||
-            "$INPUT_IMAGE" =~ ^download\.t-head\.cn/docker_test/sglang@sha256:[0-9a-f]{64}$ ]]
+        [[ "$INPUT_IMAGE" =~ ^download\.t-head\.cn/docker_test/sglang@sha256:[0-9a-f]{64}$ ]]
         [[ "${PPU_CI_JIT_ROOT:?}" == /* && "$PPU_CI_JIT_ROOT" != *[:,$'\r\n']* ]]
         export INPUT_HOST_VOLUMES="$PPU_CI_JIT_ROOT:/recipe-jit"
-        if [[ "$INPUT_IMAGE" == *@sha256:* ]]; then
-            PPU_CI_RECIPE_IMAGE_KEY=${INPUT_IMAGE##*:}
-        else
-            PPU_CI_RECIPE_IMAGE_KEY="run-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-        fi
+        PPU_CI_RECIPE_IMAGE_KEY=${INPUT_IMAGE##*:}
         export PPU_CI_RECIPE_IMAGE_KEY
         export CONTAINER_OPTIONS='shm_size: "128Gi"'
         phase wheel_verification

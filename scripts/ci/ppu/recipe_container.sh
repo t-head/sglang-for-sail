@@ -6,7 +6,7 @@ wheel_dir=${PPU_CI_WHEEL_DIR:-/wheels}
 source_dir=${PPU_CI_RECIPE_SOURCE_DIR:-/source}
 jit_dir=${PPU_CI_RECIPE_JIT_DIR:-/jit}
 
-phase() { printf '%s\n' "$1" > "$artifact_dir/recipe-phase.txt"; }
+phase() { printf '%s\n' "$1" > "$artifact_dir/worker-phase.txt"; }
 phase runtime_dependencies
 unset PYTHONPATH PYTHONHOME VIRTUAL_ENV
 export HF_HOME="$artifact_dir/hf-cache" HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1

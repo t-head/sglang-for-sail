@@ -20,10 +20,16 @@ PHASES = {
 }
 
 
-def failure_reason(source):
-    path = source / "recipe-phase.txt"
+def _read_phase(path):
     if path.is_file() and not path.is_symlink() and path.stat().st_size < 64:
         phase = path.read_text(encoding="ascii", errors="replace").strip()
         if phase in PHASES:
             return phase
-    return "unknown"
+    return None
+
+
+def failure_reason(source):
+    launcher = _read_phase(source / "recipe-phase.txt")
+    if launcher in {"cleanup", "image_resolution"}:
+        return launcher
+    return _read_phase(source / "worker-phase.txt") or launcher or "unknown"
