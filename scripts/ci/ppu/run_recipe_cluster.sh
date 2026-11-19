@@ -3,7 +3,8 @@
 set -euo pipefail
 umask 077
 
-if [[ -z "${PPU_CI_PRIVATE_RESULTS_ROOT:-}" && -n "${PPU_CI_K8S_CONFIG_SHA256:-}" ]]; then
+if [[ -n "${PPU_CI_K8S_CONFIG_SHA256:-}" &&
+    "${PPU_CI_K8S_LOADED_CONFIG_SHA256:-}" != "$PPU_CI_K8S_CONFIG_SHA256" ]]; then
     exec python3 -B scripts/ci/ppu/recipe_cluster_config.py
 fi
 

@@ -227,6 +227,33 @@ class RunEvidenceTest(unittest.TestCase):
                 self.assertFalse(summary.exists())
 
 
+class ClusterConfigBootstrapTest(unittest.TestCase):
+    def test_pinned_config_bootstrap_takes_precedence_over_inherited_root(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            scripts = root / "scripts/ci/ppu"
+            scripts.mkdir(parents=True)
+            (scripts / "recipe_cluster_config.py").write_text("raise SystemExit(29)\n")
+            process = subprocess.run(
+                ["bash", str(REPO_ROOT / "scripts/ci/ppu/run_recipe_cluster.sh")],
+                cwd=root,
+                env={
+                    **os.environ,
+                    "PATH": os.pathsep.join(
+                        (str(Path(sys.executable).parent), os.environ["PATH"])
+                    ),
+                    "GITHUB_OUTPUT": str(root / "output"),
+                    "TIER": "fast_sanity",
+                    "PPU_CI_PRIVATE_RESULTS_ROOT": str(root / "inherited"),
+                    "PPU_CI_K8S_CONFIG_SHA256": "a" * 64,
+                    "PPU_CI_K8S_LOADED_CONFIG_SHA256": "",
+                },
+                capture_output=True,
+                timeout=10,
+            )
+            self.assertEqual(process.returncode, 29)
+
+
 @unittest.skipUnless(
     all(shutil.which(tool) for tool in ("jq", "sha256sum")),
     "runner tools are required",

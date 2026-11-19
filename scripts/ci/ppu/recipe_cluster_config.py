@@ -152,7 +152,12 @@ def main():
     os.execvpe(
         "bash",
         ["bash", "scripts/ci/ppu/run_recipe_cluster.sh"],
-        {**os.environ, **values, "PPU_CI_PRIVATE_RESULTS_ROOT": str(retained)},
+        {
+            **os.environ,
+            **values,
+            "PPU_CI_PRIVATE_RESULTS_ROOT": str(retained),
+            "PPU_CI_K8S_LOADED_CONFIG_SHA256": expected,
+        },
     )
 
 
