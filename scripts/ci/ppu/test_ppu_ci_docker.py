@@ -619,7 +619,9 @@ class TestPPUCIDocker(CustomTestCase):
                 self.assertEqual(process.returncode, code, output + errors)
                 self.assertEqual(output, "")
                 destinations = (self.home / ".sglang-ppu-ci-results").glob("legacy.*")
-                destination = max(destinations, key=lambda path: path.stat().st_mtime_ns)
+                destination = max(
+                    destinations, key=lambda path: path.stat().st_mtime_ns
+                )
                 self.assert_private_pull_log((destination / "launcher.log").read_text())
                 self.assert_image_reference_is_private(
                     subprocess.CompletedProcess([], code, output, errors)

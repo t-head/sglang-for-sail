@@ -11,11 +11,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 import yaml
+from run_speculative_sanity import select_tests
 
 from sglang.test.ci.ci_register import ut_parse_one_file
 from sglang.test.test_utils import CustomTestCase
-
-from run_speculative_sanity import select_tests
 
 RUNNER = Path(__file__).resolve().parents[3] / "test/run_suite.py"
 
