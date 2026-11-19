@@ -24,7 +24,7 @@ model:
     - --mem-fraction-static
     - "0.8"
     - --chunked-prefill-size
-    - "9984"
+    - "10240"
     - --cuda-graph-max-bs-decode
     - "64"
     - --disable-prefill-cuda-graph

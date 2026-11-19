@@ -97,6 +97,9 @@ class RecipeContractTest(unittest.TestCase):
                 flags = resolved["flags"]
                 self.assertEqual(flags[flags.index("--attn-dp-size") + 1], "8")
                 self.assertEqual(flags[flags.index("--moe-a2a-backend") + 1], "deepep")
+                page_size = int(flags[flags.index("--page-size") + 1])
+                chunk_size = int(flags[flags.index("--chunked-prefill-size") + 1])
+                self.assertEqual(chunk_size % (8 * page_size), 0)
 
     def test_required_parser_fails_if_runtime_unavailable(self):
         with patch("ppu_recipe._build_sglang_serve_parser", side_effect=ImportError):
