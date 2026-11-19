@@ -210,7 +210,7 @@ jobs:
         id: wheels
         uses: actions/upload-artifact@v4
         with:
-          name: ppu-wheels-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ppu-wheels-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.check-changes.outputs.source-sha }}
           path: ${{ env.PPU_CI_WHEEL_DIR }}
           if-no-files-found: error
 
