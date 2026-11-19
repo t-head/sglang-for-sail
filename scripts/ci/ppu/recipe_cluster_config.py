@@ -147,7 +147,10 @@ def main():
     if info.st_uid != os.geteuid():
         raise ValueError("the runner does not own the private results directory")
     if sys.argv[1:] == ["--check"]:
+        from recipe_cluster_diagnostics import publish_recent_failures
+
         print("PPU cluster private configuration verified")
+        publish_recent_failures(retained, int(os.environ["GITHUB_RUN_ID"]))
         return
     os.execvpe(
         "bash",

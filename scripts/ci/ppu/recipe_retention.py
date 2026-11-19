@@ -16,6 +16,7 @@ OPTIONAL_FILES = (
     "scheduler-output",
     "scheduler-env",
     "scheduler-summary",
+    "pod-status.json",
     "ownership.log",
     "image-pull.log",
     "ppu-memory-before.log",

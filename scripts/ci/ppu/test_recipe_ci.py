@@ -20,6 +20,7 @@ from ppu_recipe import (
     validate_paths,
 )
 from recipe_bundle import sha256, wheel_inventory
+from recipe_cluster_diagnostics import diagnostic_codes
 from recipe_publish import publish, validate
 from recipe_runner import metrics_zero, read_eval_reviews
 from recipe_select import select
@@ -228,6 +229,10 @@ class RunEvidenceTest(unittest.TestCase):
 
 
 class ClusterConfigBootstrapTest(unittest.TestCase):
+    def test_prior_cluster_diagnostics_produce_fixed_codes(self):
+        value = "ImagePullBackOff Permission denied " + "/" + "nas" + "_aisw/example"
+        self.assertEqual(diagnostic_codes(value), ["image_pull", "permission_denied"])
+
     def test_pinned_config_bootstrap_takes_precedence_over_inherited_root(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -383,9 +388,7 @@ class ClusterTransportTest(unittest.TestCase):
                     self.assertEqual(public_record, {**result, "queue_s": 7})
                     self.assertIn(artifact.read_text(), job_summary.read_text())
                     self.assertIn(artifact.read_text(), process.stdout)
-                    self.assertEqual(
-                        (root / "gha-output").read_text(), "approved=true\n"
-                    )
+                    self.assertFalse((root / "gha-output").exists())
                     self.assertNotIn(
                         injected, artifact.read_text() + job_summary.read_text()
                     )

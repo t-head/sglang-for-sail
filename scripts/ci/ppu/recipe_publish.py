@@ -4,6 +4,7 @@
 import argparse
 import json
 import math
+import os
 import re
 import sys
 from pathlib import Path
@@ -164,15 +165,22 @@ def publish(payload, artifact, summary, console):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("source", type=Path)
-    parser.add_argument("artifact", type=Path)
-    parser.add_argument("summary", type=Path)
+    parser.add_argument("artifact", nargs="?", type=Path)
+    parser.add_argument("summary", nargs="?", type=Path)
+    parser.add_argument("--verify-only", action="store_true")
     args = parser.parse_args()
+    if not args.verify_only and (args.artifact is None or args.summary is None):
+        parser.error("publishing requires the artifact and summary paths")
     try:
         if args.source.stat().st_size > 8192 or args.source.is_symlink():
             raise ValueError("invalid result file")
-        publish(
-            json.loads(args.source.read_text()), args.artifact, args.summary, sys.stdout
-        )
+        record = json.loads(args.source.read_text())
+        if args.verify_only:
+            validate(record)
+            if record["source_sha"] != os.environ["PPU_CI_SOURCE_SHA"]:
+                raise ValueError("unmatched evidence source revision")
+        else:
+            publish(record, args.artifact, args.summary, sys.stdout)
     except (ValueError, OSError, KeyError, TypeError, OverflowError, RecursionError):
         print("PPU result rejected by the public evidence gate", file=sys.stderr)
         return 1

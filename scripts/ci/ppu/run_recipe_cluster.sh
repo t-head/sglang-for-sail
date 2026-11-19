@@ -8,7 +8,6 @@ if [[ -n "${PPU_CI_K8S_CONFIG_SHA256:-}" &&
     exec python3 -B scripts/ci/ppu/recipe_cluster_config.py
 fi
 
-visible_output=${GITHUB_OUTPUT:?}
 mode=${TIER:?}
 root=${PPU_CI_PRIVATE_RESULTS_ROOT:-}
 pod_root=${PPU_CI_K8S_PRIVATE_WORKER_ROOT:-}
@@ -57,6 +56,7 @@ finish() {
         wait "$child" 2>/dev/null
     fi
     if [[ -n "$JOB_NAME" && -n "$SOURCE_STAGE_DIR" ]]; then
+        timeout 15s kubectl -n "$INPUT_NAMESPACE" get pod "$JOB_NAME-worker-0" -o json > "$raw/pod-status.json" || true
         if ! bash "$infra/cleanup.sh" ||
             ! remaining=$(timeout 15s kubectl -n "$INPUT_NAMESPACE" get pods -l "ppu-job=$JOB_NAME" -o name) ||
             [[ -n "$remaining" || -e "$SOURCE_STAGE_DIR" ]]; then
@@ -81,11 +81,9 @@ finish() {
     export RECIPE_OUTCOME=failure
     (( rc == 0 )) && export RECIPE_OUTCOME=success
     python3 -B scripts/ci/ppu/recipe_report.py "$raw/public-candidate.json" || rc=1
-    if [[ -f "$raw/public-candidate.json" ]] &&
-        python3 -B scripts/ci/ppu/recipe_publish.py "$raw/public-candidate.json" \
+    if [[ ! -f "$raw/public-candidate.json" ]] ||
+        ! python3 -B scripts/ci/ppu/recipe_publish.py "$raw/public-candidate.json" \
             ppu-public/recipe.json "$public_summary" >&3; then
-        printf 'approved=true\n' >> "$visible_output"
-    else
         echo "::error::PPU cluster result could not be published" >&3
         rc=1
     fi
