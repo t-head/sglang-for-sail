@@ -24,6 +24,7 @@ from sglang.srt.layers.moe.fused_moe_triton import layer as fused_moe_layer_modu
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import draft_model_build_scope
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+from sglang.srt.managers.scheduler_components.dp_attn import _update_gather_batch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.runtime_context import (
@@ -35,6 +36,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
 )
 from sglang.srt.utils import is_sail
+from sglang.srt.utils.common import require_mlp_tp_gather
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -59,6 +61,63 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
     def tearDown(self):
         mega_moe._MEGA_MOE_SYMM_BUFFER.clear()
         super().tearDown()
+
+    def test_selector_uses_largest_sp_moe_shard(self):
+        cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK
+        dp_rows = [4096, 8192]
+        batch = SimpleNamespace(global_num_tokens=dp_rows)
+        sync = SimpleNamespace(
+            global_num_tokens=dp_rows,
+            global_num_tokens_for_logprob=dp_rows,
+            can_run_decode_cuda_graph=False,
+            can_run_draft_cuda_graph=False,
+            can_run_prefill_cuda_graph=False,
+            prefill_cuda_graph_max_prefix_len=0,
+        )
+        with (
+            get_context().override_server_args(
+                tp_size=16,
+                attn_dp_size=2,
+                ep_size=16,
+                enable_dp_lm_head=True,
+                moe_dense_tp_size=1,
+                _model_config=SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=[])
+                ),
+            ),
+            get_flags().moe.override(a2a_backend=MoeA2ABackend.MEGAMOE),
+            cap.override(1024),
+            envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.override(False),
+            envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.override(False),
+            patch.object(
+                mega_moe, "get_dp_global_num_tokens", lambda: batch.global_num_tokens
+            ),
+            patch.multiple(
+                mega_moe,
+                is_mega_moe_experts_ready=lambda _: True,
+                _log_mega_moe_hit=lambda _: None,
+            ),
+        ):
+            moe = SimpleNamespace(experts=None)
+            for largest in (8192, 8200):
+                dp_rows[-1] = largest
+                for rows in dp_rows:
+                    sync.num_tokens = sync.num_tokens_for_logprob = rows
+                    _update_gather_batch(
+                        batch, sync, require_mlp_tp_gather(), skip_global_metadata=True
+                    )
+                    self.assertEqual(batch.global_num_tokens, dp_rows)
+                    local = torch.empty((rows // 8, 1))
+                    self.assertEqual(
+                        mega_moe.should_use_mega_moe(moe, local), largest == 8192
+                    )
+
+            dp_rows[-1] = 8192
+            with get_parallel().override(attn_cp_size=2, attn_tp_size=4):
+                self.assertFalse(require_mlp_tp_gather())
+                self.assertFalse(
+                    mega_moe.should_use_mega_moe(moe, torch.empty((1024, 1)))
+                )
 
     def test_mma_type_follows_layer_w4a4_mode(self):
         experts = SimpleNamespace(_mega_moe_nvfp4=False, _mega_moe_w4a4=False)

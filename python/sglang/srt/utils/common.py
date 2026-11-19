@@ -4136,6 +4136,14 @@ def require_mlp_tp_gather(*, moe_a2a_backend=None):
             # bucket on every EP rank. As for FlashInfer A2A above, this only
             # enables DP-count bookkeeping; expert inputs remain local.
             return True
+        elif (
+            moe_a2a_backend.is_megamoe()
+            and not is_hip()
+            and get_parallel().attn_cp_size == 1
+            and get_parallel().attn_tp_size > 1
+        ):
+            # The DeepGEMM selector needs the same maximum DP count on every EP rank.
+            return True
         elif moe_a2a_backend.is_mori() and envs.SGLANG_MORI_RECV_BOUND.get():
             # Same bookkeeping, for the same reason. Bounding mori's receive
             # buffer means baking a fan-in size into a captured graph, and the
