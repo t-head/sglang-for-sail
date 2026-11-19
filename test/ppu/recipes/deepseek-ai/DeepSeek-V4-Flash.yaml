@@ -12,14 +12,24 @@ model:
   base_args:
     - --tp-size
     - "8"
+    - --attn-dp-size
+    - "8"
+    - --enable-dp-lm-head
+    - --moe-a2a-backend
+    - deepep
+    - --deepep-mode
+    - auto
     - --page-size
-    - "64"
+    - "256"
     - --mem-fraction-static
-    - "0.85"
+    - "0.8"
     - --chunked-prefill-size
     - "9984"
     - --cuda-graph-max-bs-decode
     - "64"
+    - --disable-prefill-cuda-graph
+    - --reasoning-parser
+    - deepseek-v4
     - --disable-custom-all-reduce
     - --disable-shared-experts-fusion
     - --trust-remote-code

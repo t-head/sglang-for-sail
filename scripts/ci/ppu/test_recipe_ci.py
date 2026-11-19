@@ -87,6 +87,17 @@ class RecipeContractTest(unittest.TestCase):
         self.assertIn("--disable-radix-cache", perf["flags"])
         self.assertNotIn("--load-format", perf["flags"])
 
+    def test_deepseek_attention_parallelism_uses_eight_devices(self):
+        policy = DEFAULT_POLICY_ROOT / "models/deepseek-v4-flash.yaml"
+        recipe = REPO_ROOT / _load_yaml(policy)["recipe"]
+        for tier in ("fast_sanity", "model_sanity"):
+            with self.subTest(tier=tier):
+                resolved = resolve_recipe(recipe, policy_path=policy, tier=tier)
+                self.assertEqual(resolved["ppu_count"], 8)
+                flags = resolved["flags"]
+                self.assertEqual(flags[flags.index("--attn-dp-size") + 1], "8")
+                self.assertEqual(flags[flags.index("--moe-a2a-backend") + 1], "deepep")
+
     def test_required_parser_fails_if_runtime_unavailable(self):
         with patch("ppu_recipe._build_sglang_serve_parser", side_effect=ImportError):
             with self.assertRaises(ValidationError):
