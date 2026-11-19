@@ -101,120 +101,7 @@ def handoff(directory, expected, uid, gid):
         os.close(parent)
 
 
-def export_legacy_retest(directory, marker_digest, run_id):
-    """Return specific retained logs to the authorized SSH task owner."""
-    if (
-        not directory.is_absolute()
-        or directory.name != CONFIG_NAME
-        or not re.fullmatch(r"[0-9a-f]{64}", marker_digest)
-        or not re.fullmatch(r"[0-9]+", run_id)
-    ):
-        raise ValueError("invalid private diagnostics parameters")
-    if run_id != "44600506304":
-        raise ValueError("diagnostic run was not requested")
-
-    retained = directory / "output/retained"
-    files = {}
-    for source in retained.glob(f"cluster.{run_id}.2.*"):
-        manifest = source / "SHA256SUMS"
-        if source.is_symlink() or manifest.is_symlink() or not manifest.is_file():
-            continue
-        checksums = dict(
-            tuple(line.split("  ", 1)[::-1])
-            for line in manifest.read_text().splitlines()
-        )
-        selected = {}
-        for name in (
-            "pod-status.json",
-            "runtime.log",
-            "sanity.log",
-            "test.log",
-            "launcher.log",
-            "recipe-phase.txt",
-            "exit-code.txt",
-        ):
-            entry = source / name
-            expected = checksums.get("./" + name)
-            if expected is None:
-                continue
-            if (
-                entry.is_symlink()
-                or not entry.is_file()
-                or entry.stat().st_size > 32 * 1024 * 1024
-            ):
-                raise ValueError("invalid diagnostic file")
-            content = entry.read_bytes()
-            if hashlib.sha256(content).hexdigest() != expected:
-                raise ValueError("legacy diagnostics checksum mismatch")
-            selected[name] = content
-        if not selected.get("pod-status.json"):
-            continue
-        spec = json.loads(selected["pod-status.json"])["spec"]
-        worker = next(c for c in spec["containers"] if c["name"] == "worker")
-        env = {item["name"]: item.get("value") for item in worker["env"]}
-        if (
-            env.get("TIER") == "legacy"
-            and env.get("PPU_CI_SOURCE_SHA")
-            == "8c719676c19c7868e307807d7c48f8e22c215395"
-            and spec["nodeSelector"].get("board-type") == "ZW-M890P"
-        ):
-            if files:
-                raise ValueError("ambiguous retained retest")
-            files = selected
-    if "runtime.log" not in files:
-        raise ValueError("retained retest not found")
-
-    target = directory.with_name(CONFIG_NAME + "-operator")
-    parent = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        owner = os.fstat(parent)
-        if stat.S_IMODE(owner.st_mode) != 0o700:
-            raise ValueError("operator directory is not private")
-        marker = os.open("owner-marker", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
-        with os.fdopen(marker, "rb") as stream:
-            info = os.fstat(stream.fileno())
-            if (
-                not stat.S_ISREG(info.st_mode)
-                or stat.S_IMODE(info.st_mode) != 0o600
-                or info.st_uid != owner.st_uid
-                or hashlib.sha256(stream.read(33)).hexdigest() != marker_digest
-            ):
-                raise ValueError("operator marker mismatch")
-        destination = "legacy-" + run_id + "-2"
-        try:
-            os.mkdir(destination, 0o700, dir_fd=parent)
-        except FileExistsError:
-            return
-        output = os.open(
-            destination, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent
-        )
-        try:
-            files["SHA256SUMS"] = "".join(
-                "{}  {}\n".format(hashlib.sha256(data).hexdigest(), name)
-                for name, data in sorted(files.items())
-            ).encode()
-            for name, content in files.items():
-                f = os.open(
-                    name,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                    0o600,
-                    dir_fd=output,
-                )
-                with os.fdopen(f, "wb") as stream:
-                    stream.write(content)
-                    stream.flush()
-                    os.fchown(stream.fileno(), owner.st_uid, owner.st_gid)
-            os.fchown(output, owner.st_uid, owner.st_gid)
-        finally:
-            os.close(output)
-    finally:
-        os.close(parent)
-
-
 def main():
-    if len(sys.argv) == 5 and sys.argv[1] == "--export-diagnostics":
-        export_legacy_retest(Path(sys.argv[2]), sys.argv[3], sys.argv[4])
-        return
     if len(sys.argv) == 6 and sys.argv[1] == "--handoff":
         handoff(Path(sys.argv[2]), sys.argv[3], int(sys.argv[4]), int(sys.argv[5]))
         return
@@ -264,27 +151,6 @@ def main():
 
         print("PPU cluster private configuration verified")
         publish_recent_failures(retained, int(os.environ["GITHUB_RUN_ID"]))
-        operator_marker = os.environ.get("PPU_CI_OPERATOR_HANDOFF_SHA256")
-        if operator_marker:
-            subprocess.run(
-                [
-                    "sudo",
-                    "-n",
-                    "--",
-                    sys.executable,
-                    "-I",
-                    "-B",
-                    str(Path(__file__).resolve()),
-                    "--export-diagnostics",
-                    str(directory),
-                    operator_marker,
-                    "44600506304",
-                ],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            print("Selected logs were copied to the task owner's private storage")
         return
     os.execvpe(
         "bash",

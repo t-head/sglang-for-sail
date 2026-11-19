@@ -33,7 +33,9 @@ def main():
     from sglang.test.ci.ci_utils import run_unittest_files
 
     repo = Path(__file__).resolve().parents[3]
-    return run_unittest_files(select_tests(repo), timeout_per_file=1200)
+    return run_unittest_files(
+        select_tests(repo), timeout_per_file=1200, continue_on_error=True
+    )
 
 
 if __name__ == "__main__":
