@@ -1054,6 +1054,12 @@ class EngramEmbedding(nn.Module):
                 requires_grad=False,
             )
             self._scale_f32 = scale_bytes.view(torch.float32)[: self.rows]
+        if envs.SGLANG_OPT_ENGRAM_HOST.get() and self._shared:
+            if envs.SGLANG_OPT_DSV41_ENGRAM_HOST_STAGING.get():
+                raise ValueError("Host prefetch and staging are mutually exclusive")
+            from sglang.srt.layers.engram_host import SharedHostEngram
+
+            self._host_opt = SharedHostEngram()
         self.weight.weight_loader = self._load_rows
         self.scale.weight_loader = self._load_rows
 
@@ -1163,6 +1169,10 @@ class EngramEmbedding(nn.Module):
             self.peer.connect(self.row_start, label)
         if self.host_table is not None:
             self.host_table.finish_load(label)
+        if envs.SGLANG_OPT_ENGRAM_HOST.get() and self._shared:
+            self._host_opt.finish_load(
+                self._scale_f32 if self._per_channel_scale else None, label
+            )
         logger.info(
             "engram table %s: %s scales, %s payload",
             label,
@@ -1184,6 +1194,8 @@ class EngramEmbedding(nn.Module):
             # Every shard is mapped here: read this rank's own tokens only, which
             # also covers the prefill CP and DP paths below without a collective.
             return self.peer.lookup(indices)
+        if envs.SGLANG_OPT_ENGRAM_HOST.get() and self._shared:
+            return self._host_opt.lookup(self, indices)
         if self._shared:
             if indices.shape[0] == 0:
                 return self.new_rows(indices)
@@ -1446,6 +1458,17 @@ class Engram(nn.Module):
             # empty M.
             return x
         kv, _ = self.wkv(emb.flatten(-2))
+        if (
+            envs.SGLANG_OPT_ENGRAM_HOST.get()
+            and self.embed._shared
+            and _cuda_kernels(x)
+            and self.image_token_id is None
+        ):
+            out = self.embed._host_opt.gate(
+                x, kv, self.q_weight, self.k_weight, self.eps, self.clamp_value
+            )
+            if out is not None:
+                return out
         image_ids = input_ids if self.image_token_id is not None else None
         return engram_gate(
             x,
