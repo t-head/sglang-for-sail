@@ -1,6 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Invoked by EXIT traps, including during an early failure.
+# shellcheck disable=SC2329
+retain_private() {
+    [[ "${PPU_CI_RETAIN_LEGACY:-0}" == 1 ]] || return 0
+    (
+        set -euo pipefail
+        cd -- "$PPU_CI_ARTIFACT_DIR"
+        find . -type d -exec chmod 700 {} +
+        find . -type f -exec chmod 600 {} +
+        inventory=$(mktemp)
+        find . -type f -print0 | sort -z | xargs -0 -r sha256sum > "$inventory"
+        install -m 600 "$inventory" SHA256SUMS
+        rm -f -- "$inventory"
+    )
+}
+
+# Early preflight failures also get a private checksum inventory.
+if [[ "${PPU_CI_RETAIN_LEGACY:-0}" == 1 ]]; then
+    trap 'code=$?; retain_private || code=1; exit "$code"' EXIT
+fi
+
 fail() { printf 'PPU CI: %s\n' "$*" >&2; exit 2; }
 
 for name in PPU_CI_RUNTIME_IMAGE PPU_CI_SOURCE_SHA PPU_CI_WHEEL_DIR PPU_CI_ARTIFACT_DIR \
@@ -160,6 +181,7 @@ cleanup() {
         printf 'PPU CI: container cleanup or artifact ownership recovery failed\n' >&2
         [[ "$code" != 0 ]] || code=1
     fi
+    retain_private || code=1
     exec 9>&-
     exit "$code"
 }

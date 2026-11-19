@@ -1,0 +1,30 @@
+schema_version: ppu-serving/v1
+ppu:
+  framework: sglang
+  visibility: public
+  assets: {model: glm-5.3-mxfp4, tokenizer: glm-5.3-mxfp4}
+  hf_model_id: T-HEAD/GLM-5.3-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken
+  golden_model_key: glm_5_3_mxfp4
+  topology: {kind: single_node, nodes: 1, devices_per_node: 8}
+  external_env: [DG_USE_MOE_DYNAMIC_TILE, HGGC_EMBEDDED_COPY_THRESHOLD, SGLANG_NSA_DUAL_STREAM]
+model:
+  model_id: zai-org/GLM-5.3
+  base_args:
+    - --tp-size
+    - "8"
+    - --page-size
+    - "64"
+    - --mem-fraction-static
+    - "0.85"
+    - --chunked-prefill-size
+    - "8192"
+    - --cuda-graph-max-bs
+    - "64"
+    - --disable-custom-all-reduce
+    - --trust-remote-code
+  base_env:
+    DG_USE_MOE_DYNAMIC_TILE: "1"
+    HGGC_EMBEDDED_COPY_THRESHOLD: "0x10000"
+    SGLANG_NSA_DUAL_STREAM: "1"
+variants:
+  default: {precision: mxfp4}

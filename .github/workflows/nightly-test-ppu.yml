@@ -1,0 +1,241 @@
+name: Nightly Test (PPU)
+
+on:
+  pull_request:
+    branches: [main, 'release/**']
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      ref:
+        type: string
+        default: ''
+      model_filter:
+        type: string
+        default: ''
+      runtime_image:
+        type: string
+        default: download.t-head.cn/docker_test/sglang:release-v0.5.23-20261116-cf244d4
+      skip_wheel_build:
+        type: boolean
+        default: false
+      wheel_artifact_run_id:
+        type: string
+        default: ''
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        default: ''
+      model_filter:
+        type: string
+        default: ''
+      runtime_image:
+        type: string
+        default: download.t-head.cn/docker_test/sglang:release-v0.5.23-20261116-cf244d4
+      tier:
+        type: string
+        default: model_sanity
+      skip_wheel_build:
+        type: boolean
+        default: false
+      wheel_artifact_run_id:
+        type: string
+        default: ''
+      wheel_artifact_id:
+        type: string
+        default: ''
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ppu-${{ inputs.tier || 'model_sanity' }}-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  GIT_CONFIG_NOSYSTEM: '1'
+  TIER: ${{ inputs.tier || 'model_sanity' }}
+
+jobs:
+  pr-gate:
+    if: >-
+      github.repository == 't-head/sglang-for-sail' &&
+      (github.event_name != 'pull_request' ||
+       inputs.tier == 'fast_sanity' ||
+       (github.event.action == 'labeled' &&
+        github.event.label.name == 'run-ci-ppu-nightly' &&
+        !github.event.pull_request.draft))
+    uses: ./.github/workflows/pr-gate.yml
+    with:
+      require-run-ci: true
+      require-label: ${{ inputs.tier == 'fast_sanity' && 'run-ci-ppu' || 'run-ci-ppu-nightly' }}
+
+  plan:
+    needs: pr-gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      source-sha: ${{ steps.plan.outputs.source }}
+      models: ${{ steps.plan.outputs.models }}
+      input-artifact-id: ${{ steps.plan.outputs.artifact }}
+      input-run-id: ${{ steps.plan.outputs.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate policies and public failure fixtures
+        run: |
+          python3 -m pip install --quiet PyYAML
+          python3 -B -m unittest discover -s scripts/ci/ppu -p 'test_recipe*.py'
+      - name: Select models and candidate wheel inputs
+        id: plan
+        env:
+          MODEL_FILTER: ${{ inputs.model_filter || '' }}
+          SKIP_BUILD: ${{ inputs.skip_wheel_build || false }}
+          WHEEL_RUN: ${{ inputs.wheel_artifact_run_id || '' }}
+          WHEEL_ID: ${{ inputs.wheel_artifact_id || '' }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          source=$(git rev-parse HEAD)
+          models=$(python3 -B scripts/ci/ppu/recipe_select.py "$TIER" --model-filter "$MODEL_FILTER")
+          if [[ "$SKIP_BUILD" == true ]]; then
+            if [[ -n "$WHEEL_ID" ]]; then
+              [[ "$WHEEL_ID" =~ ^[0-9]+$ && -z "$WHEEL_RUN" ]]
+              WHEEL_RUN="$GITHUB_RUN_ID"
+            else
+              [[ "$WHEEL_RUN" =~ ^[0-9]+$ ]]
+              WHEEL_ID=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$WHEEL_RUN/artifacts" |
+                jq -er --arg prefix "ppu-wheels-$WHEEL_RUN-"                   '[.[].artifacts[] | select(.expired | not) | select(.name | startswith($prefix))] |
+                    max_by(.id).id')
+            fi
+          else
+            [[ -z "$WHEEL_RUN" && -z "$WHEEL_ID" ]]
+          fi
+          printf 'source=%s\nmodels=%s\nartifact=%s\nrun_id=%s\n' "$source" "$models" "$WHEEL_ID" "$WHEEL_RUN" >> "$GITHUB_OUTPUT"
+
+  ppu-build:
+    needs: plan
+    if: inputs.skip_wheel_build != true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    container:
+      image: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-hggcrt3-py312-20261005
+    outputs:
+      wheel-artifact-id: ${{ steps.wheels.outputs.artifact-id }}
+    env:
+      PPU_CI_SOURCE_SHA: ${{ needs.plan.outputs.source-sha }}
+      MAX_JOBS: '2'
+      SGL_KERNEL_COMPILE_THREADS: '2'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.source-sha }}
+          persist-credentials: false
+      - name: Build native SAIL wheel and Recipe bundle
+        run: |
+          set -euo pipefail
+          umask 077
+          private=$(mktemp -d)
+          export PPU_CI_ARTIFACT_DIR="$private" PPU_CI_WHEEL_DIR="$private/wheels"
+          mkdir "$PPU_CI_WHEEL_DIR"
+          printf 'PPU_CI_WHEEL_DIR=%s\n' "$PPU_CI_WHEEL_DIR" >> "$GITHUB_ENV"
+          if ! bash scripts/ci/ppu/build_and_test.sh build > "$private/launcher.log" 2>&1; then
+            echo "::error::Native SAIL wheel build failed"
+            exit 1
+          fi
+          if ! python3 -B scripts/ci/ppu/recipe_bundle.py pack "$PPU_CI_WHEEL_DIR" "$PPU_CI_SOURCE_SHA" > "$private/pack.log" 2>&1; then
+            echo "::error::Candidate recipe packaging failed"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        id: wheels
+        with:
+          name: ppu-wheels-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.PPU_CI_WHEEL_DIR }}
+          if-no-files-found: error
+
+  recipe-sanity:
+    name: ${{ inputs.tier == 'fast_sanity' && 'Fast Sanity' || 'Model Sanity' }} (${{ matrix.model }})
+    needs: [plan, ppu-build]
+    if: >-
+      !cancelled() && needs.plan.result == 'success' &&
+      (needs.ppu-build.result == 'success' ||
+       (inputs.skip_wheel_build == true && needs.ppu-build.result == 'skipped'))
+    runs-on: 8-ppu-m890p
+    timeout-minutes: ${{ inputs.tier == 'fast_sanity' && 40 || 360 }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.models) }}
+    env:
+      MODEL_KEY: ${{ matrix.model }}
+      PPU_CI_SOURCE_SHA: ${{ needs.plan.outputs.source-sha }}
+      PPU_CI_RECIPE_RUNTIME_IMAGE: ${{ inputs.runtime_image || 'download.t-head.cn/docker_test/sglang:release-v0.5.23-20261116-cf244d4' }}
+    steps:
+      - name: Initialize private job directories
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          work=$(mktemp -d "$RUNNER_TEMP/recipe.XXXXXXXX")
+          echo "::add-mask::$work"
+          echo "::add-mask::$GITHUB_WORKSPACE"
+          mkdir "$work/wheels"
+          printf 'PPU_CI_ARTIFACT_DIR=%s\nPPU_CI_WHEEL_DIR=%s\n' "$work" "$work/wheels" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.source-sha }}
+          persist-credentials: false
+      - name: Fetch exact candidate bundle
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.plan.outputs.input-artifact-id || needs.ppu-build.outputs.wheel-artifact-id }}
+          run-id: ${{ needs.plan.outputs.input-run-id || github.run_id }}
+          github-token: ${{ github.token }}
+          merge-multiple: true
+          path: ${{ env.PPU_CI_WHEEL_DIR }}
+      - name: Run recipe privately
+        id: run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          exec > "$PPU_CI_ARTIFACT_DIR/launcher.log" 2>&1
+          host_python=${PPU_CI_HOST_PYTHON:-python3}
+          PPU_CI_JOB_QUEUE_S=$("$host_python" -B scripts/ci/ppu/recipe_queue.py)
+          export PPU_CI_JOB_QUEUE_S
+          unset GH_TOKEN
+          exec bash scripts/ci/ppu/run_recipe.sh
+      - name: Retain private logs and publish the checked result
+        id: publish
+        if: always() && steps.run.outcome != 'skipped'
+        env:
+          RECIPE_OUTCOME: ${{ steps.run.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          result="$PPU_CI_ARTIFACT_DIR/public-candidate.json"
+          code=0
+          host_python=${PPU_CI_HOST_PYTHON:-python3}
+          "$host_python" -B scripts/ci/ppu/recipe_report.py "$result" > "$PPU_CI_ARTIFACT_DIR/report.log" 2>&1 || code=$?
+          test -f "$result" || { echo "::error::PPU result preparation failed"; exit 1; }
+          "$host_python" -B scripts/ci/ppu/recipe_publish.py "$result" ppu-public/recipe.json "$GITHUB_STEP_SUMMARY"
+          echo "approved=true" >> "$GITHUB_OUTPUT"
+          exit "$code"
+      - name: Upload checked public evidence
+        if: always() && steps.publish.outputs.approved == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TIER }}-${{ matrix.model }}-${{ github.run_attempt }}
+          path: ppu-public/recipe.json
+          if-no-files-found: error

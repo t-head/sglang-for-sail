@@ -4,8 +4,8 @@ on:
   push:
     branches: [ main ]
   pull_request:
-    branches: [ main ]
-    types: [opened, synchronize, reopened, labeled]
+    branches: [main, 'release/**']
+    types: [opened, synchronize, reopened, labeled, ready_for_review]
   workflow_dispatch:
     inputs:
       run_all_tests:
@@ -71,6 +71,17 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
 
+      - uses: actions/setup-python@v5
+        if: hashFiles('scripts/ci/ppu/test_recipe*.py') != ''
+        with:
+          python-version: '3.12'
+
+      - name: Run local Recipe policy and public evidence tests
+        if: hashFiles('scripts/ci/ppu/test_recipe*.py') != ''
+        run: |
+          python3 -m pip install --quiet PyYAML
+          python3 -B -m unittest discover -s scripts/ci/ppu -p 'test_recipe*.py'
+
       - name: Pin the source revision for every job
         id: source
         run: printf 'sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -94,7 +105,9 @@ jobs:
           filters: |
             ppu:
               - ".github/workflows/pr-test-ppu.yml"
+              - ".github/workflows/nightly-test-ppu.yml"
               - "scripts/ci/ppu/**"
+              - "test/ppu/**"
               - "python/sglang/srt/platforms/sail.py"
               - "python/sglang/kernels/aot/setup_sail.py"
               - "python/sglang/kernels/aot/pyproject_sail.toml"
@@ -114,7 +127,6 @@ jobs:
     with:
       require-run-ci: true
       require-label: run-ci-ppu
-    secrets: inherit
 
   ppu-build:
     name: >-
@@ -159,7 +171,14 @@ jobs:
       - name: Build native SAIL wheels
         run: |
           mkdir -p "$PPU_CI_WHEEL_DIR"
-          bash scripts/ci/ppu/build_and_test.sh build
+          if ! bash scripts/ci/ppu/build_and_test.sh build > "$PPU_CI_ARTIFACT_DIR/launcher.log" 2>&1; then
+            echo "::error::Native SAIL wheel build failed"
+            exit 1
+          fi
+          if ! python3 -B scripts/ci/ppu/recipe_bundle.py pack "$PPU_CI_WHEEL_DIR" "$PPU_CI_SOURCE_SHA" > "$PPU_CI_ARTIFACT_DIR/pack.log" 2>&1; then
+            echo "::error::Candidate recipe packaging failed"
+            exit 1
+          fi
 
       - name: Upload PPU wheels
         id: wheels
@@ -168,14 +187,6 @@ jobs:
           name: ppu-wheels-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.PPU_CI_WHEEL_DIR }}
           if-no-files-found: error
-
-      - name: Upload build diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ppu-build-logs-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.PPU_CI_ARTIFACT_DIR }}
-          if-no-files-found: warn
 
   ppu-sanity:
     name: >-
@@ -202,7 +213,10 @@ jobs:
     steps:
       - name: Initialize private runtime directories and Git configuration
         run: |
+          umask 077
           work="$(mktemp -d "${RUNNER_TEMP}/ppu-runtime.XXXXXX")"
+          echo "::add-mask::$work"
+          echo "::add-mask::$GITHUB_WORKSPACE"
           touch "$work/gitconfig"
           mkdir "$work/wheels" "$work/artifacts"
           {
@@ -227,36 +241,31 @@ jobs:
           merge-multiple: true
           path: ${{ env.PPU_CI_WHEEL_DIR }}
 
-      - name: Run both speculative sanity files in isolated Docker
-        env:
-          CONFIG_PPU_CI_DEVICE: ${{ vars.PPU_CI_DEVICE }}
-          CONFIG_PPU_CI_TARGET_MODEL_PATH: ${{ vars.PPU_CI_TARGET_MODEL_PATH }}
-          CONFIG_PPU_CI_EAGLE3_MODEL_PATH: ${{ vars.PPU_CI_EAGLE3_MODEL_PATH }}
-          CONFIG_PPU_CI_DFLASH_MODEL_PATH: ${{ vars.PPU_CI_DFLASH_MODEL_PATH }}
-          CONFIG_PPU_CI_EVAL_CACHE: ${{ vars.PPU_CI_EVAL_CACHE }}
-        run: |
-          for key in PPU_CI_DEVICE PPU_CI_TARGET_MODEL_PATH PPU_CI_EAGLE3_MODEL_PATH PPU_CI_DFLASH_MODEL_PATH PPU_CI_EVAL_CACHE; do
-            override="CONFIG_$key"
-            if [[ -n "${!override}" ]]; then
-              export "$key=${!override}"
-            fi
-          done
-          exec bash scripts/ci/ppu/run_test.sh
+      - name: Run both speculative sanity files with private retention
+        run: exec bash scripts/ci/ppu/run_legacy_private.sh > "$PPU_CI_ARTIFACT_DIR/legacy-launcher.log" 2>&1
 
-      - name: Upload runtime diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ppu-runtime-logs-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.PPU_CI_ARTIFACT_DIR }}
-          if-no-files-found: warn
+  ppu-fast-sanity:
+    needs: [check-changes, pr-gate, ppu-build, ppu-sanity]
+    if: >-
+      !cancelled() && needs.ppu-build.result == 'success' &&
+      needs.check-changes.outputs.ppu == 'true'
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    uses: ./.github/workflows/nightly-test-ppu.yml
+    with:
+      ref: ${{ needs.check-changes.outputs.source-sha }}
+      tier: fast_sanity
+      skip_wheel_build: true
+      wheel_artifact_id: ${{ needs.ppu-build.outputs.wheel-artifact-id }}
 
   pr-test-ppu-finish:
     name: >-
       ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
            github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
           'ignored-label-pr-test-ppu-finish' || 'pr-test-ppu-finish' }}
-    needs: [pr-gate, check-changes, ppu-build, ppu-sanity]
+    needs: [pr-gate, check-changes, ppu-build, ppu-sanity, ppu-fast-sanity]
     if: always() && needs.check-changes.result != 'skipped'
     runs-on: ubuntu-latest
     permissions: {}
@@ -267,17 +276,18 @@ jobs:
           PPU_IN_SCOPE: ${{ needs.check-changes.outputs.ppu }}
           BUILD_RESULT: ${{ needs.ppu-build.result }}
           SANITY_RESULT: ${{ needs.ppu-sanity.result }}
+          FAST_RESULT: ${{ needs.ppu-fast-sanity.result }}
         run: |
           if jq -e 'any(.[]; .result == "failure" or .result == "cancelled")' <<< "$NEEDS_JSON" >/dev/null; then
             printf '%s\n' '::error::A PPU CI dependency failed or was cancelled.'
             exit 1
           fi
           if [[ "$PPU_IN_SCOPE" == "true" ]]; then
-            if [[ "$BUILD_RESULT" != "success" || "$SANITY_RESULT" != "success" ]]; then
-              printf '%s\n' '::error::PPU scope requires a successful native build and both PPU sanity files.'
+            if [[ "$BUILD_RESULT" != "success" || "$SANITY_RESULT" != "success" || "$FAST_RESULT" != "success" ]]; then
+              printf '%s\n' '::error::PPU scope requires a successful native build and all PPU sanity jobs.'
               exit 1
             fi
-            printf '%s\n' 'Native build and both PPU sanity files passed.'
+            printf '%s\n' 'Native build and all PPU sanity jobs passed.'
           else
             printf '%s\n' 'PPU is outside this run scope; no PPU tests were requested.'
           fi

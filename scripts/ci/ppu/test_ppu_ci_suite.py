@@ -12,8 +12,10 @@ from unittest.mock import patch
 
 import yaml
 
-from sglang.test.ci.ci_register import HWBackend, collect_tests, ut_parse_one_file
+from sglang.test.ci.ci_register import ut_parse_one_file
 from sglang.test.test_utils import CustomTestCase
+
+from run_speculative_sanity import select_tests
 
 RUNNER = Path(__file__).resolve().parents[3] / "test/run_suite.py"
 
@@ -38,19 +40,7 @@ class TestPPUCISuite(CustomTestCase):
 
     def test_ppu_suite_contains_both_speculative_sanity_files(self):
         registered = RUNNER.parent / "registered"
-        files = [
-            str(path)
-            for path in registered.rglob("*.py")
-            if path.name not in ("conftest.py", "__init__.py")
-        ]
-        tests = collect_tests(files)
-        ppu_tests = [
-            test
-            for test in tests
-            if test.backend == HWBackend.PPU
-            and test.effective_suite == "stage-a-test-1-gpu-ppu"
-            and not test.disabled
-        ]
+        ppu_tests = select_tests(RUNNER.parent.parent)
         self.assertCountEqual(
             [
                 Path(test.filename).relative_to(registered).as_posix()
@@ -71,10 +61,10 @@ class TestPPUCISuite(CustomTestCase):
         )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "repo with spaces"
-            (root / "test").mkdir(parents=True)
+            (root / "scripts/ci/ppu").mkdir(parents=True)
             artifacts = root / "artifacts"
             artifacts.mkdir()
-            (root / "test/run_suite.py").write_text(
+            (root / "scripts/ci/ppu/run_speculative_sanity.py").write_text(
                 "import os, sys\n"
                 "print(os.environ['FIXTURE_SUMMARY'], file=sys.stderr)\n"
                 "sys.exit(int(os.environ['FIXTURE_EXIT']))\n"
@@ -154,7 +144,7 @@ class TestPPUCIWorkflow(CustomTestCase):
         )
         self.assertCountEqual(
             self.jobs["pr-test-ppu-finish"]["needs"],
-            ["pr-gate", "check-changes", "ppu-build", "ppu-sanity"],
+            ["pr-gate", "check-changes", "ppu-build", "ppu-sanity", "ppu-fast-sanity"],
         )
         self.assertEqual(
             self.jobs["ppu-sanity"]["if"], "needs.check-changes.outputs.ppu == 'true'"
@@ -188,7 +178,7 @@ class TestPPUCIWorkflow(CustomTestCase):
                     "${{ needs.check-changes.outputs.source-sha }}",
                 )
 
-    def test_sanity_runs_on_every_ppu_generation_with_distinct_artifacts(self):
+    def test_sanity_runs_on_every_ppu_generation_with_private_retention(self):
         sanity = self.jobs["ppu-sanity"]
         self.assertEqual(sanity["runs-on"], "${{ matrix.runner }}")
         self.assertIs(sanity["strategy"]["fail-fast"], False)
@@ -196,12 +186,12 @@ class TestPPUCIWorkflow(CustomTestCase):
             sanity["strategy"]["matrix"]["runner"], ["8-ppu-m890p", "16-ppu-zw810e"]
         )
         self.assertIn("matrix.runner", sanity["name"])
-        upload = next(
-            step
-            for step in sanity["steps"]
-            if step.get("name") == "Upload runtime diagnostics"
+        self.assertFalse(
+            any("upload-artifact" in step.get("uses", "") for step in sanity["steps"])
         )
-        self.assertIn("${{ matrix.runner }}", upload["with"]["name"])
+        self.assertIn(
+            "exec bash scripts/ci/ppu/run_legacy_private.sh", sanity["steps"][-1]["run"]
+        )
 
     def test_finish_requires_successful_build_and_sanity_when_in_scope(self):
         finish = self.jobs["pr-test-ppu-finish"]["steps"][0]
@@ -224,6 +214,7 @@ class TestPPUCIWorkflow(CustomTestCase):
                                 PPU_IN_SCOPE=str(in_scope).lower(),
                                 BUILD_RESULT=build,
                                 SANITY_RESULT=sanity,
+                                FAST_RESULT="success",
                             ),
                             capture_output=True,
                             text=True,
@@ -238,6 +229,7 @@ class TestPPUCIWorkflow(CustomTestCase):
         for variable, job in (
             ("BUILD_RESULT", "ppu-build"),
             ("SANITY_RESULT", "ppu-sanity"),
+            ("FAST_RESULT", "ppu-fast-sanity"),
         ):
             self.assertEqual(finish["env"][variable], "${{ needs." + job + ".result }}")
 

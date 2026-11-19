@@ -171,6 +171,8 @@ class TestPPUCIDocker(CustomTestCase):
         self.launcher = script_dir / "run_test.sh"
         if SCRIPT.exists():
             shutil.copyfile(SCRIPT, self.launcher)
+        wrapper = SCRIPT.with_name("run_legacy_private.sh")
+        shutil.copyfile(wrapper, script_dir / wrapper.name)
         self.bin = self.root / "bin"
         self.bin.mkdir()
         for name, body in (("docker", DOCKER), ("git", GIT)):
@@ -527,16 +529,16 @@ class TestPPUCIDocker(CustomTestCase):
             step
             for step in workflow["jobs"]["ppu-sanity"]["steps"]
             if step.get("name")
-            == "Run both speculative sanity files in isolated Docker"
+            == "Run both speculative sanity files with private retention"
         )
         env = {
             **self.env,
             "BLOCK_TEST": "1",
             "RUNNER_TEMP": str(self.root / "runner-a"),
+            "GITHUB_RUN_ID": "12",
+            "GITHUB_RUN_ATTEMPT": "1",
             **updates,
         }
-        for key in step["env"]:
-            env[key] = env.pop(key.removeprefix("CONFIG_"), "")
         # Sourcing prevents bash -c's implicit exec from masking the wrapper bug.
         step_script = self.root / "workflow-step.sh"
         step_script.write_text(step["run"])
@@ -615,7 +617,10 @@ class TestPPUCIDocker(CustomTestCase):
                 process.send_signal(sig)
                 output, errors = process.communicate(timeout=CANCELLATION_BUDGET)
                 self.assertEqual(process.returncode, code, output + errors)
-                self.assert_private_pull_log(output)
+                self.assertEqual(output, "")
+                destinations = (self.home / ".sglang-ppu-ci-results").glob("legacy.*")
+                destination = max(destinations, key=lambda path: path.stat().st_mtime_ns)
+                self.assert_private_pull_log((destination / "launcher.log").read_text())
                 self.assert_image_reference_is_private(
                     subprocess.CompletedProcess([], code, output, errors)
                 )

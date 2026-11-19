@@ -1,0 +1,30 @@
+schema_version: ppu-serving/v1
+ppu:
+  framework: sglang
+  visibility: public
+  assets: {model: deepseek-v4-flash-mxfp4, tokenizer: deepseek-v4-flash-mxfp4}
+  hf_model_id: T-HEAD/DeepSeek-V4-Flash-0731-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken
+  golden_model_key: deepseek_v4_mxfp4
+  topology: {kind: single_node, nodes: 1, devices_per_node: 8}
+  external_env: [DG_USE_MOE_DYNAMIC_TILE, HGGC_EMBEDDED_COPY_THRESHOLD]
+model:
+  model_id: deepseek-ai/DeepSeek-V4-Flash
+  base_args:
+    - --tp-size
+    - "8"
+    - --page-size
+    - "64"
+    - --mem-fraction-static
+    - "0.85"
+    - --chunked-prefill-size
+    - "9984"
+    - --cuda-graph-max-bs
+    - "64"
+    - --disable-custom-all-reduce
+    - --disable-shared-experts-fusion
+    - --trust-remote-code
+  base_env:
+    DG_USE_MOE_DYNAMIC_TILE: "1"
+    HGGC_EMBEDDED_COPY_THRESHOLD: "0x10000"
+variants:
+  default: {precision: mxfp4}
