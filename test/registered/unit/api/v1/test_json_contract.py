@@ -30,6 +30,7 @@ from sglang.api.v1.api_types import (
     decode_SamplingParamsOrList,
     decode_StringListOrList,
     decode_StringOrList,
+    decode_TokenIds,
     decode_TokenIdsOrList,
     encode_FinishReason,
     encode_MediaInput,
@@ -46,6 +47,60 @@ def compact(value) -> str:
 
 def sp(text: str) -> SamplingParams:
     return SamplingParams.from_json_value(json.loads(text))
+
+
+class TestLargeTokenIds(CustomTestCase):
+    def test_large_integer_arrays_preserve_values_and_copy(self):
+        class Integer(int):
+            pass
+
+        for size in (0, 63, 64, 65, 131072):
+            values = list(range(size))
+            if size:
+                values[-1] = Integer(1 << 100)
+            decoded = decode_TokenIds(values)
+            self.assertEqual(decoded, values)
+            self.assertIsNot(decoded, values)
+            if size:
+                self.assertIs(decoded[-1], values[-1])
+
+    def test_large_invalid_arrays_keep_first_error(self):
+        for value, text in (
+            (True, "boolean `true`"),
+            (1.0, "floating point `1.0`"),
+            ("1", 'string "1"'),
+            (None, "null"),
+            ([], "sequence"),
+            ({}, "map"),
+        ):
+            for index in (0, 63, 1023):
+                values = list(range(1024))
+                values[index] = value
+                with self.assertRaises(JsonContractError) as ctx:
+                    decode_TokenIds(values)
+                self.assertEqual(
+                    str(ctx.exception), f"invalid type: {text}, expected i64"
+                )
+
+    def test_native_sequence_coercions_do_not_change_contract(self):
+        for values in ((1, 2), range(100), "123", None):
+            with self.assertRaises(JsonContractError):
+                decode_TokenIds(values)
+
+        class ListWithIterator(list):
+            def __iter__(self):
+                return iter(["bad"])
+
+        with self.assertRaisesRegex(JsonContractError, 'string "bad"'):
+            decode_TokenIds(ListWithIterator(range(100)))
+
+    def test_large_batches_keep_shape_and_error_order(self):
+        values = [list(range(1024)), [], list(range(65))]
+        self.assertEqual(decode_TokenIdsOrList(values), values)
+        values[0][-1] = False
+        values[2][0] = "later"
+        with self.assertRaisesRegex(JsonContractError, "boolean `false`"):
+            decode_TokenIdsOrList(values)
 
 
 class TestSamplingParams(CustomTestCase):

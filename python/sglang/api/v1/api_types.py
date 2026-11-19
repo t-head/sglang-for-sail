@@ -11,6 +11,7 @@ options exactly as the Rust server does. Decode with
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import msgspec
@@ -60,6 +61,24 @@ def _expect_int(v: Any, expected: str) -> int:
     if _is_int(v):
         return v
     raise _invalid_type(v, expected=expected)
+
+
+# Read once at import; set before starting the server.
+_OPT_API_INT_LIST = os.environ.get("SGLANG_OPT_API_INT_LIST", "0") == "1"
+
+if _OPT_API_INT_LIST:
+    def _expect_int_list(v: Any, expected: str) -> List[int]:
+        values = _expect_seq(v, expected="a sequence")
+        if type(values) is list and len(values) >= 64:
+            try:
+                # Validate large token arrays in C, without coercing bool/float/str.
+                # Discard the converted copy to preserve Python int subclasses.
+                msgspec.convert(values, type=List[int], strict=True)
+            except msgspec.ValidationError:
+                pass  # Keep the schema's first-error text and accepted Python types.
+            else:
+                return list(values)
+        return [_expect_int(e, expected=expected) for e in values]
 
 
 def _expect_uint(v: Any, expected: str) -> int:
@@ -935,8 +954,12 @@ KvHintsEnvelopeOrList = Union[KvHintsEnvelope, KvHintsEnvelopeList]
 # ---- codecs: parsed JSON value <-> Python value ----
 
 
-def decode_TokenIds(value: Any) -> TokenIds:
-    return [_expect_int(e, expected="i64") for e in _expect_seq(value, expected="a sequence")]
+if _OPT_API_INT_LIST:
+    def decode_TokenIds(value: Any) -> TokenIds:
+        return _expect_int_list(value, expected="i64")
+else:
+    def decode_TokenIds(value: Any) -> TokenIds:
+        return [_expect_int(e, expected="i64") for e in _expect_seq(value, expected="a sequence")]
 
 
 def encode_TokenIds(v: TokenIds) -> List[Any]:
@@ -1018,8 +1041,12 @@ def encode_Int64OrList(v: Int64OrList) -> Any:
     return v
 
 
-def decode_Int64List(value: Any) -> Int64List:
-    return [_expect_int(e, expected="i64") for e in _expect_seq(value, expected="a sequence")]
+if _OPT_API_INT_LIST:
+    def decode_Int64List(value: Any) -> Int64List:
+        return _expect_int_list(value, expected="i64")
+else:
+    def decode_Int64List(value: Any) -> Int64List:
+        return [_expect_int(e, expected="i64") for e in _expect_seq(value, expected="a sequence")]
 
 
 def encode_Int64List(v: Int64List) -> List[Any]:
@@ -1143,8 +1170,12 @@ def encode_Matched(v: Matched) -> Any:
     return v
 
 
-def decode_MatchedTokens(value: Any) -> MatchedTokens:
-    return [_expect_int(e, expected="i64") for e in _expect_seq(value, expected="a sequence")]
+if _OPT_API_INT_LIST:
+    def decode_MatchedTokens(value: Any) -> MatchedTokens:
+        return _expect_int_list(value, expected="i64")
+else:
+    def decode_MatchedTokens(value: Any) -> MatchedTokens:
+        return [_expect_int(e, expected="i64") for e in _expect_seq(value, expected="a sequence")]
 
 
 def encode_MatchedTokens(v: MatchedTokens) -> List[Any]:
