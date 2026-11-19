@@ -1,9 +1,10 @@
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.utils import is_cpu, is_npu, is_xpu
+from sglang.srt.utils import is_cpu, is_npu, is_sail, is_xpu
 
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
@@ -180,6 +181,39 @@ class TritonGDNKernel(LinearAttnKernelBase):
         inplace_update: bool = True,
         **kwargs,
     ) -> tuple:
+        if (
+            envs.SGLANG_SAIL_PLA_CUDA.get()
+            and is_sail()
+            and q.is_cuda
+            and inplace_update
+            and not kwargs.get("requires_intermediate_states", False)
+            and kwargs.get("track_state") is None
+            and not kwargs.get("num_state_checkpoints", 0)
+            # PLA plans chunks on the host. Keep direct Graph capture on the
+            # existing Triton path; breakable graphs use their eager GDN break.
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            from sglang.srt.layers.attention.linear.kernels.gdn_pla import (
+                pla_gdn_prefill,
+                pla_host_offsets,
+            )
+
+            offsets = pla_host_offsets(
+                kwargs.get("seq_lens_cpu"), query_start_loc, q.shape[1]
+            )
+            if offsets is not None:
+                return pla_gdn_prefill(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                    raw_cu_seqlens=offsets,
+                )
+
         recurrent_state = ssm_states
         recurrent_state_indices_args = {"initial_state_indices": cache_indices}
         inplace_update_args = {"inplace_update": inplace_update}
