@@ -44,6 +44,7 @@ defaults:
     shell: bash
 
 env:
+  PPU_CI_K8S_CONFIG_SHA256: '2837a41fc2d4052482fec5de222eb4b0a7e44fc68f827923c9633ae217cf112a'
   GIT_CONFIG_NOSYSTEM: "1"
 
 jobs:
@@ -128,6 +129,31 @@ jobs:
       require-run-ci: true
       require-label: run-ci-ppu
 
+  ppu-cluster-config:
+    name: ppu-cluster-config
+    needs: [check-changes, pr-gate]
+    if: github.repository == 't-head/sglang-for-sail' && needs.check-changes.outputs.ppu == 'true'
+    runs-on: k8s-runner-group-cpu-thead
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check-changes.outputs.source-sha }}
+          persist-credentials: false
+      - name: Fetch pinned Cluster Run backend
+        uses: actions/checkout@v4
+        with:
+          repository: t-head/ci-infra
+          ref: 96e25147971f5d2a04d828f8ad508cae38a4fa8a
+          path: .ppu-infra
+          persist-credentials: false
+      - name: Verify the private staging configuration
+        run: python3 -B scripts/ci/ppu/recipe_cluster_config.py --check
+
   ppu-build:
     name: >-
       ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
@@ -194,7 +220,7 @@ jobs:
            github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
           format('ignored-label-ppu-sanity ({0})', matrix.board) ||
           format('ppu-sanity ({0})', matrix.board) }}
-    needs: [check-changes, pr-gate, ppu-build]
+    needs: [check-changes, pr-gate, ppu-build, ppu-cluster-config]
     if: needs.check-changes.outputs.ppu == 'true'
     strategy:
       fail-fast: false
@@ -239,9 +265,10 @@ jobs:
           exec bash scripts/ci/ppu/run_recipe_cluster.sh
 
   ppu-fast-sanity:
-    needs: [check-changes, pr-gate, ppu-build]
+    needs: [check-changes, pr-gate, ppu-build, ppu-cluster-config]
     if: >-
       !cancelled() && needs.ppu-build.result == 'success' &&
+      needs.ppu-cluster-config.result == 'success' &&
       needs.check-changes.outputs.ppu == 'true'
     permissions:
       contents: read

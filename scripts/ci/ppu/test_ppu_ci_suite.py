@@ -139,7 +139,8 @@ class TestPPUCIWorkflow(CustomTestCase):
             self.jobs["ppu-build"]["needs"], ["check-changes", "pr-gate"]
         )
         self.assertCountEqual(
-            self.jobs["ppu-sanity"]["needs"], ["check-changes", "pr-gate", "ppu-build"]
+            self.jobs["ppu-sanity"]["needs"],
+            ["check-changes", "pr-gate", "ppu-build", "ppu-cluster-config"],
         )
         self.assertCountEqual(
             self.jobs["pr-test-ppu-finish"]["needs"],
