@@ -1730,6 +1730,15 @@ class DeepseekV4AttnBackend(
                 raise ValueError("Indexer request owners must match query rows")
             request_indices = request_indices.to(torch.int32).contiguous()
             c_seq_lens = c_seq_lens.masked_fill(request_indices < 0, 0)
+        # PPU metadata dispatch uses the stored Q width; its planner receives
+        # logical D after the packed format is resolved in the SAIL adapter.
+        query_head_dim = self.index_head_dim
+        if (
+            is_sail()
+            and not use_sail_dsv4_int8_indexer()
+            and (compress_ratio in (1, 2) or self.enable_deepseek_v4_fp4_indexer)
+        ):
+            query_head_dim //= 2
         return PagedIndexerMetadata(
             page_size=self.page_size,
             compressed_page_size=index_page_size or self.page_size // compress_ratio,
@@ -1767,7 +1776,7 @@ class DeepseekV4AttnBackend(
                     max(32, self.index_n_heads)
                     if compress_ratio in (1, 2) and use_sail_dsv4_int8_indexer()
                     else self.index_n_heads,
-                    self.index_head_dim,
+                    query_head_dim,
                 )
             ),
         )

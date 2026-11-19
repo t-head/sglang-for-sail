@@ -127,8 +127,14 @@ def _jit_main_q_indexer_rope_hadamard_quant_module(dtype: torch.dtype):
 
 
 @cache_once
-def _jit_main_q_indexer_rope_hadamard_fp4_quant_module(dtype: torch.dtype):
-    args = make_cpp_args(dtype, is_arch_support_pdl())
+def _jit_main_q_indexer_rope_hadamard_fp4_quant_module(
+    dtype: torch.dtype, weights_dtype: torch.dtype = torch.float32
+):
+    args = (
+        make_cpp_args(dtype, is_arch_support_pdl())
+        if weights_dtype == torch.float32
+        else make_cpp_args(dtype, is_arch_support_pdl(), weights_dtype)
+    )
     return load_jit(
         make_name("main_q_indexer_rope_hadamard_fp4_quant"),
         *args,
@@ -288,6 +294,8 @@ def fused_q_indexer_rope_hadamard_fp4_quant(
     weight_scale: float,
     freqs_cis: torch.Tensor,
     positions: torch.Tensor,
+    *,
+    weights_dtype: torch.dtype = torch.float32,
 ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
     if _is_hip:
         raise RuntimeError("DeepSeek V4 FP4 indexer requires the CUDA fused Q path.")
@@ -298,10 +306,14 @@ def fused_q_indexer_rope_hadamard_fp4_quant(
         device=q_input.device,
     )
     q_sf = torch.empty(q_input.shape[:-1], dtype=torch.int32, device=q_input.device)
+    if weights_dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError("FP4 indexer weights must be float32 or bfloat16")
     weights_out = torch.empty(
-        (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
+        (*q_input.shape[:-1], 1), dtype=weights_dtype, device=q_input.device
     )
-    module = _jit_main_q_indexer_rope_hadamard_fp4_quant_module(q_input.dtype)
+    module = _jit_main_q_indexer_rope_hadamard_fp4_quant_module(
+        q_input.dtype, weights_dtype
+    )
     module.forward(
         q_input,
         q_fp4,
