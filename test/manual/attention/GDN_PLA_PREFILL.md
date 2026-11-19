@@ -54,3 +54,30 @@ Porting reference: https://github.com/flytiger-eco/sglang-for-sail/pull/152
 The v0.5.18 implementation also used the shared master switch for prefill.
 This port preserves the newer read-only scoring and graph metadata contracts.
 No extra GDN-prefill selector or temporary route instrumentation is required.
+
+## Padding and cold capture
+
+Negative state slots are padding. Scratch rows start at zero, and only
+nonnegative slots are scattered back, for contiguous and strided pools.
+The GDN backend applies the same rule to its convolution/SSM gather path.
+
+PLA-enabled eager calls prepare the Triton metadata used by direct capture.
+The first call for a cached shape/layout signature also warms Triton on an
+independent scratch state pool, so compilation/autotuning finishes outside
+capture without applying the recurrence twice to the caller's state. Metadata
+cache misses may read device lengths during this eager preparation. The
+warmup-signature cache is bounded; direct capture still requires a fixed chunk
+plan, while breakable graphs rebuild the eager plan per batch.
+
+PPU CI declares stage B and schedules its five kernel files after stage A on
+the verified SM8.9/M890P domain. The SM8.0/810E job retains stage A because
+stage B also contains FP8 MegaAttention. CI selftests check global suite
+validity, exact membership, and both stages' completeness/exit status.
+
+Stage B disables bulk DeepGEMM precompilation only for the kernel suite; each
+tested shape still compiles on demand. Serving and accuracy runs retain their
+original precompile setting.
+
+CI wheel artifacts bootstrap missing pytest, pluggy and iniconfig without
+replacing preinstalled packages. Dependency snapshots still reject changes to
+existing packages, including operator libraries.

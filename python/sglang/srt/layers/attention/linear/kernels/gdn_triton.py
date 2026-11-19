@@ -1,3 +1,5 @@
+from collections import OrderedDict
+
 import torch
 
 from sglang.srt.environ import envs
@@ -43,6 +45,55 @@ class TritonGDNKernel(LinearAttnKernelBase):
 
     supports_packed_decode: bool = not is_cpu() and not is_npu()
     supports_strided_target_verify_qkv: bool = True
+
+    def __init__(self):
+        self._triton_capture_signatures = OrderedDict()
+
+    def _prepare_triton_capture(self, q, k, v, g, beta, ssm_states, query_start_loc):
+        from sglang.kernels.ops.attention.fla.chunk import CHUNK_SIZE
+        from sglang.kernels.ops.attention.fla.index import (
+            prepare_chunk_indices,
+            prepare_chunk_offsets,
+        )
+
+        # Populate the exact metadata cache keys used by direct capture. PLA's
+        # own host plan does not populate these Triton caches.
+        prepare_chunk_indices(query_start_loc, CHUNK_SIZE)
+        prepare_chunk_offsets(query_start_loc, CHUNK_SIZE)
+        output_chunk_size = min(CHUNK_SIZE, max(16, 1 << (q.shape[1] - 1).bit_length()))
+        prepare_chunk_indices(query_start_loc, output_chunk_size)
+        signature = (
+            tuple(
+                (t.device, t.dtype, tuple(t.shape), tuple(t.stride()))
+                for t in (q, k, v, g, beta)
+            ),
+            ssm_states.dtype,
+            query_start_loc.numel(),
+        )
+        if signature not in self._triton_capture_signatures:
+            # Autotuning must also finish before capture. Use a scratch pool:
+            # warmup must not apply the recurrence twice to the caller's state.
+            count = query_start_loc.numel() - 1
+            scratch = ssm_states.new_zeros((count, *ssm_states.shape[1:]))
+            slots = torch.arange(count, dtype=query_start_loc.dtype, device=q.device)
+            chunk_gated_delta_rule(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=scratch,
+                initial_state_indices=slots,
+                cu_seqlens=query_start_loc,
+                head_first=False,
+                use_qk_l2norm_in_kernel=True,
+                inplace_update=True,
+            )
+            self._triton_capture_signatures[signature] = None
+            if len(self._triton_capture_signatures) > 64:
+                self._triton_capture_signatures.popitem(last=False)
+        else:
+            self._triton_capture_signatures.move_to_end(signature)
 
     def packed_decode(
         self,
@@ -202,6 +253,9 @@ class TritonGDNKernel(LinearAttnKernelBase):
                 kwargs.get("seq_lens_cpu"), query_start_loc, q.shape[1]
             )
             if offsets is not None:
+                self._prepare_triton_capture(
+                    q, k, v, g, beta, ssm_states, query_start_loc
+                )
                 return pla_gdn_prefill(
                     q,
                     k,

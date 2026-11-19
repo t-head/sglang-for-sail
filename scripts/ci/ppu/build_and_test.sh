@@ -160,3 +160,14 @@ python3 "$repo/test/run_suite.py" --hw ppu --suite stage-a-test-1-gpu-ppu --time
     2>&1 | tee "$artifacts/sanity.log"
 # Require both sanity files; update this count when extending the suite.
 grep -Fxq 'Test Summary: 2/2 passed' "$artifacts/sanity.log"
+
+# The stage-B suite includes FP8 MegaAttention, which requires the verified
+# M890P domain. Keep the 810E job on the existing BF16 sanity coverage.
+ppu_compute_capability=$(python3 -c 'import torch; major, minor = torch.cuda.get_device_capability(); print(f"{major}.{minor}")')
+if [[ "$ppu_compute_capability" == "8.9" ]]; then
+    SGLANG_JIT_DEEPGEMM_PRECOMPILE=0 python3 "$repo/test/run_suite.py" --hw ppu --suite stage-b-test-1-gpu-ppu --timeout-per-file 1200 \
+        2>&1 | tee "$artifacts/kernels.log"
+    grep -Fxq 'Test Summary: 5/5 passed' "$artifacts/kernels.log"
+else
+    printf 'PPU kernel stage B is not scheduled for compute capability %s.\n' "$ppu_compute_capability"
+fi

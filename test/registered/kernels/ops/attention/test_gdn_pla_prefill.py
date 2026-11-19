@@ -16,6 +16,67 @@ register_ppu_ci(est_time=120, suite="stage-b-test-1-gpu-ppu")
 
 @unittest.skipUnless(is_sail(), "PLA requires a PPU SAIL device")
 class TestPLAPrefillNumerics(CustomTestCase):
+    def test_negative_slots_preserve_pool_and_match_triton(self):
+        torch.manual_seed(46)
+        lengths = [65, 37, 23]
+        total = sum(lengths)
+        q, k = [
+            torch.randn(1, total, 4, 128, device="cuda", dtype=torch.bfloat16)
+            for _ in range(2)
+        ]
+        v = torch.randn(1, total, 12, 128, device="cuda", dtype=torch.bfloat16)
+        g = -torch.rand(1, total, 12, device="cuda")
+        beta = torch.rand_like(g)
+        cu = torch.tensor([0, 65, 102, total], device="cuda", dtype=torch.int32)
+        for dtype in (torch.float32, torch.bfloat16):
+            for strided in (False, True):
+                for values in ([3, -1, -1], [-1, -1, -1]):
+                    with self.subTest(dtype=dtype, strided=strided, slots=values):
+                        initial = (
+                            torch.randn(5, 12, 128, 128, device="cuda", dtype=dtype)
+                            * 0.02
+                        )
+                        reference = initial.clone()
+                        if strided:
+                            backing = torch.empty(
+                                *initial.shape, 2, device="cuda", dtype=dtype
+                            )
+                            backing[..., 0] = initial
+                            actual = backing[..., 0]
+                        else:
+                            actual = initial.clone()
+                        slots = torch.tensor(values, device="cuda", dtype=torch.int32)
+                        results = []
+                        kernel = TritonGDNKernel()
+                        for enabled, pool in zip((False, True), (reference, actual)):
+                            with envs.SGLANG_SAIL_PLA_CUDA.override(enabled):
+                                results.append(
+                                    kernel.extend(
+                                        q,
+                                        k,
+                                        v,
+                                        g,
+                                        beta,
+                                        ssm_states=pool,
+                                        cache_indices=slots,
+                                        query_start_loc=cu,
+                                        seq_lens_cpu=lengths,
+                                    )[0]
+                                )
+                        torch.testing.assert_close(
+                            results[0], results[1], atol=2e-2, rtol=1e-2
+                        )
+                        torch.testing.assert_close(
+                            reference, actual, atol=2e-2, rtol=1e-2
+                        )
+                        untouched = torch.tensor(
+                            [0, 1, 2, 4] if values[0] >= 0 else list(range(5)),
+                            device="cuda",
+                        )
+                        torch.testing.assert_close(
+                            actual[untouched], initial[untouched], atol=0, rtol=0
+                        )
+
     def test_ragged_continuation_and_state_semantics(self):
         from pla.prefill import flashqla
 
@@ -214,11 +275,11 @@ class TestPLAPrefillNumerics(CustomTestCase):
                 seq_lens_cpu=[65, 37],
             )[0]
 
-        # Warm Triton before capture; the captured path must stay device-driven.
-        with envs.SGLANG_SAIL_PLA_CUDA.override(False):
-            run(state)
+        # A fresh cu tensor has no FLA metadata cache entries. Warm only with
+        # PLA enabled, then immediately exercise the direct-capture fallback.
         graph = torch.cuda.CUDAGraph()
         with envs.SGLANG_SAIL_PLA_CUDA.override(True):
+            run(state)
             with torch.cuda.graph(graph):
                 captured = run(state)
         # Direct FLA capture has a fixed per-sequence chunk plan (2,1).

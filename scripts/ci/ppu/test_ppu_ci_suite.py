@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -59,7 +60,44 @@ class TestPPUCISuite(CustomTestCase):
             ["core/test_basic_sanity_eagle3.py", "core/test_basic_sanity_dflash.py"],
         )
 
-    def test_runtime_requires_both_sanity_files_to_pass(self):
+    def test_ppu_stage_b_is_declared_and_contains_the_kernel_tests(self):
+        spec = importlib.util.spec_from_file_location("ppu_suite_runner", RUNNER)
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        gdn = RUNNER.parent / "registered/kernels/ops/attention/test_gdn_pla_prefill.py"
+        runner.validate_all_suites(collect_tests([str(gdn)]))
+        tests = collect_tests(
+            [
+                str(p)
+                for p in (RUNNER.parent / "registered").rglob("*.py")
+                if p.name not in ("conftest.py", "__init__.py")
+            ]
+        )
+        # This executes the real global check before any hardware filtering.
+        runner.validate_all_suites(tests)
+        kernels = [
+            Path(t.filename).relative_to(RUNNER.parent / "registered").as_posix()
+            for t in tests
+            if t.backend == HWBackend.PPU
+            and t.effective_suite == "stage-b-test-1-gpu-ppu"
+            and not t.disabled
+        ]
+        self.assertIn(
+            "SGLANG_JIT_DEEPGEMM_PRECOMPILE=0 python3",
+            Path(__file__).with_name("build_and_test.sh").read_text(),
+        )
+        self.assertCountEqual(
+            kernels,
+            [
+                "kernels/ops/attention/test_gdn_pla_prefill.py",
+                "kernels/ops/attention/test_minimax_m3_msa_ppu_page_table_tail.py",
+                "kernels/ops/elementwise/test_silu_and_mul_masked_post_per_token_quant_fp8.py",
+                "kernels/ops/attention/dsv4/test_mega_attention_ppu.py",
+                "kernels/ops/gemm/test_ppu_bf16_dense_gemm.py",
+            ],
+        )
+
+    def test_runtime_requires_sanity_and_scheduled_kernel_files_to_pass(self):
         source = Path(__file__).with_name("build_and_test.sh").read_text()
         marker = 'cd "$artifacts"\n'
         self.assertIn(marker, source)
@@ -72,40 +110,76 @@ class TestPPUCISuite(CustomTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "repo with spaces"
             (root / "test").mkdir(parents=True)
-            artifacts = root / "artifacts"
-            artifacts.mkdir()
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            python = bin_dir / "python3"
+            python.write_text(
+                '#!/bin/sh\nif [ "$1" = "-c" ]; then echo "$FIXTURE_CAPABILITY"; else exec "$FIXTURE_PYTHON" "$@"; fi\n'
+            )
+            python.chmod(0o755)
             (root / "test/run_suite.py").write_text(
                 "import os, sys\n"
-                "print(os.environ['FIXTURE_SUMMARY'], file=sys.stderr)\n"
-                "sys.exit(int(os.environ['FIXTURE_EXIT']))\n"
+                "stage = 'B' if 'stage-b-test-1-gpu-ppu' in sys.argv else 'A'\n"
+                "print(os.environ['FIXTURE_SUMMARY_' + stage], file=sys.stderr)\n"
+                "sys.exit(int(os.environ['FIXTURE_EXIT_' + stage]))\n"
             )
-            for summary, exit_code, expected in (
-                ("Test Summary: 2/2 passed", 0, 0),
-                ("Test Summary: 0/0 passed", 0, 1),
-                ("Test Summary: 1/1 passed", 0, 1),
-                ("Test Summary: 1/2 passed", 0, 1),
-                ("Test Summary: 3/3 passed", 0, 1),
-                ("Test Summary: 2/2 passed", 7, 7),
-                ("Test Summary: 2/2 passed (incomplete)", 0, 1),
-                ("", 0, 1),
-            ):
-                with self.subTest(summary=summary, exit_code=exit_code):
-                    result = subprocess.run(
-                        ["bash", "-c", script],
-                        env=dict(
+            for stage in ("A", "B"):
+                count = 2 if stage == "A" else 5
+                good = f"Test Summary: {count}/{count} passed"
+                for text, code, expected in (
+                    (good, 0, 0),
+                    ("Test Summary: 0/0 passed", 0, 1),
+                    ("Test Summary: 1/1 passed", 0, 1),
+                    (f"Test Summary: 1/{count} passed", 0, 1),
+                    (f"Test Summary: {count + 1}/{count + 1} passed", 0, 1),
+                    (good, 7, 7),
+                    (good + " (incomplete)", 0, 1),
+                    ("", 0, 1),
+                ):
+                    with self.subTest(stage=stage, text=text, code=code):
+                        artifacts = root / "artifacts"
+                        artifacts.mkdir(exist_ok=True)
+                        env = dict(
                             os.environ,
                             repo=str(root),
                             artifacts=str(artifacts),
-                            FIXTURE_SUMMARY=summary,
-                            FIXTURE_EXIT=str(exit_code),
-                        ),
-                        capture_output=True,
-                        text=True,
-                        timeout=10,
-                    )
-                    self.assertEqual(
-                        result.returncode, expected, result.stdout + result.stderr
-                    )
+                            PATH=str(bin_dir) + os.pathsep + os.environ["PATH"],
+                            FIXTURE_PYTHON=sys.executable,
+                            FIXTURE_CAPABILITY="8.9",
+                            FIXTURE_SUMMARY_A="Test Summary: 2/2 passed",
+                            FIXTURE_EXIT_A="0",
+                            FIXTURE_SUMMARY_B="Test Summary: 5/5 passed",
+                            FIXTURE_EXIT_B="0",
+                        )
+                        env["FIXTURE_SUMMARY_" + stage] = text
+                        env["FIXTURE_EXIT_" + stage] = str(code)
+                        result = subprocess.run(
+                            ["bash", "-c", script],
+                            env=env,
+                            capture_output=True,
+                            text=True,
+                            timeout=10,
+                        )
+                        self.assertEqual(
+                            result.returncode, expected, result.stdout + result.stderr
+                        )
+            # The 810E job must not execute the FP8 stage on unsupported hardware.
+            env.update(
+                FIXTURE_CAPABILITY="8.0",
+                FIXTURE_SUMMARY_A="Test Summary: 2/2 passed",
+                FIXTURE_EXIT_A="0",
+                FIXTURE_SUMMARY_B="must not run",
+                FIXTURE_EXIT_B="9",
+            )
+            result = subprocess.run(
+                ["bash", "-c", script],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("not scheduled for compute capability 8.0", result.stdout)
 
 
 class TestPPUCIWorkflow(CustomTestCase):

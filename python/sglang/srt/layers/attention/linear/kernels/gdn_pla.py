@@ -38,8 +38,13 @@ def pla_gdn_prefill(
 
     # The indexed API uses [slot, H, V, K], unlike legacy non-indexed PLA
     # states [batch, H, K, V]. Preserve both that layout and the state dtype.
-    needs_gather = not ssm_states.is_contiguous()
-    state = ssm_states[cache_indices].contiguous() if needs_gather else ssm_states
+    needs_gather = not ssm_states.is_contiguous() or bool((cache_indices < 0).any())
+    if needs_gather:
+        valid = cache_indices >= 0
+        state = ssm_states[cache_indices.clamp_min(0)].contiguous()
+        state.masked_fill_(~valid.view(-1, *([1] * (state.ndim - 1))), 0)
+    else:
+        state = ssm_states
     indices = cache_indices.to(dtype=torch.int32).contiguous()
     if needs_gather:
         indices = torch.arange(
@@ -61,7 +66,8 @@ def pla_gdn_prefill(
         final_state_dtype=ssm_states.dtype,
     )
     if needs_gather:
-        ssm_states[cache_indices] = state
+        # Negative slots are zero-initialized scratch rows, never pool slots.
+        ssm_states[cache_indices[valid]] = state[valid]
     # Indexed PLA writes final states in place. Its ht is NOT the per-chunk h
     # needed for prefix tracking; those batches are dispatched to Triton.
     return output, None, None

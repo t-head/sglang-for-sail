@@ -15,6 +15,63 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class TestPLAPrefillContract(CustomTestCase):
+    def test_padding_rows_start_zero_and_never_write_real_slots(self):
+        for dtype in (torch.float32, torch.bfloat16):
+            for strided in (False, True):
+                for slot_values in ([1, -1, -1], [-1, -1, -1]):
+                    with self.subTest(dtype=dtype, strided=strided, slots=slot_values):
+                        state = (
+                            torch.arange(4 * 2 * 4 * 3).reshape(4, 2, 4, 3).to(dtype)
+                        )
+                        if strided:
+                            storage = torch.empty(4, 2, 4, 3, 2, dtype=dtype)
+                            storage[..., 0] = state
+                            state = storage[..., 0]
+                        before = state.clone()
+                        slots = torch.tensor(slot_values)
+                        cu = torch.tensor([0, 2, 3, 5])
+                        q = torch.randn(1, 5, 2, 3)
+                        v = torch.randn(1, 5, 2, 4)
+                        gates = torch.randn(1, 5, 2)
+
+                        def forward(**kw):
+                            rows = kw["initial_state"][kw["initial_state_indices"]]
+                            valid = slots >= 0
+                            torch.testing.assert_close(
+                                rows[~valid], torch.zeros_like(rows[~valid])
+                            )
+                            torch.testing.assert_close(
+                                rows[valid], before[slots[valid]]
+                            )
+                            kw["initial_state"][kw["initial_state_indices"]] += 2
+                            return None, None, v, None, None
+
+                        module = ModuleType("pla.prefill.flashqla")
+                        module.chunk_gated_delta_rule_fwd = forward
+                        with patch.dict(
+                            sys.modules,
+                            {
+                                "pla": ModuleType("pla"),
+                                "pla.prefill": ModuleType("pla.prefill"),
+                                "pla.prefill.flashqla": module,
+                            },
+                        ):
+                            gdn_pla.pla_gdn_prefill(
+                                q,
+                                q,
+                                v,
+                                gates,
+                                gates,
+                                ssm_states=state,
+                                cache_indices=slots,
+                                query_start_loc=cu,
+                                raw_cu_seqlens=(0, 2, 3, 5),
+                            )
+                        expected = before.clone()
+                        valid = slots >= 0
+                        expected[slots[valid]] += 2
+                        torch.testing.assert_close(state, expected, atol=0, rtol=0)
+
     def test_indexed_state_layout_precision_and_untouched_slots(self):
         # Rectangular states expose accidental use of PLA's legacy K,V layout.
         for dtype in (torch.float32, torch.bfloat16):

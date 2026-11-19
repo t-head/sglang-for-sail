@@ -7,6 +7,11 @@ from importlib import metadata
 from pathlib import Path
 
 BUILD_TARGETS = {"sglang", "sgl-kernel", "sglang-kernel"}
+TEST_TOOL_ADDITIONS = {
+    "pytest": "8.3.5",
+    "pluggy": "1.6.0",
+    "iniconfig": "2.1.0",
+}
 PINNED_ADDITIONS = {
     "sailify": "1.0.0",
     "sgl-eval": "0.1.2",
@@ -14,6 +19,7 @@ PINNED_ADDITIONS = {
     "latex2sympy2-extended": "1.11.0",
     "antlr4-python3-runtime": "4.9.3",
     "editdistance": "0.8.1",
+    **TEST_TOOL_ADDITIONS,
 }
 
 
@@ -37,7 +43,7 @@ def snapshot():
 
 def validate_evaluators(packages):
     for name, version in PINNED_ADDITIONS.items():
-        if name == "sailify" or name not in packages:
+        if name == "sailify" or name in TEST_TOOL_ADDITIONS or name not in packages:
             continue
         installed = packages[name]["version"]
         if installed != version:

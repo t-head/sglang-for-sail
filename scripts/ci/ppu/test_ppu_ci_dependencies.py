@@ -17,6 +17,9 @@ ADDITIONS = {
     "latex2sympy2-extended": "1.11.0",
     "antlr4-python3-runtime": "4.9.3",
     "editdistance": "0.8.1",
+    "pytest": "8.3.5",
+    "pluggy": "1.6.0",
+    "iniconfig": "2.1.0",
 }
 WHEELS = {
     "sailify": "sailify-1.0.0-py3-none-any.whl",
@@ -25,6 +28,9 @@ WHEELS = {
     "latex2sympy2-extended": "latex2sympy2_extended-1.11.0-py3-none-any.whl",
     "antlr4-python3-runtime": "antlr4_python3_runtime-4.9.3-1-py3-none-any.whl",
     "editdistance": "editdistance-0.8.1-cp312-cp312-linux_x86_64.whl",
+    "pytest": "pytest-8.3.5-py3-none-any.whl",
+    "pluggy": "pluggy-1.6.0-py3-none-any.whl",
+    "iniconfig": "iniconfig-2.1.0-py3-none-any.whl",
 }
 
 
@@ -124,7 +130,7 @@ class TestPPUCIDependencies(CustomTestCase):
             )
             return result, wheel_dir
 
-    def test_requirements_cli_emits_only_pinned_evaluators(self):
+    def test_requirements_cli_emits_pinned_evaluators_and_test_tools(self):
         result, _ = self.run_isolated_cli(
             "requirements", {"sailify": "vendor-version", "sgl-eval": "99.0.0"}
         )
@@ -135,7 +141,10 @@ class TestPPUCIDependencies(CustomTestCase):
             "math-verify==0.9.0\n"
             "latex2sympy2-extended==1.11.0\n"
             "antlr4-python3-runtime==4.9.3\n"
-            "editdistance==0.8.1\n",
+            "editdistance==0.8.1\n"
+            "pytest==8.3.5\n"
+            "pluggy==1.6.0\n"
+            "iniconfig==2.1.0\n",
         )
         self.assertEqual(result.stderr, "")
 
@@ -173,9 +182,30 @@ class TestPPUCIDependencies(CustomTestCase):
                 )
                 self.assertEqual(result.stderr, "")
 
+    def test_preinstalled_test_tools_are_not_replaced(self):
+        installed = {
+            **ADDITIONS,
+            "pytest": "8.4.2",
+            "pluggy": "1.5.0",
+            "iniconfig": "2.0.0",
+        }
+        result, _ = self.run_isolated_cli("missing-wheels", installed)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        before = {
+            name: {"version": version, "record": "preinstalled"}
+            for name, version in installed.items()
+        }
+        self.assertEqual(self.check_snapshots(before, before).returncode, 0)
+        after = {
+            **before,
+            "pytest": {"version": ADDITIONS["pytest"], "record": "replaced"},
+        }
+        self.assertNotEqual(self.check_snapshots(before, after).returncode, 0)
+
     def test_cli_rejects_preinstalled_evaluator_pin_conflicts(self):
         for name, version in ADDITIONS.items():
-            if name == "sailify":
+            if name in {"sailify", "pytest", "pluggy", "iniconfig"}:
                 continue
             with self.subTest(name=name):
                 result, _ = self.run_isolated_cli(
