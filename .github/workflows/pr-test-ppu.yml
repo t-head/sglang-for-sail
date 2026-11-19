@@ -152,8 +152,6 @@ jobs:
           path: .ppu-infra
           persist-credentials: false
       - name: Verify the private staging configuration
-        env:
-          PPU_CI_OPERATOR_HANDOFF_SHA256: '20412533e32f23eaa475718362dcd7651595f7ec5dc90a2b08f175e5d74d3102'
         run: python3 -B scripts/ci/ppu/recipe_cluster_config.py --check
 
   ppu-build:

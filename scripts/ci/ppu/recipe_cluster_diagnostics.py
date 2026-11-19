@@ -7,6 +7,7 @@ import re
 RULES = {
     "image_pull": r"ErrImagePull|ImagePullBackOff|failed to pull image|manifest unknown",
     "registry_auth": r"status code: (401|403)|pull access denied|authorization failed|insufficient_scope",
+    "checkout_ownership": r"detected dubious ownership",
     "source_archive": r"tar: .*Cannot open|source archive.*(missing|not found)",
     "permission_denied": r"permission denied|operation not permitted",
     "capacity_ppu": r"Insufficient .*ppu",

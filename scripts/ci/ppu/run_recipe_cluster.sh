@@ -35,6 +35,16 @@ read_output() {
     awk -F= -v key="$1" '$1 == key {print substr($0, length(key)+2)}' "$GITHUB_OUTPUT" | tail -1
 }
 
+record_runtime_image() {
+    local image_id digest
+    image_id=$(jq -er '.status.containerStatuses[] | select(.name == "worker") | .imageID' "$1") || return 1
+    digest=${image_id#docker-pullable://}
+    [[ "$digest" =~ ^download\.t-head\.cn/docker_test/sglang@sha256:[0-9a-f]{64}$ ]] || return 1
+    [[ "$INPUT_IMAGE" != *@sha256:* || "$digest" == "$INPUT_IMAGE" ]] || return 1
+    jq --arg image "$digest" '. + {runtime_image:$image}' wheels/recipe-manifest.json > "$raw/provenance.tmp" &&
+        mv -- "$raw/provenance.tmp" "$raw/provenance.json"
+}
+
 export JOB_NAME="" SOURCE_STAGE_DIR="" INPUT_JOB_STATUS=failed INPUT_WORKFLOW_STATUS=failure
 phase() { printf '%s\n' "$1" > "$raw/recipe-phase.txt"; }
 child=""
@@ -57,6 +67,9 @@ finish() {
     fi
     if [[ -n "$JOB_NAME" && -n "$SOURCE_STAGE_DIR" ]]; then
         timeout 15s kubectl -n "$INPUT_NAMESPACE" get pod "$JOB_NAME-worker-0" -o json > "$raw/pod-status.json" || true
+        if [[ "$mode" != legacy && ! -f "$raw/provenance.json" && -s "$raw/pod-status.json" ]]; then
+            record_runtime_image "$raw/pod-status.json" || true
+        fi
         if ! bash "$infra/cleanup.sh" ||
             ! remaining=$(timeout 15s kubectl -n "$INPUT_NAMESPACE" get pods -l "ppu-job=$JOB_NAME" -o name) ||
             [[ -n "$remaining" || -e "$SOURCE_STAGE_DIR" ]]; then
@@ -198,12 +211,8 @@ INPUT_JOB_STATUS=$(read_output job_status)
 if [[ "$mode" != legacy ]]; then
     # The kubelet reports the worker's resolved pullable image reference.
     phase image_resolution
-    image_id=$(kubectl -n "$INPUT_NAMESPACE" get pod "$JOB_NAME-worker-0" -o json |
-        jq -er '.status.containerStatuses[] | select(.name == "worker") | .imageID')
-    digest=${image_id#docker-pullable://}
-    [[ "$digest" =~ ^download\.t-head\.cn/docker_test/sglang@sha256:[0-9a-f]{64}$ ]]
-    [[ "$INPUT_IMAGE" != *@sha256:* || "$digest" == "$INPUT_IMAGE" ]]
-    jq --arg image "$digest" '. + {runtime_image:$image}' wheels/recipe-manifest.json > "$raw/provenance.json"
+    timeout 15s kubectl -n "$INPUT_NAMESPACE" get pod "$JOB_NAME-worker-0" -o json > "$raw/pod-status.json"
+    record_runtime_image "$raw/pod-status.json"
     jq --argjson queue "$queue_s" '.queue_s = $queue' "$raw/results/summary.json" > "$raw/summary.tmp"
     mv -- "$raw/summary.tmp" "$raw/results/summary.json"
 fi

@@ -20,6 +20,9 @@ trap finish EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
 cd /workspace/source
+# Cluster Run preserves the CPU runner's checkout ownership in the archive.
+# Trust this one unpacked checkout, then verify its candidate revision.
+export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="$PWD"
 export PPU_CI_WHEEL_DIR="$PWD/wheels" PPU_CI_RECIPE_SOURCE_DIR="$PWD"
 [[ $(git rev-parse HEAD) == "${PPU_CI_SOURCE_SHA:?}" ]]
 if [[ "$TIER" == legacy ]]; then
