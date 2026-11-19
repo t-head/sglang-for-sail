@@ -60,6 +60,46 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         mega_moe._MEGA_MOE_SYMM_BUFFER.clear()
         super().tearDown()
 
+    def test_selector_uses_largest_sp_moe_shard(self):
+        cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK
+        with (
+            get_context().override_server_args(
+                tp_size=16,
+                attn_dp_size=2,
+                ep_size=16,
+                _model_config=SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=[])
+                ),
+            ),
+            get_flags().moe.override(a2a_backend=MoeA2ABackend.MEGAMOE),
+            cap.override(1024),
+            envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.override(False),
+            patch.multiple(
+                mega_moe,
+                is_mega_moe_experts_ready=lambda _: True,
+                _log_mega_moe_hit=lambda _: None,
+            ),
+        ):
+            moe = SimpleNamespace(experts=None)
+            local = torch.empty((512, 1))
+            for dp_rows, selected in (
+                ([4096, 8192], True),
+                ([4096, 8200], False),
+                ([4096], False),
+            ):
+                with patch.object(
+                    mega_moe, "get_dp_global_num_tokens", return_value=dp_rows
+                ):
+                    self.assertEqual(mega_moe.should_use_mega_moe(moe, local), selected)
+
+            with (
+                get_parallel().override(attn_cp_size=2, attn_tp_size=4),
+                patch.object(
+                    mega_moe, "get_dp_global_num_tokens", return_value=[4096, 8192]
+                ),
+            ):
+                self.assertFalse(mega_moe.should_use_mega_moe(moe, local))
+
     def test_mma_type_follows_layer_w4a4_mode(self):
         experts = SimpleNamespace(_mega_moe_nvfp4=False, _mega_moe_w4a4=False)
         with patch.object(mega_moe, "_is_sail", False):
