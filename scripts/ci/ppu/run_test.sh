@@ -144,7 +144,9 @@ artifact_parent=${inputs[1]}
 
 # Never unlink the shared lock: waiters must keep using the same inode.
 exec 9>>"/tmp/sglang-ppu-ci-device-$device.lock"
-flock -n 9 || fail "PPU device $device is busy"
+lock_wait=${PPU_CI_DEVICE_LOCK_WAIT_SECONDS:-0}
+[[ "$lock_wait" =~ ^[0-9]+$ ]] || fail 'Invalid device lock wait'
+flock -w "$lock_wait" 9 || fail "PPU device $device is busy"
 private=$(mktemp -d "$artifact_parent/runtime.XXXXXXXX")
 uid=$(id -u)
 gid=$(id -g)

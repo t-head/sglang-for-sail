@@ -10,5 +10,5 @@ root=$(realpath -e -- "$root")
 [[ "$root" != "$RUNNER_TEMP" && "$root" != "$RUNNER_TEMP/"* ]]
 destination=$(mktemp -d "$root/legacy.${GITHUB_RUN_ID:?}.${GITHUB_RUN_ATTEMPT:?}.XXXXXXXX")
 export PPU_CI_ARTIFACT_DIR="$destination"
-export PPU_CI_RETAIN_LEGACY=1
+export PPU_CI_RETAIN_LEGACY=1 PPU_CI_DEVICE_LOCK_WAIT_SECONDS=900
 exec bash scripts/ci/ppu/run_test.sh > "$destination/launcher.log" 2>&1

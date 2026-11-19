@@ -245,7 +245,7 @@ jobs:
         run: exec bash scripts/ci/ppu/run_legacy_private.sh > "$PPU_CI_ARTIFACT_DIR/legacy-launcher.log" 2>&1
 
   ppu-fast-sanity:
-    needs: [check-changes, pr-gate, ppu-build, ppu-sanity]
+    needs: [check-changes, pr-gate, ppu-build]
     if: >-
       !cancelled() && needs.ppu-build.result == 'success' &&
       needs.check-changes.outputs.ppu == 'true'
