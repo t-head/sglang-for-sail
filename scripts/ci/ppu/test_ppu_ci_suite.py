@@ -191,11 +191,23 @@ class TestPPUCIWorkflow(CustomTestCase):
             sanity["strategy"]["matrix"]["board"], ["ZW-M890P", "OAM-810E"]
         )
         self.assertIn("matrix.board", sanity["name"])
-        self.assertFalse(
-            any("upload-artifact" in step.get("uses", "") for step in sanity["steps"])
+        uploads = [
+            step
+            for step in sanity["steps"]
+            if step.get("uses", "").startswith("actions/upload-artifact@")
+        ]
+        self.assertEqual(len(uploads), 1)
+        self.assertEqual(uploads[0]["with"]["path"], "ppu-public/legacy.json")
+        self.assertEqual(
+            uploads[0]["if"], "always() && steps.evidence.outputs.approved == 'true'"
+        )
+        steps = {step["id"]: step for step in sanity["steps"] if "id" in step}
+        self.assertIn(
+            "recipe_publish.py --verify-only ppu-public/legacy.json",
+            steps["evidence"]["run"],
         )
         self.assertIn(
-            "exec bash scripts/ci/ppu/run_recipe_cluster.sh", sanity["steps"][-1]["run"]
+            "exec bash scripts/ci/ppu/run_recipe_cluster.sh", steps["cluster"]["run"]
         )
 
     def test_finish_requires_successful_build_and_sanity_when_in_scope(self):
