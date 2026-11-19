@@ -1600,7 +1600,7 @@ class DeepseekV4AttnBackend(
         if not use_dsv41_int8_indexer() and (
             compress_ratio in (1, 2) or self.enable_deepseek_v4_fp4_indexer
         ):
-            # The PPU planner takes the stored Q width: two FP4 values per byte.
+            # Keep the packed Q shape; the PPU planner receives logical D below.
             query_head_dim //= 2
         return PagedIndexerMetadata(
             page_size=self.page_size,
@@ -1619,6 +1619,16 @@ class DeepseekV4AttnBackend(
             rows_per_request=rows_per_request,
             request_indices=request_indices if is_sail() else None,
             build_paged_mqa_logits_metadata=build_paged_mqa_logits_metadata,
+            qk_dtype=(
+                torch.int8
+                if is_sail()
+                and (
+                    use_dsv41_int8_indexer()
+                    or compress_ratio in (1, 2)
+                    or self.enable_deepseek_v4_fp4_indexer
+                )
+                else torch.float8_e4m3fn
+            ),
             q_fp8_shape=torch.Size(
                 (
                     c_seq_lens.shape[0]

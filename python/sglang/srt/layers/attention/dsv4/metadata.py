@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_row_bytes,
     mqa_logits_rows_per_chunk,
     mqa_logits_should_chunk,
+    sail_paged_mqa_metadata,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -182,6 +183,7 @@ class PagedIndexerMetadata:
     compressed_seq_lens: torch.Tensor
     use_topk_v2: bool
     q_fp8_shape: Optional[torch.Size] = None
+    qk_dtype: torch.dtype = torch.float8_e4m3fn
     force_deep_gemm_metadata: bool = False
     use_prefill_cuda_graph: bool = False
     # Indexer source compression ratio: 4 for c4, 1 or 2 for the dsv41 sources.
@@ -206,7 +208,7 @@ class PagedIndexerMetadata:
 
     def __post_init__(self):
         if is_sail():
-            # Update opaque PPU schedules with graph compute; init only plans row chunks.
+            # Build PPU schedules once per forward/chunk, shared by all layers.
             num_rows = self.compressed_seq_lens.numel()
             self.mqa_logits_budget_bytes = self._mqa_logits_budget(num_rows=num_rows)
             self.rows_per_chunk = plan_indexer_row_chunks(
@@ -215,16 +217,48 @@ class PagedIndexerMetadata:
                 budget_bytes=self.mqa_logits_budget_bytes,
                 sm120_row_cap=None,
             )
-            self.deep_gemm_metadata = (
-                [
-                    None
-                    for _ in iter_row_chunks(
+
+            def build_schedule(rows):
+                if (
+                    self.q_fp8_shape is None
+                    or not self.build_paged_mqa_logits_metadata
+                    or rows.start == rows.stop
+                ):
+                    return None
+                if (
+                    self.qk_dtype == torch.float8_e4m3fn
+                    and not self.force_deep_gemm_metadata
+                    and (
+                        envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+                        or envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
+                        or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+                    )
+                ):
+                    return None
+                head_dim = self.q_fp8_shape[3]
+                indices = None
+                if self.qk_dtype == torch.int8 and head_dim == 64:
+                    head_dim *= 2  # Packed MXFP4 storage width -> logical D.
+                    if self.request_indices is not None:
+                        indices = self.request_indices[rows]
+                return sail_paged_mqa_metadata(
+                    self.compressed_seq_lens[rows],
+                    self.compressed_page_size,
+                    self.q_fp8_shape[2],
+                    head_dim,
+                    self.qk_dtype,
+                    indices,
+                )
+
+            if self.rows_per_chunk is not None:
+                self.deep_gemm_metadata = [
+                    build_schedule(rows)
+                    for rows in iter_row_chunks(
                         num_rows=num_rows, rows_per_chunk=self.rows_per_chunk
                     )
                 ]
-                if self.rows_per_chunk is not None
-                else None
-            )
+            else:
+                self.deep_gemm_metadata = build_schedule(slice(0, num_rows))
         elif (
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
             or is_xpu()
@@ -277,14 +311,6 @@ class PagedIndexerMetadata:
                     self.rows_per_chunk,
                     self.mqa_logits_budget_bytes,
                 )
-            extra_kwargs = {}
-            if is_sail() and self.q_fp8_shape is not None and not use_jit_indexer:
-                extra_kwargs["metadata_extra"] = (
-                    self.rows_per_request,
-                    self.q_fp8_shape[2],
-                    self.q_fp8_shape[3],
-                    1,
-                )
             if self.rows_per_chunk is not None:
                 # Chunk metadata is shared by all indexer layers in this forward.
                 self.deep_gemm_metadata = [
@@ -292,7 +318,6 @@ class PagedIndexerMetadata:
                         compressed_seq_lens[rows].view(-1, group),
                         self.compressed_page_size,
                         deep_gemm.get_num_sms(),
-                        **extra_kwargs,
                     )
                     for rows in iter_row_chunks(
                         num_rows=num_rows, rows_per_chunk=self.rows_per_chunk
@@ -303,7 +328,6 @@ class PagedIndexerMetadata:
                     compressed_seq_lens.view(-1, group),
                     self.compressed_page_size,
                     deep_gemm.get_num_sms(),
-                    **extra_kwargs,
                 )
 
             assert isinstance(self.deep_gemm_metadata, (torch.Tensor, list))
@@ -416,6 +440,7 @@ class PagedIndexerMetadata:
                 "rows_per_request",
                 "build_paged_mqa_logits_metadata",
                 "q_fp8_shape",
+                "qk_dtype",
             ],
             copy_fields=copy_fields,
             assign_fields=assign_fields,

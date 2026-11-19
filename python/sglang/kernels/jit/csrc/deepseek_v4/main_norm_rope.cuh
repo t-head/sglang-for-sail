@@ -961,7 +961,7 @@ struct FusedQIndexerRopeHadamardFp4QuantParams {
   void* __restrict__ q_fp4;
   int32_t* __restrict__ q_sf;
   const void* __restrict__ weight;
-  float* __restrict__ weights_out;
+  void* __restrict__ weights_out;
   float weight_scale;
   const float* __restrict__ freqs_cis;
   const void* __restrict__ positions;
@@ -983,7 +983,7 @@ struct FusedQIndexerRopeFirstFp4QuantParams {
   uint32_t num_heads;
 };
 
-template <typename DType, typename PosT, bool kUsePDL>
+template <typename DType, typename PosT, bool kUsePDL, typename WeightT = float>
 Q_KERNEL void
 fused_q_indexer_rope_hadamard_fp4_quant(const __grid_constant__ FusedQIndexerRopeHadamardFp4QuantParams params) {
   using namespace device;
@@ -1096,7 +1096,7 @@ fused_q_indexer_rope_hadamard_fp4_quant(const __grid_constant__ FusedQIndexerRop
     if ((lane_id & 7) == 0) {
       reinterpret_cast<uint8_t*>(params.q_sf + work_id)[lane_id >> 3] = scale_ue8m0;
     }
-    params.weights_out[work_id] = weight_val * params.weight_scale;
+    static_cast<WeightT*>(params.weights_out)[work_id] = cast<WeightT>(weight_val * params.weight_scale);
   }
 }
 
@@ -1187,10 +1187,10 @@ fused_q_indexer_rope_first_fp4_quant(const __grid_constant__ FusedQIndexerRopeFi
   }
 }
 
-template <typename DType, bool kUsePDL>
+template <typename DType, bool kUsePDL, typename WeightT = float>
 struct FusedQIndexerRopeHadamardFp4QuantKernel {
   template <typename PosT>
-  static constexpr auto kernel = fused_q_indexer_rope_hadamard_fp4_quant<DType, PosT, kUsePDL>;
+  static constexpr auto kernel = fused_q_indexer_rope_hadamard_fp4_quant<DType, PosT, kUsePDL, WeightT>;
 
   static void forward(
       const tvm::ffi::TensorView q_input,
@@ -1223,7 +1223,7 @@ struct FusedQIndexerRopeHadamardFp4QuantKernel {
         .verify(q_fp4);
     TensorMatcher({B, H}).with_dtype<int32_t>().with_device(device_).verify(q_sf);
     TensorMatcher({B, H}).with_dtype<DType>().with_device(device_).verify(weight);
-    TensorMatcher({B, H, 1}).with_dtype<float>().with_device(device_).verify(weights_out);
+    TensorMatcher({B, H, 1}).with_dtype<WeightT>().with_device(device_).verify(weights_out);
     TensorMatcher({-1, kRopeDim}).with_dtype<float>().with_device(device_).verify(freqs_cis);
     auto pos_dtype = SymbolicDType{};
     TensorMatcher({B}).with_dtype<int32_t, int64_t>(pos_dtype).with_device(device_).verify(positions);
@@ -1243,7 +1243,7 @@ struct FusedQIndexerRopeHadamardFp4QuantKernel {
         .q_fp4 = q_fp4.data_ptr(),
         .q_sf = static_cast<int32_t*>(q_sf.data_ptr()),
         .weight = weight.data_ptr(),
-        .weights_out = static_cast<float*>(weights_out.data_ptr()),
+        .weights_out = weights_out.data_ptr(),
         .weight_scale = static_cast<float>(weight_scale),
         .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
         .positions = positions.data_ptr(),
