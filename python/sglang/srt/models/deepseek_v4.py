@@ -5258,7 +5258,13 @@ class DeepseekV4ForCausalLM(
                 )
         else:
             self.lm_head = PPMissingLayer()
-        self.logits_processor = LogitsProcessor(config)
+        # Work around the PPU Torch symmetric-memory rendezvous race (Aone 88947144).
+        self.logits_processor = LogitsProcessor(
+            config,
+            enable_multimem_all_gather=not (
+                get_platform().is_sail and get_parallel().nnodes > 1
+            ),
+        )
         self.capture_aux_hidden_states = False
         get_attn_tp_context().init_context(config.q_lora_rank, is_dsa=True)
 
