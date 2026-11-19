@@ -58,6 +58,22 @@ def sail_mqa_logits(q, kv, weights, starts, ends, *, max_seqlen_k=0):
     )
 
 
+class SailPagedMQAMetadata:
+    def __init__(self, tensor, config, indices=None):
+        self.tensor = tensor
+        self.config = config
+        self.indices = indices
+
+    def copy_(self, other):
+        if self.config != other.config or (self.indices is None) != (
+            other.indices is None
+        ):
+            raise ValueError("PPU schedule configuration changed during graph replay")
+        self.tensor.copy_(other.tensor)
+        if self.indices is not None:
+            self.indices.copy_(other.indices)
+
+
 def sail_paged_mqa_metadata(
     context_lens, page_size, heads, head_dim, qk_dtype, indices=None
 ):
@@ -69,12 +85,26 @@ def sail_paged_mqa_metadata(
         indices = indices.to(device=context_lens.device, dtype=torch.int32).contiguous()
         if indices.ndim != 1 or indices.numel() != context_lens.shape[0]:
             raise ValueError("request indices must contain one owner per query row")
-    return deep_gemm.get_paged_mqa_logits_metadata(
+        dummy_ids = torch.arange(
+            -1,
+            -context_lens.shape[0] - 1,
+            -1,
+            device=context_lens.device,
+            dtype=torch.int32,
+        )
+        indices = torch.where(context_lens[:, 0] == 0, dummy_ids, indices)
+    num_sms = deep_gemm.get_num_sms()
+    tensor = deep_gemm.get_paged_mqa_logits_metadata(
         context_lens,
         page_size,
-        deep_gemm.get_num_sms(),
+        num_sms,
         indices=indices,
         metadata_extra=(1, heads, head_dim, qk_dtype),
+    )
+    return SailPagedMQAMetadata(
+        tensor,
+        (context_lens.shape[0], page_size, heads, head_dim, qk_dtype, num_sms),
+        indices,
     )
 
 
@@ -89,7 +119,7 @@ def sail_paged_mqa_logits(
     *,
     indices=None,
 ):
-    """Generate the schedule with the compute SM configuration for graph replay."""
+    """Reuse forward metadata only when it matches the PPU compute configuration."""
     import deep_gemm
 
     packed = isinstance(q, tuple)
@@ -110,11 +140,6 @@ def sail_paged_mqa_logits(
         indices = indices.to(device=values.device, dtype=torch.int32).contiguous()
         if indices.ndim != 1 or indices.numel() != values.shape[0]:
             raise ValueError("request indices must contain one owner per query row")
-        # Give zero-context graph padding rows distinct dummy groups.
-        dummy_ids = -torch.arange(
-            1, values.shape[0] + 1, device=values.device, dtype=torch.int32
-        )
-        indices = torch.where(context_lens[:, 0] == 0, dummy_ids, indices)
         q = (values.contiguous().view(torch.int8), q[1].contiguous())
         dtype, head_dim = torch.int8, values.shape[-1] * 2
         weights = weights.to(torch.bfloat16).contiguous()
@@ -131,10 +156,26 @@ def sail_paged_mqa_logits(
             if dtype == torch.int8
             else deep_gemm.fp8_paged_mqa_logits
         )
-    # Schedules are backend-opaque; do not reuse SGLang JIT or other-device metadata.
-    schedule_meta = sail_paged_mqa_metadata(
-        context_lens, kv_cache.shape[1], values.shape[2], head_dim, dtype, indices
+    config = (
+        values.shape[0],
+        kv_cache.shape[1],
+        values.shape[2],
+        head_dim,
+        dtype,
+        deep_gemm.get_num_sms(),
     )
+    # Raw tensors may be SGLang JIT or other-device schedules. Only reuse
+    # explicitly typed PPU metadata, within the forward that prepared it.
+    if (
+        not isinstance(schedule_meta, SailPagedMQAMetadata)
+        or schedule_meta.config != config
+        or (schedule_meta.indices is None) != (indices is None)
+    ):
+        schedule_meta = sail_paged_mqa_metadata(
+            context_lens, kv_cache.shape[1], values.shape[2], head_dim, dtype, indices
+        )
+    indices = schedule_meta.indices
+    schedule_meta = schedule_meta.tensor
     return fn(
         q,
         kv_cache,

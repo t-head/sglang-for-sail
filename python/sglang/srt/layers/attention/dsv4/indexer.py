@@ -1278,7 +1278,8 @@ class C4IndexerBackendMixin:
             if _USE_INT8 and not use_fp4_indexer:
                 from deep_gemm import int8_paged_mqa_logits as fn
             elif use_fp4_indexer and not use_aiter_fp4:
-                weights = weights.float()
+                if not is_sail():
+                    weights = weights.float()
                 if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
                     raise RuntimeError(
                         "DeepSeek V4 FP4 indexer requires DeepGEMM indexer."
@@ -1714,7 +1715,12 @@ class C4Indexer(nn.Module):
             return (q_fp4, q_scale), weight
         if self.use_fp4_indexer:
             return fused_q_indexer_rope_hadamard_fp4_quant(
-                q.contiguous(), weight, self.weight_scale, self.freqs_cis, positions
+                q.contiguous(),
+                weight,
+                self.weight_scale,
+                self.freqs_cis,
+                positions,
+                weights_dtype=torch.bfloat16 if is_sail() else torch.float32,
             )
         elif _USE_INT8:
             return fused_q_indexer_rope_hadamard_int8_quant(

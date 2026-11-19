@@ -54,7 +54,12 @@ def load_symbol(path, name, namespace, *, stop_after=None):
 def api_functions():
     namespace = {"torch": torch}
     path = ATTENTION / "mqa_logits_utils.py"
-    for name in ("sail_mqa_logits", "sail_paged_mqa_metadata", "sail_paged_mqa_logits"):
+    for name in (
+        "SailPagedMQAMetadata",
+        "sail_mqa_logits",
+        "sail_paged_mqa_metadata",
+        "sail_paged_mqa_logits",
+    ):
         load_symbol(path, name, namespace)
     return SimpleNamespace(**namespace)
 
@@ -202,6 +207,147 @@ class TestIndexerAPI(unittest.TestCase):
         )
         self.assertEqual(self.dg.get_paged_mqa_logits_metadata.call_args.args[2], 12)
 
+    def test_forward_schedule_reused_without_owner_or_weight_kernels(self):
+        q = self.packed(paged=True)
+        lens = torch.tensor([3, 5, 7, 0], dtype=torch.int32)
+        owners = torch.tensor([7, 7, 12, 12], dtype=torch.int32)
+        weights = torch.ones(4, 32, dtype=torch.bfloat16)
+        cache = torch.zeros(2, 64, 1, 68, dtype=torch.uint8)
+        table = torch.zeros(4, 2, dtype=torch.int32)
+        plan = self.api.sail_paged_mqa_metadata(lens, 64, 32, 128, torch.int8, owners)
+        self.assertEqual(plan.indices.tolist(), [7, 7, 12, -4])
+        self.assertEqual(owners.tolist(), [7, 7, 12, 12])
+        self.assertIs(
+            self.dg.get_paged_mqa_logits_metadata.call_args.kwargs["indices"],
+            plan.indices,
+        )
+        with (
+            patch.object(torch, "arange") as arange,
+            patch.object(torch, "where") as where,
+        ):
+            for _ in range(3):
+                self.api.sail_paged_mqa_logits(
+                    q, cache, weights, lens, table, plan, 128, indices=owners
+                )
+                args, kwargs = self.dg.fp8_fp4_paged_mqa_logits.call_args
+                self.assertIs(args[2], weights)
+                self.assertIs(args[5], plan.tensor)
+                self.assertIs(kwargs["indices"], plan.indices)
+        self.assertEqual(arange.call_count, 0)
+        self.assertEqual(where.call_count, 0)
+        self.assertEqual(self.dg.get_paged_mqa_logits_metadata.call_count, 1)
+        self.assertEqual(self.dg.fp8_fp4_paged_mqa_logits.call_count, 3)
+
+    def test_grouped_padding_does_not_skip_preceding_valid_rows(self):
+        def grouped_schedule(lens, *args, indices, **kwargs):
+            bounds = torch.zeros_like(lens)
+            start = 0
+            for end in range(1, len(indices) + 1):
+                if end == len(indices) or indices[end] != indices[start]:
+                    bounds[start:end] = lens[end - 1]
+                    start = end
+            return bounds
+
+        def grouped_logits(q, cache, weights, lens, table, schedule, width, **kwargs):
+            out = torch.full((len(lens), width), float("-inf"))
+            for row in range(len(lens)):
+                count = min(lens[row, 0].item(), schedule[row, 0].item())
+                out[row, :count] = row + 1
+            return out
+
+        self.dg.get_paged_mqa_logits_metadata.side_effect = grouped_schedule
+        self.dg.fp8_fp4_paged_mqa_logits.side_effect = grouped_logits
+        owners = torch.tensor([5, 5, 9, 9], dtype=torch.int32)
+        for lengths in ([33, 64, 95, 0], [0, 64, 0, 95], [0, 0, 0, 0]):
+            with self.subTest(lengths=lengths):
+                lens = torch.tensor(lengths, dtype=torch.int32)
+                plan = self.api.sail_paged_mqa_metadata(
+                    lens, 64, 32, 128, torch.int8, owners
+                )
+                padding = plan.indices[lens == 0]
+                self.assertTrue(bool((padding < 0).all()))
+                self.assertEqual(padding.unique().numel(), padding.numel())
+                self.assertTrue(torch.equal(plan.indices[lens > 0], owners[lens > 0]))
+                self.assertEqual(owners.tolist(), [5, 5, 9, 9])
+                out = self.api.sail_paged_mqa_logits(
+                    self.packed(paged=True),
+                    torch.zeros(2, 64, 1, 68, dtype=torch.uint8),
+                    torch.ones(4, 32, dtype=torch.bfloat16),
+                    lens,
+                    torch.zeros(4, 2, dtype=torch.int32),
+                    plan,
+                    128,
+                    indices=owners,
+                )
+                self.assertIs(
+                    self.dg.fp8_fp4_paged_mqa_logits.call_args.kwargs["indices"],
+                    plan.indices,
+                )
+                for row, count in enumerate(lengths):
+                    self.assertTrue(bool((out[row, :count] == row + 1).all()))
+                    self.assertTrue(bool(out[row, count:].isneginf().all()))
+
+    def test_schedule_rebuilt_for_changed_compute_configuration(self):
+        q = self.packed(paged=True)
+        lens = torch.ones(4, dtype=torch.int32)
+        owners = torch.arange(4, dtype=torch.int32)
+        cache = torch.zeros(2, 64, 1, 68, dtype=torch.uint8)
+        table = torch.zeros(4, 2, dtype=torch.int32)
+        plan = self.api.sail_paged_mqa_metadata(lens, 64, 32, 128, torch.int8, owners)
+        # Changing SM allocation must not reuse an incompatible opaque schedule.
+        self.dg.get_num_sms.return_value = 12
+        self.api.sail_paged_mqa_logits(
+            q, cache, torch.ones(4, 32), lens, table, plan, 128, indices=owners
+        )
+        self.assertEqual(self.dg.get_paged_mqa_logits_metadata.call_count, 2)
+        self.assertEqual(self.dg.get_paged_mqa_logits_metadata.call_args.args[2], 12)
+        # Clipped/padded queries and differently tiled heads/pages also rebuild.
+        for rows, page_size, heads, dim, dtype in (
+            (2, 64, 32, 128, torch.int8),
+            (4, 128, 32, 128, torch.int8),
+            (4, 64, 64, 128, torch.int8),
+            (4, 64, 32, 64, torch.int8),
+            (4, 64, 32, 128, torch.float8_e4m3fn),
+        ):
+            self.dg.get_num_sms.return_value = 24
+            self.api.sail_paged_mqa_logits(
+                torch.zeros(rows, 1, heads, dim, dtype=dtype),
+                torch.zeros(2, page_size, 1, dim + 4, dtype=torch.uint8),
+                torch.ones(rows, heads),
+                lens[:rows],
+                table[:rows],
+                plan,
+                128,
+            )
+            self.assertEqual(
+                self.dg.get_paged_mqa_logits_metadata.call_args.kwargs[
+                    "metadata_extra"
+                ],
+                (1, heads, dim, dtype),
+            )
+        self.assertEqual(self.dg.get_paged_mqa_logits_metadata.call_count, 7)
+
+    def test_packed_schedule_without_owners_is_rebuilt(self):
+        lens = torch.tensor([33, 64, 95, 0], dtype=torch.int32)
+        owners = torch.tensor([5, 5, 9, 9], dtype=torch.int32)
+        plan = self.api.sail_paged_mqa_metadata(lens, 64, 32, 128, torch.int8)
+        self.api.sail_paged_mqa_logits(
+            self.packed(paged=True),
+            torch.zeros(2, 64, 1, 68, dtype=torch.uint8),
+            torch.ones(4, 32, dtype=torch.bfloat16),
+            lens,
+            torch.zeros(4, 2, dtype=torch.int32),
+            plan,
+            128,
+            indices=owners,
+        )
+        self.assertEqual(self.dg.get_paged_mqa_logits_metadata.call_count, 2)
+        normalized = self.dg.get_paged_mqa_logits_metadata.call_args.kwargs["indices"]
+        self.assertEqual(normalized.tolist(), [5, 5, 9, -4])
+        self.assertIs(
+            self.dg.fp8_fp4_paged_mqa_logits.call_args.kwargs["indices"], normalized
+        )
+
     def test_legacy_paged_metadata_uses_real_dtype(self):
         for dtype, name in (
             (torch.int8, "int8_paged_mqa_logits"),
@@ -341,6 +487,46 @@ class TestIndexerAPI(unittest.TestCase):
             self.assertEqual(args[4].shape, (4, 2))
             self.assertEqual(kwargs["indices"].tolist(), expected)
 
+    def test_paged_fp8_metadata_uses_registered_target_flags(self):
+        from dataclasses import dataclass, field, fields
+
+        from sglang.srt.environ import envs
+
+        namespace = {
+            "torch": torch,
+            "dataclass": dataclass,
+            "field": field,
+            "fields": fields,
+            "envs": envs,
+            "is_sail": lambda: True,
+            "is_hip": lambda: False,
+            "plan_indexer_row_chunks": lambda **kwargs: None,
+            "sail_paged_mqa_metadata": self.api.sail_paged_mqa_metadata,
+        }
+        metadata_class = load_symbol(
+            ATTENTION / "dsv4/metadata.py", "PagedIndexerMetadata", namespace
+        )
+        with (
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(False),
+            envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(False),
+        ):
+            for dtype in (None, torch.float8_e4m3fn):
+                with self.subTest(dtype=dtype):
+                    metadata = metadata_class(
+                        page_size=256,
+                        compressed_page_size=64,
+                        page_table=torch.zeros(4, 2, dtype=torch.int32),
+                        compressed_seq_lens=torch.ones(4, dtype=torch.int32),
+                        use_topk_v2=False,
+                        q_fp8_shape=torch.Size((4, 1, 32, 128)),
+                        q_dtype=dtype,
+                    )
+                    self.assertEqual(
+                        metadata.deep_gemm_metadata.config[:5],
+                        (4, 64, 32, 128, torch.float8_e4m3fn),
+                    )
+        self.assertEqual(self.dg.get_paged_mqa_logits_metadata.call_count, 2)
+
     def test_paged_metadata_copy_keeps_request_buffer_address(self):
         from dataclasses import dataclass, field, fields
 
@@ -352,6 +538,7 @@ class TestIndexerAPI(unittest.TestCase):
             "is_sail": lambda: True,
             "is_hip": lambda: False,
             "plan_indexer_row_chunks": lambda **kwargs: 2,
+            "sail_paged_mqa_metadata": self.api.sail_paged_mqa_metadata,
         }
         path = ATTENTION / "dsv4/metadata.py"
         load_symbol(path, "iter_row_chunks", namespace)
@@ -366,16 +553,212 @@ class TestIndexerAPI(unittest.TestCase):
                 compressed_seq_lens=torch.tensor([3, 4, 5, 6, 0], dtype=torch.int32),
                 use_topk_v2=False,
                 rows_per_request=3,
+                q_fp8_shape=torch.Size((5, 1, 32, 64)),
+                q_dtype=torch.int8,
                 request_indices=torch.tensor(owners, dtype=torch.int32),
             )
 
-        current = make([7, 7, 7, 12, -5])
-        newer = make([7, 12, 12, 12, -5])
+        current = make([7, 7, 7, 12, 12])
+        newer = make([7, 12, 12, 12, 12])
         pointer = current.request_indices.data_ptr()
         current.copy_(newer)
         self.assertEqual(current.request_indices.data_ptr(), pointer)
-        self.assertEqual(current.request_indices.tolist(), [7, 12, 12, 12, -5])
+        self.assertEqual(current.request_indices.tolist(), [7, 12, 12, 12, 12])
         self.assertEqual(len(current.row_chunks()), 3)
+        self.assertEqual(self.dg.get_paged_mqa_logits_metadata.call_count, 6)
+        with (
+            patch.object(torch, "arange") as arange,
+            patch.object(torch, "where") as where,
+        ):
+            for _ in range(3):
+                for rows, plan in current.row_chunks():
+                    count = rows.stop - rows.start
+                    self.assertEqual(plan.config[:5], (count, 64, 32, 128, torch.int8))
+                    expected = current.request_indices[rows].clone()
+                    expected[current.compressed_seq_lens[rows] == 0] = -1
+                    self.assertTrue(torch.equal(plan.indices, expected))
+                    self.api.sail_paged_mqa_logits(
+                        self.packed(rows=count, paged=True),
+                        torch.zeros(2, 64, 1, 68, dtype=torch.uint8),
+                        torch.ones(count, 32, dtype=torch.bfloat16),
+                        current.compressed_seq_lens[rows],
+                        current.page_table[rows],
+                        plan,
+                        128,
+                        indices=current.request_indices[rows],
+                    )
+                    self.assertIs(
+                        self.dg.fp8_fp4_paged_mqa_logits.call_args.kwargs["indices"],
+                        plan.indices,
+                    )
+        arange.assert_not_called()
+        where.assert_not_called()
+        self.assertEqual(self.dg.get_paged_mqa_logits_metadata.call_count, 6)
+        self.assertEqual(self.dg.fp8_fp4_paged_mqa_logits.call_count, 9)
+
+    def test_graph_schedule_copy_updates_in_place(self):
+        metadata = self.api.SailPagedMQAMetadata
+        config = (4, 64, 32, 128, torch.int8, 24)
+        captured = metadata(
+            torch.zeros(25, 2, dtype=torch.int32),
+            config,
+            torch.tensor([5, 5, 9, -4], dtype=torch.int32),
+        )
+        replay = metadata(
+            torch.ones(25, 2, dtype=torch.int32),
+            config,
+            torch.tensor([5, -2, 9, -4], dtype=torch.int32),
+        )
+        pointer = captured.tensor.data_ptr()
+        owners_pointer = captured.indices.data_ptr()
+        captured.copy_(replay)
+        self.assertEqual(captured.tensor.data_ptr(), pointer)
+        self.assertEqual(captured.indices.data_ptr(), owners_pointer)
+        self.assertTrue(torch.equal(captured.tensor, replay.tensor))
+        self.assertTrue(torch.equal(captured.indices, replay.indices))
+        with self.assertRaisesRegex(ValueError, "configuration changed"):
+            captured.copy_(metadata(replay.tensor, config))
+
+    def test_paged_graph_metadata_refreshes_schedule_and_lengths(self):
+        from dataclasses import dataclass, field, fields
+
+        namespace = {
+            "torch": torch,
+            "dataclass": dataclass,
+            "field": field,
+            "fields": fields,
+            "is_sail": lambda: True,
+            "is_hip": lambda: False,
+            "plan_indexer_row_chunks": lambda **kwargs: None,
+            "sail_paged_mqa_metadata": self.api.sail_paged_mqa_metadata,
+        }
+        path = ATTENTION / "dsv4/metadata.py"
+        load_symbol(path, "iter_row_chunks", namespace)
+        load_symbol(path, "copy_metadata", namespace)
+        metadata_class = load_symbol(path, "PagedIndexerMetadata", namespace)
+        self.dg.get_paged_mqa_logits_metadata.side_effect = (
+            lambda lens, *args, **kwargs: lens.clone()
+        )
+        namespace["iter_row_chunks"] = Mock(side_effect=AssertionError("not chunked"))
+
+        def make(lens, owners, build=True):
+            return metadata_class(
+                page_size=256,
+                compressed_page_size=64,
+                page_table=torch.zeros(len(lens), 2, dtype=torch.int32),
+                compressed_seq_lens=torch.tensor(lens, dtype=torch.int32),
+                request_indices=torch.tensor(owners, dtype=torch.int32),
+                q_fp8_shape=torch.Size((len(lens), 1, 32, 64)),
+                q_dtype=torch.int8,
+                use_topk_v2=False,
+                use_prefill_cuda_graph=True,
+                build_paged_mqa_logits_metadata=build,
+            )
+
+        captured = make([3, 5, 7, 0], [7, 7, 12, 12])
+        replay = make([9, 0, 13, 0], [7, 7, 12, 12])
+        pointer = captured.deep_gemm_metadata.tensor.data_ptr()
+        owners_pointer = captured.deep_gemm_metadata.indices.data_ptr()
+        request_pointer = captured.request_indices.data_ptr()
+        captured.copy_(replay)
+        self.assertEqual(captured.deep_gemm_metadata.tensor.data_ptr(), pointer)
+        self.assertEqual(captured.deep_gemm_metadata.indices.data_ptr(), owners_pointer)
+        self.assertEqual(captured.request_indices.data_ptr(), request_pointer)
+        self.assertEqual(captured.deep_gemm_metadata.indices.tolist(), [7, -2, 12, -4])
+        self.assertTrue(
+            torch.equal(
+                captured.deep_gemm_metadata.tensor[:, 0], replay.compressed_seq_lens
+            )
+        )
+        self.assertTrue(torch.equal(captured.request_indices, replay.request_indices))
+        self.api.sail_paged_mqa_logits(
+            self.packed(paged=True),
+            torch.zeros(2, 64, 1, 68, dtype=torch.uint8),
+            torch.ones(4, 32, dtype=torch.bfloat16),
+            captured.compressed_seq_lens,
+            captured.page_table,
+            captured.deep_gemm_metadata,
+            128,
+            indices=captured.request_indices,
+        )
+        self.assertEqual(self.dg.get_paged_mqa_logits_metadata.call_count, 2)
+        self.assertIs(
+            self.dg.fp8_fp4_paged_mqa_logits.call_args.args[5],
+            captured.deep_gemm_metadata.tensor,
+        )
+        self.assertIs(
+            self.dg.fp8_fp4_paged_mqa_logits.call_args.kwargs["indices"],
+            captured.deep_gemm_metadata.indices,
+        )
+        self.assertIsNone(make([], []).deep_gemm_metadata)
+        self.assertIsNone(
+            make([3, 5, 7, 0], [7, 7, 12, 12], build=False).deep_gemm_metadata
+        )
+        namespace["iter_row_chunks"].assert_not_called()
+        self.assertEqual(self.dg.get_paged_mqa_logits_metadata.call_count, 2)
+
+    def test_true_int8_forward_metadata_does_not_normalize_owners(self):
+        from dataclasses import dataclass, field
+
+        namespace = {
+            "torch": torch,
+            "dataclass": dataclass,
+            "field": field,
+            "is_sail": lambda: True,
+            "plan_indexer_row_chunks": lambda **kwargs: None,
+            "sail_paged_mqa_metadata": self.api.sail_paged_mqa_metadata,
+        }
+        metadata_class = load_symbol(
+            ATTENTION / "dsv4/metadata.py", "PagedIndexerMetadata", namespace
+        )
+        with (
+            patch.object(torch, "arange") as arange,
+            patch.object(torch, "where") as where,
+        ):
+            metadata = metadata_class(
+                page_size=256,
+                compressed_page_size=64,
+                page_table=torch.zeros(4, 2, dtype=torch.int32),
+                compressed_seq_lens=torch.tensor([33, 64, 95, 0], dtype=torch.int32),
+                request_indices=torch.tensor([5, 5, 9, 9], dtype=torch.int32),
+                q_fp8_shape=torch.Size((4, 1, 32, 128)),
+                q_dtype=torch.int8,
+                use_topk_v2=False,
+            )
+        arange.assert_not_called()
+        where.assert_not_called()
+        self.assertIsNone(metadata.deep_gemm_metadata.indices)
+        self.assertIsNone(
+            self.dg.get_paged_mqa_logits_metadata.call_args.kwargs["indices"]
+        )
+
+    def test_fp4_fused_producer_allocates_requested_weight_dtype(self):
+        module = SimpleNamespace(forward=Mock())
+        factory = Mock(return_value=module)
+        namespace = {
+            "torch": torch,
+            "_is_hip": False,
+            "_jit_main_q_indexer_rope_hadamard_fp4_quant_module": factory,
+        }
+        producer = load_symbol(
+            ROOT / "python/sglang/kernels/ops/attention/dsv4/norm_rope.py",
+            "fused_q_indexer_rope_hadamard_fp4_quant",
+            namespace,
+        )
+        q = torch.ones(3, 32, 128, dtype=torch.bfloat16)
+        weight = torch.ones(3, 32, dtype=torch.bfloat16)
+        freqs = torch.ones(8, 32, dtype=torch.complex64)
+        positions = torch.arange(3, dtype=torch.int32)
+        for dtype in (torch.float32, torch.bfloat16):
+            (_, scales), output = producer(
+                q, weight, 0.125, freqs, positions, weights_dtype=dtype
+            )
+            self.assertEqual(output.dtype, dtype)
+            self.assertEqual(output.shape, (3, 32, 1))
+            self.assertEqual(scales.shape, (3, 32))
+            self.assertIs(module.forward.call_args.args[4], output)
+            self.assertEqual(factory.call_args.args, (q.dtype, dtype))
+        self.assertEqual(module.forward.call_count, 2)
 
     def test_m890_forced_true_int8_rejected(self):
         for sm, forced in ((80, False), (80, True), (89, False), (89, True)):
@@ -568,9 +951,18 @@ class TestIndexerAPI(unittest.TestCase):
             expected_lens = lengths[idx].masked_fill(expected < 0, 0)
             self.assertTrue(torch.equal(metadata.compressed_seq_lens, expected_lens))
             self.assertEqual(metadata.page_table.shape[0], expected.numel())
-            self.assertEqual(metadata.q_fp8_shape, (expected.numel(), 1, 32, 128))
+            # The shape records packed PPU storage, while the typed planner
+            # independently receives the logical D128 checked above.
+            self.assertEqual(metadata.q_fp8_shape, (expected.numel(), 1, 32, 64))
+            self.assertEqual(metadata.q_dtype, torch.int8)
         with self.assertRaisesRegex(ValueError, "match query rows"):
             init_indexer(model, core, request_indices=torch.tensor([7]))
+        # Preserve the target's non-SAIL query-shape and dtype contract.
+        namespace["is_sail"] = lambda: False
+        ordinary = init_indexer(model, core)
+        self.assertEqual(ordinary.q_fp8_shape[-1], 128)
+        self.assertEqual(ordinary.q_dtype, torch.int8)
+        self.assertIsNone(ordinary.request_indices)
 
 
 @unittest.skipUnless(
@@ -769,9 +1161,16 @@ class TestIndexerGPU(unittest.TestCase):
                 else None
             )
 
-            def compute():
+            def make_plan():
+                return self.api.sail_paged_mqa_metadata(
+                    lens, 64, 32, 128, torch.int8 if packed else q.dtype, ids
+                )
+
+            def compute(plan=None):
+                if plan is None:
+                    plan = make_plan()
                 return self.api.sail_paged_mqa_logits(
-                    q, cache, w, lens, table, None, 128, indices=ids
+                    q, cache, w, lens, table, plan, 128, indices=ids
                 )
 
             def select(logits):
@@ -819,6 +1218,30 @@ class TestIndexerGPU(unittest.TestCase):
                 captured[valid].float(), logical_ref[valid], rtol=0, atol=0
             )
             check_indices(captured_indices)
+
+            shared_plan = make_plan()
+            select(compute(shared_plan))
+            torch.cuda.synchronize()
+            shared_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(shared_graph):
+                shared_out = compute(shared_plan)
+                shared_indices = select(shared_out)
+            schedule_pointer = shared_plan.tensor.data_ptr()
+            owners_pointer = shared_plan.indices.data_ptr() if packed else None
+            lens.copy_(torch.tensor([23, 49, 87, 0], device="cuda", dtype=torch.int32))
+            if packed:
+                ids.copy_(torch.tensor([5, 5, 9, 9], device="cuda", dtype=torch.int32))
+            shared_plan.copy_(make_plan())
+            self.assertEqual(shared_plan.tensor.data_ptr(), schedule_pointer)
+            if packed:
+                self.assertEqual(shared_plan.indices.data_ptr(), owners_pointer)
+                self.assertEqual(shared_plan.indices.tolist(), [5, 5, 9, -4])
+            shared_graph.replay()
+            valid = torch.arange(128, device="cuda")[None, :] < lens[:, None]
+            torch.testing.assert_close(
+                shared_out[valid].float(), logical_ref[valid], rtol=0, atol=0
+            )
+            check_indices(shared_indices)
         torch.cuda.synchronize()
 
 
