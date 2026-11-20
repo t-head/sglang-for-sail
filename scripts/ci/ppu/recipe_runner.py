@@ -91,12 +91,12 @@ def probes(cfg, *, fast):
         "/v1/chat/completions", json.dumps(payload).encode(), timeout=90
     ) as response:
         answer = json.load(response)["choices"][0]
-    if not fast:
-        (RESULTS / "chat-probe-response.json").write_text(json.dumps(answer) + "\n")
-    content = answer["message"].get("content")
+    (RESULTS / "chat-probe-response.json").write_text(json.dumps(answer) + "\n")
+    message = answer["message"]
+    content = message.get("content")
+    text_fields = (content, message.get("reasoning_content")) if fast else (content,)
     if (
-        not isinstance(content, str)
-        or not content.strip()
+        not any(isinstance(field, str) and field.strip() for field in text_fields)
         or not answer["finish_reason"]
     ):
         raise ValueError("incomplete non-streaming response")
@@ -452,8 +452,13 @@ def run(policy_path, tier, queue_s):
         cold_total = 0
         start = time.monotonic()
         has_layer_override = config["layer_override"] is not None
-        # A cold GLM run was still capturing prefill graphs at 1,000 seconds.
-        full_ready_timeout = 1350 if policy["model_id"] == "zai-org/GLM-5.3" else 1000
+        full_ready_timeout = 1000
+        if (
+            policy["model_id"] == "zai-org/GLM-5.3"
+            or policy_path.stem == "qwen3.8-flash-next"
+        ):
+            # Cold graph capture and the first kernel compilation need extra time.
+            full_ready_timeout = 1350
         try:
             with server(
                 config,

@@ -27,7 +27,13 @@ from recipe_cluster_config import load_settings
 from recipe_cluster_diagnostics import diagnostic_codes
 from recipe_publish import publish, validate
 from recipe_report import legacy_result
-from recipe_runner import cached_model_path, metrics_zero, read_eval_reviews, run
+from recipe_runner import (
+    cached_model_path,
+    metrics_zero,
+    probes,
+    read_eval_reviews,
+    run,
+)
 from recipe_select import cluster_width, select
 
 
@@ -52,6 +58,45 @@ def fast_result():
 
 
 class RecipeContractTest(unittest.TestCase):
+    def test_fast_probe_accepts_reasoning_only_completion_with_complete_sse(self):
+        settings = {"prompt": "Compute 6 * 7.", "max_tokens": 16}
+        answer = {
+            "message": {"content": None, "reasoning_content": "reasoning text"},
+            "finish_reason": "length",
+        }
+        stream = io.BytesIO(
+            b'data: {"choices":[{"delta":{"reasoning_content":"R"},"finish_reason":null}]}\n\n'
+            b'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\n'
+            b"data: [DONE]\n\n"
+        )
+        stream.headers = Mock()
+        stream.headers.get_content_type.return_value = "text/event-stream"
+        with tempfile.TemporaryDirectory() as temp:
+            results = Path(temp) / "results"
+            results.mkdir()
+            with patch("recipe_runner.RESULTS", results):
+                response = io.BytesIO(json.dumps({"choices": [answer]}).encode())
+                with patch("recipe_runner.request", side_effect=(response, stream)):
+                    probes(settings, fast=True)
+                self.assertEqual(
+                    json.loads((results / "chat-probe-response.json").read_text()),
+                    answer,
+                )
+                for fast, choice in (
+                    (True, dict(answer, finish_reason=None)),
+                    (True, dict(answer, message={"content": " "})),
+                    (False, answer),
+                ):
+                    with self.subTest(fast=fast, choice=choice):
+                        response = io.BytesIO(
+                            json.dumps({"choices": [choice]}).encode()
+                        )
+                        with patch("recipe_runner.request", return_value=response):
+                            with self.assertRaisesRegex(
+                                ValueError, "non-streaming response"
+                            ):
+                                probes(settings, fast=fast)
+
     def test_default_fast_selects_all_models(self):
         self.assertEqual(
             select("fast_sanity", ""),
@@ -177,6 +222,7 @@ class RecipeContractTest(unittest.TestCase):
         for name, value in (
             ("--tp-size", "8"),
             ("--attn-dp-size", "8"),
+            ("--attention-backend", "triton"),
             ("--moe-a2a-backend", "deepep"),
             ("--speculative-algorithm", "NEXTN"),
             ("--load-format", "dummy"),
@@ -211,7 +257,8 @@ class RecipeContractTest(unittest.TestCase):
         for name, value in (
             ("--tp-size", "4"),
             ("--context-length", "16384"),
-            ("--page-size", "64"),
+            ("--attention-backend", "triton"),
+            ("--speculative-algorithm", "NEXTN"),
             ("--load-format", "dummy"),
         ):
             self.assertEqual(flags[flags.index(name) + 1], value)
@@ -221,10 +268,6 @@ class RecipeContractTest(unittest.TestCase):
             "--enable-dp-lm-head",
             "--moe-a2a-backend",
             "--moe-dense-tp-size",
-            "--speculative-algorithm",
-            "--speculative-num-steps",
-            "--speculative-eagle-topk",
-            "--linear-attn-verify-backend",
         ):
             self.assertNotIn(name, flags)
         self.assertIn("--disable-radix-cache", flags)
@@ -236,6 +279,7 @@ class RecipeContractTest(unittest.TestCase):
         recipe = REPO_ROOT / _load_yaml(policy)["recipe"]
         config = resolve_recipe(recipe, policy_path=policy, tier="model_sanity")
         flags = config["flags"]
+        self.assertEqual(flags[flags.index("--attention-backend") + 1], "triton")
         self.assertEqual(flags[flags.index("--page-size") + 1], "64")
         self.assertEqual(
             flags[flags.index("--mamba-radix-cache-strategy") + 1], "extra_buffer"
@@ -281,6 +325,8 @@ class RecipeContractTest(unittest.TestCase):
             ("glm-5.3-flash", 1000, 2),
             ("deepseek-v4-flash", 1000, 8),
             ("qwen3.8-27b", 1000, 2),
+            ("qwen3.8-flash-next", 1350, 8),
+            ("qwen3.8-flash-next-tp4", 1000, 4),
         ):
             with (
                 self.subTest(model=model),
