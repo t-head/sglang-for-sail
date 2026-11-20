@@ -393,9 +393,22 @@ def cached_model_path(repo_id, revision):
     )
     if snapshot.name != revision:
         raise ValueError("expected a pinned model snapshot")
-    for name in ("config.json", "tokenizer.json"):
-        if not (snapshot / name).is_file():
-            raise ValueError("offline model snapshot lacks metadata")
+    config_path = snapshot / "config.json"
+    if not config_path.is_file():
+        raise ValueError("offline model snapshot lacks config metadata")
+    if not (snapshot / "tokenizer.json").is_file():
+        config = json.loads(config_path.read_text())
+        kimi_tokenizer_files = (
+            "tokenizer_config.json",
+            "tiktoken.model",
+            "tokenization_kimi.py",
+            "tool_declaration_ts.py",
+        )
+        if config.get("model_type") != "kimi_k25" or any(
+            not (snapshot / name).is_file() or (snapshot / name).stat().st_size == 0
+            for name in kimi_tokenizer_files
+        ):
+            raise ValueError("offline model snapshot lacks tokenizer metadata")
     index = json.loads((snapshot / "model.safetensors.index.json").read_text())
     shards = set(index["weight_map"].values())
     if not shards or any(

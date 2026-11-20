@@ -57,8 +57,10 @@ class RecipeContractTest(unittest.TestCase):
             {
                 "include": [
                     {"model": "deepseek-v4-flash"},
+                    {"model": "deepseek-v4-pro"},
                     {"model": "deepseek-v4.1-flash"},
                     {"model": "glm-5.3"},
+                    {"model": "kimi-k2.6"},
                     {"model": "minimax-m3"},
                 ]
             },
@@ -72,6 +74,9 @@ class RecipeContractTest(unittest.TestCase):
             select("model_sanity", "glm")
         with self.assertRaises(ValueError):
             select("model_sanity", "glm-5.3,glm-5.3")
+        for model in ("deepseek-v4-pro", "kimi-k2.6"):
+            with self.subTest(model=model), self.assertRaises(ValueError):
+                select("model_sanity", model)
 
     def test_policy_switches(self):
         policy = DEFAULT_POLICY_ROOT / "models/glm-5.3.yaml"
@@ -101,7 +106,12 @@ class RecipeContractTest(unittest.TestCase):
             timings["cold_start_s"] = 3.0
             yield
 
-        for model, ready_timeout in (("glm-5.3", 1350), ("deepseek-v4-flash", 1000)):
+        for model, ready_timeout in (
+            ("glm-5.3", 1350),
+            ("deepseek-v4-flash", 1000),
+            ("deepseek-v4-pro", 1000),
+            ("kimi-k2.6", 1000),
+        ):
             with (
                 self.subTest(model=model),
                 tempfile.TemporaryDirectory() as temp,
@@ -116,6 +126,7 @@ class RecipeContractTest(unittest.TestCase):
                 self.assertEqual(server.call_count, 1)
                 config, label, _, timeout = server.call_args.args
                 self.assertEqual((label, timeout), ("fast_full", ready_timeout))
+                self.assertEqual(config["ppu_count"], 8)
                 self.assertIn("dummy", config["flags"])
                 self.assertNotIn("--json-model-override-args", config["flags"])
                 probes.assert_called_once()
@@ -161,6 +172,44 @@ class RecipeContractTest(unittest.TestCase):
                 )
                 shard.unlink()
                 with self.assertRaisesRegex(ValueError, "missing shards"):
+                    cached_model_path(repo_id, revision)
+
+    def test_kimi_snapshot_accepts_only_complete_tiktoken_metadata(self):
+        repo_id = "T-HEAD/Kimi-K2.6-MXFP4-FP8"
+        revision = "d" * 40
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            snapshot = root / revision
+            snapshot.mkdir()
+            config = snapshot / "config.json"
+            config.write_text(json.dumps({"model_type": "kimi_k25"}))
+            for name in (
+                "tokenizer_config.json",
+                "tokenization_kimi.py",
+                "tool_declaration_ts.py",
+            ):
+                (snapshot / name).write_text("fixture")
+            (snapshot / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": {"weight": "weight.safetensors"}})
+            )
+            (snapshot / "weight.safetensors").write_bytes(b"fixture")
+            download = Mock(return_value=str(snapshot))
+            with (
+                patch.dict(os.environ, {"HF_HUB_CACHE": str(root)}),
+                patch.dict(
+                    sys.modules,
+                    {"huggingface_hub": SimpleNamespace(snapshot_download=download)},
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "lacks tokenizer metadata"):
+                    cached_model_path(repo_id, revision)
+                (snapshot / "tiktoken.model").write_bytes(b"fixture")
+                self.assertEqual(
+                    cached_model_path(repo_id, revision),
+                    (str(snapshot.resolve()), revision),
+                )
+                config.write_text(json.dumps({"model_type": "qwen3"}))
+                with self.assertRaisesRegex(ValueError, "lacks tokenizer metadata"):
                     cached_model_path(repo_id, revision)
 
     def test_new_model_ref_is_resolved_to_a_concrete_revision(self):
