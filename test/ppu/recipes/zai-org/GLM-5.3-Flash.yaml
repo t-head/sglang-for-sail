@@ -13,10 +13,12 @@ model:
     - "2"
     - --context-length
     - "16384"
+    - --page-size
+    - "64"
     - --dsa-prefill-backend
     - flashmla_sparse
     - --dsa-decode-backend
-    - flashmla_sparse
+    - flashmla_kv
     - --kv-cache-dtype
     - bfloat16
     - --disable-custom-all-reduce
