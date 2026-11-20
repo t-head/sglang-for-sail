@@ -183,6 +183,25 @@ class RecipeContractTest(unittest.TestCase):
                 self.assertIsNone(result["layer_override"])
                 self.assertNotIn("fallback_reason", result)
 
+    def test_model_sanity_startup_budget_accounts_for_deepseek_pro_weight_load(self):
+        for model, timeout in (
+            ("deepseek-v4-pro", 6000),
+            ("glm-5.3", 4500),
+            ("kimi-k2.6", 2400),
+        ):
+            with (
+                self.subTest(model=model),
+                tempfile.TemporaryDirectory() as temp,
+                patch.dict(os.environ, {"PPU_RECIPE_CONTAINER_MODEL": temp}),
+                patch("recipe_runner.RESULTS", Path(temp) / "results"),
+                patch(
+                    "recipe_runner.server", side_effect=RuntimeError("stop at launch")
+                ) as launch,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "stop at launch"):
+                    run(DEFAULT_POLICY_ROOT / f"models/{model}.yaml", "model_sanity", 0)
+                self.assertEqual(launch.call_args.args[-1], timeout)
+
     def test_cached_model_requires_the_exact_snapshot_offline(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
