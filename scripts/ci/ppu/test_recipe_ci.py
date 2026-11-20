@@ -202,8 +202,24 @@ class RecipeContractTest(unittest.TestCase):
         ):
             self.assertNotIn(name, flags)
         self.assertIn("--disable-radix-cache", flags)
-        with self.assertRaises(ValueError):
-            select("model_sanity", model)
+
+    def test_qwen_flash_next_tp4_nightly_uses_real_weights_and_paged_mamba_cache(self):
+        model = "qwen3.8-flash-next-tp4"
+        self.assert_nightly_reference(model, width=4, correct=1285)
+        policy = DEFAULT_POLICY_ROOT / f"models/{model}.yaml"
+        recipe = REPO_ROOT / _load_yaml(policy)["recipe"]
+        config = resolve_recipe(recipe, policy_path=policy, tier="model_sanity")
+        flags = config["flags"]
+        self.assertEqual(flags[flags.index("--page-size") + 1], "64")
+        self.assertEqual(
+            flags[flags.index("--mamba-radix-cache-strategy") + 1], "extra_buffer"
+        )
+        for flag in (
+            "--disable-radix-cache",
+            "--speculative-algorithm",
+            "--load-format",
+        ):
+            self.assertNotIn(flag, flags)
 
     def test_policy_switches(self):
         policy = DEFAULT_POLICY_ROOT / "models/glm-5.3.yaml"

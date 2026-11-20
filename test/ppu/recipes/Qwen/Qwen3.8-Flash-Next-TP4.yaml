@@ -4,6 +4,7 @@ ppu:
   visibility: public
   assets: {model: qwen3.8-flash-next-mxfp4, tokenizer: qwen3.8-flash-next-mxfp4}
   hf_model_id: T-HEAD/Qwen3.8-Flash-Next-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken
+  golden_model_key: qwen3.8_flash_next_mxfp4_tp4
   topology: {kind: single_node, nodes: 1, devices_per_node: 4}
 model:
   model_id: Qwen/Qwen3.8-Flash-Next
@@ -38,3 +39,16 @@ model:
     - --trust-remote-code
 variants:
   default: {precision: mxfp4}
+presets:
+  model_sanity:
+    remove_args:
+      - --speculative-algorithm
+      - --speculative-num-steps
+      - --speculative-eagle-topk
+      - --linear-attn-verify-backend
+    args:
+      - --page-size
+      - "64"
+      - --mamba-radix-cache-strategy
+      - extra_buffer
+      - --disable-overlap-schedule

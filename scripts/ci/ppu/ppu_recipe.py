@@ -78,6 +78,7 @@ ALLOWED_PRESET_SLOTS = frozenset(
         "decode_nographs",
         "dp_ep_low_latency",
         "eval_longctx",
+        "model_sanity",
         "prefill_long",
         "tp8",
     }
