@@ -9,10 +9,14 @@ on:
   workflow_dispatch:
     inputs:
       run_all_tests:
-        description: "Build and run both sanity files even without PPU path changes"
+        description: "Run Recipe CI even without PPU path changes"
         required: false
         type: boolean
         default: true
+      run_legacy_sanity:
+        description: "Run only the single-device DFlash and EAGLE3 checks"
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       ref:
@@ -21,15 +25,19 @@ on:
         type: string
         default: ''
       run_all_tests:
-        description: "Run all tests (for releasing or testing purpose)"
+        description: "Run Recipe CI even without PPU path changes"
         required: false
+        type: boolean
+        default: false
+      run_legacy_sanity:
+        description: "Run only the single-device DFlash and EAGLE3 checks"
         type: boolean
         default: false
 
 concurrency:
-  # Unrelated label events must not cancel or replace the active PPU checks.
+  # Keep legacy-only runs and unrelated label events separate from Recipe CI.
   group: >-
-    pr-test-ppu-${{
+    pr-test-ppu-${{ inputs.run_legacy_sanity && 'legacy' || 'recipe' }}-${{
       (github.event_name == 'pull_request' &&
        github.event.action == 'labeled' &&
        github.event.label.name != 'run-ci' &&
@@ -63,7 +71,7 @@ jobs:
       contents: read
       pull-requests: read
     outputs:
-      ppu: ${{ steps.filter.outputs.ppu == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
+      ppu: ${{ inputs.run_legacy_sanity || steps.filter.outputs.ppu == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
       source-sha: ${{ steps.source.outputs.sha }}
     steps:
       - name: Checkout code
@@ -90,7 +98,7 @@ jobs:
       - name: Determine run mode
         id: run-mode
         env:
-          RUN_ALL_TESTS: ${{ inputs.run_all_tests }}
+          RUN_ALL_TESTS: ${{ inputs.run_all_tests || inputs.run_legacy_sanity }}
         run: |
           if [[ "$RUN_ALL_TESTS" == "true" ]]; then
             echo "run_all_tests=true" >> "$GITHUB_OUTPUT"
@@ -114,8 +122,6 @@ jobs:
               - "python/sglang/kernels/aot/pyproject_sail.toml"
               - "python/sglang/kernels/aot/csrc/common_extension_sail.cc"
               - "python/sglang/kernels/jit/utils/compile/sailify.py"
-              - "test/registered/core/test_basic_sanity_eagle3.py"
-              - "test/registered/core/test_basic_sanity_dflash.py"
 
   pr-gate:
     name: >-
@@ -214,14 +220,10 @@ jobs:
           path: ${{ env.PPU_CI_WHEEL_DIR }}
           if-no-files-found: error
 
-  ppu-sanity:
-    name: >-
-      ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
-           github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
-          format('ignored-label-ppu-sanity ({0})', matrix.board) ||
-          format('ppu-sanity ({0})', matrix.board) }}
+  ppu-legacy-sanity:
+    name: ppu-legacy-sanity (${{ matrix.board }})
     needs: [check-changes, pr-gate, ppu-build, ppu-cluster-config]
-    if: needs.check-changes.outputs.ppu == 'true'
+    if: inputs.run_legacy_sanity == true && needs.check-changes.outputs.ppu == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -283,7 +285,8 @@ jobs:
   ppu-fast-sanity:
     needs: [check-changes, pr-gate, ppu-build, ppu-cluster-config]
     if: >-
-      !cancelled() && needs.ppu-build.result == 'success' &&
+      !cancelled() && inputs.run_legacy_sanity != true &&
+      needs.ppu-build.result == 'success' &&
       needs.ppu-cluster-config.result == 'success' &&
       needs.check-changes.outputs.ppu == 'true'
     permissions:
@@ -299,32 +302,30 @@ jobs:
 
   pr-test-ppu-finish:
     name: >-
-      ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
-           github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
-          'ignored-label-pr-test-ppu-finish' || 'pr-test-ppu-finish' }}
-    needs: [pr-gate, check-changes, ppu-build, ppu-sanity, ppu-fast-sanity]
-    if: always() && needs.check-changes.result != 'skipped'
+      ${{ inputs.run_legacy_sanity && 'legacy-only-pr-test-ppu-finish' ||
+          ((github.event_name == 'pull_request' && github.event.action == 'labeled' &&
+            github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
+           'ignored-label-pr-test-ppu-finish' || 'pr-test-ppu-finish') }}
+    needs: [pr-gate, check-changes, ppu-build, ppu-cluster-config, ppu-fast-sanity]
+    if: always() && inputs.run_legacy_sanity != true && needs.check-changes.result != 'skipped'
     runs-on: ubuntu-latest
     permissions: {}
     steps:
-      - name: Require successful native build and both PPU sanity files when requested
+      - name: Require a successful native build, runner preflight and Recipe Fast Sanity
         env:
           NEEDS_JSON: ${{ toJson(needs) }}
           PPU_IN_SCOPE: ${{ needs.check-changes.outputs.ppu }}
-          BUILD_RESULT: ${{ needs.ppu-build.result }}
-          SANITY_RESULT: ${{ needs.ppu-sanity.result }}
-          FAST_RESULT: ${{ needs.ppu-fast-sanity.result }}
         run: |
           if jq -e 'any(.[]; .result == "failure" or .result == "cancelled")' <<< "$NEEDS_JSON" >/dev/null; then
             printf '%s\n' '::error::A PPU CI dependency failed or was cancelled.'
             exit 1
           fi
           if [[ "$PPU_IN_SCOPE" == "true" ]]; then
-            if [[ "$BUILD_RESULT" != "success" || "$SANITY_RESULT" != "success" || "$FAST_RESULT" != "success" ]]; then
-              printf '%s\n' '::error::PPU scope requires a successful native build and all PPU sanity jobs.'
+            if ! jq -e 'all(.[]; .result == "success")' <<< "$NEEDS_JSON" >/dev/null; then
+              printf '%s\n' '::error::PPU scope requires a successful native build, runner preflight and Recipe Fast Sanity.'
               exit 1
             fi
-            printf '%s\n' 'Native build and all PPU sanity jobs passed.'
+            printf '%s\n' 'Native build, runner preflight and Recipe Fast Sanity passed.'
           else
             printf '%s\n' 'PPU is outside this run scope; no PPU tests were requested.'
           fi

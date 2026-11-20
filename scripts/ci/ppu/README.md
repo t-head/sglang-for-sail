@@ -4,9 +4,18 @@ The release branch owns the SGLang serving recipes, test policies and 890P accur
 
 - **Fast Sanity** runs every model with a `fast_sanity` policy. It uses dummy weights, attempts a two-layer override first and can retry with the full layer count when startup fails. Both non-streaming and streaming probes must complete.
 - **Model Sanity** runs real weights once per model. It runs GSM8K main (1,319 questions), reconciles each scored sample with the reference band, verifies the KV gauge after a cache flush, and runs the native microbench at concurrency 1 and 16. The same-server performance measurements are diagnostic.
-- The existing single-device EAGLE3 and DFlash tests run separately. They retain their private outputs under the runner's results root.
+- **Legacy single-device sanity** runs EAGLE3 and DFlash on both board types when explicitly requested. Each test reports its original result and the runner retains the raw output privately.
 
 For release PRs, use `run-ci` with `run-ci-ppu` for Fast Sanity. Apply `run-ci-ppu-nightly` to an eligible ready PR to trigger Model Sanity. Nightly dispatch and reusable inputs also allow an exact model filter and reuse of a candidate build with `skip_wheel_build` and `wheel_artifact_run_id`.
+
+The default PR check requires the native build, runner preflight and Recipe Fast Sanity. To run the separate single-device workflow on the release branch after it lands, dispatch the same workflow in legacy-only mode.
+
+```bash
+gh workflow run pr-test-ppu.yml --repo t-head/sglang-for-sail \
+  --ref release/v0.5.23 -f run_legacy_sanity=true
+```
+
+The reusable workflow accepts the same boolean input and a candidate `ref`.
 
 ## Provision the cluster runner
 

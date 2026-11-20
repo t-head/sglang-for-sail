@@ -122,6 +122,8 @@ class TestPPUCIWorkflow(CustomTestCase):
             ("python/sglang/test/ci/ci_register.py", False),
             ("python/sglang/test/ci/ci_utils.py", False),
             ("test/run_suite.py", False),
+            ("test/registered/core/test_basic_sanity_eagle3.py", False),
+            ("test/registered/core/test_basic_sanity_dflash.py", False),
             (".github/workflows/pr-test-ppu.yml", True),
             ("scripts/ci/ppu/run_test.sh", True),
             ("python/sglang/srt/platforms/sail.py", True),
@@ -139,19 +141,26 @@ class TestPPUCIWorkflow(CustomTestCase):
             self.jobs["ppu-build"]["needs"], ["check-changes", "pr-gate"]
         )
         self.assertCountEqual(
-            self.jobs["ppu-sanity"]["needs"],
+            self.jobs["ppu-legacy-sanity"]["needs"],
             ["check-changes", "pr-gate", "ppu-build", "ppu-cluster-config"],
         )
         self.assertCountEqual(
             self.jobs["pr-test-ppu-finish"]["needs"],
-            ["pr-gate", "check-changes", "ppu-build", "ppu-sanity", "ppu-fast-sanity"],
+            [
+                "pr-gate",
+                "check-changes",
+                "ppu-build",
+                "ppu-cluster-config",
+                "ppu-fast-sanity",
+            ],
         )
         self.assertEqual(
-            self.jobs["ppu-sanity"]["if"], "needs.check-changes.outputs.ppu == 'true'"
+            self.jobs["ppu-legacy-sanity"]["if"],
+            "inputs.run_legacy_sanity == true && needs.check-changes.outputs.ppu == 'true'",
         )
         self.assertEqual(
             self.jobs["pr-test-ppu-finish"]["if"],
-            "always() && needs.check-changes.result != 'skipped'",
+            "always() && inputs.run_legacy_sanity != true && needs.check-changes.result != 'skipped'",
         )
         runtime = RUNNER.parent.parent / "scripts/ci/ppu/build_and_test.sh"
         self.assertNotIn("--hw cpu", runtime.read_text())
@@ -164,7 +173,7 @@ class TestPPUCIWorkflow(CustomTestCase):
         # test_ppu_ci_docker.py.
         expected = self.jobs["check-changes"]["steps"][0]["with"]["ref"]
         self.assertEqual(expected, "${{ inputs.ref || github.sha }}")
-        for name in ("ppu-build", "ppu-sanity"):
+        for name in ("ppu-build", "ppu-legacy-sanity"):
             with self.subTest(job=name):
                 job = self.jobs[name]
                 checkout = next(
@@ -184,7 +193,7 @@ class TestPPUCIWorkflow(CustomTestCase):
                 )
 
     def test_sanity_runs_on_every_ppu_generation_with_private_retention(self):
-        sanity = self.jobs["ppu-sanity"]
+        sanity = self.jobs["ppu-legacy-sanity"]
         self.assertEqual(sanity["runs-on"], "k8s-runner-group-cpu-thead")
         self.assertIs(sanity["strategy"]["fail-fast"], False)
         self.assertEqual(
@@ -210,28 +219,41 @@ class TestPPUCIWorkflow(CustomTestCase):
             "exec bash scripts/ci/ppu/run_recipe_cluster.sh", steps["cluster"]["run"]
         )
 
-    def test_finish_requires_successful_build_and_sanity_when_in_scope(self):
-        finish = self.jobs["pr-test-ppu-finish"]["steps"][0]
-        statuses = ("success", "failure", "cancelled", "skipped")
-        for build in statuses:
-            for sanity in statuses:
+    def test_legacy_mode_is_explicit_and_separate_from_recipe_ci(self):
+        path = RUNNER.parent.parent / ".github/workflows/pr-test-ppu.yml"
+        workflow = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+        for event in ("workflow_dispatch", "workflow_call"):
+            self.assertEqual(
+                workflow["on"][event]["inputs"]["run_legacy_sanity"]["default"], "false"
+            )
+        self.assertIn("inputs.run_legacy_sanity", workflow["concurrency"]["group"])
+        self.assertIn(
+            "inputs.run_legacy_sanity", self.jobs["check-changes"]["outputs"]["ppu"]
+        )
+        self.assertIn(
+            "inputs.run_legacy_sanity != true", self.jobs["ppu-fast-sanity"]["if"]
+        )
+        self.assertIn(
+            "legacy-only-pr-test-ppu-finish", self.jobs["pr-test-ppu-finish"]["name"]
+        )
+
+    def test_finish_requires_each_recipe_dependency_when_in_scope(self):
+        job = self.jobs["pr-test-ppu-finish"]
+        finish = job["steps"][0]
+        for dependency in job["needs"]:
+            for status in ("success", "failure", "cancelled", "skipped"):
                 for in_scope in (True, False):
-                    with self.subTest(build=build, sanity=sanity, in_scope=in_scope):
-                        needs = {
-                            name: {"result": "success"}
-                            for name in self.jobs["pr-test-ppu-finish"]["needs"]
-                        }
-                        needs["ppu-build"] = {"result": build}
-                        needs["ppu-sanity"] = {"result": sanity}
+                    with self.subTest(
+                        dependency=dependency, status=status, in_scope=in_scope
+                    ):
+                        needs = {name: {"result": "success"} for name in job["needs"]}
+                        needs[dependency] = {"result": status}
                         result = subprocess.run(
                             ["bash", "-e", "-o", "pipefail", "-c", finish["run"]],
                             env=dict(
                                 os.environ,
                                 NEEDS_JSON=json.dumps(needs),
                                 PPU_IN_SCOPE=str(in_scope).lower(),
-                                BUILD_RESULT=build,
-                                SANITY_RESULT=sanity,
-                                FAST_RESULT="success",
                             ),
                             capture_output=True,
                             text=True,
@@ -240,15 +262,9 @@ class TestPPUCIWorkflow(CustomTestCase):
                         allowed = {"success"} if in_scope else {"success", "skipped"}
                         self.assertEqual(
                             result.returncode == 0,
-                            build in allowed and sanity in allowed,
+                            status in allowed,
                             result.stdout + result.stderr,
                         )
-        for variable, job in (
-            ("BUILD_RESULT", "ppu-build"),
-            ("SANITY_RESULT", "ppu-sanity"),
-            ("FAST_RESULT", "ppu-fast-sanity"),
-        ):
-            self.assertEqual(finish["env"][variable], "${{ needs." + job + ".result }}")
 
 
 class TestPPUManualSelftests(CustomTestCase):
