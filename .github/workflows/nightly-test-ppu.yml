@@ -1,0 +1,329 @@
+name: Nightly Test (PPU)
+
+on:
+  # Use the protected base branch's workflow for privileged runner jobs.
+  pull_request_target:
+    branches: [main, 'release/**']
+    types: [labeled, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      ref:
+        type: string
+        default: ''
+      model_filter:
+        type: string
+        default: ''
+      runtime_image:
+        type: string
+        default: download.t-head.cn/docker_test/sglang:release-v0.5.23-20261116-cf244d4
+      skip_wheel_build:
+        type: boolean
+        default: false
+      wheel_artifact_run_id:
+        type: string
+        default: ''
+  workflow_call:
+    outputs:
+      sanity-result:
+        value: ${{ inputs.tier == 'cluster_preflight' && jobs.cluster-preflight.outputs.result || jobs.recipe-sanity.outputs.result }}
+    inputs:
+      ref:
+        type: string
+        default: ''
+      model_filter:
+        type: string
+        default: ''
+      runtime_image:
+        type: string
+        default: download.t-head.cn/docker_test/sglang:release-v0.5.23-20261116-cf244d4
+      tier:
+        type: string
+        default: model_sanity
+      skip_wheel_build:
+        type: boolean
+        default: false
+      wheel_artifact_run_id:
+        type: string
+        default: ''
+      wheel_artifact_id:
+        type: string
+        default: ''
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ppu-${{ inputs.tier || 'model_sanity' }}-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  PPU_CI_K8S_CONFIG_SHA256: '180dcea0645c98f89109617547ce31000d4cd84850cd3fdfb7771030985962ec'
+  GIT_CONFIG_NOSYSTEM: '1'
+  TIER: ${{ inputs.tier || 'model_sanity' }}
+
+jobs:
+  pr-gate:
+    if: >-
+      github.repository == 't-head/sglang-for-sail' &&
+      (github.event_name != 'pull_request_target' || inputs.tier == 'fast_sanity' ||
+       github.event.action != 'labeled' ||
+       contains(fromJSON('["run-ci","run-ci-ppu-nightly"]'), github.event.label.name))
+    uses: ./.github/workflows/ppu-approval.yml
+    with:
+      label: ${{ inputs.tier == 'fast_sanity' && 'run-ci-ppu' || 'run-ci-ppu-nightly' }}
+      ref: ${{ inputs.ref || '' }}
+
+  cluster-preflight:
+    outputs:
+      result: ${{ steps.check.outcome }}
+    needs: pr-gate
+    if: inputs.tier == 'cluster_preflight' && needs.pr-gate.outputs.approved == 'true'
+    runs-on: k8s-runner-group-cpu-thead
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: t-head/ci-infra
+          ref: 96e25147971f5d2a04d828f8ad508cae38a4fa8a
+          path: .ppu-infra
+          persist-credentials: false
+      - id: check
+        run: python3 -B scripts/ci/ppu/recipe_cluster_config.py --check
+
+  plan:
+    needs: pr-gate
+    if: inputs.tier != 'cluster_preflight' && needs.pr-gate.outputs.approved == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      source-sha: ${{ steps.plan.outputs.source }}
+      models: ${{ steps.plan.outputs.models }}
+      input-artifact-id: ${{ steps.plan.outputs.artifact }}
+      input-run-id: ${{ steps.plan.outputs.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || (github.event_name == 'workflow_dispatch' && github.sha) || inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate policies and public failure fixtures
+        run: |
+          python3 -m pip install --quiet PyYAML
+          python3 -B -m unittest discover -s scripts/ci/ppu -p 'test_recipe*.py'
+      - name: Select models and candidate wheel inputs
+        id: plan
+        env:
+          MODEL_FILTER: ${{ inputs.model_filter || '' }}
+          SKIP_BUILD: ${{ inputs.skip_wheel_build || false }}
+          WHEEL_RUN: ${{ inputs.wheel_artifact_run_id || '' }}
+          WHEEL_ID: ${{ inputs.wheel_artifact_id || '' }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          source=$(git rev-parse HEAD)
+          models=$(python3 -B scripts/ci/ppu/recipe_select.py "$TIER" --model-filter "$MODEL_FILTER")
+          if [[ "$SKIP_BUILD" == true ]]; then
+            if [[ -n "$WHEEL_ID" ]]; then
+              [[ "$WHEEL_ID" =~ ^[0-9]+$ && -z "$WHEEL_RUN" ]]
+              WHEEL_RUN="$GITHUB_RUN_ID"
+            else
+              [[ "$WHEEL_RUN" =~ ^[0-9]+$ ]]
+              WHEEL_ID=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$WHEEL_RUN/artifacts" |
+                jq -er --arg prefix "ppu-wheels-$WHEEL_RUN-" \
+                  '[.[].artifacts[] | select(.expired | not) | select(.name | startswith($prefix))] |
+                    max_by(.id).id')
+            fi
+          else
+            [[ -z "$WHEEL_RUN" && -z "$WHEEL_ID" ]]
+            if [[ "$TIER" == model_sanity && "$PR_HEAD" =~ ^[0-9a-f]{40}$ ]] &&
+                runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/pr-test-ppu.yml/runs?event=pull_request_target&head_sha=$PR_HEAD&per_page=10" \
+                  --jq '.workflow_runs[].id'); then
+              for run in $runs; do
+                [[ "$run" =~ ^[0-9]+$ ]] || continue
+                if artifact=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$run/artifacts" |
+                    jq -er --arg prefix "ppu-wheels-$run-" --arg suffix "-$source" \
+                      '[.[].artifacts[] | select(.expired | not) | select(.name | startswith($prefix) and endswith($suffix))] |
+                        max_by(.id).id'); then
+                  [[ "$artifact" =~ ^[0-9]+$ ]] || continue
+                  WHEEL_RUN=$run
+                  WHEEL_ID=$artifact
+                  break
+                fi
+              done
+            fi
+          fi
+          printf 'source=%s\nmodels=%s\nartifact=%s\nrun_id=%s\n' "$source" "$models" "$WHEEL_ID" "$WHEEL_RUN" >> "$GITHUB_OUTPUT"
+
+  ppu-build:
+    needs: plan
+    if: needs.plan.outputs.input-artifact-id == ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    container:
+      image: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-hggcrt3-py312-20261005
+    outputs:
+      wheel-artifact-id: ${{ steps.wheels.outputs.artifact-id }}
+    env:
+      PPU_CI_SOURCE_SHA: ${{ needs.plan.outputs.source-sha }}
+      MAX_JOBS: '2'
+      SGL_KERNEL_COMPILE_THREADS: '2'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Initialize private build directories and Git configuration
+        run: |
+          umask 077
+          work=$(mktemp -d "${RUNNER_TEMP}/ppu-build.XXXXXX")
+          touch "$work/gitconfig"
+          mkdir "$work/wheels" "$work/artifacts"
+          {
+            printf 'GIT_CONFIG_GLOBAL=%s\n' "$work/gitconfig"
+            printf 'PPU_CI_WHEEL_DIR=%s\n' "$work/wheels"
+            printf 'PPU_CI_ARTIFACT_DIR=%s\n' "$work/artifacts"
+          } >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ needs.plan.outputs.source-sha }}
+          persist-credentials: false
+      - name: Build native SAIL wheel and Recipe bundle
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          if ! bash scripts/ci/ppu/build_and_test.sh build > "$PPU_CI_ARTIFACT_DIR/launcher.log" 2>&1; then
+            echo "::error::Native SAIL wheel build failed"
+            exit 1
+          fi
+          if ! python3 -B scripts/ci/ppu/recipe_bundle.py pack "$PPU_CI_WHEEL_DIR" "$PPU_CI_SOURCE_SHA" > "$PPU_CI_ARTIFACT_DIR/pack.log" 2>&1; then
+            echo "::error::Candidate recipe packaging failed"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        id: wheels
+        with:
+          name: ppu-wheels-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.plan.outputs.source-sha }}
+          path: ${{ env.PPU_CI_WHEEL_DIR }}
+          if-no-files-found: error
+
+  evalscope-wheels:
+    needs: plan
+    if: inputs.tier != 'fast_sanity'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      artifact-id: ${{ steps.wheels.outputs.artifact-id }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare the isolated offline EvalScope wheelhouse
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir evalscope-wheels
+          test_env="$RUNNER_TEMP/evalscope-check"
+          if ! {
+            python3 -m pip wheel --index-url https://pypi.org/simple \
+              --wheel-dir evalscope-wheels 'evalscope==1.15.0' &&
+            python3 -m venv "$test_env" &&
+            "$test_env/bin/python" -m pip install --no-index \
+              --find-links evalscope-wheels 'evalscope==1.15.0' &&
+            "$test_env/bin/python" -c 'from evalscope import TaskConfig, run_task'
+          } > "$RUNNER_TEMP/evalscope-wheelhouse.log" 2>&1; then
+            echo "::error::Offline EvalScope wheelhouse validation failed"
+            exit 1
+          fi
+          (cd evalscope-wheels && sha256sum -- *.whl > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        id: wheels
+        with:
+          name: evalscope-wheels-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evalscope-wheels/
+          if-no-files-found: error
+
+  recipe-sanity:
+    outputs:
+      result: ${{ steps.cluster.outcome }}
+    name: ${{ inputs.tier == 'fast_sanity' && 'Fast Sanity' || 'Model Sanity' }} (${{ matrix.model }})
+    needs: [plan, ppu-build, evalscope-wheels]
+    if: >-
+      !cancelled() && needs.plan.result == 'success' &&
+      (inputs.tier == 'fast_sanity' || needs.evalscope-wheels.result == 'success') &&
+      (needs.ppu-build.result == 'success' ||
+       (needs.plan.outputs.input-artifact-id != '' && needs.ppu-build.result == 'skipped'))
+    runs-on: k8s-runner-group-cpu-thead
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: ${{ inputs.tier == 'fast_sanity' && 40 || 360 }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.models) }}
+    env:
+      MODEL_KEY: ${{ matrix.model }}
+      RECIPE_PPU_COUNT: ${{ matrix.ppu_count || 8 }}
+      PPU_CI_SOURCE_SHA: ${{ needs.plan.outputs.source-sha }}
+      PPU_CI_RECIPE_RUNTIME_IMAGE: ${{ inputs.runtime_image || 'download.t-head.cn/docker_test/sglang:release-v0.5.23-20261116-cf244d4' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ needs.plan.outputs.source-sha }}
+          persist-credentials: false
+      - name: Fetch exact candidate bundle
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.plan.outputs.input-artifact-id || needs.ppu-build.outputs.wheel-artifact-id }}
+          run-id: ${{ needs.plan.outputs.input-run-id || github.run_id }}
+          github-token: ${{ github.token }}
+          merge-multiple: true
+          path: wheels
+      - name: Fetch the isolated evaluator wheelhouse
+        if: inputs.tier != 'fast_sanity'
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.evalscope-wheels.outputs.artifact-id }}
+          merge-multiple: true
+          path: evalscope-wheels
+      - name: Fetch pinned Cluster Run backend
+        uses: actions/checkout@v4
+        with:
+          repository: t-head/ci-infra
+          ref: 96e25147971f5d2a04d828f8ad508cae38a4fa8a
+          path: .ppu-infra
+          persist-credentials: false
+      - name: Orchestrate PPU Pod with private logs
+        id: cluster
+        shell: bash
+        run: |
+          export PPU_PUBLIC_SUMMARY="$GITHUB_STEP_SUMMARY"
+          exec bash scripts/ci/ppu/run_recipe_cluster.sh
+      - name: Approve only the checked public evidence file
+        id: evidence
+        if: always() && steps.cluster.outcome != 'skipped'
+        shell: bash
+        run: |
+          if [[ -f ppu-public/recipe.json && ! -L ppu-public/recipe.json ]] &&
+            python3 -B scripts/ci/ppu/recipe_publish.py --verify-only ppu-public/recipe.json >/dev/null 2>&1; then
+            printf 'approved=true\n' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Upload checked public evidence
+        if: always() && steps.evidence.outputs.approved == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TIER }}-${{ matrix.model }}-${{ github.run_attempt }}
+          path: ppu-public/recipe.json
+          if-no-files-found: error
