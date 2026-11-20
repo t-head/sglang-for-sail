@@ -453,10 +453,7 @@ def run(policy_path, tier, queue_s):
         start = time.monotonic()
         has_layer_override = config["layer_override"] is not None
         full_ready_timeout = 1000
-        if (
-            policy["model_id"] == "zai-org/GLM-5.3"
-            or policy_path.stem == "qwen3.8-flash-next"
-        ):
+        if policy["model_id"] in {"zai-org/GLM-5.3", "Qwen/Qwen3.8-Flash-Next"}:
             # Cold graph capture and the first kernel compilation need extra time.
             full_ready_timeout = 1350
         try:
