@@ -1,0 +1,42 @@
+schema_version: ppu-serving/v1
+ppu:
+  framework: sglang
+  visibility: public
+  assets: {model: qwen3.8-flash-next-mxfp4, tokenizer: qwen3.8-flash-next-mxfp4}
+  hf_model_id: T-HEAD/Qwen3.8-Flash-Next-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken
+  topology: {kind: single_node, nodes: 1, devices_per_node: 4}
+model:
+  model_id: Qwen/Qwen3.8-Flash-Next
+  base_args:
+    - --tp-size
+    - "4"
+    - --context-length
+    - "16384"
+    - --attention-backend
+    - triton
+    - --mem-fraction-static
+    - "0.9"
+    - --max-running-requests
+    - "128"
+    - --chunked-prefill-size
+    - "8192"
+    - --speculative-algorithm
+    - NEXTN
+    - --speculative-num-steps
+    - "2"
+    - --speculative-eagle-topk
+    - "1"
+    - --linear-attn-prefill-backend
+    - triton
+    - --linear-attn-decode-backend
+    - triton
+    - --linear-attn-verify-backend
+    - triton
+    - --mamba-ssm-dtype
+    - bfloat16
+    - --ple-offload-embedding
+    - --reasoning-parser
+    - auto
+    - --trust-remote-code
+variants:
+  default: {precision: mxfp4}
