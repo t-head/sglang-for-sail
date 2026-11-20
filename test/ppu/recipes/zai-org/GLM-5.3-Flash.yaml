@@ -21,6 +21,7 @@ model:
     - flashmla_kv
     - --kv-cache-dtype
     - bfloat16
+    - --disable-prefill-cuda-graph
     - --disable-custom-all-reduce
     - --trust-remote-code
 variants:
