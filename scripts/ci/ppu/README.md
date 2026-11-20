@@ -2,7 +2,7 @@
 
 The release branch owns the SGLang serving recipes, test policies and 890P accuracy references in `test/ppu`. Native SAIL wheels and their Recipe bundle carry the same source revision. The runner verifies the wheel inventory, archive and recipe tree before installation and records the release runtime's manifest digest.
 
-- **Fast Sanity** runs every model with a `fast_sanity` policy. The current models start directly with full-layer dummy weights. Both non-streaming and streaming probes must complete.
+- **Fast Sanity** runs every model with a `fast_sanity` policy. The current models start directly with full-layer dummy weights. The model policy controls prefix caching. Both non-streaming and streaming probes must complete.
 - **Model Sanity** runs real weights once per model. It runs GSM8K main (1,319 questions), reconciles each scored sample with the reference band, verifies the KV gauge after a cache flush, and runs the native microbench at concurrency 1 and 16. The same-server performance measurements are diagnostic.
 - **Legacy single-device sanity** runs EAGLE3 and DFlash on both board types when explicitly requested. Each test reports its original result and the runner retains the raw output privately.
 

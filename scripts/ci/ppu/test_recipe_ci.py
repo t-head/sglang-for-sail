@@ -20,6 +20,7 @@ from ppu_recipe import (
     _load_yaml,
     resolve_recipe,
     validate_paths,
+    validate_policy_structure,
 )
 from recipe_bundle import sha256, wheel_inventory
 from recipe_cluster_config import load_settings
@@ -60,6 +61,7 @@ class RecipeContractTest(unittest.TestCase):
                     {"model": "deepseek-v4.1-flash"},
                     {"model": "glm-5.3"},
                     {"model": "minimax-m3"},
+                    {"model": "qwen3.8-flash-next"},
                 ]
             },
         )
@@ -72,6 +74,33 @@ class RecipeContractTest(unittest.TestCase):
             select("model_sanity", "glm")
         with self.assertRaises(ValueError):
             select("model_sanity", "glm-5.3,glm-5.3")
+
+    def test_qwen_flash_next_fast_uses_the_eight_device_deepep_profile(self):
+        policy = DEFAULT_POLICY_ROOT / "models/qwen3.8-flash-next.yaml"
+        recipe = REPO_ROOT / _load_yaml(policy)["recipe"]
+        resolved = resolve_recipe(recipe, policy_path=policy, tier="fast_sanity")
+        self.assertEqual(resolved["ppu_count"], 8)
+        self.assertIsNone(resolved["layer_override"])
+        flags = resolved["flags"]
+        for name, value in (
+            ("--tp-size", "8"),
+            ("--attn-dp-size", "8"),
+            ("--moe-a2a-backend", "deepep"),
+            ("--speculative-algorithm", "NEXTN"),
+            ("--load-format", "dummy"),
+        ):
+            self.assertEqual(flags[flags.index(name) + 1], value)
+        self.assertIn("--disable-radix-cache", flags)
+        self.assertIn("--ple-offload-embedding", flags)
+        self.assertNotIn("--dp-size", flags)
+        with self.assertRaises(ValueError):
+            select("model_sanity", "qwen3.8-flash-next")
+
+    def test_fast_sanity_policy_rejects_an_unknown_cache_value(self):
+        policy = _load_yaml(DEFAULT_POLICY_ROOT / "models/qwen3.8-flash-next.yaml")
+        policy["tiers"]["fast_sanity"]["cache"] = "auto"
+        with self.assertRaisesRegex(ValidationError, r"fast_sanity\.cache"):
+            validate_policy_structure(policy, context="test")
 
     def test_policy_switches(self):
         policy = DEFAULT_POLICY_ROOT / "models/glm-5.3.yaml"
