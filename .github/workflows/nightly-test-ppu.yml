@@ -1,7 +1,8 @@
 name: Nightly Test (PPU)
 
 on:
-  pull_request:
+  # Use the protected base branch's workflow for privileged runner jobs.
+  pull_request_target:
     branches: [main, 'release/**']
     types: [labeled]
   workflow_dispatch:
@@ -63,7 +64,7 @@ jobs:
   pr-gate:
     if: >-
       github.repository == 't-head/sglang-for-sail' &&
-      (github.event_name != 'pull_request' ||
+      (github.event_name != 'pull_request_target' ||
        inputs.tier == 'fast_sanity' ||
        (github.event.action == 'labeled' &&
         github.event.label.name == 'run-ci-ppu-nightly' &&
@@ -72,6 +73,9 @@ jobs:
     with:
       require-run-ci: true
       require-label: ${{ inputs.tier == 'fast_sanity' && 'run-ci-ppu' || 'run-ci-ppu-nightly' }}
+      require-fresh-label: true
+      # Fast Sanity's caller already applied the shared PR cooldown.
+      cool-down-minutes: ${{ inputs.tier != 'fast_sanity' && 120 || 0 }}
 
   plan:
     needs: pr-gate
@@ -85,7 +89,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || inputs.ref || github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -121,7 +126,7 @@ jobs:
           else
             [[ -z "$WHEEL_RUN" && -z "$WHEEL_ID" ]]
             if [[ "$TIER" == model_sanity && "$PR_HEAD" =~ ^[0-9a-f]{40}$ ]] &&
-                runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/pr-test-ppu.yml/runs?event=pull_request&head_sha=$PR_HEAD&per_page=10" \
+                runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/pr-test-ppu.yml/runs?event=pull_request_target&head_sha=$PR_HEAD&per_page=10" \
                   --jq '.workflow_runs[].id'); then
               for run in $runs; do
                 [[ "$run" =~ ^[0-9]+$ ]] || continue
@@ -169,6 +174,7 @@ jobs:
           } >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ needs.plan.outputs.source-sha }}
           persist-credentials: false
       - name: Build native SAIL wheel and Recipe bundle
@@ -234,7 +240,9 @@ jobs:
       (inputs.tier == 'fast_sanity' || needs.evalscope-wheels.result == 'success') &&
       (needs.ppu-build.result == 'success' ||
        (needs.plan.outputs.input-artifact-id != '' && needs.ppu-build.result == 'skipped'))
-    runs-on: k8s-runner-group-cpu-thead
+    runs-on:
+      group: sglang-ppu-ci
+      labels: k8s-runner-group-cpu-thead
     container:
       image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: ${{ inputs.tier == 'fast_sanity' && 40 || 360 }}
@@ -248,6 +256,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ needs.plan.outputs.source-sha }}
           persist-credentials: false
       - name: Fetch exact candidate bundle
