@@ -16,6 +16,7 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa_backend import DSAMetadata
+    from sglang.srt.layers.attention.mqa_logits_utils import SailPagedMQAMetadata
 
 
 class BaseIndexerMetadata(ABC):
@@ -99,7 +100,7 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
     attn_metadata: DSAMetadata
     topk_transform_method: TopkTransformMethod
     topk_backend: DSATopKBackend = DSATopKBackend.SGL_KERNEL
-    paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
+    paged_mqa_schedule_metadata: Optional[torch.Tensor | SailPagedMQAMetadata] = None
     paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
     force_unfused_topk: bool = False
     # the PAGED extend runs the exact v2 packed top-k (see DSATopKBackend)

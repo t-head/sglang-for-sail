@@ -107,6 +107,10 @@ from sglang.srt.layers.attention.kv_shard_hooks import (
     get_kv_shard_pool,
     prepare_kv_shard_forward,
 )
+from sglang.srt.layers.attention.mqa_logits_utils import (
+    SailPagedMQAMetadata,
+    sail_paged_mqa_metadata,
+)
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     grow_multi_ctas_kv_counter_buffer_if_needed,
     make_persistent_multi_ctas_kv_counter_buffer,
@@ -340,7 +344,7 @@ class DSAMetadata:
     flashmla_metadata: Optional[DSAFlashMLAMetadata] = None
     # DeepGEMM schedule metadata for paged MQA logits (decode/target_verify/draft_extend only).
     # Precomputed once per forward batch and reused across layers.
-    paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
+    paged_mqa_schedule_metadata: Optional[torch.Tensor | SailPagedMQAMetadata] = None
     # 2D context_lens used to build the schedule above; the indexer reuses it
     # as DG's `context_lens` arg so the broadcast doesn't rebuild per layer.
     paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
@@ -1159,8 +1163,18 @@ class DeepseekSparseAttnBackend(
     def _build_paged_mqa_schedule_metadata(
         self,
         seqlens_32_2d: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
+        request_indices: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor | SailPagedMQAMetadata]:
         if _is_sail and not envs.SGLANG_SAIL_BF16_INDEXER.get():
+            if request_indices is not None:
+                return sail_paged_mqa_metadata(
+                    seqlens_32_2d,
+                    64,
+                    max(32, self.indexer_n_heads),
+                    self.indexer_head_dim,
+                    torch.int8,
+                    request_indices,
+                )
             # Build PPU schedules at indexer compute with the actual Q, owners, and SM count.
             return None
         return resolve_paged_mqa_logits_metadata_fn()(
@@ -1179,8 +1193,15 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         seqlens_32_2d: torch.Tensor,
     ) -> None:
-        new_schedule = self._build_paged_mqa_schedule_metadata(seqlens_32_2d)
         current_schedule = metadata.paged_mqa_schedule_metadata
+        if isinstance(current_schedule, SailPagedMQAMetadata):
+            current_schedule.copy_(
+                self._build_paged_mqa_schedule_metadata(
+                    seqlens_32_2d, request_indices=metadata.token_to_batch_idx
+                )
+            )
+            return
+        new_schedule = self._build_paged_mqa_schedule_metadata(seqlens_32_2d)
         if current_schedule is None:
             object.__setattr__(metadata, "paged_mqa_schedule_metadata", new_schedule)
             return
@@ -2029,6 +2050,7 @@ class DeepseekSparseAttnBackend(
 
         paged_mqa_schedule_metadata = None
         paged_mqa_ctx_lens_2d = None
+        request_indices = None
         if is_cuda() and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
@@ -2037,6 +2059,15 @@ class DeepseekSparseAttnBackend(
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_mode, cache_seqlens_int32, seqlens_expanded, bs
             )
+            if _is_sail and forward_mode.is_target_verify():
+                indexer_pool = getattr(
+                    self.token_to_kv_pool, "full_kv_pool", self.token_to_kv_pool
+                )
+                if getattr(indexer_pool, "use_fp4_indexer", False):
+                    # Fixed verify rows keep their request owners across replays.
+                    request_indices = (
+                        dsa_cu_seqlens_q[:-1] // self.speculative_num_draft_tokens
+                    )
             # CUDA graph captures the schedule tensor's shape and data pointer.
             # Reserve schedule capacity for the largest context this graph can
             # replay; per-replay code refreshes the valid prefix in-place.
@@ -2046,14 +2077,14 @@ class DeepseekSparseAttnBackend(
                     paged_mqa_ctx_lens_2d, self.req_to_token.shape[1]
                 )
                 paged_mqa_schedule_metadata = self._build_paged_mqa_schedule_metadata(
-                    capacity_ctx_lens_2d
+                    capacity_ctx_lens_2d, request_indices=request_indices
                 )
             else:
                 paged_mqa_ctx_lens_2d = torch.full_like(
                     paged_mqa_ctx_lens_2d, self.req_to_token.shape[1]
                 )
                 paged_mqa_schedule_metadata = self._build_paged_mqa_schedule_metadata(
-                    paged_mqa_ctx_lens_2d
+                    paged_mqa_ctx_lens_2d, request_indices=request_indices
                 )
 
         metadata = DSAMetadata(
@@ -2073,6 +2104,7 @@ class DeepseekSparseAttnBackend(
             dsa_seqlens_expanded=seqlens_expanded,
             real_page_table=real_page_table,
             dsa_extend_seq_lens_list=dsa_extend_seq_lens_list,
+            token_to_batch_idx=request_indices,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
         )
         metadata = self._init_kpool_metadata_capture(metadata, bs, forward_mode)
