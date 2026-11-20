@@ -281,7 +281,7 @@ class RecipeContractTest(unittest.TestCase):
                 chunk_size = int(flags[flags.index("--chunked-prefill-size") + 1])
                 self.assertEqual(chunk_size % (8 * page_size), 0)
 
-    def test_deepseek_tp8_uses_same_checkpoint_and_disables_fused_tp_moe(self):
+    def test_deepseek_tp8_uses_same_checkpoint_and_paged_short_prefill(self):
         policy = DEFAULT_POLICY_ROOT / "models/deepseek-v4-flash-tp8.yaml"
         recipe = REPO_ROOT / _load_yaml(policy)["recipe"]
         default_policy = DEFAULT_POLICY_ROOT / "models/deepseek-v4-flash.yaml"
@@ -293,9 +293,9 @@ class RecipeContractTest(unittest.TestCase):
                 self.assertEqual(resolved["ppu_count"], 8)
                 self.assertEqual(resolved["hf_model_id"], default["hf_model_id"])
                 self.assertNotEqual(resolved["config_digest"], default["config_digest"])
-                fused_moe = "SGLANG_SAIL_DEEPGEMM_MOE_TP_FUSED"
-                self.assertEqual(resolved["server_env"][fused_moe], "0")
-                self.assertNotIn(fused_moe, default["server_env"])
+                sparse_prefill = "SGLANG_OPT_FLASHMLA_SPARSE_PREFILL"
+                self.assertEqual(resolved["server_env"][sparse_prefill], "0")
+                self.assertNotIn(sparse_prefill, default["server_env"])
                 flags = resolved["flags"]
                 self.assertEqual(flags[flags.index("--tp-size") + 1], "8")
                 for flag in (

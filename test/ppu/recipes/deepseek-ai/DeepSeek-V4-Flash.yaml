@@ -46,4 +46,4 @@ presets:
       - --moe-a2a-backend
       - --deepep-mode
     env:
-      SGLANG_SAIL_DEEPGEMM_MOE_TP_FUSED: "0"
+      SGLANG_OPT_FLASHMLA_SPARSE_PREFILL: "0"
