@@ -1,0 +1,26 @@
+schema_version: ppu-serving/v1
+ppu:
+  framework: sglang
+  visibility: public
+  assets: {model: step5-preview-mxfp4, tokenizer: step5-preview-mxfp4}
+  hf_model_id: T-HEAD/Step-5-Preview-MoE-Quant-W-MXFP4-A-MXFP4
+  topology: {kind: single_node, nodes: 1, devices_per_node: 8}
+model:
+  model_id: stepfun-ai/Step-5-Preview
+  base_args:
+    - --tp-size
+    - "4"
+    - --pp-size
+    - "2"
+    - --quantization
+    - mxfp4
+    - --kv-cache-dtype
+    - bfloat16
+    - --page-size
+    - "64"
+    - --attention-backend
+    - fa3
+    - --disable-overlap-schedule
+    - --trust-remote-code
+variants:
+  default: {precision: mxfp4}
