@@ -10,7 +10,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from ppu_recipe import (
     DEFAULT_POLICY_ROOT,
@@ -21,11 +22,11 @@ from ppu_recipe import (
     validate_paths,
 )
 from recipe_bundle import sha256, wheel_inventory
-from recipe_cluster_config import MODEL_PATH_SETTINGS, load_settings
+from recipe_cluster_config import load_settings
 from recipe_cluster_diagnostics import diagnostic_codes
 from recipe_publish import publish, validate
 from recipe_report import legacy_result
-from recipe_runner import metrics_zero, read_eval_reviews, run
+from recipe_runner import cached_model_path, metrics_zero, read_eval_reviews, run
 from recipe_select import select
 
 
@@ -50,7 +51,7 @@ def fast_result():
 
 
 class RecipeContractTest(unittest.TestCase):
-    def test_default_fast_selects_all_admitted_models(self):
+    def test_default_fast_selects_all_models(self):
         self.assertEqual(
             select("fast_sanity", ""),
             {
@@ -71,29 +72,6 @@ class RecipeContractTest(unittest.TestCase):
             select("model_sanity", "glm")
         with self.assertRaises(ValueError):
             select("model_sanity", "glm-5.3,glm-5.3")
-        for model in ("deepseek-v4.1-flash", "minimax-m3"):
-            with self.subTest(model=model), self.assertRaises(ValueError):
-                select("model_sanity", model)
-
-    def test_only_registered_models_resolve_and_publish(self):
-        script = REPO_ROOT / "scripts/ci/ppu/recipe_cluster_config.py"
-        command = [sys.executable, "-B", str(script), "--model-path-key"]
-        keys = {
-            "deepseek-v4.1-flash": "PPU_CI_DSV41_FLASH_MODEL_PATH",
-            "minimax-m3": "PPU_CI_MINIMAX_M3_MODEL_PATH",
-        }
-        for model, key in keys.items():
-            with self.subTest(model=model):
-                output = subprocess.check_output(
-                    [*command, model], env={key: "/assets/private"}, text=True
-                )
-                self.assertEqual(output.strip(), key)
-                validate({**fast_result(), "model": model})
-        unknown = subprocess.run([*command, "unknown-model"], capture_output=True)
-        self.assertNotEqual(unknown.returncode, 0)
-        self.assertFalse(unknown.stdout)
-        with self.assertRaises(ValueError):
-            validate({**fast_result(), "model": "unknown-model"})
 
     def test_policy_switches(self):
         policy = DEFAULT_POLICY_ROOT / "models/glm-5.3.yaml"
@@ -123,8 +101,7 @@ class RecipeContractTest(unittest.TestCase):
             timings["cold_start_s"] = 3.0
             yield
 
-        for model in MODEL_PATH_SETTINGS:
-            ready_timeout = 1350 if model == "glm-5.3" else 1000
+        for model, ready_timeout in (("glm-5.3", 1350), ("deepseek-v4-flash", 1000)):
             with (
                 self.subTest(model=model),
                 tempfile.TemporaryDirectory() as temp,
@@ -144,6 +121,95 @@ class RecipeContractTest(unittest.TestCase):
                 probes.assert_called_once()
                 self.assertIsNone(result["layer_override"])
                 self.assertNotIn("fallback_reason", result)
+
+    def test_cached_model_requires_the_exact_snapshot_offline(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            checkpoint = root / "checkpoint"
+            checkpoint.mkdir()
+            snapshot = root / ("a" * 40)
+            snapshot.symlink_to(checkpoint, target_is_directory=True)
+            for name in ("config.json", "tokenizer.json"):
+                (checkpoint / name).write_text("{}")
+            (checkpoint / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": {"weight": "weight.safetensors"}})
+            )
+            shard = checkpoint / "weight.safetensors"
+            shard.write_bytes(b"fixture")
+            repo_id = "example/quantized-model"
+            revision = "a" * 40
+            download = Mock(return_value=str(snapshot))
+            with (
+                patch.dict(os.environ, {"HF_HUB_CACHE": str(root)}),
+                patch.dict(
+                    sys.modules,
+                    {"huggingface_hub": SimpleNamespace(snapshot_download=download)},
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "pinned model snapshot"):
+                    cached_model_path(repo_id, "main")
+                download.assert_not_called()
+                self.assertEqual(
+                    cached_model_path(repo_id, revision),
+                    (str(checkpoint.resolve()), revision),
+                )
+                download.assert_called_once_with(
+                    repo_id=repo_id,
+                    revision=revision,
+                    cache_dir=root,
+                    local_files_only=True,
+                )
+                shard.unlink()
+                with self.assertRaisesRegex(ValueError, "missing shards"):
+                    cached_model_path(repo_id, revision)
+
+    def test_new_model_ref_is_resolved_to_a_concrete_revision(self):
+        repo_id = "example/quantized-model"
+        revision = "b" * 40
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "models--example--quantized-model"
+            ref = repo / "refs/main"
+            ref.parent.mkdir(parents=True)
+            ref.write_text(revision)
+            snapshot = repo / "snapshots" / revision
+            snapshot.mkdir(parents=True)
+            for name in ("config.json", "tokenizer.json"):
+                (snapshot / name).write_text("{}")
+            (snapshot / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": {"weight": "weight.safetensors"}})
+            )
+            (snapshot / "weight.safetensors").write_bytes(b"fixture")
+            download = Mock(return_value=str(snapshot))
+            with (
+                patch.dict(os.environ, {"HF_HUB_CACHE": str(root)}),
+                patch.dict(
+                    sys.modules,
+                    {
+                        "huggingface_hub": SimpleNamespace(snapshot_download=download),
+                        "huggingface_hub.file_download": SimpleNamespace(
+                            repo_folder_name=Mock(return_value=repo.name)
+                        ),
+                        "huggingface_hub.utils": SimpleNamespace(
+                            validate_repo_id=Mock()
+                        ),
+                    },
+                ),
+            ):
+                self.assertEqual(
+                    cached_model_path(repo_id, None),
+                    (str(snapshot.resolve()), revision),
+                )
+                download.assert_called_once_with(
+                    repo_id=repo_id,
+                    revision=revision,
+                    cache_dir=root,
+                    local_files_only=True,
+                )
+                ref.write_text("not-a-revision")
+                with self.assertRaisesRegex(ValueError, "pinned model snapshot"):
+                    cached_model_path(repo_id, None)
+                self.assertEqual(download.call_count, 1)
 
     def test_deepseek_attention_parallelism_uses_eight_devices(self):
         policy = DEFAULT_POLICY_ROOT / "models/deepseek-v4-flash.yaml"
@@ -429,9 +495,16 @@ class ClusterConfigBootstrapTest(unittest.TestCase):
 class ClusterTransportTest(unittest.TestCase):
     def test_scheduler_streams_stay_private(self):
         injected = "/" + "nas" + "_aisw/fixture " + ".".join(("10", "4", "5", "6"))
-        result = {**fast_result(), "model": "deepseek-v4.1-flash"}
-        for tampered in (False, True):
-            with self.subTest(tampered=tampered), tempfile.TemporaryDirectory() as temp:
+        for model, tampered in (
+            ("glm-5.3", False),
+            ("deepseek-v4.1-flash", False),
+            ("glm-5.3", True),
+        ):
+            with (
+                self.subTest(model=model, tampered=tampered),
+                tempfile.TemporaryDirectory() as temp,
+            ):
+                result = dict(fast_result(), model=model)
                 root = Path(temp)
                 workspace = root / "checkout"
                 staging = root / "staging"
@@ -443,6 +516,7 @@ class ClusterTransportTest(unittest.TestCase):
                     folder.mkdir(parents=True)
                 scripts = workspace / "scripts/ci/ppu"
                 shutil.copytree(REPO_ROOT / "scripts/ci/ppu", scripts)
+                shutil.copytree(DEFAULT_POLICY_ROOT, workspace / "test/ppu/policy")
                 (scripts / "recipe_bundle.py").write_text("# Verified separately\n")
                 (payloads / "recipe-manifest.json").write_text(
                     json.dumps({"recipe_tree_sha256": result["recipe_tree_sha256"]})
@@ -485,9 +559,7 @@ class ClusterTransportTest(unittest.TestCase):
                 (backend / "submit.sh").write_text(
                     'test "$INPUT_NNODES/$INPUT_NPROC_PER_NODE/$INPUT_NODE_SELECTOR" = "0/8/board-type=ZW-M890P" || exit 1\n'
                     'test -f "$SOURCE_STAGE_DIR" || exit 1\n'
-                    'jq -e --arg path "$PPU_CI_DSV41_FLASH_MODEL_PATH" '
-                    "'.PPU_CI_RECIPE_MODEL_PATH == $path and .PPU_CI_GLM53_MODEL_PATH == null' "
-                    '<<< "$USER_ENV_JSON" || exit 1\n'
+                    'jq -e --arg cache "$PPU_CI_HF_CACHE_ROOT" --arg model "$MODEL_KEY" --arg revision "$PPU_CI_GLM53_MODEL_REVISION" \'.PPU_CI_HF_CACHE_ROOT == $cache and .MODEL_KEY == $model and (if $model == "glm-5.3" then .PPU_CI_HF_MODEL_REVISION == $revision else (has("PPU_CI_HF_MODEL_REVISION") | not) end)\' <<< "$USER_ENV_JSON" >/dev/null || exit 1\n'
                     'printf "%s\\n" "$INJECTED_FIXTURE"\n'
                     'printf "job_status=scheduled\\nstart_time=1\\ndeadline=2\\nqueue_duration_seconds=7\\n" >> "$GITHUB_OUTPUT"\n'
                 )
@@ -512,7 +584,7 @@ class ClusterTransportTest(unittest.TestCase):
                         )
                     ),
                     "TIER": "fast_sanity",
-                    "MODEL_KEY": result["model"],
+                    "MODEL_KEY": model,
                     "GITHUB_OUTPUT": str(root / "gha-output"),
                     "PPU_PUBLIC_SUMMARY": str(root / "gha-summary"),
                     "GITHUB_WORKSPACE": str(workspace),
@@ -526,8 +598,8 @@ class ClusterTransportTest(unittest.TestCase):
                     "PPU_CI_K8S_STAGE_ROOT": str(staging),
                     "PPU_CI_SOURCE_SHA": result["source_sha"],
                     "PPU_CI_JIT_ROOT": str(root / "jit"),
-                    "PPU_CI_GLM53_MODEL_PATH": str(root / "other-model"),
-                    "PPU_CI_DSV41_FLASH_MODEL_PATH": str(root / "model"),
+                    "PPU_CI_HF_CACHE_ROOT": str(root / "cache"),
+                    "PPU_CI_GLM53_MODEL_REVISION": "c" * 40,
                     "PPU_CI_RECIPE_RUNTIME_IMAGE": result["runtime_image"],
                     "INJECTED_FIXTURE": injected,
                 }

@@ -11,6 +11,7 @@ PHASES = {
     "eval_environment",
     "platform_check",
     "recipe_validation",
+    "model_cache_check",
     "server_startup",
     "chat_probe",
     "gsm8k_eval",

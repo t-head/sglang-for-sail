@@ -6,7 +6,6 @@ import json
 import re
 
 from ppu_recipe import DEFAULT_POLICY_ROOT, _load_yaml, validate_paths
-from recipe_cluster_config import MODEL_PATH_SETTINGS
 
 
 def select(tier, model_filter):
@@ -18,8 +17,6 @@ def select(tier, model_filter):
         if tier in _load_yaml(path).get("tiers", {}):
             if not re.fullmatch(r"[a-z0-9][a-z0-9.-]*", path.stem):
                 raise ValueError("invalid policy model key")
-            if path.stem not in MODEL_PATH_SETTINGS:
-                raise ValueError(f"missing checkpoint setting for policy {path.stem}")
             models[path.stem] = path
     requested = (
         [key.strip() for key in model_filter.split(",")]

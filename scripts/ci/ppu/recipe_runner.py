@@ -370,18 +370,61 @@ def run_evaluation(stage, config):
     return json.loads((RESULTS / "gsm8k-result.json").read_text())
 
 
+def cached_model_path(repo_id, revision):
+    from huggingface_hub import snapshot_download
+
+    cache = Path(os.environ["HF_HUB_CACHE"])
+    if revision is None:
+        from huggingface_hub.file_download import repo_folder_name
+        from huggingface_hub.utils import validate_repo_id
+
+        validate_repo_id(repo_id)
+        repo_dir = cache / repo_folder_name(repo_id=repo_id, repo_type="model")
+        revision = (repo_dir / "refs/main").read_text().strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise ValueError("expected a pinned model snapshot")
+    snapshot = Path(
+        snapshot_download(
+            repo_id=repo_id,
+            revision=revision,
+            cache_dir=cache,
+            local_files_only=True,
+        )
+    )
+    if snapshot.name != revision:
+        raise ValueError("expected a pinned model snapshot")
+    for name in ("config.json", "tokenizer.json"):
+        if not (snapshot / name).is_file():
+            raise ValueError("offline model snapshot lacks metadata")
+    index = json.loads((snapshot / "model.safetensors.index.json").read_text())
+    shards = set(index["weight_map"].values())
+    if not shards or any(
+        Path(name).is_absolute()
+        or ".." in Path(name).parts
+        or not (snapshot / name).is_file()
+        or (snapshot / name).stat().st_size == 0
+        for name in shards
+    ):
+        raise ValueError("offline model snapshot has missing shards")
+    return str(snapshot.resolve(strict=True)), revision
+
+
 def run(policy_path, tier, queue_s):
     policy = _load_yaml(policy_path)
     recipe = REPO_ROOT / policy["recipe"]
     assets = RESULTS.parent / "assets.json"
-    model_asset = _load_yaml(recipe)["ppu"]["assets"]
-    assets.write_text(
-        json.dumps(
-            {
-                name: os.environ["PPU_RECIPE_CONTAINER_MODEL"]
-                for name in model_asset.values()
-            }
+    recipe_ppu = _load_yaml(recipe)["ppu"]
+    revision = os.environ.get("PPU_CI_HF_MODEL_REVISION")
+    uses_cache_ref = revision is None and "PPU_CI_HF_CACHE_ROOT" in os.environ
+    if revision is None and not uses_cache_ref:
+        model_path = os.environ["PPU_RECIPE_CONTAINER_MODEL"]
+    else:
+        phase("model_cache_check")
+        model_path, snapshot_revision = cached_model_path(
+            recipe_ppu["hf_model_id"], revision
         )
+    assets.write_text(
+        json.dumps({name: model_path for name in recipe_ppu["assets"].values()})
     )
 
     resolve = dict(
@@ -390,6 +433,8 @@ def run(policy_path, tier, queue_s):
         assets_map_path=assets,
         served_model_name=MODEL,
     )
+    if uses_cache_ref:
+        resolve["cache_revision"] = snapshot_revision
     config = resolve_recipe(recipe, **resolve)
     if config["ppu_count"] != 8 or policy["model_id"] != config["model_id"]:
         raise ValueError("incorrect recipe identity or device width")

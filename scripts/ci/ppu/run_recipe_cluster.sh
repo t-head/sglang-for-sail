@@ -129,8 +129,7 @@ stage_root=${PPU_CI_K8S_STAGE_ROOT:?}
 [[ -d wheels && ! -L wheels ]]
 case "$mode" in
     fast_sanity|model_sanity)
-        model_path_key=$(python3 -B scripts/ci/ppu/recipe_cluster_config.py --model-path-key "${MODEL_KEY:?}")
-        export PPU_CI_RECIPE_MODEL_PATH=${!model_path_key:?}
+        [[ "$MODEL_KEY" =~ ^[a-z0-9][a-z0-9.-]*$ && -f "test/ppu/policy/models/$MODEL_KEY.yaml" ]]
         INPUT_NODE_SELECTOR=board-type=ZW-M890P
         INPUT_NPROC_PER_NODE=8
         INPUT_TIMEOUT_MINUTES=330
@@ -170,6 +169,7 @@ export PPU_CI_WORKER_ARTIFACT_DIR
 USER_ENV_JSON=$(python3 -B - <<'PY'
 import json
 import os
+import re
 from pathlib import PurePosixPath
 
 keys = ["TIER", "PPU_CI_SOURCE_SHA", "PPU_CI_WORKER_ARTIFACT_DIR"]
@@ -179,14 +179,26 @@ if os.environ["TIER"] == "legacy":
         "PPU_CI_DFLASH_MODEL_PATH", "PPU_CI_EVAL_CACHE",
     ]
 else:
-    keys += ["MODEL_KEY", "PPU_CI_RECIPE_IMAGE_KEY", "PPU_CI_RECIPE_MODEL_PATH"]
+    keys += ["MODEL_KEY", "PPU_CI_RECIPE_IMAGE_KEY", "PPU_CI_HF_CACHE_ROOT"]
     if os.environ["TIER"] == "model_sanity":
         keys += ["PPU_CI_GSM8K_PATH"]
 values = {key: os.environ[key] for key in keys}
+if os.environ["TIER"] != "legacy":
+    revision_key = {
+        "glm-5.3": "PPU_CI_GLM53_MODEL_REVISION",
+        "deepseek-v4-flash": "PPU_CI_DSV4_FLASH_MODEL_REVISION",
+    }.get(os.environ["MODEL_KEY"])
+    if revision_key is not None:
+        revision = os.environ[revision_key]
+        if not re.fullmatch(r"[0-9a-f]{40}", revision):
+            raise ValueError("expected a pinned model snapshot")
+        values["PPU_CI_HF_MODEL_REVISION"] = revision
 for key, value in values.items():
     if not value or any(ord(char) < 32 for char in value):
         raise ValueError("invalid worker input")
-    if key.startswith("PPU_CI_") and key not in ("PPU_CI_SOURCE_SHA", "PPU_CI_RECIPE_IMAGE_KEY"):
+    if key.startswith("PPU_CI_") and key not in (
+        "PPU_CI_SOURCE_SHA", "PPU_CI_RECIPE_IMAGE_KEY", "PPU_CI_HF_MODEL_REVISION"
+    ):
         if not PurePosixPath(value).is_absolute() or ".." in PurePosixPath(value).parts:
             raise ValueError("expected an absolute worker path")
 print(json.dumps(values))

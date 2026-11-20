@@ -12,19 +12,17 @@ from pathlib import Path
 
 BACKEND_SHA = "96e25147971f5d2a04d828f8ad508cae38a4fa8a"
 CONFIG_NAME = ".sglang-recipe-ci-v0523"
-MODEL_PATH_SETTINGS = {
-    "deepseek-v4-flash": "PPU_CI_DSV4_FLASH_MODEL_PATH",
-    "deepseek-v4.1-flash": "PPU_CI_DSV41_FLASH_MODEL_PATH",
-    "glm-5.3": "PPU_CI_GLM53_MODEL_PATH",
-    "minimax-m3": "PPU_CI_MINIMAX_M3_MODEL_PATH",
-}
 SETTINGS = {
     "PPU_CI_K8S_STAGE_ROOT",
     "PPU_CI_K8S_PRIVATE_WORKER_ROOT",
     "PPU_CI_K8S_RUNTIME_DIGEST",
     "PPU_CI_RUNTIME_IMAGE",
     "PPU_CI_JIT_ROOT",
-    *MODEL_PATH_SETTINGS.values(),
+    "PPU_CI_HF_CACHE_ROOT",
+    "PPU_CI_GLM53_MODEL_REVISION",
+    "PPU_CI_DSV4_FLASH_MODEL_REVISION",
+    "PPU_CI_GLM53_MODEL_PATH",
+    "PPU_CI_DSV4_FLASH_MODEL_PATH",
     "PPU_CI_GSM8K_PATH",
     "PPU_CI_TARGET_MODEL_PATH",
     "PPU_CI_EAGLE3_MODEL_PATH",
@@ -113,9 +111,6 @@ def handoff(directory, expected, uid, gid):
 
 
 def main():
-    if len(sys.argv) == 3 and sys.argv[1] == "--model-path-key":
-        print(MODEL_PATH_SETTINGS[sys.argv[2]])
-        return
     if len(sys.argv) == 6 and sys.argv[1] == "--handoff":
         handoff(Path(sys.argv[2]), sys.argv[3], int(sys.argv[4]), int(sys.argv[5]))
         return

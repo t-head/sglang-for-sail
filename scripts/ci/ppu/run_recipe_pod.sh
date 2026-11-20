@@ -32,8 +32,7 @@ if [[ "$TIER" == legacy ]]; then
 fi
 printf '%s\n' wheel_verification > "$PPU_CI_ARTIFACT_DIR/worker-phase.txt"
 python3 -B scripts/ci/ppu/recipe_bundle.py check "$PPU_CI_WHEEL_DIR" "$PPU_CI_SOURCE_SHA"
-export PPU_RECIPE_CONTAINER_MODEL=${PPU_CI_RECIPE_MODEL_PATH:?}
-[[ -f "$PPU_RECIPE_CONTAINER_MODEL/config.json" && -d /recipe-jit ]]
+[[ -d "${PPU_CI_HF_CACHE_ROOT:?}/hub" && -d /recipe-jit ]]
 if [[ "$TIER" == model_sanity ]]; then
     [[ -d "${PPU_CI_GSM8K_PATH:?}" ]]
     export PPU_CI_EVAL_WHEEL_DIR="$PWD/evalscope-wheels"
