@@ -59,6 +59,7 @@ class RecipeContractTest(unittest.TestCase):
                     {"model": "deepseek-v4-flash"},
                     {"model": "deepseek-v4.1-flash"},
                     {"model": "glm-5.3"},
+                    {"model": "minimax-m3-fp8"},
                     {"model": "minimax-m3"},
                 ]
             },
@@ -93,12 +94,29 @@ class RecipeContractTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             select("model_sanity", model)
 
-    def test_minimax_nightly_uses_published_quantized_reference(self):
+    def test_minimax_fp8_selects_the_fp8_checkpoint(self):
+        model = "minimax-m3-fp8"
+        policy_path = DEFAULT_POLICY_ROOT / f"models/{model}.yaml"
+        recipe = REPO_ROOT / _load_yaml(policy_path)["recipe"]
+        config = resolve_recipe(recipe, policy_path=policy_path, tier="fast_sanity")
         self.assertEqual(
-            select("model_sanity", "minimax-m3"),
-            {"include": [{"model": "minimax-m3"}]},
+            config["hf_model_id"],
+            "T-HEAD/MiniMax-M3-Quant-W-FP8-PerChannel-A-FP8-PerToken",
         )
-        policy_path = DEFAULT_POLICY_ROOT / "models/minimax-m3.yaml"
+        self.assertEqual(config["ppu_count"], 8)
+        self.assertTrue(config["dummy_weights"])
+        self.assertIsNone(config["layer_override"])
+
+    def test_minimax_nightly_uses_published_quantized_reference(self):
+        self.assert_minimax_nightly_reference("minimax-m3")
+        self.assert_minimax_nightly_reference("minimax-m3-fp8")
+
+    def assert_minimax_nightly_reference(self, model):
+        self.assertEqual(
+            select("model_sanity", model),
+            {"include": [{"model": model}]},
+        )
+        policy_path = DEFAULT_POLICY_ROOT / f"models/{model}.yaml"
         policy = _load_yaml(policy_path)
         config = resolve_recipe(
             REPO_ROOT / policy["recipe"], policy_path=policy_path, tier="model_sanity"
