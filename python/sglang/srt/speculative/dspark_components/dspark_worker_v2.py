@@ -101,11 +101,15 @@ from sglang.srt.utils import (
     is_cuda,
     is_cuda_alike,
     is_npu,
+    is_sail,
 )
 from sglang.srt.utils.common import async_h2d
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.model_executor.model_runner import (
+        ModelRunner,
+        SamplingPrewarmResult,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +174,37 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def weight_update_runners(self) -> list[tuple[str, "ModelRunner"]]:
         return [("draft", self.draft_model_runner)] if self._hosts_draft else []
+
+    def prewarm_sampling(self) -> "SamplingPrewarmResult":
+        result = super().prewarm_sampling()
+        # Non-last PP stages do not initialize gamma or draft-side state.
+        if not self._hosts_draft:
+            return result
+        device = torch.device(self.target_worker.device)
+        if (
+            not is_sail()
+            or device.type != "cuda"
+            or torch.version.hip is not None
+            or self._is_pd_prefill
+            or self._simulate_acc_len > 0
+            or target_model_type(self.target_worker) != "deepseek_v41"
+        ):
+            return result
+        if device.index is None:
+            device = torch.device(device.type, torch.cuda.current_device())
+        from sglang.srt.speculative.dspark_components.dspark_sampling_warmup import (
+            prewarm_dspark_sampling,
+        )
+
+        prewarm_dspark_sampling(
+            gamma=self.gamma,
+            verify_slots=self.verify_num_draft_tokens,
+            vocab_size=self.target_worker.model_runner.model_config.vocab_size,
+            device=device,
+            stream=torch.cuda.current_stream(device),
+            block_verification=get_spec().speculative_use_block_verification,
+        )
+        return result
 
     def __init__(
         self,

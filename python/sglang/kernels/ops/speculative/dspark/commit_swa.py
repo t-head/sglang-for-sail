@@ -5,13 +5,13 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["N"], do_not_specialize_on_alignment=["N"])
 def _committed_swa_locations(
     LOC,
     MAP,
     LENS,
     OUT,
-    N: tl.constexpr,
+    N,
     WIDTH: tl.constexpr,
     MAP_SIZE: tl.constexpr,
     BLOCK: tl.constexpr,

@@ -1232,6 +1232,26 @@ class ModelRunner:
     def prewarm_sampling(self) -> SamplingPrewarmResult:
         """Warm the sampling path after graph initialization."""
         self.sampling_prewarm_result = SamplingPrewarmResult()
+        if (
+            self.is_generation
+            and not self.is_draft_worker
+            and self.pp_group.is_last_rank
+            and torch.device(self.device).type == "cuda"
+            and torch.version.hip is None
+            and get_exec().kernel.sampling_backend == "flashinfer"
+        ):
+            from sglang.srt.layers.sampler import Sampler
+            from sglang.srt.sampling.sampling_prewarm import (
+                prewarm_flashinfer_sampling,
+            )
+
+            # Custom samplers may have additional state or a different contract.
+            if type(self.sampler) is Sampler:
+                prewarm_flashinfer_sampling(
+                    self.sampler,
+                    vocab_size=self.model_config.vocab_size,
+                    device=self.device,
+                )
         return self.sampling_prewarm_result
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
