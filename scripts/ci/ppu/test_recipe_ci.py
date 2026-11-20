@@ -59,7 +59,8 @@ def fast_result():
 
 class RecipeContractTest(unittest.TestCase):
     def test_fast_probe_accepts_reasoning_only_completion_with_complete_sse(self):
-        settings = {"prompt": "Compute 6 * 7.", "max_tokens": 16}
+        sampling = {"temperature": 1.0, "top_p": 1.0, "top_k": -1}
+        settings = {"prompt": "Compute 6 * 7.", "max_tokens": 16, **sampling}
         answer = {
             "message": {"content": None, "reasoning_content": "reasoning text"},
             "finish_reason": "length",
@@ -76,8 +77,13 @@ class RecipeContractTest(unittest.TestCase):
             results.mkdir()
             with patch("recipe_runner.RESULTS", results):
                 response = io.BytesIO(json.dumps({"choices": [answer]}).encode())
-                with patch("recipe_runner.request", side_effect=(response, stream)):
+                with patch(
+                    "recipe_runner.request", side_effect=(response, stream)
+                ) as request:
                     probes(settings, fast=True)
+                for call in request.call_args_list:
+                    payload = json.loads(call.args[1])
+                    self.assertEqual({key: payload[key] for key in sampling}, sampling)
                 self.assertEqual(
                     json.loads((results / "chat-probe-response.json").read_text()),
                     answer,
