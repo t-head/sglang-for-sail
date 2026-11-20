@@ -177,10 +177,12 @@ def validate(payload):
             )
         ):
             raise ValueError("passing result lacks evidence")
-        if tier == "fast_sanity" and (payload["layer_override"] is None) != (
-            "fallback_reason" in payload
+        if (
+            tier == "fast_sanity"
+            and "fallback_reason" in payload
+            and payload["layer_override"] is not None
         ):
-            raise ValueError("fallback result lacks reason")
+            raise ValueError("fallback result retained a layer override")
         if tier == "model_sanity" and (
             not all(
                 payload[key]

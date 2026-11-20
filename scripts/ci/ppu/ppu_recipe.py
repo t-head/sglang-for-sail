@@ -1182,10 +1182,8 @@ def _collect_all_recipe_flag_sets(
     sets.append((f"{recipe_path.name}:default", default_res["flags"]))
     sets.append(
         (
-            f"{recipe_path.name}:fast_sanity_2l",
-            resolve_recipe(
-                recipe_path, cache="enabled", dummy_weights=True, layer_override=2
-            )["flags"],
+            f"{recipe_path.name}:fast_sanity",
+            resolve_recipe(recipe_path, cache="enabled", dummy_weights=True)["flags"],
         )
     )
     for feat_name, feat_cfg in recipe.get("features", {}).items():

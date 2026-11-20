@@ -402,14 +402,17 @@ def run(policy_path, tier, queue_s):
         sanity = policy["tiers"][tier]
         cold_total = 0
         start = time.monotonic()
+        has_layer_override = config["layer_override"] is not None
         try:
-            with server(config, "fast_2l", result, 420):
+            with server(
+                config,
+                "fast_2l" if has_layer_override else "fast_full",
+                result,
+                420 if has_layer_override else 1000,
+            ):
                 probes(sanity["probe"], fast=True)
         except StartupError as error:
-            if (
-                not sanity.get("fallback_full_layers")
-                or config["layer_override"] is None
-            ):
+            if not sanity.get("fallback_full_layers") or not has_layer_override:
                 raise
             cold_total = time.monotonic() - start
             result["fallback_reason"] = str(error)

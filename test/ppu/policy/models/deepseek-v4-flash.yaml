@@ -10,8 +10,6 @@ accuracy_gate:
 tiers:
   fast_sanity:
     dummy_weights: true
-    layer_override: 2
-    fallback_full_layers: true
     cache: enabled
     probe:
       prompt: "Compute 6 * 7 and reply with the integer only."

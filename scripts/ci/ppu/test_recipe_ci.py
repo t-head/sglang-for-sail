@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
 import io
 import json
 import os
@@ -24,7 +25,7 @@ from recipe_cluster_config import load_settings
 from recipe_cluster_diagnostics import diagnostic_codes
 from recipe_publish import publish, validate
 from recipe_report import legacy_result
-from recipe_runner import metrics_zero, read_eval_reviews
+from recipe_runner import metrics_zero, read_eval_reviews, run
 from recipe_select import select
 
 
@@ -44,7 +45,7 @@ def fast_result():
         "private_retention": True,
         "queue_s": 2,
         "cold_start_s": 3.0,
-        "layer_override": 2,
+        "layer_override": None,
     }
 
 
@@ -76,18 +77,47 @@ class RecipeContractTest(unittest.TestCase):
         self.assertEqual(
             resolved["argv"][:5], ["python3", "-I", "-B", "-m", "sglang.launch_server"]
         )
-        self.assertEqual(resolved["layer_override"], 2)
-        self.assertIn('{"num_hidden_layers":2}', resolved["flags"])
+        self.assertIsNone(resolved["layer_override"])
+        self.assertNotIn("--json-model-override-args", resolved["flags"])
         self.assertIn("dummy", resolved["flags"])
         self.assertNotIn("--disable-radix-cache", resolved["flags"])
-        fallback = resolve_recipe(
-            recipe, policy_path=policy, tier="fast_sanity", layer_override=None
+        explicit_override = resolve_recipe(
+            recipe, policy_path=policy, tier="fast_sanity", layer_override=2
         )
-        self.assertNotIn("--json-model-override-args", fallback["flags"])
-        self.assertNotEqual(fallback["config_digest"], resolved["config_digest"])
+        self.assertIn('{"num_hidden_layers":2}', explicit_override["flags"])
+        self.assertNotEqual(
+            explicit_override["config_digest"], resolved["config_digest"]
+        )
         perf = resolve_recipe(recipe, cache="disabled")
         self.assertIn("--disable-radix-cache", perf["flags"])
         self.assertNotIn("--load-format", perf["flags"])
+
+    def test_fast_runs_each_model_directly_with_full_layers(self):
+        @contextlib.contextmanager
+        def ready(config, label, timings, timeout):
+            timings["cold_start_s"] = 3.0
+            yield
+
+        for model in ("glm-5.3", "deepseek-v4-flash"):
+            with (
+                self.subTest(model=model),
+                tempfile.TemporaryDirectory() as temp,
+                patch.dict(os.environ, {"PPU_RECIPE_CONTAINER_MODEL": temp}),
+                patch("recipe_runner.RESULTS", Path(temp) / "results"),
+                patch("recipe_runner.server", side_effect=ready) as server,
+                patch("recipe_runner.probes") as probes,
+            ):
+                result = run(
+                    DEFAULT_POLICY_ROOT / f"models/{model}.yaml", "fast_sanity", 0
+                )
+                self.assertEqual(server.call_count, 1)
+                config, label, _, timeout = server.call_args.args
+                self.assertEqual((label, timeout), ("fast_full", 1000))
+                self.assertIn("dummy", config["flags"])
+                self.assertNotIn("--json-model-override-args", config["flags"])
+                probes.assert_called_once()
+                self.assertIsNone(result["layer_override"])
+                self.assertNotIn("fallback_reason", result)
 
     def test_deepseek_attention_parallelism_uses_eight_devices(self):
         policy = DEFAULT_POLICY_ROOT / "models/deepseek-v4-flash.yaml"
@@ -167,6 +197,14 @@ class RunEvidenceTest(unittest.TestCase):
             summary.write_text("".join(json.dumps(row) + "\n" for row in rows))
             with self.assertRaisesRegex(ValueError, "duplicate"):
                 read_eval_reviews(Path(root), 1319, 0.9689, 1319)
+
+    def test_fast_evidence_accepts_direct_full_and_previous_fallback(self):
+        result = fast_result()
+        validate(result)
+        validate({**result, "fallback_reason": "server_exit"})
+        validate({**result, "layer_override": 2})
+        with self.assertRaisesRegex(ValueError, "retained a layer override"):
+            validate({**result, "layer_override": 2, "fallback_reason": "server_exit"})
 
     def test_pass_requires_complete_nightly_evidence(self):
         result = fast_result()
@@ -389,7 +427,7 @@ class ClusterTransportTest(unittest.TestCase):
                     "sse_verified": True,
                     "cold_start_s": 3.0,
                     "queue_s": 0,
-                    "layer_override": 2,
+                    "layer_override": None,
                     "config_digest": result["config_digest"],
                 }
                 if tampered:
