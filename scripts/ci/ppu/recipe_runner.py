@@ -424,7 +424,9 @@ def run(policy_path, tier, queue_s):
         )
     else:
         stages = {stage["kind"]: stage for stage in policy["tiers"][tier]["stages"]}
-        with server(config, "model_sanity", result, 2400):
+        # GLM's 141-shard cold load took 35 minutes before DeepGEMM warmup.
+        ready_timeout = 4500 if policy["model_id"] == "zai-org/GLM-5.3" else 2400
+        with server(config, "model_sanity", result, ready_timeout):
             probes(stages["sanity"]["probe"], fast=False)
             result["sse_verified"] = True
             start = time.monotonic()
