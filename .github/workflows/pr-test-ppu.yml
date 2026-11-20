@@ -3,7 +3,8 @@ name: PR Test (PPU)
 on:
   push:
     branches: [ main ]
-  pull_request:
+  # Use the protected base branch's workflow for privileged runner jobs.
+  pull_request_target:
     branches: [main, 'release/**']
     types: [opened, synchronize, reopened, labeled, ready_for_review]
   workflow_dispatch:
@@ -34,16 +35,20 @@ on:
         type: boolean
         default: false
 
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
 concurrency:
   # Keep legacy-only runs and unrelated label events separate from Recipe CI.
   group: >-
     pr-test-ppu-${{ inputs.run_legacy_sanity && 'legacy' || 'recipe' }}-${{
-      (github.event_name == 'pull_request' &&
+      (github.event_name == 'pull_request_target' &&
        github.event.action == 'labeled' &&
-       github.event.label.name != 'run-ci' &&
        github.event.label.name != 'run-ci-ppu') &&
       format('ignored-label-{0}', github.run_id) ||
-      inputs.ref || github.ref
+      github.event.pull_request.number || inputs.ref || github.ref
     }}
   cancel-in-progress: true
 
@@ -58,41 +63,37 @@ env:
 jobs:
   check-changes:
     name: >-
-      ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
-           github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
+      ${{ (github.event_name == 'pull_request_target' && github.event.action == 'labeled' &&
+           github.event.label.name != 'run-ci-ppu') &&
           'ignored-label-check-changes' || 'check-changes' }}
     if: |
-      github.event_name != 'pull_request' ||
+      github.event_name != 'pull_request_target' ||
       github.event.action != 'labeled' ||
-      github.event.label.name == 'run-ci' ||
       github.event.label.name == 'run-ci-ppu'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: read
     outputs:
-      ppu: ${{ inputs.run_legacy_sanity || steps.filter.outputs.ppu == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
-      source-sha: ${{ steps.source.outputs.sha }}
+      ppu: >-
+        ${{ inputs.run_legacy_sanity || steps.filter.outputs.ppu == 'true' ||
+          steps.run-mode.outputs.run_all_tests == 'true' ||
+          (github.event_name == 'pull_request_target' &&
+           (contains(github.event.pull_request.labels.*.name, 'run-ci-ppu') ||
+            (github.event.action == 'labeled' && github.event.label.name == 'run-ci-ppu') ||
+            (startsWith(github.base_ref, 'release/') && steps.filter.outputs.release-code == 'true'))) }}
+      source-sha: ${{ github.event.pull_request.head.sha || steps.source.outputs.sha }}
     steps:
-      - name: Checkout code
+      - name: Checkout the non-PR source
+        if: github.event_name != 'pull_request_target'
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
 
-      - uses: actions/setup-python@v5
-        if: hashFiles('scripts/ci/ppu/test_recipe*.py') != ''
-        with:
-          python-version: '3.12'
-
-      - name: Run local Recipe policy and public evidence tests
-        if: hashFiles('scripts/ci/ppu/test_recipe*.py') != ''
-        run: |
-          python3 -m pip install --quiet PyYAML
-          python3 -B -m unittest discover -s scripts/ci/ppu -p 'test_recipe*.py'
-
       - name: Pin the source revision for every job
         id: source
+        if: github.event_name != 'pull_request_target'
         run: printf 'sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Determine run mode
@@ -122,11 +123,14 @@ jobs:
               - "python/sglang/kernels/aot/pyproject_sail.toml"
               - "python/sglang/kernels/aot/csrc/common_extension_sail.cc"
               - "python/sglang/kernels/jit/utils/compile/sailify.py"
+            release-code:
+              - "python/sglang/**"
+              - "sgl-kernel/**"
 
   pr-gate:
     name: >-
-      ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
-           github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
+      ${{ (github.event_name == 'pull_request_target' && github.event.action == 'labeled' &&
+           github.event.label.name != 'run-ci-ppu') &&
           'ignored-label-pr-gate' || 'pr-gate' }}
     needs: check-changes
     if: needs.check-changes.outputs.ppu == 'true'
@@ -134,12 +138,37 @@ jobs:
     with:
       require-run-ci: true
       require-label: run-ci-ppu
+      require-fresh-label: true
+
+  ppu-ci-selftest:
+    needs: [check-changes, pr-gate]
+    if: needs.check-changes.outputs.ppu == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ needs.check-changes.outputs.source-sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run Recipe and PPU infrastructure selftests
+        run: |
+          python3 -m pip install --quiet PyYAML huggingface-hub
+          python3 -B -m unittest discover -s scripts/ci/ppu -p 'test_recipe*.py'
+          bash scripts/ci/ppu/run_selftests.sh
 
   ppu-cluster-config:
     name: ppu-cluster-config
-    needs: [check-changes, pr-gate]
+    needs: [check-changes, ppu-ci-selftest]
     if: github.repository == 't-head/sglang-for-sail' && needs.check-changes.outputs.ppu == 'true'
-    runs-on: k8s-runner-group-cpu-thead
+    runs-on:
+      group: sglang-ppu-ci
+      labels: k8s-runner-group-cpu-thead
     container:
       image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: 5
@@ -148,6 +177,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ needs.check-changes.outputs.source-sha }}
           persist-credentials: false
       - name: Fetch pinned Cluster Run backend
@@ -162,10 +192,10 @@ jobs:
 
   ppu-build:
     name: >-
-      ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
-           github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
+      ${{ (github.event_name == 'pull_request_target' && github.event.action == 'labeled' &&
+           github.event.label.name != 'run-ci-ppu') &&
           'ignored-label-ppu-build' || 'ppu-build' }}
-    needs: [check-changes, pr-gate]
+    needs: [check-changes, ppu-ci-selftest]
     if: needs.check-changes.outputs.ppu == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -191,13 +221,13 @@ jobs:
             printf 'PPU_CI_ARTIFACT_DIR=%s\n' "$work/artifacts"
           } >> "$GITHUB_ENV"
 
-      # Same ref as check-changes. build_and_test.sh rejects any HEAD other than
-      # PPU_CI_SOURCE_SHA, so a workflow_call branch that moves after
-      # check-changes fails the run instead of building different code.
+      # Build the exact commit selected on the hosted runner and, for PRs,
+      # approved by the fresh label event.
       - name: Checkout the triggering source revision
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ needs.check-changes.outputs.source-sha }}
           persist-credentials: false
 
       - name: Build native SAIL wheels
@@ -228,7 +258,9 @@ jobs:
       fail-fast: false
       matrix:
         board: [ZW-M890P, OAM-810E]
-    runs-on: k8s-runner-group-cpu-thead
+    runs-on:
+      group: sglang-ppu-ci
+      labels: k8s-runner-group-cpu-thead
     container:
       image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: 60
@@ -244,6 +276,7 @@ jobs:
         timeout-minutes: 10
         uses: actions/checkout@v4
         with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ needs.check-changes.outputs.source-sha }}
           persist-credentials: false
       - name: Download the matching PPU wheel artifact
@@ -303,15 +336,15 @@ jobs:
   pr-test-ppu-finish:
     name: >-
       ${{ inputs.run_legacy_sanity && 'legacy-only-pr-test-ppu-finish' ||
-          ((github.event_name == 'pull_request' && github.event.action == 'labeled' &&
-            github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
+          ((github.event_name == 'pull_request_target' && github.event.action == 'labeled' &&
+            github.event.label.name != 'run-ci-ppu') &&
            'ignored-label-pr-test-ppu-finish' || 'pr-test-ppu-finish') }}
-    needs: [pr-gate, check-changes, ppu-build, ppu-cluster-config, ppu-fast-sanity]
+    needs: [pr-gate, check-changes, ppu-ci-selftest, ppu-build, ppu-cluster-config, ppu-fast-sanity]
     if: always() && inputs.run_legacy_sanity != true && needs.check-changes.result != 'skipped'
     runs-on: ubuntu-latest
     permissions: {}
     steps:
-      - name: Require a successful native build, runner preflight and Recipe Fast Sanity
+      - name: Require successful Linux selftests, native build, runner preflight and Recipe Fast Sanity
         env:
           NEEDS_JSON: ${{ toJson(needs) }}
           PPU_IN_SCOPE: ${{ needs.check-changes.outputs.ppu }}
@@ -322,10 +355,10 @@ jobs:
           fi
           if [[ "$PPU_IN_SCOPE" == "true" ]]; then
             if ! jq -e 'all(.[]; .result == "success")' <<< "$NEEDS_JSON" >/dev/null; then
-              printf '%s\n' '::error::PPU scope requires a successful native build, runner preflight and Recipe Fast Sanity.'
+              printf '%s\n' '::error::PPU scope requires successful Linux selftests, native build, runner preflight and Recipe Fast Sanity.'
               exit 1
             fi
-            printf '%s\n' 'Native build, runner preflight and Recipe Fast Sanity passed.'
+            printf '%s\n' 'Linux selftests, native build, runner preflight and Recipe Fast Sanity passed.'
           else
             printf '%s\n' 'PPU is outside this run scope; no PPU tests were requested.'
           fi
