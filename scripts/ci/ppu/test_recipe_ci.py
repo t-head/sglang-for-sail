@@ -76,9 +76,8 @@ class RecipeContractTest(unittest.TestCase):
             select("model_sanity", "glm")
         with self.assertRaises(ValueError):
             select("model_sanity", "glm-5.3,glm-5.3")
-        for model in ("qwen3.8-27b", "glm-5.3-tp4"):
-            with self.subTest(model=model), self.assertRaises(ValueError):
-                select("model_sanity", model)
+        with self.assertRaises(ValueError):
+            select("model_sanity", "qwen3.8-27b")
 
     def test_plan_rejects_width_mismatch_and_multiple_nodes(self):
         policy = DEFAULT_POLICY_ROOT / "models/qwen3.8-27b.yaml"
@@ -110,6 +109,9 @@ class RecipeContractTest(unittest.TestCase):
 
     def test_glm_flash_nightly_uses_tp2_and_full_gsm8k_reference(self):
         self.assert_nightly_reference("glm-5.3-flash", width=2, correct=1279)
+
+    def test_glm_nightly_has_separate_tp4_reference(self):
+        self.assert_nightly_reference("glm-5.3-tp4", width=4, correct=1282)
 
     def assert_nightly_reference(self, model, *, width, correct):
         self.assertEqual(
