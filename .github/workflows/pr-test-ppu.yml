@@ -191,6 +191,24 @@ jobs:
           persist-credentials: false
       - name: Verify the private staging configuration
         run: python3 -B scripts/ci/ppu/recipe_cluster_config.py --check
+      - name: Check native two-worker prerequisites
+        if: github.event_name == 'workflow_dispatch' && inputs.preflight_only
+        run: |
+          set -euo pipefail
+          if [[ -x /opt/bin/kubectl ]]; then export PATH="/opt/bin:$PATH"; fi
+          command -v ssh-keygen >/dev/null
+          for verb in create get delete; do
+            if ! timeout --signal=KILL 10s kubectl auth can-i "$verb" secrets -n ppu-sched >/dev/null 2>&1; then
+              printf 'The orchestration identity lacks a required native master permission or authorization could not be verified.\n'
+              exit 1
+            fi
+          done
+          master_root=/wl_nas/devops/runtime/master
+          if [[ ! -d "$master_root" || -L "$master_root" || ! -w "$master_root" || ! -x "$master_root" ]]; then
+            printf 'The native master runtime directory is unavailable to the orchestration identity.\n'
+            exit 1
+          fi
+          printf 'Native two-worker prerequisites verified.\n'
 
   ppu-build:
     name: >-
