@@ -9,4 +9,7 @@ tiers:
     probe:
       prompt: "Compute 6 * 7 and reply with the integer only."
       max_tokens: 16
-      temperature: 0.0
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+      seed: 42
