@@ -200,7 +200,7 @@ def accept_sampling(
     return correct_len, bonus, cap_trim_lens
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["n"], do_not_specialize_on_alignment=["n"])
 def _gather_two_level_bonus_kernel(
     accept_index_ptr,
     predicts_ptr,
@@ -787,7 +787,7 @@ def finalize_accept_lens(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["bs"], do_not_specialize_on_alignment=["bs"])
 def _finalize_accept_lens_kernel(
     correct_len_ptr,
     cap_trim_ptr,

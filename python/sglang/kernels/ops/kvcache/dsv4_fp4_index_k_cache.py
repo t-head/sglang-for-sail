@@ -66,7 +66,7 @@ def store_fp4_index_k_cache(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["n"])
 def _gather_fp4_index_k_kernel(
     cache,
     cache_stride,

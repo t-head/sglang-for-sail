@@ -140,7 +140,7 @@ def _select_block(
     tl.store(P + (row * PARTS + part) * 2 + 1, idx.to(tl.float32, bitcast=True))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["BS"], do_not_specialize_on_alignment=["BS"])
 def _markov_sample_finish_kernel(
     P,
     OUT,
