@@ -1027,9 +1027,9 @@ def validate_policy_structure(
                 raise ValidationError(
                     f"{context}: invalid fast sanity weight or layer policy"
                 )
-            if fs["cache"] != "enabled":
+            if fs["cache"] not in ("enabled", "disabled"):
                 raise ValidationError(
-                    f"{context}.tiers.fast_sanity.cache must be 'enabled'"
+                    f"{context}.tiers.fast_sanity.cache must be 'enabled' or 'disabled'"
                 )
         if "model_sanity" in tiers:
             ms = _check_keys(

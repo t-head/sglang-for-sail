@@ -59,10 +59,31 @@ class RecipeContractTest(unittest.TestCase):
                     {"model": "deepseek-v4-flash"},
                     {"model": "deepseek-v4.1-flash"},
                     {"model": "glm-5.3"},
+                    {"model": "minimax-m3.1-flash"},
                     {"model": "minimax-m3"},
                 ]
             },
         )
+
+    def test_minimax_m31_flash_selects_its_own_channelwise_fp8_snapshot(self):
+        model = "minimax-m3.1-flash"
+        policy = DEFAULT_POLICY_ROOT / f"models/{model}.yaml"
+        recipe = REPO_ROOT / _load_yaml(policy)["recipe"]
+        config = resolve_recipe(recipe, policy_path=policy, tier="fast_sanity")
+        self.assertEqual(
+            config["hf_model_id"],
+            "T-HEAD/MiniMax-M3.1-Flash-Quant-W-FP8-PerChannel-A-FP8-PerToken",
+        )
+        self.assertEqual(config["ppu_count"], 8)
+        self.assertTrue(config["dummy_weights"])
+        self.assertIsNone(config["layer_override"])
+        flags = config["flags"]
+        self.assertEqual(flags[flags.index("--tp-size") + 1], "8")
+        self.assertIn("--disable-radix-cache", flags)
+        self.assertNotIn("--attn-dp-size", flags)
+        self.assertNotIn("--speculative-algorithm", flags)
+        with self.assertRaises(ValueError):
+            select("model_sanity", model)
 
     def test_nightly_exact_filter(self):
         self.assertEqual(
