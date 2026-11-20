@@ -374,10 +374,12 @@ def run_evaluation(stage, config):
     return json.loads((RESULTS / "gsm8k-result.json").read_text())
 
 
-def cached_model_path(repo_id, revision):
+def cached_model_path(repo_id, revision, *, metadata_only=False):
     from huggingface_hub import snapshot_download
 
     cache = Path(os.environ["HF_HUB_CACHE"])
+    if metadata_only:
+        cache = cache / ".sglang-metadata-probe"
     if revision is None:
         from huggingface_hub.file_download import repo_folder_name
         from huggingface_hub.utils import validate_repo_id
@@ -403,10 +405,11 @@ def cached_model_path(repo_id, revision):
     index = json.loads((snapshot / "model.safetensors.index.json").read_text())
     shards = set(index["weight_map"].values())
     if not shards or any(
-        Path(name).is_absolute()
-        or ".." in Path(name).parts
-        or not (snapshot / name).is_file()
-        or (snapshot / name).stat().st_size == 0
+        Path(name).is_absolute() or ".." in Path(name).parts for name in shards
+    ):
+        raise ValueError("offline model snapshot has an invalid weight index")
+    if not metadata_only and any(
+        not (snapshot / name).is_file() or (snapshot / name).stat().st_size == 0
         for name in shards
     ):
         raise ValueError("offline model snapshot has missing shards")
@@ -420,12 +423,17 @@ def run(policy_path, tier, queue_s):
     recipe_ppu = _load_yaml(recipe)["ppu"]
     revision = os.environ.get("PPU_CI_HF_MODEL_REVISION")
     uses_cache_ref = revision is None and "PPU_CI_HF_CACHE_ROOT" in os.environ
+    metadata_probe = (
+        uses_cache_ref
+        and tier == "fast_sanity"
+        and policy_path.stem == "minimax-m3.1-flash"
+    )
     if revision is None and not uses_cache_ref:
         model_path = os.environ["PPU_RECIPE_CONTAINER_MODEL"]
     else:
         phase("model_cache_check")
         model_path, snapshot_revision = cached_model_path(
-            recipe_ppu["hf_model_id"], revision
+            recipe_ppu["hf_model_id"], revision, metadata_only=metadata_probe
         )
     assets.write_text(
         json.dumps({name: model_path for name in recipe_ppu["assets"].values()})
@@ -440,6 +448,10 @@ def run(policy_path, tier, queue_s):
     if uses_cache_ref:
         resolve["cache_revision"] = snapshot_revision
     config = resolve_recipe(recipe, **resolve)
+    if metadata_probe and (
+        not config["dummy_weights"] or config["layer_override"] is not None
+    ):
+        raise ValueError("the metadata probe requires full-layer dummy weights")
     if config["ppu_count"] != 8 or policy["model_id"] != config["model_id"]:
         raise ValueError("incorrect recipe identity or device width")
     result = {

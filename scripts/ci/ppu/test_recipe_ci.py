@@ -286,6 +286,36 @@ class RecipeContractTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "missing shards"):
                     cached_model_path(repo_id, revision)
 
+    def test_metadata_probe_uses_its_own_offline_cache(self):
+        repo_id = "example/quantized-model"
+        revision = "a" * 40
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cache = root / ".sglang-metadata-probe"
+            repo = cache / "models--example--quantized-model"
+            (repo / "refs").mkdir(parents=True)
+            (repo / "refs/main").write_text(revision)
+            snapshot = repo / "snapshots" / revision
+            snapshot.mkdir(parents=True)
+            for name in ("config.json", "tokenizer.json"):
+                (snapshot / name).write_text("{}")
+            weight_index = snapshot / "model.safetensors.index.json"
+            weight_index.write_text(
+                json.dumps({"weight_map": {"weight": "weight.safetensors"}})
+            )
+            with patch.dict(os.environ, {"HF_HUB_CACHE": str(root)}):
+                self.assertEqual(
+                    cached_model_path(repo_id, None, metadata_only=True),
+                    (str(snapshot.resolve()), revision),
+                )
+                with self.assertRaises(FileNotFoundError):
+                    cached_model_path(repo_id, None)
+                weight_index.write_text(
+                    json.dumps({"weight_map": {"weight": "../unexpected"}})
+                )
+                with self.assertRaisesRegex(ValueError, "invalid weight index"):
+                    cached_model_path(repo_id, None, metadata_only=True)
+
     def test_new_model_ref_is_resolved_to_a_concrete_revision(self):
         repo_id = "example/quantized-model"
         revision = "b" * 40
