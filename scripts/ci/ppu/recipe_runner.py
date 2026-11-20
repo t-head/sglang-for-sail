@@ -452,8 +452,13 @@ def run(policy_path, tier, queue_s):
         cold_total = 0
         start = time.monotonic()
         has_layer_override = config["layer_override"] is not None
-        # A cold GLM run was still capturing prefill graphs at 1,000 seconds.
-        full_ready_timeout = 1350 if policy["model_id"] == "zai-org/GLM-5.3" else 1000
+        full_ready_timeout = 1000
+        if (
+            policy["model_id"] == "zai-org/GLM-5.3"
+            or policy_path.stem == "qwen3.8-flash-next"
+        ):
+            # Cold graph capture and the first kernel compilation need extra time.
+            full_ready_timeout = 1350
         try:
             with server(
                 config,

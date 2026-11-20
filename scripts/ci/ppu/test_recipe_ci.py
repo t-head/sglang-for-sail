@@ -308,6 +308,8 @@ class RecipeContractTest(unittest.TestCase):
             ("glm-5.3-flash", 1000, 2),
             ("deepseek-v4-flash", 1000, 8),
             ("qwen3.8-27b", 1000, 2),
+            ("qwen3.8-flash-next", 1350, 8),
+            ("qwen3.8-flash-next-tp4", 1000, 4),
         ):
             with (
                 self.subTest(model=model),
