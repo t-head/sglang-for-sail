@@ -26,9 +26,10 @@ from recipe_bundle import sha256, wheel_inventory
 from recipe_cluster_config import load_settings
 from recipe_cluster_diagnostics import diagnostic_codes
 from recipe_publish import publish, validate
-from recipe_report import legacy_result
+from recipe_report import legacy_result, main as report_main
 from recipe_runner import (
     cached_model_path,
+    evaluate,
     metrics_zero,
     probes,
     read_eval_reviews,
@@ -610,6 +611,214 @@ class RunEvidenceTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "duplicate"):
                 read_eval_reviews(Path(root), 1319, 0.9689, 1319)
 
+    def test_dp8_absent_golden_runs_all_stages_and_only_publishes_a_failure(self):
+        model = "qwen3.8-flash-next"
+        policy = DEFAULT_POLICY_ROOT / f"models/{model}.yaml"
+        config = resolve_recipe(
+            REPO_ROOT / _load_yaml(policy)["recipe"],
+            policy_path=policy,
+            tier="model_sanity",
+        )
+        calls = []
+
+        @contextlib.contextmanager
+        def fake_server(config, label, timings, timeout):
+            timings["cold_start_s"] = 3
+            yield
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            private = root / "private"
+            private.mkdir(mode=0o700)
+            (private / "launcher.log").touch()
+            results = private / "results"
+            results.mkdir()
+            provenance = {
+                key: fast_result()[key]
+                for key in ("recipe_tree_sha256", "runtime_image")
+            }
+            (private / "provenance.json").write_text(json.dumps(provenance))
+            golden_dir = root / "test/ppu/golden"
+            golden_dir.mkdir(parents=True)
+            dataset_dir = root / "test/ppu/policy/datasets"
+            dataset_dir.mkdir(parents=True)
+            shutil.copy(DEFAULT_POLICY_ROOT / "datasets/gsm8k.yaml", dataset_dir)
+            recipe = Path(_load_yaml(policy)["recipe"])
+            (root / recipe.parent).mkdir(parents=True)
+            shutil.copy(REPO_ROOT / recipe, root / recipe)
+
+            def evaluate_fixture(*, task_cfg):
+                calls.append("eval")
+                self.assertIsNone(task_cfg.limit)
+                self.assertEqual(task_cfg.eval_batch_size, 128)
+                self.assertEqual(task_cfg.seed, 42)
+                review = Path(task_cfg.work_dir) / "reviews/model/gsm8k_main.jsonl"
+                review.parent.mkdir(parents=True, exist_ok=True)
+                with review.open("w") as output:
+                    for number in range(1319):
+                        row = {
+                            "sample_score": {
+                                "sample_id": number,
+                                "score": {
+                                    "status": "success",
+                                    "value": int(number < 1278),
+                                },
+                            }
+                        }
+                        output.write(json.dumps(row) + "\n")
+                return {"gsm8k": SimpleNamespace(num=1319, score=1278 / 1319)}
+
+            with (
+                patch("recipe_runner.RESULTS", results),
+                patch("recipe_runner.REPO_ROOT", root),
+                patch("recipe_runner.server", side_effect=fake_server),
+                patch(
+                    "recipe_runner.probes",
+                    side_effect=lambda *a, **k: calls.append("probe"),
+                ),
+                patch("recipe_runner.flush", side_effect=lambda: calls.append("flush")),
+                patch(
+                    "recipe_runner.bench",
+                    side_effect=lambda stage, config, concurrency, count, label: (
+                        calls.append((concurrency, count, label))
+                    ),
+                ),
+                patch.dict(
+                    sys.modules,
+                    {
+                        "evalscope": SimpleNamespace(
+                            TaskConfig=SimpleNamespace, run_task=evaluate_fixture
+                        )
+                    },
+                ),
+                patch.dict(
+                    os.environ,
+                    {"PPU_RECIPE_CONTAINER_MODEL": "/offline-fixture"},
+                    clear=True,
+                ),
+            ):
+                summary = run(policy, "model_sanity", 0)
+                completed_phase = (private / "worker-phase.txt").read_text()
+                self.assertEqual(completed_phase, "baseline_collection\n")
+                self.assertEqual(
+                    calls,
+                    [
+                        "probe",
+                        "eval",
+                        "flush",
+                        (1, 2, "warmup"),
+                        "flush",
+                        (1, 8, "measure"),
+                        "flush",
+                        (16, 8, "warmup"),
+                        "flush",
+                        (16, 32, "measure"),
+                    ],
+                )
+                stage = _load_yaml(policy)["tiers"]["model_sanity"]["stages"][1]
+                for wrong_config in (
+                    {"golden_model_key": "other"},
+                    {"ppu_count": 4},
+                    {"hf_model_id": "other-checkpoint"},
+                ):
+                    with self.subTest(wrong_config=wrong_config):
+                        with self.assertRaises(FileNotFoundError):
+                            evaluate(stage, {**config, **wrong_config})
+                golden = golden_dir / f"accuracy_{config['golden_model_key']}_890p.json"
+                golden.write_text('{"schema_version": 1}')
+                with self.assertRaisesRegex(
+                    ValueError, "golden evaluation contract mismatch"
+                ):
+                    evaluate(stage, config)
+                golden.unlink()
+                golden.symlink_to(golden_dir / "missing.json")
+                with self.assertRaises(FileNotFoundError):
+                    evaluate(stage, config)
+
+            (private / "worker-phase.txt").write_text(completed_phase)
+            (results / "summary.json").write_text(json.dumps(summary))
+            per_question = results / "gsm8k_per_question.jsonl"
+            self.assertEqual(len(per_question.read_text().splitlines()), 1319)
+            retained = root / "retained"
+            retained.mkdir(mode=0o700)
+            candidate = root / "public-candidate.json"
+            env = {
+                "PPU_CI_ARTIFACT_DIR": str(private),
+                "PPU_CI_PRIVATE_RESULTS_ROOT": str(retained),
+                "PPU_CI_SOURCE_SHA": "a" * 40,
+                "PPU_CI_QUEUE_S": "7",
+                "GITHUB_RUN_ATTEMPT": "1",
+                "GITHUB_RUN_ID": "3",
+                "GITHUB_WORKSPACE": str(root / "checkout"),
+                "RUNNER_TEMP": str(root / "runner"),
+                "MODEL_KEY": model,
+                "TIER": "model_sanity",
+                "RECIPE_OUTCOME": "failure",
+            }
+            with (
+                patch.dict(os.environ, env, clear=True),
+                patch.object(sys, "argv", ["recipe_report.py", str(candidate)]),
+            ):
+                self.assertEqual(report_main(), 1)
+            payload = json.loads(candidate.read_text())
+            self.assertEqual(
+                {
+                    key: payload[key]
+                    for key in (
+                        "outcome",
+                        "private_retention",
+                        "baseline_established",
+                        "accuracy_within_band",
+                        "gsm8k_correct",
+                        "gsm8k_count",
+                        "queue_s",
+                    )
+                },
+                {
+                    "outcome": "fail",
+                    "private_retention": True,
+                    "baseline_established": False,
+                    "accuracy_within_band": False,
+                    "gsm8k_correct": 1278,
+                    "gsm8k_count": 1319,
+                    "queue_s": 7,
+                },
+            )
+            retained_rows = (
+                retained
+                / "sglang-for-sail/3-1/model_sanity"
+                / model
+                / per_question.name
+            )
+            self.assertEqual(retained_rows.read_bytes(), per_question.read_bytes())
+            self.assertEqual(retained_rows.stat().st_mode & 0o777, 0o600)
+            console = io.StringIO()
+            publish(payload, root / "public.json", root / "summary.md", console)
+            self.assertNotIn("question_id", console.getvalue())
+            for mutation in (
+                {"outcome": "pass"},
+                {"model": "qwen3.8-flash-next-tp4"},
+                {"baseline_established": True},
+                {"accuracy_within_band": True},
+                {"private_retention": False},
+                {"gsm8k_correct": 1277},
+                {"gsm8k_count": 1318},
+                {"c16_passed": False},
+                {"golden_score": payload["gsm8k_score"]},
+            ):
+                with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                    validate({**payload, **mutation})
+            per_question.unlink()
+            with (
+                patch.dict(os.environ, {**env, "GITHUB_RUN_ATTEMPT": "2"}, clear=True),
+                patch.object(sys, "argv", ["recipe_report.py", str(candidate)]),
+            ):
+                self.assertEqual(report_main(), 1)
+            incomplete = json.loads(candidate.read_text())
+            self.assertFalse(incomplete["private_retention"])
+            with self.assertRaises(ValueError):
+                validate(incomplete)
+
     def test_fast_evidence_accepts_direct_full_and_previous_fallback(self):
         result = fast_result()
         validate(result)
@@ -821,12 +1030,14 @@ class ClusterTransportTest(unittest.TestCase):
             ("deepseek-v4.1-flash", 8, False),
             ("qwen3.8-27b", 2, False),
             ("qwen3.8-flash-next-tp4", 4, False),
+            ("qwen3.8-flash-next", 8, False),
             ("glm-5.3", 8, True),
         ):
             with (
                 self.subTest(model=model, tampered=tampered),
                 tempfile.TemporaryDirectory() as temp,
             ):
+                collecting_baseline = model == "qwen3.8-flash-next"
                 result = dict(fast_result(), model=model)
                 root = Path(temp)
                 workspace = root / "checkout"
@@ -853,6 +1064,35 @@ class ClusterTransportTest(unittest.TestCase):
                     "layer_override": None,
                     "config_digest": result["config_digest"],
                 }
+                if collecting_baseline:
+                    summary.pop("layer_override")
+                    result.pop("layer_override")
+                    summary.update(
+                        outcome="fail",
+                        baseline_established=False,
+                        accuracy_within_band=False,
+                        gsm8k_correct=1278,
+                        gsm8k_count=1319,
+                        gsm8k_score=1278 / 1319,
+                        eval_s=2,
+                        bench_s=3,
+                        cache_mode="sanity_throughput_guard",
+                        kv_gauge_zero_verified=True,
+                        c1_passed=True,
+                        c16_passed=True,
+                    )
+                    result.update(
+                        summary,
+                        tier="model_sanity",
+                        failure_phase="baseline_collection",
+                    )
+                    wheelhouse = workspace / "evalscope-wheels"
+                    wheelhouse.mkdir()
+                    wheel = wheelhouse / "fixture.whl"
+                    wheel.touch()
+                    (wheelhouse / "SHA256SUMS").write_text(
+                        f"{sha256(wheel)}  {wheel.name}\n"
+                    )
                 if tampered:
                     summary["diagnostic"] = injected
                 (workspace / "fixture.json").write_text(json.dumps(summary))
@@ -894,6 +1134,12 @@ class ClusterTransportTest(unittest.TestCase):
                     'printf "%s\\n" "$INJECTED_FIXTURE" >> "$GITHUB_STEP_SUMMARY"\n'
                     'mkdir -p "$PPU_CI_WORKER_ARTIFACT_DIR/results"\n'
                     'cp fixture.json "$PPU_CI_WORKER_ARTIFACT_DIR/results/summary.json"\n'
+                    'if [[ "$TIER" == model_sanity ]]; then\n'
+                    '  printf "baseline_collection\\n" > "$PPU_CI_WORKER_ARTIFACT_DIR/worker-phase.txt"\n'
+                    '  printf "%s\\n" "$INJECTED_FIXTURE" > "$PPU_CI_WORKER_ARTIFACT_DIR/results/gsm8k_per_question.jsonl"\n'
+                    '  echo job_status=failed >> "$GITHUB_OUTPUT"\n'
+                    "  exit 1\n"
+                    "fi\n"
                     'echo job_status=succeeded >> "$GITHUB_OUTPUT"\n'
                 )
                 (backend / "cleanup.sh").write_text(
@@ -910,8 +1156,9 @@ class ClusterTransportTest(unittest.TestCase):
                             os.environ["PATH"],
                         )
                     ),
-                    "TIER": "fast_sanity",
+                    "TIER": result["tier"],
                     "MODEL_KEY": model,
+                    "PPU_CI_GSM8K_PATH": str(root / "gsm8k"),
                     "RECIPE_PPU_COUNT": str(width),
                     "GITHUB_OUTPUT": str(root / "gha-output"),
                     "PPU_PUBLIC_SUMMARY": str(root / "gha-summary"),
@@ -945,7 +1192,9 @@ class ClusterTransportTest(unittest.TestCase):
                 artifact = workspace / "ppu-public/recipe.json"
                 job_summary = root / "gha-summary"
                 self.assertEqual(
-                    process.returncode, int(tampered), process.stdout + process.stderr
+                    process.returncode,
+                    int(tampered or collecting_baseline),
+                    process.stdout + process.stderr,
                 )
                 self.assertNotIn(injected, process.stdout + process.stderr)
                 self.assertEqual(list(staging.iterdir()), [])

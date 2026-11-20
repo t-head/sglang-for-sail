@@ -226,6 +226,7 @@ JOB_DEADLINE=$(read_output deadline)
 [[ "$JOB_START_TIME" =~ ^[0-9]+$ && "$JOB_DEADLINE" =~ ^[0-9]+$ ]]
 queue_s=$(read_output queue_duration_seconds)
 [[ "$queue_s" =~ ^[0-9]+$ ]] || exit 1
+export PPU_CI_QUEUE_S="$queue_s"
 
 phase cluster_worker
 run_backend "$infra/monitor.sh"

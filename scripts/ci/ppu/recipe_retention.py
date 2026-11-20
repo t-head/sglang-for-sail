@@ -52,7 +52,7 @@ def _check_dir_mode(directory: Path, *allowed_modes: int) -> None:
         raise ValueError("unexpected retention directory type or mode")
 
 
-def retain(environ) -> None:
+def retain(environ, *, baseline_collection=False) -> None:
     index = {
         "checkout_sha": environ["PPU_CI_SOURCE_SHA"],
         "tier": environ["TIER"],
@@ -104,8 +104,10 @@ def retain(environ) -> None:
         if not partial:
             raise
     required = {"launcher.log"}
-    if not partial:
+    if not partial or baseline_collection:
         required.update(RESULT_FILES)
+    if baseline_collection:
+        required.add("results/gsm8k_per_question.jsonl")
     entries = ["launcher.log", *RESULT_FILES, *OPTIONAL_FILES]
     review_root = source_dir / "results/evalscope"
     if review_root.is_dir() and not review_root.is_symlink():

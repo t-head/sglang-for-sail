@@ -19,6 +19,11 @@ from ppu_recipe import REPO_ROOT, _load_yaml, resolve_recipe
 
 HOST = "http://127.0.0.1:9985"
 MODEL = "recipe-model"
+QWEN_DP8_BASELINE_KEY = "qwen3.8-flash-next-dp8-ep"
+QWEN_DP8_BASELINE_CHECKPOINT = (
+    "T-HEAD/Qwen3.8-Flash-Next-MoE-Quant-W-MXFP4-A-MXFP4"
+    "-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken"
+)
 RESULTS = Path(os.environ.get("PPU_CI_ARTIFACT_DIR", "/artifacts")) / "results"
 MODEL_SANITY_READY_TIMEOUTS = {
     # GLM's 141-shard cold load took 35 minutes before DeepGEMM warmup.
@@ -222,7 +227,19 @@ def evaluate(stage, config):
         / "test/ppu/golden"
         / f"accuracy_{config['golden_model_key']}_890p.json"
     )
-    golden = json.loads(golden_path.read_text())
+    collecting_baseline = False
+    try:
+        golden = json.loads(golden_path.read_text())
+    except FileNotFoundError:
+        if (
+            config["golden_model_key"] != QWEN_DP8_BASELINE_KEY
+            or config["hf_model_id"] != QWEN_DP8_BASELINE_CHECKPOINT
+            or config["ppu_count"] != 8
+            or golden_path.is_symlink()
+        ):
+            raise
+        collecting_baseline = True
+
     expected = dataset["num_expected"]
     dataset_id = f"{dataset['id']}@{dataset['version']}"
     dataset_options = {
@@ -233,7 +250,10 @@ def evaluate(stage, config):
         or expected != 1319
         or stage["dataset"] != dataset_id
         or stage["limit"] is not None
-        or golden["schema_version"] != 2
+    ):
+        raise ValueError("golden evaluation contract mismatch")
+    if not collecting_baseline and (
+        golden["schema_version"] != 2
         or golden["benchmark"] != "gsm8k"
         or golden["chip"] != "890p"
         or golden["model"] != config["golden_model_key"]
@@ -283,14 +303,20 @@ def evaluate(stage, config):
             stream.write(
                 json.dumps({"question_id": question, "correct": answer}) + "\n"
             )
-    return {
+    result = {
         "gsm8k_score": score,
         "gsm8k_correct": correct,
         "gsm8k_count": count,
-        "golden_score": golden["score"],
-        "accuracy_within_band": abs(score - golden["score"]) <= 0.02,
-        "baseline_established": True,
+        "accuracy_within_band": False,
+        "baseline_established": False,
     }
+    if not collecting_baseline:
+        result.update(
+            golden_score=golden["score"],
+            accuracy_within_band=abs(score - golden["score"]) <= 0.02,
+            baseline_established=True,
+        )
+    return result
 
 
 def bench(stage, config, concurrency, requests, label):
@@ -527,7 +553,13 @@ def run(policy_path, tier, queue_s):
                 result[f"c{concurrency}_passed"] = True
             result["bench_s"] = round(time.monotonic() - start, 3)
             result["cache_mode"] = stage["cache_mode"]
-    result["outcome"] = "pass" if result.get("accuracy_within_band", True) else "fail"
+    if result.get("baseline_established") is False:
+        phase("baseline_collection")
+        result["outcome"] = "fail"
+    else:
+        result["outcome"] = (
+            "pass" if result.get("accuracy_within_band", True) else "fail"
+        )
     return result
 
 

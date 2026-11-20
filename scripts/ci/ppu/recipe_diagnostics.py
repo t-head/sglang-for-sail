@@ -17,6 +17,7 @@ PHASES = {
     "gsm8k_eval",
     "cache_flush",
     "micro_e2e",
+    "baseline_collection",
     "cleanup",
     "private_retention",
 }

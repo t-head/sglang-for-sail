@@ -165,6 +165,33 @@ def validate(payload):
         or not 0 <= payload["gsm8k_correct"] <= 1319
     ):
         raise ValueError("invalid correct count")
+    if payload.get("failure_phase") == "baseline_collection" or (
+        payload.get("baseline_established") is False
+    ):
+        required = (meta | BASE | NIGHTLY) - {"golden_score"}
+        if (
+            tier != "model_sanity"
+            or payload["model"] != "qwen3.8-flash-next"
+            or payload["outcome"] != "fail"
+            or payload.get("failure_phase") != "baseline_collection"
+            or not required.issubset(payload)
+            or "golden_score" in payload
+            or payload["baseline_established"] is not False
+            or payload["accuracy_within_band"] is not False
+            or not all(
+                payload[key]
+                for key in (
+                    "private_retention",
+                    "parser_checked",
+                    "sse_verified",
+                    "kv_gauge_zero_verified",
+                    "c1_passed",
+                    "c16_passed",
+                )
+            )
+            or payload["gsm8k_correct"] != round(payload["gsm8k_score"] * 1319)
+        ):
+            raise ValueError("invalid Qwen DP8 baseline collection evidence")
     if payload["outcome"] == "pass":
         required = (
             (meta - {"failure_phase"}) | BASE | (tier_fields - {"fallback_reason"})

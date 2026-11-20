@@ -52,8 +52,9 @@ def main():
         result = legacy_result(env, source)
         Path(sys.argv[1]).write_text(json.dumps(result, allow_nan=False) + "\n")
         return 0
+    diagnostic = failure_reason(source)
     try:
-        retain(env)
+        retain(env, baseline_collection=diagnostic == "baseline_collection")
         retained = True
     except (KeyError, OSError, ValueError, RuntimeError):
         retained = False
@@ -63,12 +64,12 @@ def main():
         if runner_summary.stat().st_size > 8192:
             raise ValueError("unexpected result size")
         result = json.loads(runner_summary.read_text())
+    if diagnostic == "baseline_collection" and "PPU_CI_QUEUE_S" in env:
+        result["queue_s"] = int(env["PPU_CI_QUEUE_S"])
     if outcome == "success" and result.get("outcome") != "pass":
         outcome = "failure"
     if outcome != "success" or not retained:
-        result["failure_phase"] = (
-            failure_reason(source) if retained else "private_retention"
-        )
+        result["failure_phase"] = diagnostic if retained else "private_retention"
     result.update(
         schema="ppu-sanity/v1",
         tier=env["TIER"],
