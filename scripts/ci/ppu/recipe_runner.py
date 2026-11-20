@@ -85,7 +85,11 @@ def probes(cfg, *, fast):
         "seed": cfg.get("seed", 42),
         "max_tokens": cfg["max_tokens"],
     }
-    if not fast:
+    if fast:
+        payload.update(
+            (key, cfg[key]) for key in ("temperature", "top_p", "top_k") if key in cfg
+        )
+    else:
         payload["thinking"] = {"type": "disabled"}
     with request(
         "/v1/chat/completions", json.dumps(payload).encode(), timeout=90
