@@ -12,13 +12,6 @@ model:
   base_args:
     - --tp-size
     - "8"
-    - --attn-dp-size
-    - "8"
-    - --enable-dp-lm-head
-    - --moe-a2a-backend
-    - deepep
-    - --deepep-mode
-    - auto
     - --attention-backend
     - dsv4
     - --page-size
