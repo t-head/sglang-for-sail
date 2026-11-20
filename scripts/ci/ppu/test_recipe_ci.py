@@ -78,6 +78,57 @@ class RecipeContractTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             select("model_sanity", "glm-5.3,glm-5.3")
 
+    def test_deepseek_v41_fast_uses_pure_tp8(self):
+        model = "deepseek-v4.1-flash"
+        policy = DEFAULT_POLICY_ROOT / f"models/{model}.yaml"
+        recipe = REPO_ROOT / _load_yaml(policy)["recipe"]
+        resolved = resolve_recipe(recipe, policy_path=policy, tier="fast_sanity")
+        flags = resolved["flags"]
+        self.assertEqual(resolved["ppu_count"], 8)
+        self.assertEqual(flags[flags.index("--tp-size") + 1], "8")
+        self.assertIsNone(resolved["layer_override"])
+        for flag in (
+            "--attn-dp-size",
+            "--dp-size",
+            "--enable-dp-lm-head",
+            "--moe-a2a-backend",
+            "--deepep-mode",
+        ):
+            self.assertNotIn(flag, flags)
+        with self.assertRaises(ValueError):
+            select("model_sanity", model)
+
+    def test_minimax_nightly_uses_published_quantized_reference(self):
+        self.assertEqual(
+            select("model_sanity", "minimax-m3"),
+            {"include": [{"model": "minimax-m3"}]},
+        )
+        policy_path = DEFAULT_POLICY_ROOT / "models/minimax-m3.yaml"
+        policy = _load_yaml(policy_path)
+        config = resolve_recipe(
+            REPO_ROOT / policy["recipe"], policy_path=policy_path, tier="model_sanity"
+        )
+        reference_path = (
+            REPO_ROOT
+            / "test/ppu/golden"
+            / f"accuracy_{config['golden_model_key']}_890p.json"
+        )
+        reference = json.loads(reference_path.read_text())
+        stage = next(
+            stage
+            for stage in policy["tiers"]["model_sanity"]["stages"]
+            if stage["kind"] == "evalscope"
+        )
+        self.assertEqual(config["hf_model_id"], reference["checkpoint"])
+        self.assertEqual(config["ppu_count"], reference["serving"]["ppu_count"])
+        self.assertEqual(stage["dataset"], reference["dataset"]["dataset_id"])
+        self.assertEqual(stage["generation"], reference["generation"])
+        self.assertEqual(reference["tolerance"], {"mode": "band", "abs": 0.02})
+        self.assertEqual(reference["dataset"]["num_expected"], 1319)
+        self.assertEqual(reference["score_num"], 1284)
+        self.assertIsNone(stage["limit"])
+        self.assertFalse(config["dummy_weights"])
+
     def test_policy_switches(self):
         policy = DEFAULT_POLICY_ROOT / "models/glm-5.3.yaml"
         recipe = REPO_ROOT / _load_yaml(policy)["recipe"]
