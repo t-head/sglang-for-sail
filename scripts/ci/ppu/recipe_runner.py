@@ -20,6 +20,12 @@ from ppu_recipe import REPO_ROOT, _load_yaml, resolve_recipe
 HOST = "http://127.0.0.1:9985"
 MODEL = "recipe-model"
 RESULTS = Path(os.environ.get("PPU_CI_ARTIFACT_DIR", "/artifacts")) / "results"
+MODEL_SANITY_READY_TIMEOUTS = {
+    # GLM's 141-shard cold load took 35 minutes before DeepGEMM warmup.
+    "zai-org/GLM-5.3": 4500,
+    # GLM Flash loaded 27 of 62 shards in 39 minutes.
+    "zai-org/GLM-5.3-Flash": 6600,
+}
 
 
 def phase(name):
@@ -478,8 +484,7 @@ def run(policy_path, tier, queue_s):
         )
     else:
         stages = {stage["kind"]: stage for stage in policy["tiers"][tier]["stages"]}
-        # GLM's 141-shard cold load took 35 minutes before DeepGEMM warmup.
-        ready_timeout = 4500 if policy["model_id"] == "zai-org/GLM-5.3" else 2400
+        ready_timeout = MODEL_SANITY_READY_TIMEOUTS.get(policy["model_id"], 2400)
         with server(config, "model_sanity", result, ready_timeout):
             probes(stages["sanity"]["probe"], fast=False)
             result["sse_verified"] = True

@@ -226,6 +226,26 @@ class RecipeContractTest(unittest.TestCase):
                 self.assertIsNone(result["layer_override"])
                 self.assertNotIn("fallback_reason", result)
 
+    def test_glm_flash_model_sanity_allows_slow_weight_loading(self):
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            patch.dict(
+                os.environ,
+                {"PPU_RECIPE_CONTAINER_MODEL": temp, "RECIPE_PPU_COUNT": "2"},
+            ),
+            patch("recipe_runner.RESULTS", Path(temp) / "results"),
+            patch(
+                "recipe_runner.server", side_effect=RuntimeError("stop at launch")
+            ) as launch,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop at launch"):
+                run(
+                    DEFAULT_POLICY_ROOT / "models/glm-5.3-flash.yaml", "model_sanity", 0
+                )
+            config, tier, _, timeout = launch.call_args.args
+            self.assertEqual((tier, timeout), ("model_sanity", 6600))
+            self.assertNotIn("dummy", config["flags"])
+
     def test_worker_rejects_recipe_with_wrong_allocation(self):
         with (
             tempfile.TemporaryDirectory() as temp,
