@@ -25,7 +25,8 @@ from recipe_bundle import sha256, wheel_inventory
 from recipe_cluster_config import load_settings
 from recipe_cluster_diagnostics import diagnostic_codes
 from recipe_publish import publish, validate
-from recipe_report import legacy_result, main as report_recipe
+from recipe_report import legacy_result
+from recipe_report import main as report_recipe
 from recipe_runner import cached_model_path, metrics_zero, read_eval_reviews, run
 from recipe_select import select
 
