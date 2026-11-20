@@ -80,9 +80,7 @@ jobs:
       result: ${{ steps.check.outcome }}
     needs: pr-gate
     if: inputs.tier == 'cluster_preflight' && needs.pr-gate.outputs.approved == 'true'
-    runs-on:
-      group: sglang-ppu-ci
-      labels: k8s-runner-group-cpu-thead
+    runs-on: k8s-runner-group-cpu-thead
     container:
       image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: 5
@@ -267,9 +265,7 @@ jobs:
       (inputs.tier == 'fast_sanity' || needs.evalscope-wheels.result == 'success') &&
       (needs.ppu-build.result == 'success' ||
        (needs.plan.outputs.input-artifact-id != '' && needs.ppu-build.result == 'skipped'))
-    runs-on:
-      group: sglang-ppu-ci
-      labels: k8s-runner-group-cpu-thead
+    runs-on: k8s-runner-group-cpu-thead
     container:
       image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: ${{ inputs.tier == 'fast_sanity' && 40 || 360 }}

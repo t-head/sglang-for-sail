@@ -159,8 +159,11 @@ class TestPPUCIWorkflow(unittest.TestCase):
         self.assertIn("startsWith(github.base_ref, 'release/')", output)
         self.assertIn("needs.pr-gate.outputs.approved == 'true'", output)
 
-    def test_privileged_workflows_use_fresh_approval_and_restricted_group(self):
-        for name in ("pr-test-ppu", "nightly-test-ppu"):
+    def test_cluster_jobs_use_fresh_approval_and_thead_cpu_runner(self):
+        for name, cluster_jobs in (
+            ("pr-test-ppu", ("ppu-cluster-config", "ppu-legacy-sanity")),
+            ("nightly-test-ppu", ("cluster-preflight", "recipe-sanity")),
+        ):
             with self.subTest(workflow=name):
                 source = RUNNER.parent.parent / f".github/workflows/{name}.yml"
                 workflow = yaml.load(source.read_text(), Loader=yaml.BaseLoader)
@@ -170,14 +173,8 @@ class TestPPUCIWorkflow(unittest.TestCase):
                 self.assertEqual(
                     jobs["pr-gate"]["uses"], "./.github/workflows/ppu-approval.yml"
                 )
-                cluster_jobs = [
-                    job["runs-on"]
-                    for job in jobs.values()
-                    if isinstance(job.get("runs-on"), dict)
-                ]
-                self.assertTrue(cluster_jobs)
-                for runner in cluster_jobs:
-                    self.assertEqual(runner["group"], "sglang-ppu-ci")
+                for job in cluster_jobs:
+                    self.assertEqual(jobs[job]["runs-on"], "k8s-runner-group-cpu-thead")
 
     def test_device_jobs_require_build_and_cpu_checks(self):
         selftests = self.jobs["ppu-ci-selftest"]
@@ -241,7 +238,7 @@ class TestPPUCIWorkflow(unittest.TestCase):
 
     def test_sanity_runs_on_every_ppu_generation_with_private_retention(self):
         sanity = self.jobs["ppu-legacy-sanity"]
-        self.assertEqual(sanity["runs-on"]["labels"], "k8s-runner-group-cpu-thead")
+        self.assertEqual(sanity["runs-on"], "k8s-runner-group-cpu-thead")
         self.assertIs(sanity["strategy"]["fail-fast"], False)
         self.assertEqual(
             sanity["strategy"]["matrix"]["board"], ["ZW-M890P", "OAM-810E"]

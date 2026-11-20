@@ -170,9 +170,7 @@ jobs:
     name: ppu-cluster-config
     needs: [check-changes, ppu-ci-selftest]
     if: github.repository == 't-head/sglang-for-sail' && needs.check-changes.outputs.ppu == 'true'
-    runs-on:
-      group: sglang-ppu-ci
-      labels: k8s-runner-group-cpu-thead
+    runs-on: k8s-runner-group-cpu-thead
     container:
       image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: 5
@@ -262,9 +260,7 @@ jobs:
       fail-fast: false
       matrix:
         board: [ZW-M890P, OAM-810E]
-    runs-on:
-      group: sglang-ppu-ci
-      labels: k8s-runner-group-cpu-thead
+    runs-on: k8s-runner-group-cpu-thead
     container:
       image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: 60

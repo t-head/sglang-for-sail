@@ -19,14 +19,9 @@ The reusable workflow accepts the same boolean input and a candidate `ref`.
 
 ## Provision the cluster runner
 
-Register the `k8s-runner-group-cpu-thead` runner in the `sglang-ppu-ci` runner group before enabling the workflows. Restrict the group to this repository and these selected workflows at the protected release ref:
+Cluster jobs use the T-Head CPU orchestration runner label `k8s-runner-group-cpu-thead`. PR jobs require revision-specific approval before reaching the cluster runner.
 
-- `t-head/sglang-for-sail/.github/workflows/pr-test-ppu.yml@refs/heads/release/v0.5.23`
-- `t-head/sglang-for-sail/.github/workflows/nightly-test-ppu.yml@refs/heads/release/v0.5.23`
-
-For pre-merge validation, allowlist both workflow paths at the exact same-repository maintainer validation branch. Dispatch `pr-test-ppu.yml` on that branch with `preflight_only=true`. This runs the Linux selftests and the private configuration checks via the direct and reusable workflows. A cross-branch caller can request `tier: cluster_preflight` from the same reusable workflow. Remove temporary allowlist entries after validation.
-
-Remove the runner's access through the default or other unrestricted groups. Add protected branch refs to the allowlist when deploying these workflows on those branches. The branch must already contain the trusted workflow to run its PR events.
+For pre-merge validation, dispatch `pr-test-ppu.yml` on a same-repository maintainer branch with `preflight_only=true`. This runs the Linux selftests and the private configuration checks via the direct and reusable workflows. A cross-branch caller can request `tier: cluster_preflight` from the same reusable workflow.
 
 The runner uses the pinned T-Head Cluster Run backend. The scheduler assigns one eight-card 890P Pod for each Recipe job. Each existing single-device test job requests one card on its selected board. The CPU runner passes model and dataset paths privately to the worker from its service environment. A task-specific shared configuration can supply the same variables. The workflow pins the configuration digest and verifies access in a CPU-only job before scheduling PPU Pods. Provision the task configuration and output directory for the runner account before starting jobs. Keep the configuration files at mode 0600 and the private directories at mode 0700.
 
