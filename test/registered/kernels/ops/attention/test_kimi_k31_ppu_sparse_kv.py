@@ -1,5 +1,7 @@
 """PPU K3.1 sparse prefill and paged decode over one FP8 DSA KV cache."""
 
+import sys
+
 import pytest
 import torch
 
@@ -55,3 +57,7 @@ def test_sparse_prefill_and_kv_decode_share_fp8_cache():
     torch.testing.assert_close(
         decode.reshape(64, 512).float(), reference[0], atol=0.02, rtol=0.02
     )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
