@@ -157,7 +157,7 @@ class TestPPUCIWorkflow(unittest.TestCase):
         output = check["outputs"]["ppu"]
         self.assertIn("steps.filter.outputs.release-code == 'true'", output)
         self.assertIn("startsWith(github.base_ref, 'release/')", output)
-        self.assertIn("github.event.pull_request.labels.*.name, 'run-ci-ppu'", output)
+        self.assertIn("needs.pr-gate.outputs.approved == 'true'", output)
 
     def test_privileged_workflows_use_fresh_approval_and_restricted_group(self):
         for name in ("pr-test-ppu", "nightly-test-ppu"):
@@ -210,7 +210,7 @@ class TestPPUCIWorkflow(unittest.TestCase):
             "inputs.run_legacy_sanity == true && needs.check-changes.outputs.ppu == 'true'",
         )
         self.assertIn(
-            "needs.pr-gate.outputs.approved == 'false'",
+            "needs.pr-gate.result == 'failure'",
             self.jobs["pr-test-ppu-finish"]["if"],
         )
         runtime = RUNNER.parent.parent / "scripts/ci/ppu/build_and_test.sh"

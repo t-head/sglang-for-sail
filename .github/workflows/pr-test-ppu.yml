@@ -70,10 +70,8 @@ jobs:
       ${{ (github.event_name == 'pull_request_target' && github.event.action == 'labeled' &&
            !contains(fromJSON('["run-ci","run-ci-ppu"]'), github.event.label.name)) &&
           'ignored-label-check-changes' || 'check-changes' }}
-    if: |
-      github.event_name != 'pull_request_target' ||
-      github.event.action != 'labeled' ||
-      contains(fromJSON('["run-ci","run-ci-ppu"]'), github.event.label.name)
+    needs: pr-gate
+    if: needs.pr-gate.outputs.approved == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -83,8 +81,7 @@ jobs:
         ${{ inputs.run_legacy_sanity || steps.filter.outputs.ppu == 'true' ||
           steps.run-mode.outputs.run_all_tests == 'true' ||
           (github.event_name == 'pull_request_target' &&
-           (contains(github.event.pull_request.labels.*.name, 'run-ci-ppu') ||
-            (github.event.action == 'labeled' && github.event.label.name == 'run-ci-ppu') ||
+           (needs.pr-gate.outputs.approved == 'true' ||
             (startsWith(github.base_ref, 'release/') && steps.filter.outputs.release-code == 'true'))) }}
       source-sha: ${{ github.event.pull_request.head.sha || steps.source.outputs.sha }}
     steps:
@@ -137,8 +134,10 @@ jobs:
       ${{ (github.event_name == 'pull_request_target' && github.event.action == 'labeled' &&
            !contains(fromJSON('["run-ci","run-ci-ppu"]'), github.event.label.name)) &&
           'ignored-label-pr-gate' || 'pr-gate' }}
-    needs: check-changes
-    if: needs.check-changes.outputs.ppu == 'true'
+    if: |
+      github.event_name != 'pull_request_target' ||
+      github.event.action != 'labeled' ||
+      contains(fromJSON('["run-ci","run-ci-ppu"]'), github.event.label.name)
     uses: ./.github/workflows/ppu-approval.yml
     with:
       label: run-ci-ppu
@@ -146,7 +145,7 @@ jobs:
 
   ppu-ci-selftest:
     needs: [check-changes, pr-gate]
-    if: needs.pr-gate.outputs.approved == 'true'
+    if: needs.pr-gate.outputs.approved == 'true' && needs.check-changes.outputs.ppu == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -346,8 +345,8 @@ jobs:
            'ignored-label-pr-test-ppu-finish' || 'pr-test-ppu-finish') }}
     needs: [pr-gate, check-changes, ppu-ci-selftest, ppu-build, ppu-cluster-config, ppu-fast-sanity]
     if: >-
-      always() && inputs.run_legacy_sanity != true && needs.check-changes.result != 'skipped' &&
-      !(needs.pr-gate.result == 'success' && needs.pr-gate.outputs.approved == 'false')
+      always() && inputs.run_legacy_sanity != true && (needs.pr-gate.result == 'failure' || needs.pr-gate.result == 'cancelled' ||
+       needs.check-changes.result != 'skipped')
     runs-on: ubuntu-latest
     permissions: {}
     steps:
