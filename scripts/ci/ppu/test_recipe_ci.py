@@ -183,11 +183,12 @@ class RecipeContractTest(unittest.TestCase):
                 self.assertIsNone(result["layer_override"])
                 self.assertNotIn("fallback_reason", result)
 
-    def test_model_sanity_startup_budget_accounts_for_deepseek_pro_weight_load(self):
+    def test_model_sanity_startup_budget_accounts_for_slow_weight_loads(self):
         for model, timeout in (
             ("deepseek-v4-pro", 6000),
             ("glm-5.3", 4500),
-            ("kimi-k2.6", 2400),
+            ("kimi-k2.6", 6000),
+            ("deepseek-v4-flash", 2400),
         ):
             with (
                 self.subTest(model=model),

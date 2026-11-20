@@ -22,8 +22,9 @@ MODEL = "recipe-model"
 RESULTS = Path(os.environ.get("PPU_CI_ARTIFACT_DIR", "/artifacts")) / "results"
 MODEL_SANITY_READY_TIMEOUTS = {
     "zai-org/GLM-5.3": 4500,
-    # The real-weight TP8 job was still loading MoE weights at 2400 seconds.
+    # Both real-weight TP8 jobs were still loading MoE weights at 2400 seconds.
     "deepseek-ai/DeepSeek-V4-Pro": 6000,
+    "moonshotai/Kimi-K2.6": 6000,
 }
 
 
