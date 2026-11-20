@@ -118,9 +118,7 @@ if __name__ == "__main__":
 @pytest.mark.parametrize("bf16_topk", [False, True])
 @pytest.mark.parametrize("topk", [2, 512, 2048])
 @pytest.mark.parametrize("topk_v2", [False, True])
-def test_paged_prefill_keeps_bf16_kernel_and_fp32_fallback(
-    ppu, bf16_topk, topk, topk_v2
-):
+def test_paged_bf16_respects_dsv4_topk_flag(ppu, bf16_topk, topk, topk_v2):
     from types import SimpleNamespace
 
     logits = torch.tensor([[1, 3, 2, 5, 4]], dtype=torch.bfloat16)
@@ -164,10 +162,4 @@ def test_paged_prefill_keeps_bf16_kernel_and_fp32_fallback(
     else:
         bf16_kernel.assert_not_called()
         kernels.fast_topk_transform_fused.assert_called_once()
-        scores = kernels.fast_topk_transform_fused.call_args.kwargs["score"]
-        if ppu:
-            assert scores.dtype == torch.float32
-            assert scores.stride(0) % 4 == 0
-            assert torch.equal(scores, logits.float())
-        else:
-            assert scores is logits
+        assert kernels.fast_topk_transform_fused.call_args.kwargs["score"] is logits

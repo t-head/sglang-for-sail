@@ -326,6 +326,51 @@ def test_legacy_topk_oversized_coarse_bin() -> None:
     assert_equal(decode_scores, reference, decode, batch, topk, seq_len)
 
 
+@pytest.mark.parametrize("cu_q", [(0, 1, 2, 3), (0, 2, 2, 3), (0, 2, 3)])
+@pytest.mark.parametrize("row_start", [0, 3])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float32,
+        pytest.param(
+            torch.bfloat16,
+            marks=pytest.mark.skipif(
+                torch.version.hip is not None,
+                reason="ROCm fused paged top-k requires FP32 scores",
+            ),
+        ),
+    ],
+)
+def test_paged_aot_q_mapping(cu_q, row_start, dtype):
+    topk, width = 2048, 5503
+    scores = torch.randint(-128, 128, (3, width), device="cuda").to(dtype)
+    lengths = torch.tensor([width - row_start, 7, 0], dtype=torch.int32, device="cuda")
+    pages = torch.arange((len(cu_q) - 1) * width, dtype=torch.int32, device="cuda")
+    pages = pages.view(-1, width)
+    offsets = torch.tensor(cu_q, dtype=torch.int32, device="cuda")
+
+    starts = torch.full_like(lengths, row_start) if row_start else None
+    out = fast_topk_transform_fused(scores, lengths, pages, offsets, topk, starts)
+
+    if dtype == torch.float32 and starts is None and len(cu_q) == scores.size(0) + 1:
+        # The legacy FP32 decode dispatch maps each query to the same page row.
+        owners = range(scores.size(0))
+    else:
+        owners = [
+            i for i, (lo, hi) in enumerate(zip(cu_q, cu_q[1:])) for _ in range(lo, hi)
+        ]
+    chosen = out[0].long() - owners[0] * width
+    assert ((0 <= chosen) & (chosen < width - row_start)).all()
+    assert chosen.unique().numel() == topk
+    row_scores = scores[0, row_start:].float()
+    expected = row_scores.topk(topk).values
+    torch.testing.assert_close(
+        row_scores[chosen].sort(descending=True).values, expected
+    )
+    torch.testing.assert_close(out[1, :7], pages[owners[1], :7])
+    assert (out[1, 7:] == -1).all() and (out[2] == -1).all()
+
+
 @pytest.mark.skipif(
     torch.version.hip is None,
     reason="deepseek_v4_topk_transform_512 is only built on ROCm",
