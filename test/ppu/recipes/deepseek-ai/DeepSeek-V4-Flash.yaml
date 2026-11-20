@@ -45,3 +45,5 @@ presets:
       - --enable-dp-lm-head
       - --moe-a2a-backend
       - --deepep-mode
+    env:
+      SGLANG_SAIL_DEEPGEMM_MOE_TP_FUSED: "0"
