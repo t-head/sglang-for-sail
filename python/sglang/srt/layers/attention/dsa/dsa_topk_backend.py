@@ -618,6 +618,18 @@ def _build_flashinfer_paged_args(
         q_lens = (cu_seqlens_q_topk[1:] - cu_seqlens_q_topk[:-1]).to(
             dtype=torch.int32, device=device
         )
+        # >>> E20-3a eager guardrail:  pre-raise a Python
+        # error in eager instead of letting Repeat.cu:20 poison the CUDA
+        # context.  Capture/replay path untouched.  Unreachable under the
+        # dsa_topk_backend='sgl-kernel' config of this incident.
+        if not torch.cuda.is_current_stream_capturing():
+            _e20_sum = int(q_lens.sum().item())
+            if _e20_sum != int(num_rows):
+                raise RuntimeError(
+                    "E20-3 guard: flashinfer paged row_to_batch ledger tear: "
+                    "sum(q_lens)=%d != num_rows=%d" % (_e20_sum, int(num_rows))
+                )
+        # <<< E20-3a
         row_to_batch = torch.repeat_interleave(
             row_to_batch, q_lens, output_size=num_rows
         )
@@ -630,6 +642,15 @@ def _build_flashinfer_paged_args(
             q_lens = (cu_seqlens_q_topk[1:] - cu_seqlens_q_topk[:-1]).to(
                 dtype=torch.int32, device=device
             )
+            # >>> E20-3b eager guardrail (same contract as E20-3a)
+            if not torch.cuda.is_current_stream_capturing():
+                _e20_sum2 = int(q_lens.sum().item())
+                if _e20_sum2 != int(num_rows):
+                    raise RuntimeError(
+                        "E20-3 guard: flashinfer paged arange-mapping ledger tear: "
+                        "sum(q_lens)=%d != num_rows=%d" % (_e20_sum2, int(num_rows))
+                    )
+            # <<< E20-3b
             row_to_batch = torch.repeat_interleave(
                 torch.arange(q_lens.shape[0], dtype=torch.int32, device=device),
                 q_lens,
