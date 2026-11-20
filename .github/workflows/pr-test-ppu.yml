@@ -37,7 +37,7 @@ on:
 concurrency:
   # Keep legacy-only runs and unrelated label events separate from Recipe CI.
   group: >-
-    pr-test-ppu-fast-diagnostics-${{ inputs.run_legacy_sanity && 'legacy' || 'recipe' }}-${{
+    pr-test-ppu-${{ inputs.run_legacy_sanity && 'legacy' || 'recipe' }}-${{
       (github.event_name == 'pull_request' &&
        github.event.action == 'labeled' &&
        github.event.label.name != 'run-ci' &&
@@ -158,8 +158,6 @@ jobs:
           path: .ppu-infra
           persist-credentials: false
       - name: Verify the private staging configuration
-        env:
-          PPU_CI_OPERATOR_HANDOFF_SHA256: '20412533e32f23eaa475718362dcd7651595f7ec5dc90a2b08f175e5d74d3102'
         run: python3 -B scripts/ci/ppu/recipe_cluster_config.py --check
 
   ppu-build:
@@ -168,7 +166,7 @@ jobs:
            github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
           'ignored-label-ppu-build' || 'ppu-build' }}
     needs: [check-changes, pr-gate]
-    if: needs.check-changes.outputs.ppu == 'true' && github.event.pull_request.number != 268
+    if: needs.check-changes.outputs.ppu == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     permissions:
