@@ -85,18 +85,22 @@ def probes(cfg, *, fast):
         "seed": cfg.get("seed", 42),
         "max_tokens": cfg["max_tokens"],
     }
-    if not fast:
+    if fast:
+        payload.update(
+            (key, cfg[key]) for key in ("temperature", "top_p", "top_k") if key in cfg
+        )
+    else:
         payload["thinking"] = {"type": "disabled"}
     with request(
         "/v1/chat/completions", json.dumps(payload).encode(), timeout=90
     ) as response:
         answer = json.load(response)["choices"][0]
-    if not fast:
-        (RESULTS / "chat-probe-response.json").write_text(json.dumps(answer) + "\n")
-    content = answer["message"].get("content")
+    (RESULTS / "chat-probe-response.json").write_text(json.dumps(answer) + "\n")
+    message = answer["message"]
+    content = message.get("content")
+    text_fields = (content, message.get("reasoning_content")) if fast else (content,)
     if (
-        not isinstance(content, str)
-        or not content.strip()
+        not any(isinstance(field, str) and field.strip() for field in text_fields)
         or not answer["finish_reason"]
     ):
         raise ValueError("incomplete non-streaming response")
