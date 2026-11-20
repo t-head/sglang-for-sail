@@ -10,6 +10,10 @@ phase() { printf '%s\n' "$1" > "$artifact_dir/worker-phase.txt"; }
 phase runtime_dependencies
 unset PYTHONPATH PYTHONHOME VIRTUAL_ENV
 export HF_HOME="$artifact_dir/hf-cache" HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1
+if [[ -n "${PPU_CI_HF_CACHE_ROOT:-}" ]]; then
+    export HF_HUB_CACHE="$PPU_CI_HF_CACHE_ROOT/hub"
+    export HUGGINGFACE_HUB_CACHE="$HF_HUB_CACHE"
+fi
 export TRANSFORMERS_OFFLINE=1 SGLANG_IS_IN_CI=1 PYTHONDONTWRITEBYTECODE=1
 export SGLANG_DG_CACHE_DIR="$jit_dir/sglang" DG_JIT_CACHE_DIR="$jit_dir/deepgemm"
 export DG_CACHE_DIR="$jit_dir/deepgemm" TRITON_CACHE_DIR="$jit_dir/triton"

@@ -23,8 +23,9 @@ The `k8s-runner-group-cpu-thead` runner uses the pinned T-Head Cluster Run backe
 
 | Setting | Purpose |
 | --- | --- |
-| `PPU_CI_GLM53_MODEL_PATH` | GLM-5.3 MXFP4 checkpoint directory |
-| `PPU_CI_DSV4_FLASH_MODEL_PATH` | DeepSeek-V4-Flash MXFP4 checkpoint directory |
+| `PPU_CI_HF_CACHE_ROOT` | Shared offline Hugging Face cache root containing `hub/` |
+| `PPU_CI_GLM53_MODEL_REVISION` | Pinned GLM-5.3 MXFP4 cache snapshot |
+| `PPU_CI_DSV4_FLASH_MODEL_REVISION` | Pinned DeepSeek-V4-Flash MXFP4 cache snapshot |
 | `PPU_CI_GSM8K_PATH` | Offline EvalScope GSM8K dataset directory |
 | `PPU_CI_JIT_ROOT` | Node-local persistent JIT cache root |
 | `PPU_CI_K8S_STAGE_ROOT` | Cluster Run's shared source staging directory in the CPU runner view |
@@ -33,6 +34,8 @@ The `k8s-runner-group-cpu-thead` runner uses the pinned T-Head Cluster Run backe
 | `PPU_CI_K8S_RUNTIME_DIGEST` | Optional manifest reference for the designated release runtime tag |
 | `PPU_CI_RUNTIME_IMAGE` | Existing single-device test image |
 | `PPU_CI_TARGET_MODEL_PATH`, `PPU_CI_EAGLE3_MODEL_PATH`, `PPU_CI_DFLASH_MODEL_PATH`, `PPU_CI_EVAL_CACHE` | Existing single-device assets in the worker view |
+
+The worker keeps `HF_HOME` job-local and points `HF_HUB_CACHE` and `HUGGINGFACE_HUB_CACHE` at the shared cache. The Recipe's `hf_model_id` and pinned revision resolve the checkpoint offline before server launch. The Pod must see the cache and the targets of its snapshot links.
 
 Use a runner configured for reviewed public PR revisions with public-safe runner labels, name and workspace metadata. Kubernetes device requests arbitrate card ownership. The CPU runner and worker must share access to the private per-job directory with mode 0700. The launcher captures Cluster Run diagnostics before exposing scheduler and worker results to GitHub. The evidence gate checks the runtime digest reported by Kubernetes and publishes a typed result. JIT caches for a pinned image can be reused across runs.
 

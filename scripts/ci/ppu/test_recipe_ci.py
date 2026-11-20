@@ -10,7 +10,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from ppu_recipe import (
     DEFAULT_POLICY_ROOT,
@@ -25,7 +26,7 @@ from recipe_cluster_config import load_settings
 from recipe_cluster_diagnostics import diagnostic_codes
 from recipe_publish import publish, validate
 from recipe_report import legacy_result
-from recipe_runner import metrics_zero, read_eval_reviews, run
+from recipe_runner import cached_model_path, metrics_zero, read_eval_reviews, run
 from recipe_select import select
 
 
@@ -118,6 +119,46 @@ class RecipeContractTest(unittest.TestCase):
                 probes.assert_called_once()
                 self.assertIsNone(result["layer_override"])
                 self.assertNotIn("fallback_reason", result)
+
+    def test_cached_model_requires_the_exact_snapshot_offline(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            checkpoint = root / "checkpoint"
+            checkpoint.mkdir()
+            snapshot = root / "snapshot"
+            snapshot.symlink_to(checkpoint, target_is_directory=True)
+            for name in ("config.json", "tokenizer.json"):
+                (checkpoint / name).write_text("{}")
+            (checkpoint / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": {"weight": "weight.safetensors"}})
+            )
+            shard = checkpoint / "weight.safetensors"
+            shard.write_bytes(b"fixture")
+            repo_id = "example/quantized-model"
+            revision = "a" * 40
+            download = Mock(return_value=str(snapshot))
+            with (
+                patch.dict(os.environ, {"HF_HUB_CACHE": str(root)}),
+                patch.dict(
+                    sys.modules,
+                    {"huggingface_hub": SimpleNamespace(snapshot_download=download)},
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "pinned model snapshot"):
+                    cached_model_path(repo_id, "main")
+                download.assert_not_called()
+                self.assertEqual(
+                    cached_model_path(repo_id, revision), str(checkpoint.resolve())
+                )
+                download.assert_called_once_with(
+                    repo_id=repo_id,
+                    revision=revision,
+                    cache_dir=root,
+                    local_files_only=True,
+                )
+                shard.unlink()
+                with self.assertRaisesRegex(ValueError, "missing shards"):
+                    cached_model_path(repo_id, revision)
 
     def test_deepseek_attention_parallelism_uses_eight_devices(self):
         policy = DEFAULT_POLICY_ROOT / "models/deepseek-v4-flash.yaml"
@@ -459,6 +500,7 @@ class ClusterTransportTest(unittest.TestCase):
                 (backend / "submit.sh").write_text(
                     'test "$INPUT_NNODES/$INPUT_NPROC_PER_NODE/$INPUT_NODE_SELECTOR" = "0/8/board-type=ZW-M890P" || exit 1\n'
                     'test -f "$SOURCE_STAGE_DIR" || exit 1\n'
+                    'jq -e --arg cache "$PPU_CI_HF_CACHE_ROOT" --arg revision "$PPU_CI_GLM53_MODEL_REVISION" \'.PPU_CI_HF_CACHE_ROOT == $cache and .PPU_CI_HF_MODEL_REVISION == $revision\' <<< "$USER_ENV_JSON" >/dev/null || exit 1\n'
                     'printf "%s\\n" "$INJECTED_FIXTURE"\n'
                     'printf "job_status=scheduled\\nstart_time=1\\ndeadline=2\\nqueue_duration_seconds=7\\n" >> "$GITHUB_OUTPUT"\n'
                 )
@@ -497,7 +539,8 @@ class ClusterTransportTest(unittest.TestCase):
                     "PPU_CI_K8S_STAGE_ROOT": str(staging),
                     "PPU_CI_SOURCE_SHA": result["source_sha"],
                     "PPU_CI_JIT_ROOT": str(root / "jit"),
-                    "PPU_CI_GLM53_MODEL_PATH": str(root / "model"),
+                    "PPU_CI_HF_CACHE_ROOT": str(root / "cache"),
+                    "PPU_CI_GLM53_MODEL_REVISION": "c" * 40,
                     "PPU_CI_RECIPE_RUNTIME_IMAGE": result["runtime_image"],
                     "INJECTED_FIXTURE": injected,
                 }

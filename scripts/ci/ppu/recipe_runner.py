@@ -370,18 +370,46 @@ def run_evaluation(stage, config):
     return json.loads((RESULTS / "gsm8k-result.json").read_text())
 
 
+def cached_model_path(repo_id, revision):
+    from huggingface_hub import snapshot_download
+
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise ValueError("expected a pinned model snapshot")
+    cache = Path(os.environ["HF_HUB_CACHE"])
+    snapshot = Path(
+        snapshot_download(
+            repo_id=repo_id, revision=revision, cache_dir=cache, local_files_only=True
+        )
+    )
+    for name in ("config.json", "tokenizer.json"):
+        if not (snapshot / name).is_file():
+            raise ValueError("offline model snapshot lacks metadata")
+    index = json.loads((snapshot / "model.safetensors.index.json").read_text())
+    shards = set(index["weight_map"].values())
+    if not shards or any(
+        Path(name).is_absolute()
+        or ".." in Path(name).parts
+        or not (snapshot / name).is_file()
+        or (snapshot / name).stat().st_size == 0
+        for name in shards
+    ):
+        raise ValueError("offline model snapshot has missing shards")
+    return str(snapshot.resolve(strict=True))
+
+
 def run(policy_path, tier, queue_s):
     policy = _load_yaml(policy_path)
     recipe = REPO_ROOT / policy["recipe"]
     assets = RESULTS.parent / "assets.json"
-    model_asset = _load_yaml(recipe)["ppu"]["assets"]
+    recipe_ppu = _load_yaml(recipe)["ppu"]
+    revision = os.environ.get("PPU_CI_HF_MODEL_REVISION")
+    if revision is None:
+        model_path = os.environ["PPU_RECIPE_CONTAINER_MODEL"]
+    else:
+        phase("model_cache_check")
+        model_path = cached_model_path(recipe_ppu["hf_model_id"], revision)
     assets.write_text(
-        json.dumps(
-            {
-                name: os.environ["PPU_RECIPE_CONTAINER_MODEL"]
-                for name in model_asset.values()
-            }
-        )
+        json.dumps({name: model_path for name in recipe_ppu["assets"].values()})
     )
 
     resolve = dict(

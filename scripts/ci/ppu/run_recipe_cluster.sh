@@ -169,6 +169,7 @@ export PPU_CI_WORKER_ARTIFACT_DIR
 USER_ENV_JSON=$(python3 -B - <<'PY'
 import json
 import os
+import re
 from pathlib import PurePosixPath
 
 keys = ["TIER", "PPU_CI_SOURCE_SHA", "PPU_CI_WORKER_ARTIFACT_DIR"]
@@ -178,16 +179,25 @@ if os.environ["TIER"] == "legacy":
         "PPU_CI_DFLASH_MODEL_PATH", "PPU_CI_EVAL_CACHE",
     ]
 else:
-    keys += ["MODEL_KEY", "PPU_CI_RECIPE_IMAGE_KEY"]
-    model = os.environ["MODEL_KEY"]
-    keys += ["PPU_CI_GLM53_MODEL_PATH" if model == "glm-5.3" else "PPU_CI_DSV4_FLASH_MODEL_PATH"]
+    keys += ["MODEL_KEY", "PPU_CI_RECIPE_IMAGE_KEY", "PPU_CI_HF_CACHE_ROOT"]
     if os.environ["TIER"] == "model_sanity":
         keys += ["PPU_CI_GSM8K_PATH"]
 values = {key: os.environ[key] for key in keys}
+if os.environ["TIER"] != "legacy":
+    revision_key = {
+        "glm-5.3": "PPU_CI_GLM53_MODEL_REVISION",
+        "deepseek-v4-flash": "PPU_CI_DSV4_FLASH_MODEL_REVISION",
+    }[os.environ["MODEL_KEY"]]
+    revision = os.environ[revision_key]
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise ValueError("expected a pinned model snapshot")
+    values["PPU_CI_HF_MODEL_REVISION"] = revision
 for key, value in values.items():
     if not value or any(ord(char) < 32 for char in value):
         raise ValueError("invalid worker input")
-    if key.startswith("PPU_CI_") and key not in ("PPU_CI_SOURCE_SHA", "PPU_CI_RECIPE_IMAGE_KEY"):
+    if key.startswith("PPU_CI_") and key not in (
+        "PPU_CI_SOURCE_SHA", "PPU_CI_RECIPE_IMAGE_KEY", "PPU_CI_HF_MODEL_REVISION"
+    ):
         if not PurePosixPath(value).is_absolute() or ".." in PurePosixPath(value).parts:
             raise ValueError("expected an absolute worker path")
 print(json.dumps(values))
