@@ -248,6 +248,84 @@ class RecipeContractTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "missing shards"):
                     cached_model_path(repo_id, revision)
 
+    def test_1017_metadata_probe_is_limited_to_fast_sanity(self):
+        policy = DEFAULT_POLICY_ROOT / "models/deepseek-v4.1-flash-1017.yaml"
+        published = (
+            "T-HEAD/DeepSeek-V4.1-Flash-1017-MoE-Quant-W-MXFP4-A-MXFP4"
+            "-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken"
+        )
+        alias = "T-HEAD/DeepSeek-V4.1-Flash-1017-MXFP4-FP8-Engram-MXFP8"
+        with (
+            patch.dict(os.environ, {"PPU_CI_HF_CACHE_ROOT": "/cache"}, clear=True),
+            patch("recipe_runner.phase"),
+            patch(
+                "recipe_runner.cached_model_path", side_effect=FileNotFoundError
+            ) as load,
+        ):
+            with self.assertRaises(FileNotFoundError):
+                run(policy, "fast_sanity", 0)
+            load.assert_called_once_with(
+                published,
+                "8916a3247f06596a616aac54e683eeaf2bbc963f",
+                metadata_only=True,
+            )
+            load.reset_mock()
+            with self.assertRaises(FileNotFoundError):
+                run(policy, "model_sanity", 0)
+            load.assert_called_once_with(alias, None, metadata_only=False)
+
+    def test_metadata_probe_uses_its_own_offline_cache(self):
+        repo_id = "example/quantized-model"
+        revision = "a" * 40
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cache = root / ".sglang-metadata-probe"
+            repo = cache / "models--example--quantized-model"
+            (repo / "refs").mkdir(parents=True)
+            (repo / "refs/main").write_text(revision)
+            snapshot = repo / "snapshots" / revision
+            snapshot.mkdir(parents=True)
+            for name in ("config.json", "tokenizer.json"):
+                (snapshot / name).write_text("{}")
+            weight_index = snapshot / "model.safetensors.index.json"
+            weight_index.write_text(
+                json.dumps({"weight_map": {"weight": "weight.safetensors"}})
+            )
+            download = Mock(return_value=str(snapshot))
+            with (
+                patch.dict(os.environ, {"HF_HUB_CACHE": str(root)}),
+                patch.dict(
+                    sys.modules,
+                    {
+                        "huggingface_hub": SimpleNamespace(snapshot_download=download),
+                        "huggingface_hub.file_download": SimpleNamespace(
+                            repo_folder_name=Mock(return_value=repo.name)
+                        ),
+                        "huggingface_hub.utils": SimpleNamespace(
+                            validate_repo_id=Mock()
+                        ),
+                    },
+                ),
+            ):
+                self.assertEqual(
+                    cached_model_path(repo_id, None, metadata_only=True),
+                    (str(snapshot.resolve()), revision),
+                )
+                download.assert_called_once_with(
+                    repo_id=repo_id,
+                    revision=revision,
+                    cache_dir=cache,
+                    local_files_only=True,
+                )
+                with self.assertRaises(FileNotFoundError):
+                    cached_model_path(repo_id, None)
+                self.assertEqual(download.call_count, 1)
+                weight_index.write_text(
+                    json.dumps({"weight_map": {"weight": "../unexpected"}})
+                )
+                with self.assertRaisesRegex(ValueError, "invalid weight index"):
+                    cached_model_path(repo_id, None, metadata_only=True)
+
     def test_new_model_ref_is_resolved_to_a_concrete_revision(self):
         repo_id = "example/quantized-model"
         revision = "b" * 40
