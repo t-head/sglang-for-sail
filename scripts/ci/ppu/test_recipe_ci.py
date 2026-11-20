@@ -297,6 +297,28 @@ class RecipeContractTest(unittest.TestCase):
         ):
             self.assertNotIn(flag, flags)
 
+    def test_qwen_flash_next_model_sanity_allows_slow_weight_loading(self):
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            patch.dict(
+                os.environ,
+                {"PPU_RECIPE_CONTAINER_MODEL": temp, "RECIPE_PPU_COUNT": "4"},
+            ),
+            patch("recipe_runner.RESULTS", Path(temp) / "results"),
+            patch(
+                "recipe_runner.server", side_effect=RuntimeError("stop at launch")
+            ) as launch,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop at launch"):
+                run(
+                    DEFAULT_POLICY_ROOT / "models/qwen3.8-flash-next-tp4.yaml",
+                    "model_sanity",
+                    0,
+                )
+            config, stage, _, timeout = launch.call_args.args
+            self.assertEqual((stage, timeout), ("model_sanity", 5100))
+            self.assertNotIn("--load-format", config["flags"])
+
     def test_policy_switches(self):
         policy = DEFAULT_POLICY_ROOT / "models/glm-5.3.yaml"
         recipe = REPO_ROOT / _load_yaml(policy)["recipe"]
