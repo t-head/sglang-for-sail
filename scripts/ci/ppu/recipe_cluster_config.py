@@ -47,7 +47,13 @@ def load_settings(directory, expected):
     try:
         if os.fstat(fd).st_mode & 0o007:
             raise ValueError("configuration directory is accessible to others")
-        handle = os.open("config.json", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+        # Keep existing workflow runs pinned to their original configuration.
+        try:
+            handle = os.open(
+                f"config.{expected}.json", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd
+            )
+        except FileNotFoundError:
+            handle = os.open("config.json", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
         with os.fdopen(handle, "rb") as stream:
             info = os.fstat(stream.fileno())
             if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o007:

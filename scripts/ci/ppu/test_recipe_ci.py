@@ -20,6 +20,7 @@ from ppu_recipe import (
     validate_paths,
 )
 from recipe_bundle import sha256, wheel_inventory
+from recipe_cluster_config import load_settings
 from recipe_cluster_diagnostics import diagnostic_codes
 from recipe_publish import publish, validate
 from recipe_report import legacy_result
@@ -303,6 +304,30 @@ class RunEvidenceTest(unittest.TestCase):
 
 
 class ClusterConfigBootstrapTest(unittest.TestCase):
+    def test_active_runs_keep_their_pinned_private_config(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            key = "PPU_CI_GLM53_MODEL_PATH"
+            old_settings = {key: "/old-fixture"}
+            new_settings = {key: "/new-fixture"}
+            original = root / "config.json"
+            original.write_text(json.dumps({"settings": old_settings}))
+            original.chmod(0o600)
+            old_digest = sha256(original)
+
+            staged = root / "staged.json"
+            staged.write_text(json.dumps({"settings": new_settings}))
+            staged.chmod(0o600)
+            new_digest = sha256(staged)
+            versioned = staged.rename(root / f"config.{new_digest}.json")
+
+            self.assertEqual(load_settings(root, old_digest), old_settings)
+            self.assertEqual(load_settings(root, new_digest), new_settings)
+            versioned.write_text(original.read_text())
+            with self.assertRaisesRegex(ValueError, "configuration digest mismatch"):
+                load_settings(root, new_digest)
+            self.assertEqual(load_settings(root, old_digest), old_settings)
+
     def test_prior_cluster_diagnostics_produce_fixed_codes(self):
         value = "ImagePullBackOff Permission denied " + "/" + "nas" + "_aisw/example"
         self.assertEqual(diagnostic_codes(value), ["image_pull", "permission_denied"])

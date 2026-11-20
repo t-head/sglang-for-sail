@@ -55,7 +55,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  PPU_CI_K8S_CONFIG_SHA256: '2837a41fc2d4052482fec5de222eb4b0a7e44fc68f827923c9633ae217cf112a'
+  PPU_CI_K8S_CONFIG_SHA256: 'aa2c33c83623af1cab0f0f9a1e74c9fc456e7903130667f45540c38ba6383f10'
   GIT_CONFIG_NOSYSTEM: '1'
   TIER: ${{ inputs.tier || 'model_sanity' }}
 
