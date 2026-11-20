@@ -25,7 +25,7 @@ from recipe_bundle import sha256, wheel_inventory
 from recipe_cluster_config import load_settings
 from recipe_cluster_diagnostics import diagnostic_codes
 from recipe_publish import publish, validate
-from recipe_report import legacy_result
+from recipe_report import legacy_result, main as report_recipe
 from recipe_runner import cached_model_path, metrics_zero, read_eval_reviews, run
 from recipe_select import select
 
@@ -238,6 +238,33 @@ class RunEvidenceTest(unittest.TestCase):
             summary.write_text("".join(json.dumps(row) + "\n" for row in rows))
             with self.assertRaisesRegex(ValueError, "duplicate"):
                 read_eval_reviews(Path(root), 1319, 0.9689, 1319)
+
+    def test_report_publishes_failure_when_worker_outputs_are_unreadable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            destination = Path(temp) / "public.json"
+            for outcome in ("failure", "success"):
+                with (
+                    self.subTest(outcome=outcome),
+                    patch.dict(
+                        os.environ,
+                        {
+                            "PPU_CI_ARTIFACT_DIR": temp,
+                            "RECIPE_OUTCOME": outcome,
+                            "TIER": "fast_sanity",
+                            "MODEL_KEY": "glm-5.3",
+                            "PPU_CI_SOURCE_SHA": "a" * 40,
+                        },
+                    ),
+                    patch.object(sys, "argv", ["recipe_report", str(destination)]),
+                    patch("recipe_report.retain", side_effect=PermissionError),
+                    patch.object(Path, "is_file", side_effect=PermissionError),
+                ):
+                    self.assertEqual(report_recipe(), 1)
+                    result = json.loads(destination.read_text())
+                    self.assertEqual(result["outcome"], "fail")
+                    self.assertEqual(result["failure_phase"], "private_retention")
+                    self.assertFalse(result["private_retention"])
+                validate(result)
 
     def test_fast_evidence_accepts_direct_full_and_previous_fallback(self):
         result = fast_result()
