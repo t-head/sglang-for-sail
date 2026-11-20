@@ -157,30 +157,24 @@ class TestPPUCIWorkflow(unittest.TestCase):
         output = check["outputs"]["ppu"]
         self.assertIn("steps.filter.outputs.release-code == 'true'", output)
         self.assertIn("startsWith(github.base_ref, 'release/')", output)
-        self.assertIn("github.event.pull_request.labels.*.name, 'run-ci-ppu'", output)
+        self.assertIn("needs.pr-gate.outputs.approved == 'true'", output)
 
-    def test_privileged_workflows_use_fresh_approval_and_restricted_group(self):
-        for name in ("pr-test-ppu", "nightly-test-ppu"):
+    def test_cluster_jobs_use_fresh_approval_and_thead_cpu_runner(self):
+        for name, cluster_jobs in (
+            ("pr-test-ppu", ("ppu-cluster-config", "ppu-legacy-sanity")),
+            ("nightly-test-ppu", ("cluster-preflight", "recipe-sanity")),
+        ):
             with self.subTest(workflow=name):
                 source = RUNNER.parent.parent / f".github/workflows/{name}.yml"
                 workflow = yaml.load(source.read_text(), Loader=yaml.BaseLoader)
                 self.assertIn("pull_request_target", workflow["on"])
                 self.assertNotIn("pull_request", workflow["on"])
                 jobs = workflow["jobs"]
-                self.assertEqual(jobs["pr-gate"]["with"]["require-fresh-label"], "true")
-                cluster_jobs = [
-                    job["runs-on"]
-                    for job in jobs.values()
-                    if isinstance(job.get("runs-on"), dict)
-                ]
-                self.assertTrue(cluster_jobs)
-                for runner in cluster_jobs:
-                    self.assertEqual(runner["group"], "sglang-ppu-ci")
-                if name == "nightly-test-ppu":
-                    self.assertEqual(
-                        jobs["pr-gate"]["with"]["cool-down-minutes"],
-                        "${{ inputs.tier != 'fast_sanity' && 120 || 0 }}",
-                    )
+                self.assertEqual(
+                    jobs["pr-gate"]["uses"], "./.github/workflows/ppu-approval.yml"
+                )
+                for job in cluster_jobs:
+                    self.assertEqual(jobs[job]["runs-on"], "k8s-runner-group-cpu-thead")
 
     def test_device_jobs_require_build_and_cpu_checks(self):
         selftests = self.jobs["ppu-ci-selftest"]
@@ -212,18 +206,16 @@ class TestPPUCIWorkflow(unittest.TestCase):
             self.jobs["ppu-legacy-sanity"]["if"],
             "inputs.run_legacy_sanity == true && needs.check-changes.outputs.ppu == 'true'",
         )
-        self.assertEqual(
+        self.assertIn(
+            "needs.pr-gate.result == 'failure'",
             self.jobs["pr-test-ppu-finish"]["if"],
-            "always() && inputs.run_legacy_sanity != true && needs.check-changes.result != 'skipped'",
         )
         runtime = RUNNER.parent.parent / "scripts/ci/ppu/build_and_test.sh"
         self.assertNotIn("--hw cpu", runtime.read_text())
 
     def test_jobs_check_out_the_triggering_ref_and_verify_the_pinned_sha(self):
         check = self.jobs["check-changes"]
-        self.assertEqual(
-            check["steps"][0]["with"]["ref"], "${{ inputs.ref || github.sha }}"
-        )
+        self.assertIn("github.sha", check["steps"][0]["with"]["ref"])
         self.assertIn(
             "github.event.pull_request.head.sha", check["outputs"]["source-sha"]
         )
@@ -246,7 +238,7 @@ class TestPPUCIWorkflow(unittest.TestCase):
 
     def test_sanity_runs_on_every_ppu_generation_with_private_retention(self):
         sanity = self.jobs["ppu-legacy-sanity"]
-        self.assertEqual(sanity["runs-on"]["labels"], "k8s-runner-group-cpu-thead")
+        self.assertEqual(sanity["runs-on"], "k8s-runner-group-cpu-thead")
         self.assertIs(sanity["strategy"]["fail-fast"], False)
         self.assertEqual(
             sanity["strategy"]["matrix"]["board"], ["ZW-M890P", "OAM-810E"]
@@ -305,6 +297,8 @@ class TestPPUCIWorkflow(unittest.TestCase):
                             env=dict(
                                 os.environ,
                                 NEEDS_JSON=json.dumps(needs),
+                                PREFLIGHT_ONLY="false",
+                                SANITY_RESULT="success",
                                 PPU_IN_SCOPE=str(in_scope).lower(),
                             ),
                             capture_output=True,

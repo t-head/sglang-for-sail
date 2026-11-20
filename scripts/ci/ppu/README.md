@@ -6,7 +6,7 @@ The release branch owns the SGLang serving recipes, test policies and 890P accur
 - **Model Sanity** runs real weights once per model. It runs GSM8K main (1,319 questions), reconciles each scored sample with the reference band, verifies the KV gauge after a cache flush, and runs the native microbench at concurrency 1 and 16. The same-server performance measurements are diagnostic.
 - **Legacy single-device sanity** runs EAGLE3 and DFlash on both board types when explicitly requested. Each test reports its original result and the runner retains the raw output privately.
 
-For release PRs, a maintainer with write access must first apply `run-ci`, then apply `run-ci-ppu` for Fast Sanity or `run-ci-ppu-nightly` for Model Sanity. Reapply the workload label after a new push to approve the new head SHA. Apply the same labels to fork PRs after reviewing the exact revision. Nightly dispatch and reusable inputs also allow an exact model filter and reuse of a candidate build with `skip_wheel_build` and `wheel_artifact_run_id`.
+For release PRs, a maintainer with write access must apply `run-ci` and `run-ci-ppu` for Fast Sanity or `run-ci-ppu-nightly` for Model Sanity. The labels may arrive in either order. A rerun rechecks the PR timeline. After a new push, remove and reapply the workload label to approve the current head. Apply the same labels to fork PRs after reviewing the exact revision. Nightly dispatch and reusable inputs also allow an exact model filter and reuse of a candidate build with `skip_wheel_build` and `wheel_artifact_run_id`.
 
 The PR workflow finish job requires Linux infrastructure selftests, the native build, runner preflight and Recipe Fast Sanity for changes in PPU scope. PR-triggered workflows use the protected base branch's workflow and the approved head SHA as the test source. To run the separate single-device workflow on the release branch after it lands, dispatch the same workflow in legacy-only mode.
 
@@ -19,12 +19,9 @@ The reusable workflow accepts the same boolean input and a candidate `ref`.
 
 ## Provision the cluster runner
 
-Register the `k8s-runner-group-cpu-thead` runner in the `sglang-ppu-ci` runner group before enabling the workflows. Restrict the group to this repository and these selected workflows at the protected release ref:
+Cluster jobs use the T-Head CPU orchestration runner label `k8s-runner-group-cpu-thead`. PR jobs require revision-specific approval before reaching the cluster runner.
 
-- `t-head/sglang-for-sail/.github/workflows/pr-test-ppu.yml@refs/heads/release/v0.5.23`
-- `t-head/sglang-for-sail/.github/workflows/nightly-test-ppu.yml@refs/heads/release/v0.5.23`
-
-Remove the runner's access through the default or other unrestricted groups. Add protected branch refs to the allowlist when deploying these workflows on those branches. The branch must already contain the trusted workflow to run its PR events.
+For pre-merge validation, dispatch `pr-test-ppu.yml` on a same-repository maintainer branch with `preflight_only=true`. This runs the Linux selftests and the private configuration checks via the direct and reusable workflows. A cross-branch caller can request `tier: cluster_preflight` from the same reusable workflow.
 
 The runner uses the pinned T-Head Cluster Run backend. Each Recipe job requests one 890P Pod with the width resolved from its selected policy and Recipe (2, 4, or 8 cards). The worker verifies that its visible card count and resolved Recipe match this allocation. Each existing single-device test job requests one card on its selected board. The CPU runner passes model and dataset paths privately to the worker from its service environment. A task-specific shared configuration can supply the same variables. The workflow pins the configuration digest and verifies access in a CPU-only job before scheduling PPU Pods. Provision the task configuration and output directory for the runner account before starting jobs. Keep the configuration files at mode 0600 and the private directories at mode 0700.
 
