@@ -283,6 +283,21 @@ class RecipeContractTest(unittest.TestCase):
         self.assertIsNone(stage["limit"])
         self.assertEqual(stage["seed"], 42)
         self.assertEqual(stage["eval_batch_size"], 128)
+        golden_path = (
+            REPO_ROOT
+            / f"test/ppu/golden/accuracy_{config['golden_model_key']}_890p.json"
+        )
+        golden = json.loads(golden_path.read_text())
+        self.assertEqual(golden["model"], config["golden_model_key"])
+        self.assertEqual(golden["checkpoint"], config["hf_model_id"])
+        self.assertEqual(golden["serving"]["ppu_count"], config["ppu_count"])
+        self.assertEqual(golden["serving"]["data_parallel_size"], 8)
+        self.assertTrue(golden["serving"]["enable_expert_parallel"])
+        self.assertEqual(golden["generation"], stage["generation"])
+        self.assertEqual(golden["dataset"]["dataset_id"], stage["dataset"])
+        self.assertEqual(golden["dataset"]["num_expected"], 1319)
+        self.assertEqual(golden["score_num"], 1287)
+        self.assertEqual(golden["score"], 0.9757)
 
     def test_fast_sanity_policy_rejects_an_unknown_cache_value(self):
         policy = _load_yaml(DEFAULT_POLICY_ROOT / "models/qwen3.8-flash-next.yaml")
