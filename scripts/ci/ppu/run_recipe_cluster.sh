@@ -187,6 +187,7 @@ if os.environ["TIER"] != "legacy":
     revision_key = {
         "glm-5.3": "PPU_CI_GLM53_MODEL_REVISION",
         "deepseek-v4-flash": "PPU_CI_DSV4_FLASH_MODEL_REVISION",
+        "deepseek-v4-flash-tp8": "PPU_CI_DSV4_FLASH_MODEL_REVISION",
     }.get(os.environ["MODEL_KEY"])
     if revision_key is not None:
         revision = os.environ[revision_key]

@@ -56,6 +56,7 @@ class RecipeContractTest(unittest.TestCase):
             select("fast_sanity", ""),
             {
                 "include": [
+                    {"model": "deepseek-v4-flash-tp8"},
                     {"model": "deepseek-v4-flash"},
                     {"model": "deepseek-v4.1-flash"},
                     {"model": "glm-5.3"},
@@ -67,6 +68,10 @@ class RecipeContractTest(unittest.TestCase):
     def test_nightly_exact_filter(self):
         self.assertEqual(
             select("model_sanity", "glm-5.3"), {"include": [{"model": "glm-5.3"}]}
+        )
+        self.assertEqual(
+            select("model_sanity", "deepseek-v4-flash-tp8"),
+            {"include": [{"model": "deepseek-v4-flash-tp8"}]},
         )
         with self.assertRaises(ValueError):
             select("model_sanity", "glm")
@@ -224,6 +229,28 @@ class RecipeContractTest(unittest.TestCase):
                 page_size = int(flags[flags.index("--page-size") + 1])
                 chunk_size = int(flags[flags.index("--chunked-prefill-size") + 1])
                 self.assertEqual(chunk_size % (8 * page_size), 0)
+
+    def test_deepseek_tp8_uses_same_checkpoint_and_no_attention_dp_or_ep(self):
+        policy = DEFAULT_POLICY_ROOT / "models/deepseek-v4-flash-tp8.yaml"
+        recipe = REPO_ROOT / _load_yaml(policy)["recipe"]
+        default_policy = DEFAULT_POLICY_ROOT / "models/deepseek-v4-flash.yaml"
+        for tier in ("fast_sanity", "model_sanity"):
+            with self.subTest(tier=tier):
+                resolved = resolve_recipe(recipe, policy_path=policy, tier=tier)
+                default = resolve_recipe(recipe, policy_path=default_policy, tier=tier)
+                self.assertEqual(resolved["preset"], "tp8")
+                self.assertEqual(resolved["ppu_count"], 8)
+                self.assertEqual(resolved["hf_model_id"], default["hf_model_id"])
+                self.assertNotEqual(resolved["config_digest"], default["config_digest"])
+                flags = resolved["flags"]
+                self.assertEqual(flags[flags.index("--tp-size") + 1], "8")
+                for flag in (
+                    "--attn-dp-size",
+                    "--enable-dp-lm-head",
+                    "--moe-a2a-backend",
+                    "--deepep-mode",
+                ):
+                    self.assertNotIn(flag, flags)
 
     def test_required_parser_fails_if_runtime_unavailable(self):
         with patch("ppu_recipe._build_sglang_serve_parser", side_effect=ImportError):
@@ -497,6 +524,8 @@ class ClusterTransportTest(unittest.TestCase):
         injected = "/" + "nas" + "_aisw/fixture " + ".".join(("10", "4", "5", "6"))
         for model, tampered in (
             ("glm-5.3", False),
+            ("deepseek-v4-flash", False),
+            ("deepseek-v4-flash-tp8", False),
             ("deepseek-v4.1-flash", False),
             ("glm-5.3", True),
         ):
@@ -559,7 +588,10 @@ class ClusterTransportTest(unittest.TestCase):
                 (backend / "submit.sh").write_text(
                     'test "$INPUT_NNODES/$INPUT_NPROC_PER_NODE/$INPUT_NODE_SELECTOR" = "0/8/board-type=ZW-M890P" || exit 1\n'
                     'test -f "$SOURCE_STAGE_DIR" || exit 1\n'
-                    'jq -e --arg cache "$PPU_CI_HF_CACHE_ROOT" --arg model "$MODEL_KEY" --arg revision "$PPU_CI_GLM53_MODEL_REVISION" \'.PPU_CI_HF_CACHE_ROOT == $cache and .MODEL_KEY == $model and (if $model == "glm-5.3" then .PPU_CI_HF_MODEL_REVISION == $revision else (has("PPU_CI_HF_MODEL_REVISION") | not) end)\' <<< "$USER_ENV_JSON" >/dev/null || exit 1\n'
+                    'jq -e --arg cache "$PPU_CI_HF_CACHE_ROOT" --arg model "$MODEL_KEY" '
+                    '--arg revision "$EXPECTED_REVISION" \'.PPU_CI_HF_CACHE_ROOT == $cache '
+                    'and .MODEL_KEY == $model and (.PPU_CI_HF_MODEL_REVISION // "") == $revision\' '
+                    '<<< "$USER_ENV_JSON" >/dev/null || exit 1\n'
                     'printf "%s\\n" "$INJECTED_FIXTURE"\n'
                     'printf "job_status=scheduled\\nstart_time=1\\ndeadline=2\\nqueue_duration_seconds=7\\n" >> "$GITHUB_OUTPUT"\n'
                 )
@@ -600,6 +632,12 @@ class ClusterTransportTest(unittest.TestCase):
                     "PPU_CI_JIT_ROOT": str(root / "jit"),
                     "PPU_CI_HF_CACHE_ROOT": str(root / "cache"),
                     "PPU_CI_GLM53_MODEL_REVISION": "c" * 40,
+                    "PPU_CI_DSV4_FLASH_MODEL_REVISION": "d" * 40,
+                    "EXPECTED_REVISION": {
+                        "glm-5.3": "c" * 40,
+                        "deepseek-v4-flash": "d" * 40,
+                        "deepseek-v4-flash-tp8": "d" * 40,
+                    }.get(model, ""),
                     "PPU_CI_RECIPE_RUNTIME_IMAGE": result["runtime_image"],
                     "INJECTED_FIXTURE": injected,
                 }
