@@ -14,8 +14,6 @@ import unittest
 import uuid
 from pathlib import Path
 
-from sglang.test.test_utils import CustomTestCase
-
 if sys.platform == "linux":
     import fcntl
 
@@ -157,7 +155,7 @@ else:
     sys.platform == "linux" and shutil.which("flock"),
     "The Docker host launcher requires Linux and util-linux flock",
 )
-class TestPPUCIDocker(CustomTestCase):
+class TestPPUCIDocker(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ppu-docker-test-")
         self.addCleanup(self.temp.cleanup)
@@ -445,6 +443,7 @@ class TestPPUCIDocker(CustomTestCase):
         for event in events:
             if event["args"][0] in ("stop", "rm"):
                 self.assertEqual(event["args"][-1], name)
+        self.assertEqual(commands.count("run"), 1)
         ownership = events[-1]["args"]
         self.assertEqual(ownership[0], "run")
         self.assertIn(f"{os.getuid()}:{os.getgid()}", ownership)
@@ -452,7 +451,10 @@ class TestPPUCIDocker(CustomTestCase):
         self.assertIn("NVIDIA_VISIBLE_DEVICES=void", ownership)
         self.assertIn(IMAGE_ID, ownership)
         self.assertFalse((self.root / "container.json").exists())
-        self.assertEqual(len(list(self.artifacts.glob("*/ownership-recovered"))), 1)
+        mount = ownership[ownership.index("--mount") + 1]
+        mount_fields = dict(part.split("=", 1) for part in mount.split(","))
+        recovered = Path(mount_fields["source"])
+        self.assertTrue((recovered / "ownership-recovered").is_file())
         with self.lock.open("a") as handle:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return create

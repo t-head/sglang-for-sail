@@ -73,47 +73,7 @@ def load_settings(directory, expected):
     return values
 
 
-def handoff(directory, expected, uid, gid):
-    """Give the CPU runner only the three provisioned task objects."""
-    if not directory.is_absolute() or directory.name != CONFIG_NAME or uid != 1001:
-        raise ValueError("invalid private configuration handoff")
-    if gid < 0:
-        raise ValueError("invalid runner group")
-    load_settings(directory, expected)
-    parent = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        config = os.open("config.json", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
-        try:
-            output = os.open(
-                "output", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent
-            )
-            try:
-                metadata = [os.fstat(fd) for fd in (config, output, parent)]
-                if [stat.S_IMODE(info.st_mode) for info in metadata] != [
-                    0o600,
-                    0o700,
-                    0o700,
-                ]:
-                    raise ValueError("handoff expects the original task-private modes")
-                if len({info.st_uid for info in metadata} - {uid}) > 1:
-                    raise ValueError("handoff has unexpected mixed ownership")
-                with open(config, "rb", closefd=False) as stream:
-                    if hashlib.sha256(stream.read(8193)).hexdigest() != expected:
-                        raise ValueError("handoff digest mismatch")
-                for fd in (config, output, parent):
-                    os.fchown(fd, uid, gid)
-            finally:
-                os.close(output)
-        finally:
-            os.close(config)
-    finally:
-        os.close(parent)
-
-
 def main():
-    if len(sys.argv) == 6 and sys.argv[1] == "--handoff":
-        handoff(Path(sys.argv[2]), sys.argv[3], int(sys.argv[4]), int(sys.argv[5]))
-        return
     backend = Path(os.environ["GITHUB_WORKSPACE"]) / ".ppu-infra"
     head = subprocess.check_output(
         ["git", "-C", str(backend), "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
@@ -122,32 +82,7 @@ def main():
         raise ValueError("Cluster Run revision mismatch")
     directory = staging_root(backend) / CONFIG_NAME
     expected = os.environ["PPU_CI_K8S_CONFIG_SHA256"]
-    try:
-        values = load_settings(directory, expected)
-    except PermissionError:
-        # The operator initially owns the task directory. The runner container's
-        # documented sudo capability transfers only that authenticated directory,
-        # its manifest and its output parent once.
-        subprocess.run(
-            [
-                "sudo",
-                "-n",
-                "--",
-                sys.executable,
-                "-I",
-                "-B",
-                str(Path(__file__).resolve()),
-                "--handoff",
-                str(directory),
-                expected,
-                str(os.geteuid()),
-                str(os.getegid()),
-            ],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        values = load_settings(directory, expected)
+    values = load_settings(directory, expected)
     retained = directory / "output/retained"
     retained.mkdir(mode=0o700, exist_ok=True)
     info = retained.lstat()
