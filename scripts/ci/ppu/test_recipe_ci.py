@@ -26,7 +26,13 @@ from recipe_cluster_config import load_settings
 from recipe_cluster_diagnostics import diagnostic_codes
 from recipe_publish import publish, validate
 from recipe_report import legacy_result
-from recipe_runner import cached_model_path, metrics_zero, read_eval_reviews, run
+from recipe_runner import (
+    cached_model_path,
+    metrics_zero,
+    probes,
+    read_eval_reviews,
+    run,
+)
 from recipe_select import select
 
 
@@ -51,6 +57,45 @@ def fast_result():
 
 
 class RecipeContractTest(unittest.TestCase):
+    def test_fast_probe_accepts_reasoning_only_completion_with_complete_sse(self):
+        settings = {"prompt": "Compute 6 * 7.", "max_tokens": 16}
+        answer = {
+            "message": {"content": None, "reasoning_content": "reasoning text"},
+            "finish_reason": "length",
+        }
+        stream = io.BytesIO(
+            b'data: {"choices":[{"delta":{"reasoning_content":"R"},"finish_reason":null}]}\n\n'
+            b'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\n'
+            b"data: [DONE]\n\n"
+        )
+        stream.headers = Mock()
+        stream.headers.get_content_type.return_value = "text/event-stream"
+        with tempfile.TemporaryDirectory() as temp:
+            results = Path(temp) / "results"
+            results.mkdir()
+            with patch("recipe_runner.RESULTS", results):
+                response = io.BytesIO(json.dumps({"choices": [answer]}).encode())
+                with patch("recipe_runner.request", side_effect=(response, stream)):
+                    probes(settings, fast=True)
+                self.assertEqual(
+                    json.loads((results / "chat-probe-response.json").read_text()),
+                    answer,
+                )
+                for fast, choice in (
+                    (True, dict(answer, finish_reason=None)),
+                    (True, dict(answer, message={"content": " "})),
+                    (False, answer),
+                ):
+                    with self.subTest(fast=fast, choice=choice):
+                        response = io.BytesIO(
+                            json.dumps({"choices": [choice]}).encode()
+                        )
+                        with patch("recipe_runner.request", return_value=response):
+                            with self.assertRaisesRegex(
+                                ValueError, "non-streaming response"
+                            ):
+                                probes(settings, fast=fast)
+
     def test_default_fast_selects_all_models(self):
         self.assertEqual(
             select("fast_sanity", ""),
