@@ -74,9 +74,8 @@ class RecipeContractTest(unittest.TestCase):
             select("model_sanity", "glm")
         with self.assertRaises(ValueError):
             select("model_sanity", "glm-5.3,glm-5.3")
-        for model in ("deepseek-v4-pro", "kimi-k2.6"):
-            with self.subTest(model=model), self.assertRaises(ValueError):
-                select("model_sanity", model)
+        with self.assertRaises(ValueError):
+            select("model_sanity", "kimi-k2.6")
 
     def test_policy_switches(self):
         policy = DEFAULT_POLICY_ROOT / "models/glm-5.3.yaml"
@@ -211,6 +210,36 @@ class RecipeContractTest(unittest.TestCase):
                 config.write_text(json.dumps({"model_type": "qwen3"}))
                 with self.assertRaisesRegex(ValueError, "lacks tokenizer metadata"):
                     cached_model_path(repo_id, revision)
+
+    def test_deepseek_pro_can_run_full_gsm8k_against_published_reference(self):
+        self.assertEqual(
+            select("model_sanity", "deepseek-v4-pro"),
+            {"include": [{"model": "deepseek-v4-pro"}]},
+        )
+        policy_path = DEFAULT_POLICY_ROOT / "models/deepseek-v4-pro.yaml"
+        policy = _load_yaml(policy_path)
+        config = resolve_recipe(
+            REPO_ROOT / policy["recipe"], policy_path=policy_path, tier="model_sanity"
+        )
+        reference_path = (
+            REPO_ROOT / "test/ppu/golden/accuracy_deepseek_v4_pro_mxfp4_890p.json"
+        )
+        reference = json.loads(reference_path.read_text())
+        stage = next(
+            stage
+            for stage in policy["tiers"]["model_sanity"]["stages"]
+            if stage["kind"] == "evalscope"
+        )
+        self.assertEqual(config["golden_model_key"], reference["model"])
+        self.assertEqual(config["hf_model_id"], reference["checkpoint"])
+        self.assertEqual(config["ppu_count"], reference["serving"]["ppu_count"])
+        self.assertEqual(stage["dataset"], reference["dataset"]["dataset_id"])
+        self.assertEqual(stage["generation"], reference["generation"])
+        self.assertEqual(reference["tolerance"], {"mode": "band", "abs": 0.02})
+        self.assertEqual(reference["dataset"]["num_expected"], 1319)
+        self.assertEqual(reference["score_num"], 1285)
+        self.assertIsNone(stage["limit"])
+        self.assertFalse(config["dummy_weights"])
 
     def test_new_model_ref_is_resolved_to_a_concrete_revision(self):
         repo_id = "example/quantized-model"
