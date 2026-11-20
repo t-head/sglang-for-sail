@@ -53,3 +53,5 @@ presets:
       - "64"
       - --mamba-radix-cache-strategy
       - extra_buffer
+      - --speculative-draft-model-quantization
+      - unquant

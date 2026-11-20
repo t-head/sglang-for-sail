@@ -266,6 +266,7 @@ class RecipeContractTest(unittest.TestCase):
             ("--speculative-algorithm", "NEXTN"),
             ("--speculative-num-steps", "2"),
             ("--speculative-eagle-topk", "1"),
+            ("--speculative-draft-model-quantization", "unquant"),
             ("--page-size", "64"),
             ("--mamba-radix-cache-strategy", "extra_buffer"),
         ):
