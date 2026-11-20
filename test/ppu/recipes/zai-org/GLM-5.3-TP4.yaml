@@ -4,6 +4,7 @@ ppu:
   visibility: public
   assets: {model: glm-5.3-mxfp4, tokenizer: glm-5.3-mxfp4}
   hf_model_id: T-HEAD/GLM-5.3-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken
+  golden_model_key: glm_5_3_mxfp4_tp4
   topology: {kind: single_node, nodes: 1, devices_per_node: 4}
   external_env: [DG_USE_MOE_DYNAMIC_TILE, HGGC_EMBEDDED_COPY_THRESHOLD, SGLANG_NSA_DUAL_STREAM]
 model:
@@ -11,6 +12,8 @@ model:
   base_args:
     - --tp-size
     - "4"
+    - --context-length
+    - "16384"
     - --page-size
     - "64"
     - --mem-fraction-static
