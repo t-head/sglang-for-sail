@@ -87,7 +87,7 @@ def rope_tail_fake_quant_fp4_row(
     return tl.reshape(q * scale[:, None], (D,))
 
 
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["num_pos"])
 def _rope_tail_fake_quant_fp4_kernel(
     x_ptr,
     f_ptr,
