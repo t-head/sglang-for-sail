@@ -17,6 +17,8 @@ model:
     - deepep
     - --moe-dense-tp-size
     - "1"
+    - --attention-backend
+    - triton
     - --mem-fraction-static
     - "0.9"
     - --max-running-requests

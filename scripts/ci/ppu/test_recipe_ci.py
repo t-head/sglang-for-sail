@@ -177,6 +177,7 @@ class RecipeContractTest(unittest.TestCase):
         for name, value in (
             ("--tp-size", "8"),
             ("--attn-dp-size", "8"),
+            ("--attention-backend", "triton"),
             ("--moe-a2a-backend", "deepep"),
             ("--speculative-algorithm", "NEXTN"),
             ("--load-format", "dummy"),
@@ -211,6 +212,7 @@ class RecipeContractTest(unittest.TestCase):
         for name, value in (
             ("--tp-size", "4"),
             ("--context-length", "16384"),
+            ("--attention-backend", "triton"),
             ("--speculative-algorithm", "NEXTN"),
             ("--load-format", "dummy"),
         ):

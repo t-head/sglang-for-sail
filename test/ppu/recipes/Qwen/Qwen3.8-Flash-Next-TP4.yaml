@@ -12,6 +12,8 @@ model:
     - "4"
     - --context-length
     - "16384"
+    - --attention-backend
+    - triton
     - --mem-fraction-static
     - "0.9"
     - --max-running-requests
