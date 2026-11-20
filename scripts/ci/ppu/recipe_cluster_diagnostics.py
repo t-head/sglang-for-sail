@@ -4,6 +4,8 @@
 import json
 import re
 
+from recipe_cluster_config import MODEL_PATH_SETTINGS
+
 RULES = {
     "image_pull": r"ErrImagePull|ImagePullBackOff|failed to pull image|manifest unknown",
     "registry_auth": r"status code: (401|403)|pull access denied|authorization failed|insufficient_scope",
@@ -42,7 +44,7 @@ def recent_failures(root, current_run):
     for run_id, _, run in sorted(previous, reverse=True):
         records = []
         for tier in ("fast_sanity", "model_sanity"):
-            for model in ("deepseek-v4-flash", "glm-5.3"):
+            for model in MODEL_PATH_SETTINGS:
                 directory = run / tier / model
                 if not (directory / "index.json").is_file():
                     continue

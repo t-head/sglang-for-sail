@@ -129,7 +129,8 @@ stage_root=${PPU_CI_K8S_STAGE_ROOT:?}
 [[ -d wheels && ! -L wheels ]]
 case "$mode" in
     fast_sanity|model_sanity)
-        [[ "$MODEL_KEY" == glm-5.3 || "$MODEL_KEY" == deepseek-v4-flash ]]
+        model_path_key=$(python3 -B scripts/ci/ppu/recipe_cluster_config.py --model-path-key "${MODEL_KEY:?}")
+        export PPU_CI_RECIPE_MODEL_PATH=${!model_path_key:?}
         INPUT_NODE_SELECTOR=board-type=ZW-M890P
         INPUT_NPROC_PER_NODE=8
         INPUT_TIMEOUT_MINUTES=330
@@ -178,9 +179,7 @@ if os.environ["TIER"] == "legacy":
         "PPU_CI_DFLASH_MODEL_PATH", "PPU_CI_EVAL_CACHE",
     ]
 else:
-    keys += ["MODEL_KEY", "PPU_CI_RECIPE_IMAGE_KEY"]
-    model = os.environ["MODEL_KEY"]
-    keys += ["PPU_CI_GLM53_MODEL_PATH" if model == "glm-5.3" else "PPU_CI_DSV4_FLASH_MODEL_PATH"]
+    keys += ["MODEL_KEY", "PPU_CI_RECIPE_IMAGE_KEY", "PPU_CI_RECIPE_MODEL_PATH"]
     if os.environ["TIER"] == "model_sanity":
         keys += ["PPU_CI_GSM8K_PATH"]
 values = {key: os.environ[key] for key in keys}

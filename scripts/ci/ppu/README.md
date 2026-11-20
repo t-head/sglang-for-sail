@@ -2,7 +2,7 @@
 
 The release branch owns the SGLang serving recipes, test policies and 890P accuracy references in `test/ppu`. Native SAIL wheels and their Recipe bundle carry the same source revision. The runner verifies the wheel inventory, archive and recipe tree before installation and records the release runtime's manifest digest.
 
-- **Fast Sanity** runs every model with a `fast_sanity` policy. The current models start directly with full-layer dummy weights. Both non-streaming and streaming probes must complete.
+- **Fast Sanity** runs every model with a `fast_sanity` policy. GLM-5.3, DeepSeek-V4-Flash, DeepSeek-V4.1-Flash and MiniMax-M3 start directly with full-layer dummy weights. Both non-streaming and streaming probes must complete.
 - **Model Sanity** runs real weights once per model. It runs GSM8K main (1,319 questions), reconciles each scored sample with the reference band, verifies the KV gauge after a cache flush, and runs the native microbench at concurrency 1 and 16. The same-server performance measurements are diagnostic.
 - **Legacy single-device sanity** runs EAGLE3 and DFlash on both board types when explicitly requested. Each test reports its original result and the runner retains the raw output privately.
 
@@ -25,6 +25,8 @@ The `k8s-runner-group-cpu-thead` runner uses the pinned T-Head Cluster Run backe
 | --- | --- |
 | `PPU_CI_GLM53_MODEL_PATH` | GLM-5.3 MXFP4 checkpoint directory |
 | `PPU_CI_DSV4_FLASH_MODEL_PATH` | DeepSeek-V4-Flash MXFP4 checkpoint directory |
+| `PPU_CI_DSV41_FLASH_MODEL_PATH` | DeepSeek-V4.1-Flash MXFP4 checkpoint directory |
+| `PPU_CI_MINIMAX_M3_MODEL_PATH` | MiniMax-M3 MXFP4/FP8 checkpoint directory |
 | `PPU_CI_GSM8K_PATH` | Offline EvalScope GSM8K dataset directory |
 | `PPU_CI_JIT_ROOT` | Node-local persistent JIT cache root |
 | `PPU_CI_K8S_STAGE_ROOT` | Cluster Run's shared source staging directory in the CPU runner view |

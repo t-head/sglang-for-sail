@@ -14,11 +14,8 @@ phase() { printf '%s\n' "$1" > "$private/recipe-phase.txt"; }
 phase runner_preflight
 [[ $(git rev-parse HEAD) == "$source_sha" ]]
 [[ $(git status --porcelain=v1 --ignored --ignore-submodules=none) == "" ]]
-case "$model" in
-    glm-5.3) model_path=${PPU_CI_GLM53_MODEL_PATH:?} ;;
-    deepseek-v4-flash) model_path=${PPU_CI_DSV4_FLASH_MODEL_PATH:?} ;;
-    *) exit 2 ;;
-esac
+model_path_key=$("$host_python" -B scripts/ci/ppu/recipe_cluster_config.py --model-path-key "$model")
+model_path=${!model_path_key:?}
 [[ "$tier" == fast_sanity || "$tier" == model_sanity ]]
 repo=$(pwd -P)
 model_path=$(realpath -e -- "$model_path")

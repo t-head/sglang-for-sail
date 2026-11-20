@@ -21,7 +21,7 @@ from ppu_recipe import (
     validate_paths,
 )
 from recipe_bundle import sha256, wheel_inventory
-from recipe_cluster_config import load_settings
+from recipe_cluster_config import MODEL_PATH_SETTINGS, load_settings
 from recipe_cluster_diagnostics import diagnostic_codes
 from recipe_publish import publish, validate
 from recipe_report import legacy_result
@@ -50,13 +50,15 @@ def fast_result():
 
 
 class RecipeContractTest(unittest.TestCase):
-    def test_default_fast_selects_both_models(self):
+    def test_default_fast_selects_all_admitted_models(self):
         self.assertEqual(
             select("fast_sanity", ""),
             {
                 "include": [
                     {"model": "deepseek-v4-flash"},
+                    {"model": "deepseek-v4.1-flash"},
                     {"model": "glm-5.3"},
+                    {"model": "minimax-m3"},
                 ]
             },
         )
@@ -69,6 +71,29 @@ class RecipeContractTest(unittest.TestCase):
             select("model_sanity", "glm")
         with self.assertRaises(ValueError):
             select("model_sanity", "glm-5.3,glm-5.3")
+        for model in ("deepseek-v4.1-flash", "minimax-m3"):
+            with self.subTest(model=model), self.assertRaises(ValueError):
+                select("model_sanity", model)
+
+    def test_only_registered_models_resolve_and_publish(self):
+        script = REPO_ROOT / "scripts/ci/ppu/recipe_cluster_config.py"
+        command = [sys.executable, "-B", str(script), "--model-path-key"]
+        keys = {
+            "deepseek-v4.1-flash": "PPU_CI_DSV41_FLASH_MODEL_PATH",
+            "minimax-m3": "PPU_CI_MINIMAX_M3_MODEL_PATH",
+        }
+        for model, key in keys.items():
+            with self.subTest(model=model):
+                output = subprocess.check_output(
+                    [*command, model], env={key: "/assets/private"}, text=True
+                )
+                self.assertEqual(output.strip(), key)
+                validate({**fast_result(), "model": model})
+        unknown = subprocess.run([*command, "unknown-model"], capture_output=True)
+        self.assertNotEqual(unknown.returncode, 0)
+        self.assertFalse(unknown.stdout)
+        with self.assertRaises(ValueError):
+            validate({**fast_result(), "model": "unknown-model"})
 
     def test_policy_switches(self):
         policy = DEFAULT_POLICY_ROOT / "models/glm-5.3.yaml"
@@ -98,7 +123,8 @@ class RecipeContractTest(unittest.TestCase):
             timings["cold_start_s"] = 3.0
             yield
 
-        for model, ready_timeout in (("glm-5.3", 1350), ("deepseek-v4-flash", 1000)):
+        for model in MODEL_PATH_SETTINGS:
+            ready_timeout = 1350 if model == "glm-5.3" else 1000
             with (
                 self.subTest(model=model),
                 tempfile.TemporaryDirectory() as temp,
@@ -403,7 +429,7 @@ class ClusterConfigBootstrapTest(unittest.TestCase):
 class ClusterTransportTest(unittest.TestCase):
     def test_scheduler_streams_stay_private(self):
         injected = "/" + "nas" + "_aisw/fixture " + ".".join(("10", "4", "5", "6"))
-        result = fast_result()
+        result = {**fast_result(), "model": "deepseek-v4.1-flash"}
         for tampered in (False, True):
             with self.subTest(tampered=tampered), tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
@@ -459,6 +485,9 @@ class ClusterTransportTest(unittest.TestCase):
                 (backend / "submit.sh").write_text(
                     'test "$INPUT_NNODES/$INPUT_NPROC_PER_NODE/$INPUT_NODE_SELECTOR" = "0/8/board-type=ZW-M890P" || exit 1\n'
                     'test -f "$SOURCE_STAGE_DIR" || exit 1\n'
+                    'jq -e --arg path "$PPU_CI_DSV41_FLASH_MODEL_PATH" '
+                    "'.PPU_CI_RECIPE_MODEL_PATH == $path and .PPU_CI_GLM53_MODEL_PATH == null' "
+                    '<<< "$USER_ENV_JSON" || exit 1\n'
                     'printf "%s\\n" "$INJECTED_FIXTURE"\n'
                     'printf "job_status=scheduled\\nstart_time=1\\ndeadline=2\\nqueue_duration_seconds=7\\n" >> "$GITHUB_OUTPUT"\n'
                 )
@@ -483,7 +512,7 @@ class ClusterTransportTest(unittest.TestCase):
                         )
                     ),
                     "TIER": "fast_sanity",
-                    "MODEL_KEY": "glm-5.3",
+                    "MODEL_KEY": result["model"],
                     "GITHUB_OUTPUT": str(root / "gha-output"),
                     "PPU_PUBLIC_SUMMARY": str(root / "gha-summary"),
                     "GITHUB_WORKSPACE": str(workspace),
@@ -497,7 +526,8 @@ class ClusterTransportTest(unittest.TestCase):
                     "PPU_CI_K8S_STAGE_ROOT": str(staging),
                     "PPU_CI_SOURCE_SHA": result["source_sha"],
                     "PPU_CI_JIT_ROOT": str(root / "jit"),
-                    "PPU_CI_GLM53_MODEL_PATH": str(root / "model"),
+                    "PPU_CI_GLM53_MODEL_PATH": str(root / "other-model"),
+                    "PPU_CI_DSV41_FLASH_MODEL_PATH": str(root / "model"),
                     "PPU_CI_RECIPE_RUNTIME_IMAGE": result["runtime_image"],
                     "INJECTED_FIXTURE": injected,
                 }

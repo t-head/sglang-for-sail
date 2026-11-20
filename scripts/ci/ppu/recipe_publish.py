@@ -9,10 +9,10 @@ import re
 import sys
 from pathlib import Path
 
+from recipe_cluster_config import MODEL_PATH_SETTINGS
 from recipe_diagnostics import PHASES
 
 REGISTRY = "download.t-head.cn/docker_test/sglang"
-MODELS = {"glm-5.3", "deepseek-v4-flash"}
 LEGACY_SCHEMA = "ppu-legacy-sanity/v1"
 LEGACY_CASES = {
     "test_basic_sanity_dflash.py": "dflash",
@@ -105,7 +105,7 @@ def validate(payload):
         raise ValueError("unexpected result field")
     if (
         payload["schema"] != "ppu-sanity/v1"
-        or payload["model"] not in MODELS
+        or payload["model"] not in MODEL_PATH_SETTINGS
         or payload["route"] != "native-build + sglang-release-runtime"
         or not re.fullmatch(r"[0-9a-f]{40}", payload["source_sha"])
         or payload["outcome"] not in {"pass", "fail"}
