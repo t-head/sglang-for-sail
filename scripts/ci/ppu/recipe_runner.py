@@ -403,12 +403,14 @@ def run(policy_path, tier, queue_s):
         cold_total = 0
         start = time.monotonic()
         has_layer_override = config["layer_override"] is not None
+        # A cold GLM run was still capturing prefill graphs at 1,000 seconds.
+        full_ready_timeout = 1350 if policy["model_id"] == "zai-org/GLM-5.3" else 1000
         try:
             with server(
                 config,
                 "fast_2l" if has_layer_override else "fast_full",
                 result,
-                420 if has_layer_override else 1000,
+                420 if has_layer_override else full_ready_timeout,
             ):
                 probes(sanity["probe"], fast=True)
         except StartupError as error:
@@ -417,7 +419,7 @@ def run(policy_path, tier, queue_s):
             cold_total = time.monotonic() - start
             result["fallback_reason"] = str(error)
             config = resolve_recipe(recipe, **resolve, layer_override=None)
-            with server(config, "fast_full", result, 1000):
+            with server(config, "fast_full", result, full_ready_timeout):
                 probes(sanity["probe"], fast=True)
         result.update(
             config_digest=config["config_digest"],

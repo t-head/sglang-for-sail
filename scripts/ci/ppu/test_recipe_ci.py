@@ -98,7 +98,7 @@ class RecipeContractTest(unittest.TestCase):
             timings["cold_start_s"] = 3.0
             yield
 
-        for model in ("glm-5.3", "deepseek-v4-flash"):
+        for model, ready_timeout in (("glm-5.3", 1350), ("deepseek-v4-flash", 1000)):
             with (
                 self.subTest(model=model),
                 tempfile.TemporaryDirectory() as temp,
@@ -112,7 +112,7 @@ class RecipeContractTest(unittest.TestCase):
                 )
                 self.assertEqual(server.call_count, 1)
                 config, label, _, timeout = server.call_args.args
-                self.assertEqual((label, timeout), ("fast_full", 1000))
+                self.assertEqual((label, timeout), ("fast_full", ready_timeout))
                 self.assertIn("dummy", config["flags"])
                 self.assertNotIn("--json-model-override-args", config["flags"])
                 probes.assert_called_once()
