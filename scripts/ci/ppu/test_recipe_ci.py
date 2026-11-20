@@ -76,7 +76,7 @@ class RecipeContractTest(unittest.TestCase):
             select("model_sanity", "glm")
         with self.assertRaises(ValueError):
             select("model_sanity", "glm-5.3,glm-5.3")
-        for model in ("qwen3.8-27b", "glm-5.3-flash", "glm-5.3-tp4"):
+        for model in ("qwen3.8-27b", "glm-5.3-tp4"):
             with self.subTest(model=model), self.assertRaises(ValueError):
                 select("model_sanity", model)
 
@@ -106,11 +106,17 @@ class RecipeContractTest(unittest.TestCase):
         self.assertEqual((tp4["ppu_count"], tp8["ppu_count"]), (4, 8))
 
     def test_minimax_nightly_uses_published_quantized_reference(self):
+        self.assert_nightly_reference("minimax-m3", width=8, correct=1284)
+
+    def test_glm_flash_nightly_uses_tp2_and_full_gsm8k_reference(self):
+        self.assert_nightly_reference("glm-5.3-flash", width=2, correct=1279)
+
+    def assert_nightly_reference(self, model, *, width, correct):
         self.assertEqual(
-            select("model_sanity", "minimax-m3"),
-            {"include": [{"model": "minimax-m3"}]},
+            select("model_sanity", model),
+            {"include": [{"model": model, "ppu_count": width}]},
         )
-        policy_path = DEFAULT_POLICY_ROOT / "models/minimax-m3.yaml"
+        policy_path = DEFAULT_POLICY_ROOT / f"models/{model}.yaml"
         policy = _load_yaml(policy_path)
         config = resolve_recipe(
             REPO_ROOT / policy["recipe"], policy_path=policy_path, tier="model_sanity"
@@ -132,7 +138,7 @@ class RecipeContractTest(unittest.TestCase):
         self.assertEqual(stage["generation"], reference["generation"])
         self.assertEqual(reference["tolerance"], {"mode": "band", "abs": 0.02})
         self.assertEqual(reference["dataset"]["num_expected"], 1319)
-        self.assertEqual(reference["score_num"], 1284)
+        self.assertEqual(reference["score_num"], correct)
         self.assertIsNone(stage["limit"])
         self.assertFalse(config["dummy_weights"])
 
