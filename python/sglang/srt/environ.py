@@ -1896,6 +1896,7 @@ class Envs:
     # of fp32 (the reference ranks bf16 scores); every consumer of those logits must take bf16.
     # Unset: bf16 on SM100 and on SAIL/PPU from sm89 (with bf16 head weights on SM100), fp32 elsewhere.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(None)
+    SGLANG_OPT_DSV4_Q_ONLY_ROPE_FREQ_REUSE = EnvBool(False)
     # DeepSeek-V4.1 eager prefill indexer top-k: select through the two-level
     # candidate structure (block maxima, then only the kept blocks) instead of a
     # full-width pass. 0 restores the dense top-k for A/B.

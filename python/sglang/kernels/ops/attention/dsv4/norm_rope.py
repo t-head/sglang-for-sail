@@ -8,6 +8,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip, is_xpu
 
 from .kv_layout import KVLayout
@@ -24,9 +25,11 @@ if _is_xpu:
 @cache_once
 def _jit_fused_rope_module():
     args = make_cpp_args(is_arch_support_pdl())
+    reuse_freqs = envs.SGLANG_OPT_DSV4_Q_ONLY_ROPE_FREQ_REUSE.get()
     return load_jit(
-        make_name("fused_rope"),
+        make_name("fused_rope_freq_reuse" if reuse_freqs else "fused_rope"),
         *args,
+        extra_cuda_cflags=["-DSGL_DSV4_Q_ONLY_ROPE_FREQ_REUSE=1"] if reuse_freqs else None,
         cuda_files=["deepseek_v4/rope.cuh"],
         cuda_wrappers=[("forward", f"FusedQKRopeKernel<{args}>::forward")],
     )

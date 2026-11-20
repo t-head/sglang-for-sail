@@ -84,6 +84,58 @@ __global__ __launch_bounds__(kBlockSize, 16)  //
   PDLTriggerSecondary<kUsePDL>();
 }
 
+#if defined(SGL_DSV4_Q_ONLY_ROPE_FREQ_REUSE) && \
+    (defined(SGL_SAIL) || defined(__HGGCCC__))
+template <bool kInverse>
+__device__ __forceinline__ packed_t<DType> rotate_rope_pair(
+    packed_t<DType> data, float f_real, float f_imag) {
+  using namespace device;
+  using DType2 = packed_t<DType>;
+  const auto [x_real, x_imag] = cast<fp32x2_t>(data);
+  fp32x2_t output;
+  if constexpr (kInverse) {
+    // (a + bi) * (c - di) = (ac + bd) + (bc - ad)i
+    output = {
+        x_real * f_real + x_imag * f_imag,
+        x_imag * f_real - x_real * f_imag,
+    };
+  } else {
+    // (a + bi) * (c + di) = (ac - bd) + (ad + bc)i
+    output = {
+        x_real * f_real - x_imag * f_imag,
+        x_real * f_imag + x_imag * f_real,
+    };
+  }
+  return cast<DType2>(output);
+}
+
+template <bool kUsePDL, bool kInverse, typename IndexType, unsigned Heads, unsigned Group>
+__global__ __launch_bounds__(kBlockSize, 16)
+void deepseek_rope_q_only_kernel(const __grid_constant__ FusedQKRopeParams param) {
+  using namespace device;
+  using DType2 = packed_t<DType>;
+  constexpr unsigned heads_per_block = kNumWarps * Group;
+  static_assert(Heads % heads_per_block == 0);
+  constexpr unsigned blocks_per_token = Heads / heads_per_block;
+
+  const auto warp = threadIdx.x / kWarpThreads;
+  const auto lane = threadIdx.x % kWarpThreads;
+  const auto token = blockIdx.x / blocks_per_token;
+  const auto head = (blockIdx.x % blocks_per_token) * heads_per_block + warp;
+  const auto position = static_cast<const IndexType*>(param.positions)[token];
+  const auto [f_real, f_imag] = reinterpret_cast<const fp32x2_t*>(param.freqs_cis + position * kRopeDim)[lane];
+  auto* row = pointer::offset(param.q, token * param.q_stride_batch, head * param.q_stride_head);
+  PDLWaitPrimary<kUsePDL>();
+  #pragma unroll
+  for (unsigned i = 0; i < Group; ++i) {
+    auto* head_pair = static_cast<DType2*>(pointer::offset(row, i * kNumWarps * param.q_stride_head));
+    head_pair[lane] = rotate_rope_pair<kInverse>(head_pair[lane], f_real, f_imag);
+  }
+  PDLTriggerSecondary<kUsePDL>();
+}
+
+#endif
+
 template <bool kUsePDL>
 struct FusedQKRopeKernel {
   // 4 kernel variants: {forward, inverse} x {int32, int64}
@@ -91,6 +143,22 @@ struct FusedQKRopeKernel {
   static constexpr auto kernel_fwd_i64 = deepseek_rope_kernel<kUsePDL, false, int64_t>;
   static constexpr auto kernel_inv_i32 = deepseek_rope_kernel<kUsePDL, true, int32_t>;
   static constexpr auto kernel_inv_i64 = deepseek_rope_kernel<kUsePDL, true, int64_t>;
+
+
+#if defined(SGL_DSV4_Q_ONLY_ROPE_FREQ_REUSE) && \
+    (defined(SGL_SAIL) || defined(__HGGCCC__))
+  template <unsigned Heads, unsigned Group>
+  static void launch_q_only(
+      FusedQKRopeParams params, bool pos_i32, bool inverse, DLDevice device) {
+    constexpr auto fwd32 = deepseek_rope_q_only_kernel<kUsePDL, false, int32_t, Heads, Group>;
+    constexpr auto fwd64 = deepseek_rope_q_only_kernel<kUsePDL, false, int64_t, Heads, Group>;
+    constexpr auto inv32 = deepseek_rope_q_only_kernel<kUsePDL, true, int32_t, Heads, Group>;
+    constexpr auto inv64 = deepseek_rope_q_only_kernel<kUsePDL, true, int64_t, Heads, Group>;
+    const auto kernel = inverse ? (pos_i32 ? inv32 : inv64) : (pos_i32 ? fwd32 : fwd64);
+    const auto blocks = params.batch_size * (Heads / (kNumWarps * Group));
+    host::LaunchKernel(blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
+  }
+#endif
 
   static void forward(
       const tvm::ffi::TensorView q,
@@ -156,6 +224,19 @@ struct FusedQKRopeKernel {
         .num_k_heads = num_k_heads,
         .batch_size = batch_size,
     };
+
+#if defined(SGL_DSV4_Q_ONLY_ROPE_FREQ_REUSE) && \
+    (defined(SGL_SAIL) || defined(__HGGCCC__))
+    if (num_k_heads == 0 && batch_size >= 256) {
+      switch (num_q_heads) {
+        case 8: return launch_q_only<8, 1>(params, pos_i32, inverse, device_.unwrap());
+        case 16: return launch_q_only<16, 4>(params, pos_i32, inverse, device_.unwrap());
+        case 32: return launch_q_only<32, 8>(params, pos_i32, inverse, device_.unwrap());
+        case 64: return launch_q_only<64, 16>(params, pos_i32, inverse, device_.unwrap());
+        case 128: return launch_q_only<128, 16>(params, pos_i32, inverse, device_.unwrap());
+      }
+    }
+#endif
 
     // dispatch: {inverse} x {pos_i32}
     using KernelType = decltype(kernel_fwd_i32);
