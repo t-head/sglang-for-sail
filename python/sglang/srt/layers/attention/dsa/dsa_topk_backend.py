@@ -296,8 +296,6 @@ class DSATopKBackend(Enum):
                         topk=topk,
                         ks=row_starts,
                     )
-                if is_sail() and logits.dtype == torch.bfloat16:
-                    logits = _sail_topk_fp32(logits)
                 return fast_topk_transform_fused(
                     score=logits,
                     lengths=lengths,
