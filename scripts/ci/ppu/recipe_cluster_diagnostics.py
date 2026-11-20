@@ -19,6 +19,12 @@ RULES = {
     "wheel_install": r"not a supported wheel|No matching distribution|Failed building wheel",
     "python_import": r"ModuleNotFoundError|ImportError|undefined symbol",
     "invalid_server_args": r"unrecognized arguments|argument .+: invalid choice",
+    "deep_select_topk_unavailable": (
+        r"deep_select[^\n]*(?:has no attribute ['\"]topk|cannot import[^\n]*topk)"
+        r"|cannot import name ['\"]topk['\"][^\n]*deep_select"
+    ),
+    "device_kernel": r"no kernel image is available|invalid device function|illegal memory access",
+    "model_assertion": r"\bAssertionError\b",
     "startup_timeout": r"server did not become ready|startup timed out",
     "worker_exit": r"container.+exit.?code|worker pods? failed|Command failed",
     "deadline": r"DeadlineExceeded|PPU scheduling timed out|workload timeout",
@@ -54,7 +60,14 @@ def recent_failures(root, current_run):
                 if not (directory / "index.json").is_file():
                     continue
                 code = []
-                for filename in ("launcher.log", "runtime.log", "pod-status.json"):
+                for filename in (
+                    "launcher.log",
+                    "runtime.log",
+                    "pod-status.json",
+                    "sglang_serve_fast_2l.log",
+                    "sglang_serve_fast_full.log",
+                    "sglang_serve_model_sanity.log",
+                ):
                     path = directory / filename
                     if path.is_file() and not path.is_symlink():
                         with path.open("rb") as stream:

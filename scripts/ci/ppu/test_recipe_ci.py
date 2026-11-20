@@ -24,7 +24,7 @@ from ppu_recipe import (
 )
 from recipe_bundle import sha256, wheel_inventory
 from recipe_cluster_config import load_settings
-from recipe_cluster_diagnostics import diagnostic_codes
+from recipe_cluster_diagnostics import diagnostic_codes, recent_failures
 from recipe_publish import publish, validate
 from recipe_report import legacy_result
 from recipe_runner import cached_model_path, metrics_zero, read_eval_reviews, run
@@ -644,6 +644,28 @@ class ClusterConfigBootstrapTest(unittest.TestCase):
     def test_prior_cluster_diagnostics_produce_fixed_codes(self):
         value = "ImagePullBackOff Permission denied " + "/" + "nas" + "_aisw/example"
         self.assertEqual(diagnostic_codes(value), ["image_pull", "permission_denied"])
+
+    def test_startup_diagnostics_use_retained_logs_without_raw_text(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            record = root / "sglang-for-sail/425-1/fast_sanity/qwen3.8-flash-next"
+            record.mkdir(parents=True)
+            (record / "index.json").write_text("{}")
+            (record / "sglang_serve_fast_full.log").write_text(
+                "private fixture metadata\n"
+                "AttributeError: module 'deep_select' has no attribute 'topk'\n"
+            )
+            self.assertEqual(
+                recent_failures(root, 426),
+                [
+                    {
+                        "run_id": 425,
+                        "tier": "fast_sanity",
+                        "model": "qwen3.8-flash-next",
+                        "codes": ["deep_select_topk_unavailable"],
+                    }
+                ],
+            )
 
     def test_pinned_config_bootstrap_takes_precedence_over_inherited_root(self):
         with tempfile.TemporaryDirectory() as temp:
