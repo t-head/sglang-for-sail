@@ -215,12 +215,13 @@ jobs:
     name: Verify native master startup in the release image
     needs: ppu-cluster-config
     if: github.event_name == 'workflow_dispatch' && inputs.preflight_only
-    runs-on: ubuntu-24.04
-    timeout-minutes: 16
+    runs-on: k8s-runner-group-cpu-thead
+    timeout-minutes: 14
     permissions:
       contents: read
-    env:
-      RELEASE_IMAGE: download.t-head.cn/docker_test/sglang@sha256:bcc10dbf0587c7dfc601d729008620cf923c926463eeac5d99c062d7517b24a5
+    container:
+      image: download.t-head.cn/docker_test/sglang@sha256:bcc10dbf0587c7dfc601d729008620cf923c926463eeac5d99c062d7517b24a5
+      options: --security-opt=no-new-privileges --tmpfs /mnt/wl_nas/devops/cache/openssh:rw,nosuid,nodev,noexec,size=1g
     steps:
       - name: Fetch the pinned installer
         uses: actions/checkout@v4
@@ -229,22 +230,22 @@ jobs:
           ref: 96e25147971f5d2a04d828f8ad508cae38a4fa8a
           path: .ppu-infra
           persist-credentials: false
-      - name: Install and validate SSH in a disposable CPU container
+      - name: Install and validate SSH using an ephemeral cache
         run: |
           set -euo pipefail
-          docker pull "$RELEASE_IMAGE"
-          release_deadline="$(( $(date +%s) + 360 ))"
-          docker run --rm --init --pids-limit 512 \
-            --security-opt no-new-privileges \
-            --volume "$PWD/.ppu-infra/cluster-run/scripts:/action:ro" \
-            --env "PPU_DEADLINE=$release_deadline" \
-            --entrypoint /bin/bash "$RELEASE_IMAGE" -ec '
-              /bin/bash /action/install-ssh.sh
-              mkdir -p /run/sshd
-              ssh-keygen -A
-              sshd -t
-              printf "Release image passed native SSH startup prerequisites.\n"
-            '
+          cache=/mnt/wl_nas/devops/cache/openssh
+          awk -v cache="$cache" '
+            $5 == cache {
+              for (i = 7; i < NF; ++i) if ($i == "-" && $(i+1) == "tmpfs") found = 1
+            }
+            END { exit !found }
+          ' /proc/self/mountinfo
+          export PPU_DEADLINE="$(( $(date +%s) + 360 ))"
+          bash .ppu-infra/cluster-run/scripts/install-ssh.sh
+          mkdir -p /run/sshd
+          ssh-keygen -A
+          sshd -t
+          printf 'Release image passed native SSH startup prerequisites.\n'
 
   ppu-build:
     name: >-
