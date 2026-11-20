@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from sglang.srt.configs.model_config import ModelConfig
@@ -71,6 +72,26 @@ class TestQuantLogString(CustomTestCase):
         result = model_config.get_quantization_config_log_str()
         print(f"\n[Test No Quant] Result: {result}")
         self.assertIsNone(result)
+
+
+class TestDraftQuantization(CustomTestCase):
+    def test_explicit_unquant_skips_target_quantization_for_qwen4_mtp_only(self):
+        for architecture, is_draft, explicit, should_detect in (
+            ("Qwen4ExpForCausalLMMTP", True, True, False),
+            ("Qwen4ExpForCausalLMMTP", True, False, True),
+            ("Qwen4ExpForConditionalGeneration", False, True, True),
+            ("Qwen3_5ForCausalLMMTP", True, True, True),
+        ):
+            with self.subTest(architecture=architecture, explicit=explicit):
+                config = ModelConfig.__new__(ModelConfig)
+                config.hf_config = SimpleNamespace(architectures=[architecture])
+                config.is_draft_model = is_draft
+                config.is_draft_quantization_explicit = explicit
+                config.quantization = None
+                config._parse_quant_hf_config = MagicMock(return_value=None)
+                config._find_quant_modelslim_config = MagicMock(return_value=None)
+                config._verify_quantization()
+                self.assertEqual(config._parse_quant_hf_config.called, should_detect)
 
 
 if __name__ == "__main__":
