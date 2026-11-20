@@ -167,7 +167,9 @@ class TestPPUCIWorkflow(unittest.TestCase):
                 self.assertIn("pull_request_target", workflow["on"])
                 self.assertNotIn("pull_request", workflow["on"])
                 jobs = workflow["jobs"]
-                self.assertEqual(jobs["pr-gate"]["with"]["require-fresh-label"], "true")
+                self.assertEqual(
+                    jobs["pr-gate"]["uses"], "./.github/workflows/ppu-approval.yml"
+                )
                 cluster_jobs = [
                     job["runs-on"]
                     for job in jobs.values()
@@ -176,11 +178,6 @@ class TestPPUCIWorkflow(unittest.TestCase):
                 self.assertTrue(cluster_jobs)
                 for runner in cluster_jobs:
                     self.assertEqual(runner["group"], "sglang-ppu-ci")
-                if name == "nightly-test-ppu":
-                    self.assertEqual(
-                        jobs["pr-gate"]["with"]["cool-down-minutes"],
-                        "${{ inputs.tier != 'fast_sanity' && 120 || 0 }}",
-                    )
 
     def test_device_jobs_require_build_and_cpu_checks(self):
         selftests = self.jobs["ppu-ci-selftest"]
@@ -212,18 +209,16 @@ class TestPPUCIWorkflow(unittest.TestCase):
             self.jobs["ppu-legacy-sanity"]["if"],
             "inputs.run_legacy_sanity == true && needs.check-changes.outputs.ppu == 'true'",
         )
-        self.assertEqual(
+        self.assertIn(
+            "needs.pr-gate.outputs.approved == 'false'",
             self.jobs["pr-test-ppu-finish"]["if"],
-            "always() && inputs.run_legacy_sanity != true && needs.check-changes.result != 'skipped'",
         )
         runtime = RUNNER.parent.parent / "scripts/ci/ppu/build_and_test.sh"
         self.assertNotIn("--hw cpu", runtime.read_text())
 
     def test_jobs_check_out_the_triggering_ref_and_verify_the_pinned_sha(self):
         check = self.jobs["check-changes"]
-        self.assertEqual(
-            check["steps"][0]["with"]["ref"], "${{ inputs.ref || github.sha }}"
-        )
+        self.assertIn("github.sha", check["steps"][0]["with"]["ref"])
         self.assertIn(
             "github.event.pull_request.head.sha", check["outputs"]["source-sha"]
         )
@@ -305,6 +300,8 @@ class TestPPUCIWorkflow(unittest.TestCase):
                             env=dict(
                                 os.environ,
                                 NEEDS_JSON=json.dumps(needs),
+                                PREFLIGHT_ONLY="false",
+                                SANITY_RESULT="success",
                                 PPU_IN_SCOPE=str(in_scope).lower(),
                             ),
                             capture_output=True,

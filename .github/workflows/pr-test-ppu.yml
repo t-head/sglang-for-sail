@@ -9,6 +9,10 @@ on:
     types: [opened, synchronize, reopened, labeled, ready_for_review]
   workflow_dispatch:
     inputs:
+      preflight_only:
+        description: "Verify Linux selftests and both cluster preflight paths"
+        type: boolean
+        default: false
       run_all_tests:
         description: "Run Recipe CI even without PPU path changes"
         required: false
@@ -46,7 +50,7 @@ concurrency:
     pr-test-ppu-${{ inputs.run_legacy_sanity && 'legacy' || 'recipe' }}-${{
       (github.event_name == 'pull_request_target' &&
        github.event.action == 'labeled' &&
-       github.event.label.name != 'run-ci-ppu') &&
+       !contains(fromJSON('["run-ci","run-ci-ppu"]'), github.event.label.name)) &&
       format('ignored-label-{0}', github.run_id) ||
       github.event.pull_request.number || inputs.ref || github.ref
     }}
@@ -64,12 +68,12 @@ jobs:
   check-changes:
     name: >-
       ${{ (github.event_name == 'pull_request_target' && github.event.action == 'labeled' &&
-           github.event.label.name != 'run-ci-ppu') &&
+           !contains(fromJSON('["run-ci","run-ci-ppu"]'), github.event.label.name)) &&
           'ignored-label-check-changes' || 'check-changes' }}
     if: |
       github.event_name != 'pull_request_target' ||
       github.event.action != 'labeled' ||
-      github.event.label.name == 'run-ci-ppu'
+      contains(fromJSON('["run-ci","run-ci-ppu"]'), github.event.label.name)
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -88,7 +92,7 @@ jobs:
         if: github.event_name != 'pull_request_target'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.sha || inputs.ref || github.sha }}
           persist-credentials: false
 
       - name: Pin the source revision for every job
@@ -114,6 +118,7 @@ jobs:
         with:
           filters: |
             ppu:
+              - ".github/workflows/ppu-approval.yml"
               - ".github/workflows/pr-test-ppu.yml"
               - ".github/workflows/nightly-test-ppu.yml"
               - "scripts/ci/ppu/**"
@@ -130,19 +135,18 @@ jobs:
   pr-gate:
     name: >-
       ${{ (github.event_name == 'pull_request_target' && github.event.action == 'labeled' &&
-           github.event.label.name != 'run-ci-ppu') &&
+           !contains(fromJSON('["run-ci","run-ci-ppu"]'), github.event.label.name)) &&
           'ignored-label-pr-gate' || 'pr-gate' }}
     needs: check-changes
     if: needs.check-changes.outputs.ppu == 'true'
-    uses: ./.github/workflows/pr-gate.yml
+    uses: ./.github/workflows/ppu-approval.yml
     with:
-      require-run-ci: true
-      require-label: run-ci-ppu
-      require-fresh-label: true
+      label: run-ci-ppu
+      ref: ${{ inputs.ref || '' }}
 
   ppu-ci-selftest:
     needs: [check-changes, pr-gate]
-    if: needs.check-changes.outputs.ppu == 'true'
+    if: needs.pr-gate.outputs.approved == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -160,6 +164,7 @@ jobs:
         run: |
           python3 -m pip install --quiet PyYAML huggingface-hub
           python3 -B -m unittest discover -s scripts/ci/ppu -p 'test_recipe*.py'
+          node --test scripts/ci/ppu/test_ppu_approval.cjs
           bash scripts/ci/ppu/run_selftests.sh
 
   ppu-cluster-config:
@@ -193,10 +198,10 @@ jobs:
   ppu-build:
     name: >-
       ${{ (github.event_name == 'pull_request_target' && github.event.action == 'labeled' &&
-           github.event.label.name != 'run-ci-ppu') &&
+           !contains(fromJSON('["run-ci","run-ci-ppu"]'), github.event.label.name)) &&
           'ignored-label-ppu-build' || 'ppu-build' }}
     needs: [check-changes, ppu-ci-selftest]
-    if: needs.check-changes.outputs.ppu == 'true'
+    if: inputs.preflight_only != true && needs.check-changes.outputs.ppu == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     permissions:
@@ -319,7 +324,7 @@ jobs:
     needs: [check-changes, pr-gate, ppu-build, ppu-cluster-config]
     if: >-
       !cancelled() && inputs.run_legacy_sanity != true &&
-      needs.ppu-build.result == 'success' &&
+      (needs.ppu-build.result == 'success' || (inputs.preflight_only && needs.ppu-build.result == 'skipped')) &&
       needs.ppu-cluster-config.result == 'success' &&
       needs.check-changes.outputs.ppu == 'true'
     permissions:
@@ -329,7 +334,7 @@ jobs:
     uses: ./.github/workflows/nightly-test-ppu.yml
     with:
       ref: ${{ needs.check-changes.outputs.source-sha }}
-      tier: fast_sanity
+      tier: ${{ inputs.preflight_only && 'cluster_preflight' || 'fast_sanity' }}
       skip_wheel_build: true
       wheel_artifact_id: ${{ needs.ppu-build.outputs.wheel-artifact-id }}
 
@@ -337,16 +342,20 @@ jobs:
     name: >-
       ${{ inputs.run_legacy_sanity && 'legacy-only-pr-test-ppu-finish' ||
           ((github.event_name == 'pull_request_target' && github.event.action == 'labeled' &&
-            github.event.label.name != 'run-ci-ppu') &&
+            !contains(fromJSON('["run-ci","run-ci-ppu"]'), github.event.label.name)) &&
            'ignored-label-pr-test-ppu-finish' || 'pr-test-ppu-finish') }}
     needs: [pr-gate, check-changes, ppu-ci-selftest, ppu-build, ppu-cluster-config, ppu-fast-sanity]
-    if: always() && inputs.run_legacy_sanity != true && needs.check-changes.result != 'skipped'
+    if: >-
+      always() && inputs.run_legacy_sanity != true && needs.check-changes.result != 'skipped' &&
+      !(needs.pr-gate.result == 'success' && needs.pr-gate.outputs.approved == 'false')
     runs-on: ubuntu-latest
     permissions: {}
     steps:
       - name: Require successful Linux selftests, native build, runner preflight and Recipe Fast Sanity
         env:
           NEEDS_JSON: ${{ toJson(needs) }}
+          PREFLIGHT_ONLY: ${{ inputs.preflight_only || false }}
+          SANITY_RESULT: ${{ needs.ppu-fast-sanity.outputs.sanity-result }}
           PPU_IN_SCOPE: ${{ needs.check-changes.outputs.ppu }}
         run: |
           if jq -e 'any(.[]; .result == "failure" or .result == "cancelled")' <<< "$NEEDS_JSON" >/dev/null; then
@@ -354,6 +363,13 @@ jobs:
             exit 1
           fi
           if [[ "$PPU_IN_SCOPE" == "true" ]]; then
+            if [[ "$PREFLIGHT_ONLY" == true ]]; then
+              jq -e '.["ppu-build"].result == "skipped" and (del(.["ppu-build"]) | all(.[]; .result == "success"))' <<< "$NEEDS_JSON" >/dev/null
+              [[ "$SANITY_RESULT" == success ]]
+              echo 'Linux selftests and cluster preflights passed.'
+              exit 0
+            fi
+            [[ "$SANITY_RESULT" == success ]]
             if ! jq -e 'all(.[]; .result == "success")' <<< "$NEEDS_JSON" >/dev/null; then
               printf '%s\n' '::error::PPU scope requires successful Linux selftests, native build, runner preflight and Recipe Fast Sanity.'
               exit 1

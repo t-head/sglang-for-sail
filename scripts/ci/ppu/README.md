@@ -6,7 +6,7 @@ The release branch owns the SGLang serving recipes, test policies and 890P accur
 - **Model Sanity** runs real weights once per model. It runs GSM8K main (1,319 questions), reconciles each scored sample with the reference band, verifies the KV gauge after a cache flush, and runs the native microbench at concurrency 1 and 16. The same-server performance measurements are diagnostic.
 - **Legacy single-device sanity** runs EAGLE3 and DFlash on both board types when explicitly requested. Each test reports its original result and the runner retains the raw output privately.
 
-For release PRs, a maintainer with write access must first apply `run-ci`, then apply `run-ci-ppu` for Fast Sanity or `run-ci-ppu-nightly` for Model Sanity. Reapply the workload label after a new push to approve the new head SHA. Apply the same labels to fork PRs after reviewing the exact revision. Nightly dispatch and reusable inputs also allow an exact model filter and reuse of a candidate build with `skip_wheel_build` and `wheel_artifact_run_id`.
+For release PRs, a maintainer with write access must apply `run-ci` and `run-ci-ppu` for Fast Sanity or `run-ci-ppu-nightly` for Model Sanity. The labels may arrive in either order. A rerun rechecks the PR timeline. After a new push, remove and reapply the workload label to approve the current head. Apply the same labels to fork PRs after reviewing the exact revision. Nightly dispatch and reusable inputs also allow an exact model filter and reuse of a candidate build with `skip_wheel_build` and `wheel_artifact_run_id`.
 
 The PR workflow finish job requires Linux infrastructure selftests, the native build, runner preflight and Recipe Fast Sanity for changes in PPU scope. PR-triggered workflows use the protected base branch's workflow and the approved head SHA as the test source. To run the separate single-device workflow on the release branch after it lands, dispatch the same workflow in legacy-only mode.
 
@@ -23,6 +23,8 @@ Register the `k8s-runner-group-cpu-thead` runner in the `sglang-ppu-ci` runner g
 
 - `t-head/sglang-for-sail/.github/workflows/pr-test-ppu.yml@refs/heads/release/v0.5.23`
 - `t-head/sglang-for-sail/.github/workflows/nightly-test-ppu.yml@refs/heads/release/v0.5.23`
+
+For pre-merge validation, allowlist both workflow paths at the exact same-repository maintainer validation branch. Dispatch `pr-test-ppu.yml` on that branch with `preflight_only=true`. This runs the Linux selftests and the private configuration checks via the direct and reusable workflows. A cross-branch caller can request `tier: cluster_preflight` from the same reusable workflow. Remove temporary allowlist entries after validation.
 
 Remove the runner's access through the default or other unrestricted groups. Add protected branch refs to the allowlist when deploying these workflows on those branches. The branch must already contain the trusted workflow to run its PR events.
 
