@@ -7,7 +7,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 SCRIPT = Path(__file__).resolve().parents[3] / "scripts/ci/ppu/check_dependencies.py"
 ADDITIONS = {
     "sailify": "1.0.0",

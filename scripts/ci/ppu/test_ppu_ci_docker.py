@@ -14,7 +14,6 @@ import unittest
 import uuid
 from pathlib import Path
 
-
 if sys.platform == "linux":
     import fcntl
 
