@@ -270,13 +270,14 @@ def validate_input_length(
         Error message if validation fails, None if successful
     """
     if len(req.origin_input_ids) >= max_req_input_len:
-        if allow_auto_truncate:
+        if allow_auto_truncate and max_req_input_len > 1:
             logger.warning(
                 "Request length is longer than the KV cache pool size or "
                 "the max context length. Truncated. "
                 f"{len(req.origin_input_ids)=}, {max_req_input_len=}."
             )
-            req.origin_input_ids = req.origin_input_ids[:max_req_input_len]
+            # The admission limit is exclusive, including after truncation.
+            req.origin_input_ids = req.origin_input_ids[: max_req_input_len - 1]
             return None
         else:
             error_msg = (

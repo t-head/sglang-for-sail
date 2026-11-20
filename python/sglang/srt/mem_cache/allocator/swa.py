@@ -177,6 +177,70 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
         )
 
+    def max_new_tokens_for_memory(
+        self,
+        input_tokens: int,
+        max_new_tokens: int,
+        *,
+        token_capacity: int,
+        sliding_window_size: int | None,
+        chunk_size: int | None,
+    ) -> int | None:
+        full_limit = super().max_new_tokens_for_memory(
+            input_tokens,
+            max_new_tokens,
+            token_capacity=token_capacity,
+            sliding_window_size=sliding_window_size,
+            chunk_size=chunk_size,
+        )
+        if (
+            full_limit is None
+            or type(self) is not SWATokenToKVPoolAllocator
+            or self.swa_req_ring
+        ):
+            return full_limit
+
+        from sglang.srt.mem_cache.prefill_budget import estimate_swa_kv_tokens
+
+        paged_input = -(-input_tokens // self.page_size) * self.page_size
+        chunk_limit = chunk_size if chunk_size is not None and chunk_size > 0 else None
+
+        def fits(candidate):
+            needed = estimate_swa_kv_tokens(
+                paged_input,
+                candidate,
+                sliding_window_size=sliding_window_size,
+                page_size=self.page_size,
+                allocation_limit=chunk_limit,
+            )
+            if needed < self.size_swa:
+                return True
+            if chunk_limit is None:
+                return False
+            # Match SWAPrefillBudget.check_prefill/_chunk_cap: an oversized
+            # chunk may shrink when even the empty SWA pool cannot fit it.
+            headroom = estimate_swa_kv_tokens(
+                0,
+                candidate,
+                sliding_window_size=sliding_window_size,
+                page_size=self.page_size,
+            )
+            chunk_cap = (self.size_swa - headroom) // self.page_size * self.page_size
+            return chunk_cap > 0
+
+        if not fits(0):
+            return None
+        if fits(full_limit):
+            return full_limit
+        lo, hi = 0, full_limit
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if fits(mid):
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
     def reclaim_for_prealloc(
         self, tree_cache, full_tokens: int, swa_tokens: int
     ) -> str | None:

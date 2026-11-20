@@ -38,6 +38,42 @@ class MambaFullCacheDonor(Protocol):
         ...
 
 
+def max_input_tokens_for_memory(
+    allocator,
+    max_input_tokens: int,
+    *,
+    token_capacity: int,
+    sliding_window_size: int | None,
+    chunk_size: int | None,
+) -> int:
+    """Largest input allowing one output token under the allocator's budget.
+
+    This is an inclusive bound; serving's strict input limit is one larger.
+    Callers must restrict this search to allocators with a monotone token budget.
+    """
+
+    def fits(input_tokens):
+        remaining = allocator.max_new_tokens_for_memory(
+            input_tokens,
+            1,
+            token_capacity=token_capacity,
+            sliding_window_size=sliding_window_size,
+            chunk_size=chunk_size,
+        )
+        return remaining is not None and remaining >= 1
+
+    if max_input_tokens < 0 or not fits(0):
+        return -1
+    lo, hi = 0, max_input_tokens
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if fits(mid):
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
 class BaseTokenToKVPoolAllocator(abc.ABC):
     @abc.abstractmethod
     def __init__(
@@ -100,9 +136,10 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         distributed token scaling. Shared pools use their physical byte layout.
         """
         paged_input = -(-input_tokens // self.page_size) * self.page_size
-        return max(
-            0, min(max_new_tokens, token_capacity - paged_input - self.page_size - 1)
-        )
+        remaining = token_capacity - paged_input - self.page_size - 1
+        if remaining < 0:
+            return None
+        return max(0, min(max_new_tokens, remaining))
 
     def prealloc_fits_assumes_reclaim(self) -> bool:
         """Whether `prealloc_fits` answers about the state reachable AFTER

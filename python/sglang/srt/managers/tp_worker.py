@@ -24,6 +24,7 @@ import torch
 from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadGroup
+from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
@@ -38,7 +39,13 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
+from sglang.srt.mem_cache.allocator.base import max_input_tokens_for_memory
+from sglang.srt.mem_cache.allocator.page_interleave import (
+    PageInterleavePoolAllocator,
+    page_interleave_shard_size,
+)
+from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -50,6 +57,7 @@ from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_time_usage,
 )
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.runtime_context import (
     get_device,
     get_exec,
@@ -75,6 +83,18 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
 logger = logging.getLogger(__name__)
+
+
+def get_effective_chunked_prefill_size(chunk_size, model_config):
+    """Match Scheduler's effective chunking, including disabled MM backends."""
+    if chunk_size is None or chunk_size <= 0:
+        return None
+    if (
+        model_config.is_multimodal
+        and get_resolved_model_impl(model_config) == ModelImpl.TRANSFORMERS
+    ):
+        return None
+    return chunk_size
 
 
 class BaseTpWorker(ABC):
@@ -570,6 +590,34 @@ class TpModelWorker(BaseTpWorker):
             kv_capacity - 1,
         )
         max_req_input_len = max_req_len - 5
+        allocator = self.model_runner.token_to_kv_pool_allocator
+        shard_size = page_interleave_shard_size(allocator)
+        # Specialized subclasses and shared byte pools retain their limits.
+        if (
+            (
+                type(allocator) is PagedTokenToKVPoolAllocator
+                or (
+                    type(allocator) is SWATokenToKVPoolAllocator
+                    and not allocator.swa_req_ring
+                )
+            )
+            and shard_size == 1
+        ) or (type(allocator) is PageInterleavePoolAllocator and shard_size > 1):
+            # Scheduler reserves one page per shard, not just one page total.
+            token_capacity = kv_capacity - allocator.page_size * (shard_size - 1)
+            max_req_input_len = min(
+                max_req_input_len,
+                max_input_tokens_for_memory(
+                    allocator,
+                    max_req_input_len - 1,
+                    token_capacity=token_capacity,
+                    sliding_window_size=self.sliding_window_size,
+                    chunk_size=get_effective_chunked_prefill_size(
+                        get_schedule().chunked_prefill_size, self.model_config
+                    ),
+                )
+                + 1,
+            )
         if self.dllm_algorithm is not None:
             max_req_input_len -= self.dllm_algorithm.block_size
         return (
