@@ -4,7 +4,7 @@ on:
   # Use the protected base branch's workflow for privileged runner jobs.
   pull_request_target:
     branches: [main, 'release/**']
-    types: [labeled]
+    types: [labeled, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
       ref:
@@ -23,6 +23,9 @@ on:
         type: string
         default: ''
   workflow_call:
+    outputs:
+      sanity-result:
+        value: ${{ inputs.tier == 'cluster_preflight' && jobs.cluster-preflight.outputs.result || jobs.recipe-sanity.outputs.result }}
     inputs:
       ref:
         type: string
@@ -64,21 +67,41 @@ jobs:
   pr-gate:
     if: >-
       github.repository == 't-head/sglang-for-sail' &&
-      (github.event_name != 'pull_request_target' ||
-       inputs.tier == 'fast_sanity' ||
-       (github.event.action == 'labeled' &&
-        github.event.label.name == 'run-ci-ppu-nightly' &&
-        !github.event.pull_request.draft))
-    uses: ./.github/workflows/pr-gate.yml
+      (github.event_name != 'pull_request_target' || inputs.tier == 'fast_sanity' ||
+       github.event.action != 'labeled' ||
+       contains(fromJSON('["run-ci","run-ci-ppu-nightly"]'), github.event.label.name))
+    uses: ./.github/workflows/ppu-approval.yml
     with:
-      require-run-ci: true
-      require-label: ${{ inputs.tier == 'fast_sanity' && 'run-ci-ppu' || 'run-ci-ppu-nightly' }}
-      require-fresh-label: true
-      # Fast Sanity's caller already applied the shared PR cooldown.
-      cool-down-minutes: ${{ inputs.tier != 'fast_sanity' && 120 || 0 }}
+      label: ${{ inputs.tier == 'fast_sanity' && 'run-ci-ppu' || 'run-ci-ppu-nightly' }}
+      ref: ${{ inputs.ref || '' }}
+
+  cluster-preflight:
+    outputs:
+      result: ${{ steps.check.outcome }}
+    needs: pr-gate
+    if: inputs.tier == 'cluster_preflight' && needs.pr-gate.outputs.approved == 'true'
+    runs-on: k8s-runner-group-cpu-thead
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: t-head/ci-infra
+          ref: 96e25147971f5d2a04d828f8ad508cae38a4fa8a
+          path: .ppu-infra
+          persist-credentials: false
+      - id: check
+        run: python3 -B scripts/ci/ppu/recipe_cluster_config.py --check
 
   plan:
     needs: pr-gate
+    if: inputs.tier != 'cluster_preflight' && needs.pr-gate.outputs.approved == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -90,7 +113,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
-          ref: ${{ github.event.pull_request.head.sha || inputs.ref || github.sha }}
+          ref: ${{ github.event.pull_request.head.sha || (github.event_name == 'workflow_dispatch' && github.sha) || inputs.ref || github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -233,6 +256,8 @@ jobs:
           if-no-files-found: error
 
   recipe-sanity:
+    outputs:
+      result: ${{ steps.cluster.outcome }}
     name: ${{ inputs.tier == 'fast_sanity' && 'Fast Sanity' || 'Model Sanity' }} (${{ matrix.model }})
     needs: [plan, ppu-build, evalscope-wheels]
     if: >-
@@ -240,9 +265,7 @@ jobs:
       (inputs.tier == 'fast_sanity' || needs.evalscope-wheels.result == 'success') &&
       (needs.ppu-build.result == 'success' ||
        (needs.plan.outputs.input-artifact-id != '' && needs.ppu-build.result == 'skipped'))
-    runs-on:
-      group: sglang-ppu-ci
-      labels: k8s-runner-group-cpu-thead
+    runs-on: k8s-runner-group-cpu-thead
     container:
       image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: ${{ inputs.tier == 'fast_sanity' && 40 || 360 }}
