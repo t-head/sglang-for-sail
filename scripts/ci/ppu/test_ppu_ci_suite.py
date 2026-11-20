@@ -176,6 +176,12 @@ class TestPPUCIWorkflow(unittest.TestCase):
                 for job in cluster_jobs:
                     self.assertEqual(jobs[job]["runs-on"], "k8s-runner-group-cpu-thead")
 
+    def test_protected_recipe_job_forwards_matrix_device_count(self):
+        source = RUNNER.parent.parent / ".github/workflows/nightly-test-ppu.yml"
+        workflow = yaml.load(source.read_text(), Loader=yaml.BaseLoader)
+        job = workflow["jobs"]["recipe-sanity"]
+        self.assertEqual(job["env"]["RECIPE_PPU_COUNT"], "${{ matrix.ppu_count || 8 }}")
+
     def test_device_jobs_require_build_and_cpu_checks(self):
         selftests = self.jobs["ppu-ci-selftest"]
         self.assertEqual(selftests["runs-on"], "ubuntu-latest")
