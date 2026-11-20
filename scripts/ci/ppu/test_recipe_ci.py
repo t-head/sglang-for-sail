@@ -59,6 +59,7 @@ class RecipeContractTest(unittest.TestCase):
                     {"model": "deepseek-v4-flash", "ppu_count": 8},
                     {"model": "deepseek-v4.1-flash", "ppu_count": 8},
                     {"model": "glm-5.3-flash", "ppu_count": 2},
+                    {"model": "glm-5.3-tp4", "ppu_count": 4},
                     {"model": "glm-5.3", "ppu_count": 8},
                     {"model": "minimax-m3", "ppu_count": 8},
                     {"model": "qwen3.8-27b", "ppu_count": 2},
@@ -75,7 +76,7 @@ class RecipeContractTest(unittest.TestCase):
             select("model_sanity", "glm")
         with self.assertRaises(ValueError):
             select("model_sanity", "glm-5.3,glm-5.3")
-        for model in ("qwen3.8-27b", "glm-5.3-flash"):
+        for model in ("qwen3.8-27b", "glm-5.3-flash", "glm-5.3-tp4"):
             with self.subTest(model=model), self.assertRaises(ValueError):
                 select("model_sanity", model)
 
@@ -94,6 +95,15 @@ class RecipeContractTest(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(ValueError, "unsupported cluster topology"):
                     cluster_width(policy, "fast_sanity")
+
+    def test_glm_tp4_preserves_the_pinned_model_identity(self):
+        recipes = REPO_ROOT / "test/ppu/recipes/zai-org"
+        tp8 = resolve_recipe(recipes / "GLM-5.3.yaml")
+        tp4 = resolve_recipe(recipes / "GLM-5.3-TP4.yaml")
+        self.assertEqual(tp4["model_id"], tp8["model_id"])
+        self.assertEqual(tp4["hf_model_id"], tp8["hf_model_id"])
+        self.assertEqual(tp4["server_env"], tp8["server_env"])
+        self.assertEqual((tp4["ppu_count"], tp8["ppu_count"]), (4, 8))
 
     def test_policy_switches(self):
         policy = DEFAULT_POLICY_ROOT / "models/glm-5.3.yaml"
@@ -125,6 +135,7 @@ class RecipeContractTest(unittest.TestCase):
 
         for model, ready_timeout, width in (
             ("glm-5.3", 1350, 8),
+            ("glm-5.3-tp4", 1350, 4),
             ("glm-5.3-flash", 1000, 2),
             ("deepseek-v4-flash", 1000, 8),
             ("qwen3.8-27b", 1000, 2),
@@ -547,6 +558,7 @@ class ClusterTransportTest(unittest.TestCase):
         injected = "/" + "nas" + "_aisw/fixture " + ".".join(("10", "4", "5", "6"))
         for model, width, tampered in (
             ("glm-5.3", 8, False),
+            ("glm-5.3-tp4", 4, False),
             ("deepseek-v4.1-flash", 8, False),
             ("qwen3.8-27b", 2, False),
             ("glm-5.3", 8, True),
@@ -610,7 +622,11 @@ class ClusterTransportTest(unittest.TestCase):
                 (backend / "submit.sh").write_text(
                     f'test "$INPUT_NNODES/$INPUT_NPROC_PER_NODE/$INPUT_NODE_SELECTOR" = "0/{width}/board-type=ZW-M890P" || exit 1\n'
                     'test -f "$SOURCE_STAGE_DIR" || exit 1\n'
-                    'jq -e --arg cache "$PPU_CI_HF_CACHE_ROOT" --arg model "$MODEL_KEY" --arg width "$INPUT_NPROC_PER_NODE" --arg revision "$PPU_CI_GLM53_MODEL_REVISION" \'.PPU_CI_HF_CACHE_ROOT == $cache and .MODEL_KEY == $model and .RECIPE_PPU_COUNT == $width and (if $model == "glm-5.3" then .PPU_CI_HF_MODEL_REVISION == $revision else (has("PPU_CI_HF_MODEL_REVISION") | not) end)\' <<< "$USER_ENV_JSON" >/dev/null || exit 1\n'
+                    'jq -e --arg cache "$PPU_CI_HF_CACHE_ROOT" --arg model "$MODEL_KEY" '
+                    '--arg width "$INPUT_NPROC_PER_NODE" --arg revision "$EXPECTED_REVISION" '
+                    "'.PPU_CI_HF_CACHE_ROOT == $cache and .MODEL_KEY == $model and "
+                    '.RECIPE_PPU_COUNT == $width and (.PPU_CI_HF_MODEL_REVISION // "") == $revision\' '
+                    '<<< "$USER_ENV_JSON" >/dev/null || exit 1\n'
                     'printf "%s\\n" "$INJECTED_FIXTURE"\n'
                     'printf "job_status=scheduled\\nstart_time=1\\ndeadline=2\\nqueue_duration_seconds=7\\n" >> "$GITHUB_OUTPUT"\n'
                 )
@@ -652,6 +668,9 @@ class ClusterTransportTest(unittest.TestCase):
                     "PPU_CI_JIT_ROOT": str(root / "jit"),
                     "PPU_CI_HF_CACHE_ROOT": str(root / "cache"),
                     "PPU_CI_GLM53_MODEL_REVISION": "c" * 40,
+                    "EXPECTED_REVISION": "c" * 40
+                    if model in {"glm-5.3", "glm-5.3-tp4"}
+                    else "",
                     "PPU_CI_RECIPE_RUNTIME_IMAGE": result["runtime_image"],
                     "INJECTED_FIXTURE": injected,
                 }
