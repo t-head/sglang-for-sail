@@ -281,6 +281,19 @@ class TestPPUCIWorkflow(unittest.TestCase):
             "legacy-only-pr-test-ppu-finish", self.jobs["pr-test-ppu-finish"]["name"]
         )
 
+    def test_fast_model_filter_is_available_only_for_manual_dispatch(self):
+        path = RUNNER.parent.parent / ".github/workflows/pr-test-ppu.yml"
+        workflow = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+        triggers = workflow["on"]
+        dispatch_filter = triggers["workflow_dispatch"]["inputs"]["model_filter"]
+        self.assertEqual(dispatch_filter["type"], "string")
+        self.assertEqual(dispatch_filter["default"], "")
+        self.assertNotIn("model_filter", triggers["workflow_call"]["inputs"])
+        self.assertEqual(
+            self.jobs["ppu-fast-sanity"]["with"]["model_filter"],
+            "${{ github.event_name == 'workflow_dispatch' && inputs.model_filter || '' }}",
+        )
+
     def test_finish_requires_each_recipe_dependency_when_in_scope(self):
         job = self.jobs["pr-test-ppu-finish"]
         finish = job["steps"][0]
