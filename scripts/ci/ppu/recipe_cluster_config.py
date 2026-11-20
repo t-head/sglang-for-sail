@@ -8,7 +8,6 @@ import re
 import stat
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 BACKEND_SHA = "96e25147971f5d2a04d828f8ad508cae38a4fa8a"
@@ -48,12 +47,7 @@ def load_settings(directory, expected):
     try:
         if os.fstat(fd).st_mode & 0o007:
             raise ValueError("configuration directory is accessible to others")
-        try:
-            handle = os.open(
-                f"config.{expected}.json", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd
-            )
-        except FileNotFoundError:
-            handle = os.open("config.json", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+        handle = os.open("config.json", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
         with os.fdopen(handle, "rb") as stream:
             info = os.fstat(stream.fileno())
             if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o007:
@@ -107,84 +101,7 @@ def handoff(directory, expected, uid, gid):
         os.close(parent)
 
 
-def stage_glm_config(directory, current_digest, selection_digest, uid, gid):
-    """Stage a verified, independently addressable task configuration."""
-    if (
-        not directory.is_absolute()
-        or directory.name != CONFIG_NAME
-        or uid != 1001
-        or gid < 0
-        or not re.fullmatch(r"[0-9a-f]{64}", selection_digest)
-    ):
-        raise ValueError("invalid task configuration staging parameters")
-    values = load_settings(directory, current_digest)
-    parent = os.open(
-        directory.with_name(CONFIG_NAME + "-operator"),
-        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-    )
-    try:
-        operator = os.fstat(parent)
-        if stat.S_IMODE(operator.st_mode) != 0o700:
-            raise ValueError("operator directory is not private")
-        selected = os.open(
-            "glm53-mxfp4-selection.json", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent
-        )
-        with os.fdopen(selected, "rb") as stream:
-            info = os.fstat(stream.fileno())
-            choice = stream.read(8193)
-            if (
-                not stat.S_ISREG(info.st_mode)
-                or stat.S_IMODE(info.st_mode) != 0o600
-                or info.st_uid != operator.st_uid
-                or len(choice) > 8192
-                or hashlib.sha256(choice).hexdigest() != selection_digest
-            ):
-                raise ValueError("operator selection did not match its seal")
-    finally:
-        os.close(parent)
-
-    selection = json.loads(choice)
-    model = Path(selection["glm_path"])
-    if not model.is_absolute() or ".." in model.parts:
-        raise ValueError("invalid checkpoint selection")
-    for name, key in (
-        ("config.json", "config_sha256"),
-        ("model.safetensors.index.json", "index_sha256"),
-    ):
-        if hashlib.sha256((model / name).read_bytes()).hexdigest() != selection[key]:
-            raise ValueError("checkpoint metadata mismatch")
-    values["PPU_CI_GLM53_MODEL_PATH"] = str(model)
-    payload = json.dumps({"settings": values}, sort_keys=True).encode()
-    digest = hashlib.sha256(payload).hexdigest()
-    target = directory / f"config.{digest}.json"
-    fd, staged = tempfile.mkstemp(prefix=".config.", dir=directory)
-    try:
-        with os.fdopen(fd, "wb") as output:
-            output.write(payload)
-            output.flush()
-            os.fsync(output.fileno())
-            os.fchown(output.fileno(), uid, gid)
-        try:
-            os.link(staged, target, follow_symlinks=False)
-        except FileExistsError:
-            pass
-        if load_settings(directory, digest) != values:
-            raise ValueError("staged configuration failed digest validation")
-    finally:
-        os.unlink(staged)
-    print(digest)
-
-
 def main():
-    if len(sys.argv) == 7 and sys.argv[1] == "--stage-glm-config":
-        stage_glm_config(
-            Path(sys.argv[2]),
-            sys.argv[3],
-            sys.argv[4],
-            int(sys.argv[5]),
-            int(sys.argv[6]),
-        )
-        return
     if len(sys.argv) == 6 and sys.argv[1] == "--handoff":
         handoff(Path(sys.argv[2]), sys.argv[3], int(sys.argv[4]), int(sys.argv[5]))
         return
@@ -234,31 +151,6 @@ def main():
 
         print("PPU cluster private configuration verified")
         publish_recent_failures(retained, int(os.environ["GITHUB_RUN_ID"]))
-        selection_digest = os.environ.get("PPU_GLM_SELECTION_SHA256")
-        if selection_digest:
-            digest = subprocess.check_output(
-                [
-                    "sudo",
-                    "-n",
-                    "--",
-                    sys.executable,
-                    "-I",
-                    "-B",
-                    str(Path(__file__).resolve()),
-                    "--stage-glm-config",
-                    str(directory),
-                    expected,
-                    selection_digest,
-                    str(os.geteuid()),
-                    str(os.getegid()),
-                ],
-                stderr=subprocess.DEVNULL,
-                text=True,
-            ).strip()
-            if not re.fullmatch(r"[0-9a-f]{64}", digest):
-                raise ValueError("staged configuration seal was invalid")
-            load_settings(directory, digest)
-            print(f"Staged PPU task configuration digest: {digest}")
         return
     os.execvpe(
         "bash",
