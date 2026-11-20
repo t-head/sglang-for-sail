@@ -107,103 +107,7 @@ def handoff(directory, expected, uid, gid):
         os.close(parent)
 
 
-def export_glm_startup(directory, marker_digest, run_id):
-    """Return specific retained logs to the authorized SSH task owner."""
-    if (
-        not directory.is_absolute()
-        or directory.name != CONFIG_NAME
-        or not re.fullmatch(r"[0-9a-f]{64}", marker_digest)
-        or run_id != "44651402058"
-    ):
-        raise ValueError("invalid private diagnostics parameters")
-    source = (
-        directory
-        / "output/retained/sglang-for-sail"
-        / (run_id + "-1")
-        / "model_sanity/glm-5.3"
-    )
-    index = json.loads((source / "index.json").read_text())
-    if (
-        index["run_id"] != run_id
-        or index["attempt"] != "1"
-        or index["tier"] != "model_sanity"
-        or index["model_key"] != "glm-5.3"
-        or index["checkout_sha"] != "cdc9bdf3f0cc793e591711efe6b76facf2229986"
-    ):
-        raise ValueError("private diagnostics scope mismatch")
-    files = {}
-    for name in (
-        "runtime.log",
-        "launcher.log",
-        "worker-phase.txt",
-        "sglang_serve_model_sanity.log",
-    ):
-        expected = index["files"].get(name)
-        if expected is not None:
-            file = source / name
-            if (
-                file.is_symlink()
-                or not file.is_file()
-                or file.stat().st_size > 64 * 1024 * 1024
-            ):
-                raise ValueError("invalid startup diagnostics file")
-            content = file.read_bytes()
-            if hashlib.sha256(content).hexdigest() != expected:
-                raise ValueError("private diagnostics checksum mismatch")
-            files[name] = content
-    if "sglang_serve_model_sanity.log" not in files:
-        raise ValueError("server startup diagnostics are missing")
-    target = directory.with_name(CONFIG_NAME + "-operator")
-    parent = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        owner = os.fstat(parent)
-        if stat.S_IMODE(owner.st_mode) != 0o700:
-            raise ValueError("operator directory is not private")
-        marker = os.open("owner-marker", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
-        with os.fdopen(marker, "rb") as stream:
-            info = os.fstat(stream.fileno())
-            if (
-                not stat.S_ISREG(info.st_mode)
-                or stat.S_IMODE(info.st_mode) != 0o600
-                or info.st_uid != owner.st_uid
-                or hashlib.sha256(stream.read(33)).hexdigest() != marker_digest
-            ):
-                raise ValueError("operator marker mismatch")
-        destination = "glm-startup-" + run_id
-        try:
-            os.mkdir(destination, 0o700, dir_fd=parent)
-        except FileExistsError:
-            return
-        output = os.open(
-            destination, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent
-        )
-        try:
-            files["SHA256SUMS"] = "".join(
-                "{}  {}\n".format(hashlib.sha256(data).hexdigest(), name)
-                for name, data in sorted(files.items())
-            ).encode()
-            for name, content in files.items():
-                f = os.open(
-                    name,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                    0o600,
-                    dir_fd=output,
-                )
-                with os.fdopen(f, "wb") as stream:
-                    stream.write(content)
-                    stream.flush()
-                    os.fchown(stream.fileno(), owner.st_uid, owner.st_gid)
-            os.fchown(output, owner.st_uid, owner.st_gid)
-        finally:
-            os.close(output)
-    finally:
-        os.close(parent)
-
-
 def main():
-    if len(sys.argv) == 5 and sys.argv[1] == "--export-diagnostics":
-        export_glm_startup(Path(sys.argv[2]), sys.argv[3], sys.argv[4])
-        return
     if len(sys.argv) == 6 and sys.argv[1] == "--handoff":
         handoff(Path(sys.argv[2]), sys.argv[3], int(sys.argv[4]), int(sys.argv[5]))
         return
@@ -253,27 +157,6 @@ def main():
 
         print("PPU cluster private configuration verified")
         publish_recent_failures(retained, int(os.environ["GITHUB_RUN_ID"]))
-        operator_marker = os.environ.get("PPU_CI_OPERATOR_HANDOFF_SHA256")
-        if operator_marker:
-            subprocess.run(
-                [
-                    "sudo",
-                    "-n",
-                    "--",
-                    sys.executable,
-                    "-I",
-                    "-B",
-                    str(Path(__file__).resolve()),
-                    "--export-diagnostics",
-                    str(directory),
-                    operator_marker,
-                    "44651402058",
-                ],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            print("Selected logs were copied to the task owner's private storage")
         return
     os.execvpe(
         "bash",
