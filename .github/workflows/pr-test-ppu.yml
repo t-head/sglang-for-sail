@@ -210,6 +210,42 @@ jobs:
           fi
           printf 'Native two-worker prerequisites verified.\n'
 
+
+  ppu-master-image:
+    name: Verify native master startup in the release image
+    needs: ppu-cluster-config
+    if: github.event_name == 'workflow_dispatch' && inputs.preflight_only
+    runs-on: ubuntu-24.04
+    timeout-minutes: 16
+    permissions:
+      contents: read
+    env:
+      RELEASE_IMAGE: download.t-head.cn/docker_test/sglang@sha256:bcc10dbf0587c7dfc601d729008620cf923c926463eeac5d99c062d7517b24a5
+    steps:
+      - name: Fetch the pinned installer
+        uses: actions/checkout@v4
+        with:
+          repository: t-head/ci-infra
+          ref: 96e25147971f5d2a04d828f8ad508cae38a4fa8a
+          path: .ppu-infra
+          persist-credentials: false
+      - name: Install and validate SSH in a disposable CPU container
+        run: |
+          set -euo pipefail
+          docker pull "$RELEASE_IMAGE"
+          release_deadline="$(( $(date +%s) + 360 ))"
+          docker run --rm --init --pids-limit 512 \
+            --security-opt no-new-privileges \
+            --volume "$PWD/.ppu-infra/cluster-run/scripts:/action:ro" \
+            --env "PPU_DEADLINE=$release_deadline" \
+            --entrypoint /bin/bash "$RELEASE_IMAGE" -ec '
+              /bin/bash /action/install-ssh.sh
+              mkdir -p /run/sshd
+              ssh-keygen -A
+              sshd -t
+              printf "Release image passed native SSH startup prerequisites.\n"
+            '
+
   ppu-build:
     name: >-
       ${{ (github.event_name == 'pull_request_target' && github.event.action == 'labeled' &&
