@@ -57,6 +57,7 @@ class RecipeContractTest(unittest.TestCase):
             {
                 "include": [
                     {"model": "deepseek-v4-flash"},
+                    {"model": "deepseek-v4.1-flash-1017"},
                     {"model": "deepseek-v4.1-flash"},
                     {"model": "glm-5.3"},
                     {"model": "minimax-m3"},
@@ -92,6 +93,39 @@ class RecipeContractTest(unittest.TestCase):
             self.assertNotIn(flag, flags)
         with self.assertRaises(ValueError):
             select("model_sanity", model)
+
+    def test_deepseek_v41_1017_uses_engram_snapshot_for_both_tiers(self):
+        policy_path = DEFAULT_POLICY_ROOT / "models/deepseek-v4.1-flash-1017.yaml"
+        policy = _load_yaml(policy_path)
+        recipe = REPO_ROOT / policy["recipe"]
+        fast = resolve_recipe(recipe, policy_path=policy_path, tier="fast_sanity")
+        nightly = resolve_recipe(recipe, policy_path=policy_path, tier="model_sanity")
+        legacy = resolve_recipe(recipe.with_name("DeepSeek-V4.1-Flash.yaml"))
+        for config in (fast, nightly):
+            self.assertEqual(config["ppu_count"], 8)
+            self.assertIsNone(config["layer_override"])
+            self.assertEqual(
+                config["server_env"]["SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE"], "1"
+            )
+            self.assertNotEqual(config["hf_model_id"], legacy["hf_model_id"])
+        self.assertTrue(fast["dummy_weights"])
+        self.assertFalse(nightly["dummy_weights"])
+        golden_path = (
+            REPO_ROOT
+            / "test/ppu/golden"
+            / f"accuracy_{nightly['golden_model_key']}_890p.json"
+        )
+        golden = json.loads(golden_path.read_text())
+        stage = next(
+            stage
+            for stage in policy["tiers"]["model_sanity"]["stages"]
+            if stage["kind"] == "evalscope"
+        )
+        self.assertEqual(fast["hf_model_id"], golden["checkpoint"])
+        self.assertEqual(nightly["hf_model_id"], golden["checkpoint"])
+        self.assertEqual(stage["generation"], golden["generation"])
+        self.assertEqual(golden["dataset"]["num_expected"], 1319)
+        self.assertEqual(golden["score_num"], 1281)
 
     def test_minimax_nightly_uses_published_quantized_reference(self):
         self.assertEqual(
