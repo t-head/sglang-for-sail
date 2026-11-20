@@ -480,6 +480,9 @@ def run(policy_path, tier, queue_s):
         stages = {stage["kind"]: stage for stage in policy["tiers"][tier]["stages"]}
         # GLM's 141-shard cold load took 35 minutes before DeepGEMM warmup.
         ready_timeout = 4500 if policy["model_id"] == "zai-org/GLM-5.3" else 2400
+        if policy_path.stem == "minimax-m3":
+            # The MXFP4/FP8 checkpoint loaded 26 of 59 shards in 39 minutes.
+            ready_timeout = 6600
         with server(config, "model_sanity", result, ready_timeout):
             probes(stages["sanity"]["probe"], fast=False)
             result["sse_verified"] = True

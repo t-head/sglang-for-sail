@@ -144,6 +144,21 @@ class RecipeContractTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             select("model_sanity", model)
 
+    def test_minimax_nightly_allows_slow_weight_loading(self):
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            patch.dict(os.environ, {"PPU_RECIPE_CONTAINER_MODEL": temp}),
+            patch("recipe_runner.RESULTS", Path(temp) / "results"),
+            patch(
+                "recipe_runner.server", side_effect=RuntimeError("stop at launch")
+            ) as launch,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop at launch"):
+                run(DEFAULT_POLICY_ROOT / "models/minimax-m3.yaml", "model_sanity", 0)
+            config, stage, _, timeout = launch.call_args.args
+            self.assertEqual((stage, timeout), ("model_sanity", 6600))
+            self.assertNotIn("--load-format", config["flags"])
+
     def test_minimax_nightly_uses_published_quantized_reference(self):
         self.assertEqual(
             select("model_sanity", "minimax-m3"),
