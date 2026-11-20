@@ -19,7 +19,7 @@ The reusable workflow accepts the same boolean input and a candidate `ref`.
 
 ## Provision the cluster runner
 
-The `k8s-runner-group-cpu-thead` runner uses the pinned T-Head Cluster Run backend. The scheduler assigns one eight-card 890P Pod for each Recipe job. Each existing single-device test job requests one card on its selected board. The CPU runner passes model and dataset paths privately to the worker from its service environment. A task-specific shared configuration can supply the same variables. The workflow pins the configuration digest and verifies access in a CPU-only job before scheduling PPU Pods. The runner owns the private result directories at mode 0700.
+The `k8s-runner-group-cpu-thead` runner uses the pinned T-Head Cluster Run backend. Each Recipe job requests one 890P Pod with the width resolved from its selected policy and Recipe (2, 4, or 8 cards). The worker verifies that its visible card count and resolved Recipe match this allocation. Each existing single-device test job requests one card on its selected board. The CPU runner passes model and dataset paths privately to the worker from its service environment. A task-specific shared configuration can supply the same variables. The workflow pins the configuration digest and verifies access in a CPU-only job before scheduling PPU Pods. The runner owns the private result directories at mode 0700.
 
 | Setting | Purpose |
 | --- | --- |

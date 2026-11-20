@@ -131,7 +131,8 @@ case "$mode" in
     fast_sanity|model_sanity)
         [[ "$MODEL_KEY" =~ ^[a-z0-9][a-z0-9.-]*$ && -f "test/ppu/policy/models/$MODEL_KEY.yaml" ]]
         INPUT_NODE_SELECTOR=board-type=ZW-M890P
-        INPUT_NPROC_PER_NODE=8
+        [[ "${RECIPE_PPU_COUNT:?}" =~ ^(2|4|8)$ ]]
+        INPUT_NPROC_PER_NODE=$RECIPE_PPU_COUNT
         INPUT_TIMEOUT_MINUTES=330
         [[ "$mode" != fast_sanity ]] || INPUT_TIMEOUT_MINUTES=30
         INPUT_IMAGE=${PPU_CI_RECIPE_RUNTIME_IMAGE:?}
@@ -179,7 +180,7 @@ if os.environ["TIER"] == "legacy":
         "PPU_CI_DFLASH_MODEL_PATH", "PPU_CI_EVAL_CACHE",
     ]
 else:
-    keys += ["MODEL_KEY", "PPU_CI_RECIPE_IMAGE_KEY", "PPU_CI_HF_CACHE_ROOT"]
+    keys += ["MODEL_KEY", "RECIPE_PPU_COUNT", "PPU_CI_RECIPE_IMAGE_KEY", "PPU_CI_HF_CACHE_ROOT"]
     if os.environ["TIER"] == "model_sanity":
         keys += ["PPU_CI_GSM8K_PATH"]
 values = {key: os.environ[key] for key in keys}

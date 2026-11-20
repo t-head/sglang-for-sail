@@ -436,7 +436,11 @@ def run(policy_path, tier, queue_s):
     if uses_cache_ref:
         resolve["cache_revision"] = snapshot_revision
     config = resolve_recipe(recipe, **resolve)
-    if config["ppu_count"] != 8 or policy["model_id"] != config["model_id"]:
+    expected_width = int(os.environ.get("RECIPE_PPU_COUNT", "8"))
+    if (
+        config["ppu_count"] != expected_width
+        or policy["model_id"] != config["model_id"]
+    ):
         raise ValueError("incorrect recipe identity or device width")
     result = {
         "queue_s": queue_s,

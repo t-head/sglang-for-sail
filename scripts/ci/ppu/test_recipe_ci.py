@@ -27,7 +27,7 @@ from recipe_cluster_diagnostics import diagnostic_codes
 from recipe_publish import publish, validate
 from recipe_report import legacy_result
 from recipe_runner import cached_model_path, metrics_zero, read_eval_reviews, run
-from recipe_select import select
+from recipe_select import cluster_width, select
 
 
 def fast_result():
@@ -56,22 +56,44 @@ class RecipeContractTest(unittest.TestCase):
             select("fast_sanity", ""),
             {
                 "include": [
-                    {"model": "deepseek-v4-flash"},
-                    {"model": "deepseek-v4.1-flash"},
-                    {"model": "glm-5.3"},
-                    {"model": "minimax-m3"},
+                    {"model": "deepseek-v4-flash", "ppu_count": 8},
+                    {"model": "deepseek-v4.1-flash", "ppu_count": 8},
+                    {"model": "glm-5.3-flash", "ppu_count": 2},
+                    {"model": "glm-5.3", "ppu_count": 8},
+                    {"model": "minimax-m3", "ppu_count": 8},
+                    {"model": "qwen3.8-27b", "ppu_count": 2},
                 ]
             },
         )
 
     def test_nightly_exact_filter(self):
         self.assertEqual(
-            select("model_sanity", "glm-5.3"), {"include": [{"model": "glm-5.3"}]}
+            select("model_sanity", "glm-5.3"),
+            {"include": [{"model": "glm-5.3", "ppu_count": 8}]},
         )
         with self.assertRaises(ValueError):
             select("model_sanity", "glm")
         with self.assertRaises(ValueError):
             select("model_sanity", "glm-5.3,glm-5.3")
+        for model in ("qwen3.8-27b", "glm-5.3-flash"):
+            with self.subTest(model=model), self.assertRaises(ValueError):
+                select("model_sanity", model)
+
+    def test_plan_rejects_width_mismatch_and_multiple_nodes(self):
+        policy = DEFAULT_POLICY_ROOT / "models/qwen3.8-27b.yaml"
+        for topology in (
+            {"kind": "single_node", "nodes": 1, "devices_per_node": 8},
+            {"kind": "multi_node_ep", "nodes": 2, "devices_per_node": 2},
+        ):
+            with (
+                self.subTest(topology=topology),
+                patch(
+                    "recipe_select._load_yaml",
+                    side_effect=[_load_yaml(policy), {"ppu": {"topology": topology}}],
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "unsupported cluster topology"):
+                    cluster_width(policy, "fast_sanity")
 
     def test_policy_switches(self):
         policy = DEFAULT_POLICY_ROOT / "models/glm-5.3.yaml"
@@ -101,11 +123,22 @@ class RecipeContractTest(unittest.TestCase):
             timings["cold_start_s"] = 3.0
             yield
 
-        for model, ready_timeout in (("glm-5.3", 1350), ("deepseek-v4-flash", 1000)):
+        for model, ready_timeout, width in (
+            ("glm-5.3", 1350, 8),
+            ("glm-5.3-flash", 1000, 2),
+            ("deepseek-v4-flash", 1000, 8),
+            ("qwen3.8-27b", 1000, 2),
+        ):
             with (
                 self.subTest(model=model),
                 tempfile.TemporaryDirectory() as temp,
-                patch.dict(os.environ, {"PPU_RECIPE_CONTAINER_MODEL": temp}),
+                patch.dict(
+                    os.environ,
+                    {
+                        "PPU_RECIPE_CONTAINER_MODEL": temp,
+                        "RECIPE_PPU_COUNT": str(width),
+                    },
+                ),
                 patch("recipe_runner.RESULTS", Path(temp) / "results"),
                 patch("recipe_runner.server", side_effect=ready) as server,
                 patch("recipe_runner.probes") as probes,
@@ -116,11 +149,28 @@ class RecipeContractTest(unittest.TestCase):
                 self.assertEqual(server.call_count, 1)
                 config, label, _, timeout = server.call_args.args
                 self.assertEqual((label, timeout), ("fast_full", ready_timeout))
+                self.assertEqual(config["ppu_count"], width)
                 self.assertIn("dummy", config["flags"])
                 self.assertNotIn("--json-model-override-args", config["flags"])
                 probes.assert_called_once()
                 self.assertIsNone(result["layer_override"])
                 self.assertNotIn("fallback_reason", result)
+
+    def test_worker_rejects_recipe_with_wrong_allocation(self):
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            patch.dict(
+                os.environ,
+                {"PPU_RECIPE_CONTAINER_MODEL": "unused", "RECIPE_PPU_COUNT": "8"},
+            ),
+            patch("recipe_runner.RESULTS", Path(temp) / "results"),
+            patch("recipe_runner.server") as server,
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "incorrect recipe identity or device width"
+            ):
+                run(DEFAULT_POLICY_ROOT / "models/qwen3.8-27b.yaml", "fast_sanity", 0)
+            server.assert_not_called()
 
     def test_cached_model_requires_the_exact_snapshot_offline(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -495,10 +545,11 @@ class ClusterConfigBootstrapTest(unittest.TestCase):
 class ClusterTransportTest(unittest.TestCase):
     def test_scheduler_streams_stay_private(self):
         injected = "/" + "nas" + "_aisw/fixture " + ".".join(("10", "4", "5", "6"))
-        for model, tampered in (
-            ("glm-5.3", False),
-            ("deepseek-v4.1-flash", False),
-            ("glm-5.3", True),
+        for model, width, tampered in (
+            ("glm-5.3", 8, False),
+            ("deepseek-v4.1-flash", 8, False),
+            ("qwen3.8-27b", 2, False),
+            ("glm-5.3", 8, True),
         ):
             with (
                 self.subTest(model=model, tampered=tampered),
@@ -557,9 +608,9 @@ class ClusterTransportTest(unittest.TestCase):
                 for tool in tools.iterdir():
                     tool.chmod(0o700)
                 (backend / "submit.sh").write_text(
-                    'test "$INPUT_NNODES/$INPUT_NPROC_PER_NODE/$INPUT_NODE_SELECTOR" = "0/8/board-type=ZW-M890P" || exit 1\n'
+                    f'test "$INPUT_NNODES/$INPUT_NPROC_PER_NODE/$INPUT_NODE_SELECTOR" = "0/{width}/board-type=ZW-M890P" || exit 1\n'
                     'test -f "$SOURCE_STAGE_DIR" || exit 1\n'
-                    'jq -e --arg cache "$PPU_CI_HF_CACHE_ROOT" --arg model "$MODEL_KEY" --arg revision "$PPU_CI_GLM53_MODEL_REVISION" \'.PPU_CI_HF_CACHE_ROOT == $cache and .MODEL_KEY == $model and (if $model == "glm-5.3" then .PPU_CI_HF_MODEL_REVISION == $revision else (has("PPU_CI_HF_MODEL_REVISION") | not) end)\' <<< "$USER_ENV_JSON" >/dev/null || exit 1\n'
+                    'jq -e --arg cache "$PPU_CI_HF_CACHE_ROOT" --arg model "$MODEL_KEY" --arg width "$INPUT_NPROC_PER_NODE" --arg revision "$PPU_CI_GLM53_MODEL_REVISION" \'.PPU_CI_HF_CACHE_ROOT == $cache and .MODEL_KEY == $model and .RECIPE_PPU_COUNT == $width and (if $model == "glm-5.3" then .PPU_CI_HF_MODEL_REVISION == $revision else (has("PPU_CI_HF_MODEL_REVISION") | not) end)\' <<< "$USER_ENV_JSON" >/dev/null || exit 1\n'
                     'printf "%s\\n" "$INJECTED_FIXTURE"\n'
                     'printf "job_status=scheduled\\nstart_time=1\\ndeadline=2\\nqueue_duration_seconds=7\\n" >> "$GITHUB_OUTPUT"\n'
                 )
@@ -585,6 +636,7 @@ class ClusterTransportTest(unittest.TestCase):
                     ),
                     "TIER": "fast_sanity",
                     "MODEL_KEY": model,
+                    "RECIPE_PPU_COUNT": str(width),
                     "GITHUB_OUTPUT": str(root / "gha-output"),
                     "PPU_PUBLIC_SUMMARY": str(root / "gha-summary"),
                     "GITHUB_WORKSPACE": str(workspace),
