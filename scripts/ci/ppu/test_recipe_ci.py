@@ -134,6 +134,7 @@ class RecipeContractTest(unittest.TestCase):
             ("--page-size", "64"),
             ("--kv-cache-dtype", "bfloat16"),
             ("--quantization", "mxfp4"),
+            ("--moe-runner-backend", "deep_gemm"),
             ("--load-format", "dummy"),
         ):
             self.assertEqual(flags[flags.index(flag) + 1], expected)
