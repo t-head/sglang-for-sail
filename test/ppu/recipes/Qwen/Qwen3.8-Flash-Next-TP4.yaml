@@ -13,23 +13,17 @@ model:
     - "4"
     - --context-length
     - "16384"
+    - --page-size
+    - "64"
     - --mem-fraction-static
     - "0.9"
     - --max-running-requests
     - "128"
     - --chunked-prefill-size
     - "8192"
-    - --speculative-algorithm
-    - NEXTN
-    - --speculative-num-steps
-    - "2"
-    - --speculative-eagle-topk
-    - "1"
     - --linear-attn-prefill-backend
     - triton
     - --linear-attn-decode-backend
-    - triton
-    - --linear-attn-verify-backend
     - triton
     - --mamba-ssm-dtype
     - bfloat16
@@ -41,14 +35,7 @@ variants:
   default: {precision: mxfp4}
 presets:
   model_sanity:
-    remove_args:
-      - --speculative-algorithm
-      - --speculative-num-steps
-      - --speculative-eagle-topk
-      - --linear-attn-verify-backend
     args:
-      - --page-size
-      - "64"
       - --mamba-radix-cache-strategy
       - extra_buffer
       - --disable-overlap-schedule

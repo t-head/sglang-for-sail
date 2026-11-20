@@ -211,7 +211,7 @@ class RecipeContractTest(unittest.TestCase):
         for name, value in (
             ("--tp-size", "4"),
             ("--context-length", "16384"),
-            ("--speculative-algorithm", "NEXTN"),
+            ("--page-size", "64"),
             ("--load-format", "dummy"),
         ):
             self.assertEqual(flags[flags.index(name) + 1], value)
@@ -221,6 +221,10 @@ class RecipeContractTest(unittest.TestCase):
             "--enable-dp-lm-head",
             "--moe-a2a-backend",
             "--moe-dense-tp-size",
+            "--speculative-algorithm",
+            "--speculative-num-steps",
+            "--speculative-eagle-topk",
+            "--linear-attn-verify-backend",
         ):
             self.assertNotIn(name, flags)
         self.assertIn("--disable-radix-cache", flags)
