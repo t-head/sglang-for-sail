@@ -339,13 +339,35 @@ class RecipeContractTest(unittest.TestCase):
             weight_index.write_text(
                 json.dumps({"weight_map": {"weight": "weight.safetensors"}})
             )
-            with patch.dict(os.environ, {"HF_HUB_CACHE": str(root)}):
+            download = Mock(return_value=str(snapshot))
+            with (
+                patch.dict(os.environ, {"HF_HUB_CACHE": str(root)}),
+                patch.dict(
+                    sys.modules,
+                    {
+                        "huggingface_hub": SimpleNamespace(snapshot_download=download),
+                        "huggingface_hub.file_download": SimpleNamespace(
+                            repo_folder_name=Mock(return_value=repo.name)
+                        ),
+                        "huggingface_hub.utils": SimpleNamespace(
+                            validate_repo_id=Mock()
+                        ),
+                    },
+                ),
+            ):
                 self.assertEqual(
                     cached_model_path(repo_id, None, metadata_only=True),
                     (str(snapshot.resolve()), revision),
                 )
+                download.assert_called_once_with(
+                    repo_id=repo_id,
+                    revision=revision,
+                    cache_dir=cache,
+                    local_files_only=True,
+                )
                 with self.assertRaises(FileNotFoundError):
                     cached_model_path(repo_id, None)
+                self.assertEqual(download.call_count, 1)
                 weight_index.write_text(
                     json.dumps({"weight_map": {"weight": "../unexpected"}})
                 )
