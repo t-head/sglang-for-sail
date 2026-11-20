@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 namespace sglang::device::legacy_radix_topk {
 
@@ -25,9 +26,9 @@ __device__ __forceinline__ uint32_t exact_key(float x) {
 // Exact radix top-k over finite scores. A threshold bin that fits the stash
 // keeps the original two-stash refinement; a larger one is refined by rescanning
 // the input. Unfilled output slots stay -1.
-template <int BlockSize, int OutputCapacity, int StashEntries>
+template <int BlockSize, int OutputCapacity, int StashEntries, typename ScoreT>
 __device__ __forceinline__ void
-select(const float* __restrict__ input, int32_t* __restrict__ output, int row_start, int length, int topk) {
+select(const ScoreT* __restrict__ input, int32_t* __restrict__ output, int row_start, int length, int topk) {
   static_assert(BlockSize >= kRadix + 1, "the block must initialize the complete radix histogram");
   static_assert(OutputCapacity <= StashEntries, "top-k output must fit in one shared-memory stash");
 
@@ -52,8 +53,33 @@ select(const float* __restrict__ input, int32_t* __restrict__ output, int row_st
   }
   __syncthreads();
 
-  for (int idx = tx; idx < length; idx += BlockSize) {
-    atomicAdd(&histogram[coarse_key(input[row_start + idx])], 1);
+  if constexpr (std::is_same_v<ScoreT, float>) {
+    for (int idx = tx; idx < length; idx += BlockSize) {
+      atomicAdd(&histogram[coarse_key(input[row_start + idx])], 1);
+    }
+  } else {
+    // Read four BF16 scores at a time, with scalar loads at the window edges.
+    using PackedT = uint64_t __attribute__((may_alias));
+    constexpr int kVecBytes = sizeof(PackedT);
+    constexpr int kVecSize = kVecBytes / sizeof(ScoreT);
+    const auto* scores = input + row_start;
+    const auto misalignment = reinterpret_cast<uintptr_t>(scores) % kVecBytes;
+    const int align_head = ((kVecBytes - misalignment) % kVecBytes) / sizeof(ScoreT);
+    const int head = align_head < length ? align_head : length;
+    const int vectors = (length - head) / kVecSize;
+    const auto* aligned = reinterpret_cast<const PackedT*>(scores + head);
+    for (int vec = tx; vec < vectors; vec += BlockSize) {
+      const PackedT packed = aligned[vec];
+      ScoreT values[kVecSize];
+      __builtin_memcpy(values, &packed, kVecBytes);
+#pragma unroll
+      for (int i = 0; i < kVecSize; ++i) {
+        atomicAdd(&histogram[coarse_key(values[i])], 1);
+      }
+    }
+    if (tx < head) atomicAdd(&histogram[coarse_key(scores[tx])], 1);
+    const int tail = head + vectors * kVecSize;
+    if (tx < length - tail) atomicAdd(&histogram[coarse_key(scores[tail + tx])], 1);
   }
   __syncthreads();
 

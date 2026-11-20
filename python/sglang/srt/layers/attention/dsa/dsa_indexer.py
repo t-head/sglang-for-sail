@@ -62,6 +62,7 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     MQA_LOGITS_MAX_BYTES_ROCM,
     MQA_LOGITS_STATIC_SKIP_ELEMS,
     MQA_LOGITS_TOTAL_MEM_FRACTION,
+    SailPagedMQAMetadata,
     mqa_logits_budget_bytes,
     mqa_logits_free_mem_fraction,
     mqa_logits_row_bytes,
@@ -904,13 +905,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     ):
         # FP4 indexer path: per-block Q scales travel alongside Q values, so
         # there is no per-token scalar to fold into the head-gate weights.
-        # DeepGEMM's fp8_fp4_mqa_logits requires fp32 weights — the FP8 path
-        # lands on fp32 naturally via promote_types(bf16, fp32 q_scale); here
-        # we have to pin the cast explicitly.
+        # Both paged and ragged MQA consume BF16 weights on this path.
         weights = self._weights_proj_bf16_in_fp32_out(x)
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * self.softmax_scale
-        return weights.to(torch.float32)
+        return weights.to(torch.bfloat16)
 
     @torch.compile(dynamic=True)
     def _apply_q_scale_and_softmax_scale(
@@ -1337,7 +1336,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         weights: torch.Tensor,
         context_lens: torch.Tensor,
         block_table: torch.Tensor,
-        schedule_meta: torch.Tensor,
+        schedule_meta: Optional[torch.Tensor | SailPagedMQAMetadata],
         max_context_len: int,
         clean_logits: bool = True,
         indices: Optional[torch.Tensor] = None,
@@ -2084,7 +2083,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 row_weights,
                 seqlens_32_2d[:q_offset],
                 block_tables[:q_offset],
-                None,
+                schedule_metadata if self.use_fp4 else None,
                 max_seq_len,
                 clean_logits=False,
                 indices=request_indices,

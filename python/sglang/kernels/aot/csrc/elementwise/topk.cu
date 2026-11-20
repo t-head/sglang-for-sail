@@ -10,6 +10,7 @@
 #include <ATen/core/TensorBody.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/macros/Macros.h>
+#include <c10/util/BFloat16.h>
 #include <c10/util/Exception.h>
 #include <cuda.h>
 #include <cuda_fp16.h>
@@ -39,8 +40,9 @@ constexpr size_t kSmem = 48 * 1024;  // bytes
 constexpr size_t kSmem = 8 * 1024 * sizeof(uint32_t);  // 32KB (bytes)
 #endif
 
+template <typename ScoreT>
 struct FastTopKParams {
-  const float* __restrict__ input;         // [B, input_stride]
+  const ScoreT* __restrict__ input;        // [B, input_stride]
   const int32_t* __restrict__ row_starts;  // [B]
   int32_t* __restrict__ indices;           // [B, TopK]
   int32_t* __restrict__ lengths;           // [B]
@@ -56,8 +58,9 @@ __device__ void naive_topk_cuda(const float* __restrict__ score, int32_t* __rest
 }
 
 // keep the first `length` entries, set others to -1
+template <typename ScoreT>
 __device__ void naive_topk_transform(
-    const float* __restrict__ score,
+    const ScoreT* __restrict__ score,
     int32_t length,
     int32_t* __restrict__ dst_page_table,
     const int32_t* __restrict__ src_page_table) {
@@ -76,14 +79,16 @@ __device__ void naive_topk_transform_ragged(
   }
 }
 
-__device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restrict__ index, int row_start, int length) {
+template <typename ScoreT>
+__device__ void
+fast_topk_cuda_tl(const ScoreT* __restrict__ input, int* __restrict__ index, int row_start, int length) {
   ::sglang::device::legacy_radix_topk::select<kThreadsPerBlock, TopK, static_cast<int>(kSmem / (2 * sizeof(int)))>(
       input, index, row_start, length, TopK);
   __syncthreads();
 }
 
 __global__ __launch_bounds__(kThreadsPerBlock)  // topk
-    void topk_kernel(const FastTopKParams params) {
+    void topk_kernel(const FastTopKParams<float> params) {
   const auto& [input, row_starts, indices, lengths, input_stride] = params;
   const auto bid = static_cast<uint64_t>(blockIdx.x);
   const auto row_start = row_starts == nullptr ? 0 : row_starts[bid];
@@ -97,18 +102,38 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // topk
   }
 }
 
+template <typename ScoreT>
 __global__ __launch_bounds__(kThreadsPerBlock)  // decode
     void topk_transform_decode_kernel(
-        const FastTopKParams params,
+        const FastTopKParams<ScoreT> params,
         int32_t* __restrict__ dst_page_table,
         const int32_t* __restrict__ src_page_table,
-        const int64_t src_stride) {
+        const int64_t src_stride,
+        const int32_t* __restrict__ cu_seqlens_q) {
   const auto& [input, _1, _2, lengths, input_stride] = params;
   const auto bid = static_cast<uint64_t>(blockIdx.x);
   const auto tid = threadIdx.x;
   const auto row_start = 0;
   const auto length = lengths[bid];
-  const auto src_page_entry = src_page_table + bid * src_stride;
+  auto page_row = bid;
+  if constexpr (std::is_same_v<ScoreT, at::BFloat16>) {
+    // Equal row counts can still include an empty group (e.g. [0, 2, 2]).
+    const auto query = static_cast<int64_t>(bid);
+    if (cu_seqlens_q[bid] != query || cu_seqlens_q[bid + 1] != query + 1) {
+      int64_t lo = 0;
+      auto hi = static_cast<int64_t>(gridDim.x);
+      while (lo + 1 < hi) {
+        const auto mid = lo + (hi - lo) / 2;
+        if (cu_seqlens_q[mid] <= query) {
+          lo = mid;
+        } else {
+          hi = mid;
+        }
+      }
+      page_row = lo;
+    }
+  }
+  const auto src_page_entry = src_page_table + page_row * src_stride;
   const auto dst_page_entry = dst_page_table + bid * TopK;
   const auto score = input + bid * input_stride;
   if (length <= TopK) {
@@ -128,9 +153,10 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // decode
   }
 }
 
+template <typename ScoreT>
 __global__ __launch_bounds__(kThreadsPerBlock)  // prefill
     void topk_transform_prefill_kernel(
-        const FastTopKParams params,
+        const FastTopKParams<ScoreT> params,
         int32_t* __restrict__ dst_page_table,
         const int32_t* __restrict__ src_page_table,
         const int64_t src_stride,
@@ -182,7 +208,7 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // prefill
 
 __global__ __launch_bounds__(kThreadsPerBlock)  // prefill, ragged kv
     void topk_transform_prefill_ragged_kernel(
-        const FastTopKParams params,
+        const FastTopKParams<float> params,
         int32_t* __restrict__ topk_indices_ragged,
         const int32_t* __restrict__ topk_indices_offset) {
   const auto& [input, row_starts, _, lengths, input_stride] = params;
@@ -211,11 +237,12 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // prefill, ragged kv
   }
 }
 
+template <typename ScoreT = float>
 auto get_params(
     const at::Tensor& score,
     const at::Tensor& lengths,
     std::optional<at::Tensor> row_starts_opt = std::nullopt,
-    std::optional<at::Tensor> indices_opt = std::nullopt) -> FastTopKParams {
+    std::optional<at::Tensor> indices_opt = std::nullopt) -> FastTopKParams<ScoreT> {
   const auto B = score.size(0);
   TORCH_CHECK(score.dim() == 2 && score.stride(1) == 1);
   if (row_starts_opt.has_value()) {
@@ -234,8 +261,8 @@ auto get_params(
     indices_data_ptr = indices.data_ptr<int32_t>();
   }
 
-  return FastTopKParams{
-      .input = score.data_ptr<float>(),
+  return FastTopKParams<ScoreT>{
+      .input = score.data_ptr<ScoreT>(),
       .row_starts = row_starts_opt.has_value() ? row_starts_opt->data_ptr<int32_t>() : nullptr,
       .indices = indices_data_ptr,
       .lengths = lengths.data_ptr<int32_t>(),
@@ -284,7 +311,8 @@ void fast_topk_interface(
   TORCH_CHECK(result == cudaSuccess, "topk kernel failed:", ::cudaGetErrorString(result));
 }
 
-void fast_topk_transform_interface(
+template <typename ScoreT>
+static void fast_topk_transform(
     const at::Tensor& score,
     const at::Tensor& lengths,
     at::Tensor& dst_page_table,
@@ -299,7 +327,7 @@ void fast_topk_transform_interface(
   if (row_starts_opt.has_value()) {
     CHECK_CUDA(row_starts_opt.value());
   }
-  const auto params = get_params(score, lengths, row_starts_opt);
+  const auto params = get_params<ScoreT>(score, lengths, row_starts_opt);
   const auto B = score.size(0);
   TORCH_CHECK(dst_page_table.dim() == 2 && dst_page_table.is_contiguous());
   TORCH_CHECK(src_page_table.dim() == 2 && src_page_table.stride(1) == 1);
@@ -316,18 +344,18 @@ void fast_topk_transform_interface(
   const auto block = dim3{kThreadsPerBlock};
   const auto src_stride = src_page_table.stride(0);
 
-  // dispatch to decode or prefill
-  // extend and draft extend: row_starts_opt is not null, invokes the prefill kernel
-  // decode: row_starts_opt is null, invokes the decode kernel
-  // target verify: row_starts_opt is null, invokes the prefill kernel
   const auto is_decode = !row_starts_opt.has_value() && prefill_bs == B;
   if (is_decode) {
-    setup_kernel_smem_once<topk_transform_decode_kernel, kSmem>();
-    topk_transform_decode_kernel<<<grid, block, kSmem, stream>>>(
-        params, dst_page_table.data_ptr<int32_t>(), src_page_table.data_ptr<int32_t>(), src_stride);
+    const int32_t* decode_offsets = nullptr;
+    if constexpr (std::is_same_v<ScoreT, at::BFloat16>) {
+      decode_offsets = cu_seqlens_q.data_ptr<int32_t>();
+    }
+    setup_kernel_smem_once<topk_transform_decode_kernel<ScoreT>, kSmem>();
+    topk_transform_decode_kernel<ScoreT><<<grid, block, kSmem, stream>>>(
+        params, dst_page_table.data_ptr<int32_t>(), src_page_table.data_ptr<int32_t>(), src_stride, decode_offsets);
   } else {
-    setup_kernel_smem_once<topk_transform_prefill_kernel, kSmem>();
-    topk_transform_prefill_kernel<<<grid, block, kSmem, stream>>>(
+    setup_kernel_smem_once<topk_transform_prefill_kernel<ScoreT>, kSmem>();
+    topk_transform_prefill_kernel<ScoreT><<<grid, block, kSmem, stream>>>(
         params,
         dst_page_table.data_ptr<int32_t>(),
         src_page_table.data_ptr<int32_t>(),
@@ -338,6 +366,20 @@ void fast_topk_transform_interface(
 
   const auto result = cudaGetLastError();
   TORCH_CHECK(result == cudaSuccess, "topk kernel failed:", ::cudaGetErrorString(result));
+}
+
+void fast_topk_transform_interface(
+    const at::Tensor& score,
+    const at::Tensor& lengths,
+    at::Tensor& dst_page_table,
+    const at::Tensor& src_page_table,
+    const at::Tensor& cu_seqlens_q,
+    std::optional<at::Tensor> row_starts_opt) {
+  if (score.scalar_type() == at::kBFloat16) {
+    return fast_topk_transform<at::BFloat16>(
+        score, lengths, dst_page_table, src_page_table, cu_seqlens_q, row_starts_opt);
+  }
+  fast_topk_transform<float>(score, lengths, dst_page_table, src_page_table, cu_seqlens_q, row_starts_opt);
 }
 
 void fast_topk_transform_ragged_interface(
