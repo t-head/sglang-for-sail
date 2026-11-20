@@ -237,8 +237,51 @@ class RecipeContractTest(unittest.TestCase):
         self.assertIn("--disable-radix-cache", flags)
         self.assertIn("--ple-offload-embedding", flags)
         self.assertNotIn("--dp-size", flags)
-        with self.assertRaises(ValueError):
-            select("model_sanity", "qwen3.8-flash-next")
+        self.assertNotIn("--page-size", flags)
+        self.assertNotIn("--mamba-radix-cache-strategy", flags)
+
+    def test_qwen_flash_next_dp8_nightly_keeps_nextn_and_enables_paged_cache(self):
+        model = "qwen3.8-flash-next"
+        self.assertEqual(
+            select("model_sanity", model),
+            {"include": [{"model": model, "ppu_count": 8}]},
+        )
+        policy = DEFAULT_POLICY_ROOT / f"models/{model}.yaml"
+        config = resolve_recipe(
+            REPO_ROOT / _load_yaml(policy)["recipe"],
+            policy_path=policy,
+            tier="model_sanity",
+        )
+        self.assertEqual(config["golden_model_key"], "qwen3.8-flash-next-dp8-ep")
+        self.assertFalse(config["dummy_weights"])
+        flags = config["flags"]
+        for name, value in (
+            ("--tp-size", "8"),
+            ("--attn-dp-size", "8"),
+            ("--moe-a2a-backend", "deepep"),
+            ("--attention-backend", "triton"),
+            ("--linear-attn-prefill-backend", "triton"),
+            ("--linear-attn-decode-backend", "triton"),
+            ("--linear-attn-verify-backend", "triton"),
+            ("--speculative-algorithm", "NEXTN"),
+            ("--speculative-num-steps", "2"),
+            ("--speculative-eagle-topk", "1"),
+            ("--page-size", "64"),
+            ("--mamba-radix-cache-strategy", "extra_buffer"),
+        ):
+            self.assertEqual(flags[flags.index(name) + 1], value)
+        self.assertIn("--enable-dp-lm-head", flags)
+        for name in (
+            "--disable-radix-cache",
+            "--load-format",
+            "--disable-overlap-schedule",
+        ):
+            self.assertNotIn(name, flags)
+        stages = _load_yaml(policy)["tiers"]["model_sanity"]["stages"]
+        stage = next(stage for stage in stages if stage["kind"] == "evalscope")
+        self.assertIsNone(stage["limit"])
+        self.assertEqual(stage["seed"], 42)
+        self.assertEqual(stage["eval_batch_size"], 128)
 
     def test_fast_sanity_policy_rejects_an_unknown_cache_value(self):
         policy = _load_yaml(DEFAULT_POLICY_ROOT / "models/qwen3.8-flash-next.yaml")

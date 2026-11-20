@@ -2,6 +2,11 @@ schema_version: ppu-test-policy/v1
 model_id: Qwen/Qwen3.8-Flash-Next
 recipe: test/ppu/recipes/Qwen/Qwen3.8-Flash-Next.yaml
 hardware: zhenwu_m890
+accuracy_gate:
+  method: golden_band
+  golden_band_abs: 0.02
+  golden_source: framework_repo
+  save_per_question: true
 tiers:
   fast_sanity:
     dummy_weights: true
@@ -13,3 +18,51 @@ tiers:
       top_p: 1.0
       top_k: -1
       seed: 42
+  model_sanity:
+    stages:
+      - id: sanity
+        kind: sanity
+        cache: enabled
+        preset: model_sanity
+        probe:
+          prompt: "Compute 6 * 7 and reply with the integer only."
+          expected_substring: "42"
+          max_tokens: 128
+          temperature: 0.0
+          seed: 42
+      - id: eval-gsm8k
+        kind: evalscope
+        cache: enabled
+        preset: model_sanity
+        dataset: gsm8k@2026-11
+        limit: null
+        seed: 42
+        eval_batch_size: 128
+        generation:
+          temperature: 1.0
+          top_p: 0.95
+          max_tokens: 10240
+          top_k: 20
+          min_p: 0.0
+          presence_penalty: 0.0
+          repetition_penalty: 1.0
+      - id: bench-micro
+        kind: bench
+        cache: enabled
+        preset: model_sanity
+        cache_mode: sanity_throughput_guard
+        engine: sglang_bench
+        input:
+          source: client_random
+          input_length: 4096
+          output_length: 512
+          range_ratio: 1.0
+        concurrencies:
+          - 1
+          - 16
+        request_count_by_concurrency:
+          1: 8
+          16: 32
+        warmup_count_by_concurrency:
+          1: 2
+          16: 8
