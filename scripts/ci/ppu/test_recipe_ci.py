@@ -73,6 +73,26 @@ class RecipeContractTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             select("model_sanity", "glm-5.3,glm-5.3")
 
+    def test_deepseek_v41_fast_uses_pure_tp8(self):
+        model = "deepseek-v4.1-flash"
+        policy = DEFAULT_POLICY_ROOT / f"models/{model}.yaml"
+        recipe = REPO_ROOT / _load_yaml(policy)["recipe"]
+        resolved = resolve_recipe(recipe, policy_path=policy, tier="fast_sanity")
+        flags = resolved["flags"]
+        self.assertEqual(resolved["ppu_count"], 8)
+        self.assertEqual(flags[flags.index("--tp-size") + 1], "8")
+        self.assertIsNone(resolved["layer_override"])
+        for flag in (
+            "--attn-dp-size",
+            "--dp-size",
+            "--enable-dp-lm-head",
+            "--moe-a2a-backend",
+            "--deepep-mode",
+        ):
+            self.assertNotIn(flag, flags)
+        with self.assertRaises(ValueError):
+            select("model_sanity", model)
+
     def test_minimax_nightly_uses_published_quantized_reference(self):
         self.assertEqual(
             select("model_sanity", "minimax-m3"),
