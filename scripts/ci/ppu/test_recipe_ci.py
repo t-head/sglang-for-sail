@@ -58,7 +58,6 @@ class RecipeContractTest(unittest.TestCase):
                 "include": [
                     {"model": "deepseek-v4-flash", "ppu_count": 8},
                     {"model": "deepseek-v4.1-flash", "ppu_count": 8},
-                    {"model": "glm-5.3-flash", "ppu_count": 2},
                     {"model": "glm-5.3-tp4", "ppu_count": 4},
                     {"model": "glm-5.3", "ppu_count": 8},
                     {"model": "minimax-m3", "ppu_count": 8},
@@ -127,9 +126,6 @@ class RecipeContractTest(unittest.TestCase):
     def test_minimax_nightly_uses_published_quantized_reference(self):
         self.assert_nightly_reference("minimax-m3", width=8, correct=1284)
 
-    def test_glm_flash_nightly_uses_tp2_and_full_gsm8k_reference(self):
-        self.assert_nightly_reference("glm-5.3-flash", width=2, correct=1279)
-
     def test_glm_nightly_has_separate_tp4_reference(self):
         self.assert_nightly_reference("glm-5.3-tp4", width=4, correct=1282)
 
@@ -195,7 +191,6 @@ class RecipeContractTest(unittest.TestCase):
         for model, ready_timeout, width in (
             ("glm-5.3", 1350, 8),
             ("glm-5.3-tp4", 1350, 4),
-            ("glm-5.3-flash", 1000, 2),
             ("deepseek-v4-flash", 1000, 8),
             ("qwen3.8-27b", 1000, 2),
         ):
