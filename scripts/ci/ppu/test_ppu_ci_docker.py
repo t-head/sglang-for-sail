@@ -14,16 +14,11 @@ import unittest
 import uuid
 from pathlib import Path
 
-import yaml
-
-from sglang.test.test_utils import CustomTestCase
-
 if sys.platform == "linux":
     import fcntl
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "scripts/ci/ppu/run_test.sh"
-WORKFLOW = REPO / ".github/workflows/pr-test-ppu.yml"
 # Finish before GitHub's ~7.5s SIGINT + 2.5s SIGTERM force-kill window.
 CANCELLATION_BUDGET = 7.5
 SHA = "a" * 40
@@ -160,7 +155,7 @@ else:
     sys.platform == "linux" and shutil.which("flock"),
     "The Docker host launcher requires Linux and util-linux flock",
 )
-class TestPPUCIDocker(CustomTestCase):
+class TestPPUCIDocker(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ppu-docker-test-")
         self.addCleanup(self.temp.cleanup)
@@ -171,6 +166,8 @@ class TestPPUCIDocker(CustomTestCase):
         self.launcher = script_dir / "run_test.sh"
         if SCRIPT.exists():
             shutil.copyfile(SCRIPT, self.launcher)
+        wrapper = SCRIPT.with_name("run_legacy_private.sh")
+        shutil.copyfile(wrapper, script_dir / wrapper.name)
         self.bin = self.root / "bin"
         self.bin.mkdir()
         for name, body in (("docker", DOCKER), ("git", GIT)):
@@ -446,6 +443,7 @@ class TestPPUCIDocker(CustomTestCase):
         for event in events:
             if event["args"][0] in ("stop", "rm"):
                 self.assertEqual(event["args"][-1], name)
+        self.assertEqual(commands.count("run"), 1)
         ownership = events[-1]["args"]
         self.assertEqual(ownership[0], "run")
         self.assertIn(f"{os.getuid()}:{os.getgid()}", ownership)
@@ -453,7 +451,10 @@ class TestPPUCIDocker(CustomTestCase):
         self.assertIn("NVIDIA_VISIBLE_DEVICES=void", ownership)
         self.assertIn(IMAGE_ID, ownership)
         self.assertFalse((self.root / "container.json").exists())
-        self.assertEqual(len(list(self.artifacts.glob("*/ownership-recovered"))), 1)
+        mount = ownership[ownership.index("--mount") + 1]
+        mount_fields = dict(part.split("=", 1) for part in mount.split(","))
+        recovered = Path(mount_fields["source"])
+        self.assertTrue((recovered / "ownership-recovered").is_file())
         with self.lock.open("a") as handle:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return create
@@ -522,24 +523,17 @@ class TestPPUCIDocker(CustomTestCase):
         self.assertEqual(list(self.home.iterdir()), [])
 
     def start_blocked(self, **updates):
-        workflow = yaml.safe_load(WORKFLOW.read_text())
-        step = next(
-            step
-            for step in workflow["jobs"]["ppu-sanity"]["steps"]
-            if step.get("name")
-            == "Run both speculative sanity files in isolated Docker"
-        )
         env = {
             **self.env,
             "BLOCK_TEST": "1",
             "RUNNER_TEMP": str(self.root / "runner-a"),
+            "GITHUB_RUN_ID": "12",
+            "GITHUB_RUN_ATTEMPT": "1",
             **updates,
         }
-        for key in step["env"]:
-            env[key] = env.pop(key.removeprefix("CONFIG_"), "")
-        # Sourcing prevents bash -c's implicit exec from masking the wrapper bug.
+        # Sourcing exercises the explicit exec used by the local Docker wrapper.
         step_script = self.root / "workflow-step.sh"
-        step_script.write_text(step["run"])
+        step_script.write_text("exec bash scripts/ci/ppu/run_legacy_private.sh\n")
         process = subprocess.Popen(
             [
                 "bash",
@@ -615,7 +609,12 @@ class TestPPUCIDocker(CustomTestCase):
                 process.send_signal(sig)
                 output, errors = process.communicate(timeout=CANCELLATION_BUDGET)
                 self.assertEqual(process.returncode, code, output + errors)
-                self.assert_private_pull_log(output)
+                self.assertEqual(output, "")
+                destinations = (self.home / ".sglang-ppu-ci-results").glob("legacy.*")
+                destination = max(
+                    destinations, key=lambda path: path.stat().st_mtime_ns
+                )
+                self.assert_private_pull_log((destination / "launcher.log").read_text())
                 self.assert_image_reference_is_private(
                     subprocess.CompletedProcess([], code, output, errors)
                 )
