@@ -176,6 +176,12 @@ class TestPPUCIWorkflow(unittest.TestCase):
                 for job in cluster_jobs:
                     self.assertEqual(jobs[job]["runs-on"], "k8s-runner-group-cpu-thead")
 
+    def test_protected_recipe_job_forwards_matrix_device_count(self):
+        source = RUNNER.parent.parent / ".github/workflows/nightly-test-ppu.yml"
+        workflow = yaml.load(source.read_text(), Loader=yaml.BaseLoader)
+        job = workflow["jobs"]["recipe-sanity"]
+        self.assertEqual(job["env"]["RECIPE_PPU_COUNT"], "${{ matrix.ppu_count || 8 }}")
+
     def test_device_jobs_require_build_and_cpu_checks(self):
         selftests = self.jobs["ppu-ci-selftest"]
         self.assertEqual(selftests["runs-on"], "ubuntu-latest")
@@ -279,6 +285,19 @@ class TestPPUCIWorkflow(unittest.TestCase):
         )
         self.assertIn(
             "legacy-only-pr-test-ppu-finish", self.jobs["pr-test-ppu-finish"]["name"]
+        )
+
+    def test_fast_model_filter_is_available_only_for_manual_dispatch(self):
+        path = RUNNER.parent.parent / ".github/workflows/pr-test-ppu.yml"
+        workflow = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+        triggers = workflow["on"]
+        dispatch_filter = triggers["workflow_dispatch"]["inputs"]["model_filter"]
+        self.assertEqual(dispatch_filter["type"], "string")
+        self.assertEqual(dispatch_filter["default"], "")
+        self.assertNotIn("model_filter", triggers["workflow_call"]["inputs"])
+        self.assertEqual(
+            self.jobs["ppu-fast-sanity"]["with"]["model_filter"],
+            "${{ github.event_name == 'workflow_dispatch' && inputs.model_filter || '' }}",
         )
 
     def test_finish_requires_each_recipe_dependency_when_in_scope(self):

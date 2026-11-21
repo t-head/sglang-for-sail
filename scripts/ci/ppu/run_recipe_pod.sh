@@ -33,7 +33,7 @@ fi
 printf '%s\n' wheel_verification > "$PPU_CI_ARTIFACT_DIR/worker-phase.txt"
 python3 -B scripts/ci/ppu/recipe_bundle.py check "$PPU_CI_WHEEL_DIR" "$PPU_CI_SOURCE_SHA"
 [[ -d "${PPU_CI_HF_CACHE_ROOT:?}/hub" && -d /recipe-jit ]]
-: "${PPU_CI_HF_MODEL_REVISION:?}"
+[[ "${RECIPE_PPU_COUNT:?}" =~ ^(2|4|8)$ ]]
 if [[ "$TIER" == model_sanity ]]; then
     [[ -d "${PPU_CI_GSM8K_PATH:?}" ]]
     export PPU_CI_EVAL_WHEEL_DIR="$PWD/evalscope-wheels"

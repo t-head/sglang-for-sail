@@ -4,6 +4,8 @@
 import json
 import re
 
+from recipe_publish import MODEL_POLICY_ROOT
+
 RULES = {
     "image_pull": r"ErrImagePull|ImagePullBackOff|failed to pull image|manifest unknown",
     "registry_auth": r"status code: (401|403)|pull access denied|authorization failed|insufficient_scope",
@@ -39,10 +41,15 @@ def recent_failures(root, current_run):
         run_id, attempt = map(int, run.name.split("-"))
         if run_id != current_run:
             previous.append((run_id, attempt, run))
+    models = sorted(
+        policy.stem
+        for policy in MODEL_POLICY_ROOT.glob("*.yaml")
+        if re.fullmatch(r"[a-z0-9][a-z0-9.-]*", policy.stem)
+    )
     for run_id, _, run in sorted(previous, reverse=True):
         records = []
         for tier in ("fast_sanity", "model_sanity"):
-            for model in ("deepseek-v4-flash", "glm-5.3"):
+            for model in models:
                 directory = run / tier / model
                 if not (directory / "index.json").is_file():
                     continue
