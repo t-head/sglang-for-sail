@@ -71,6 +71,22 @@ def test_valid_prefix_across_token_stride() -> None:
     _check_valid_prefix(8, 5, H=512, block_n=512, limit=None)
 
 
+@pytest.mark.parametrize("expert_rows", [1, 3], ids=["too-short", "too-long"])
+def test_jit_rejects_mismatched_row_experts(expert_rows) -> None:
+    from sglang.kernels.ops.elementwise.silu_mul_quant import _jit_tp_module
+
+    num_rows, H = 2, 256
+    gateup = torch.zeros((num_rows, 2 * H), dtype=torch.bfloat16, device="cuda")
+    quant = torch.empty((num_rows, H // 2), dtype=torch.uint8, device="cuda")
+    scale = torch.empty((H // 64, num_rows), dtype=torch.uint16, device="cuda")
+    experts = torch.zeros(expert_rows, dtype=torch.int32, device="cuda")
+    module = _jit_tp_module(False, H, True)
+    with pytest.raises(
+        RuntimeError, match=r"row_experts must have shape \[num_tokens\]"
+    ):
+        module.run(gateup, quant, scale, 0.0, experts)
+
+
 def _check_valid_prefix(num_rows, valid_rows, H, block_n, limit) -> None:
     from sglang.kernels.ops.elementwise.silu_mul_quant import (
         _jit_tp_module,

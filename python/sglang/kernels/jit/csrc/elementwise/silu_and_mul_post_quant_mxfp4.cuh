@@ -356,6 +356,10 @@ struct SiluMulMxfp4TP {
     const int hidden_blocks = N_padded / kBlockN;
 
     RuntimeCheck(row_experts.has_value() == kUseValidPrefix, "row_experts / prefix mismatch");
+    if constexpr (kUseValidPrefix) {
+      const auto& experts = row_experts.value();
+      RuntimeCheck(experts.ndim() == 1 && experts.size(0) == num_tokens, "row_experts must have shape [num_tokens]");
+    }
     RuntimeCheck(num_tokens > 0, "num_tokens must be positive");
     RuntimeCheck(N > 0 && N % 2 == 0, "N must be positive and even, got N=", N);
 
