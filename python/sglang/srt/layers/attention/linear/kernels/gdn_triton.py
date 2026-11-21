@@ -232,6 +232,8 @@ class TritonGDNKernel(LinearAttnKernelBase):
         inplace_update: bool = True,
         **kwargs,
     ) -> tuple:
+        # Share the existing PLA prefill/decode switch; QSA is independent.
+        # Rebuild server graphs after changing it rather than toggling live.
         if (
             envs.SGLANG_SAIL_PLA_CUDA.get()
             and is_sail()

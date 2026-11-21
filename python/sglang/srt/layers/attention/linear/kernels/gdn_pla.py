@@ -34,6 +34,8 @@ def pla_gdn_prefill(
     raw_cu_seqlens,
 ):
     # Keep the optional native extension out of the default Triton import path.
+    # Requires indexed FlashQLA with raw_cu_seqlens/normalize_qk and
+    # final_state_dtype support; g/beta are already activated by the caller.
     from pla.prefill.flashqla import chunk_gated_delta_rule_fwd
 
     # The indexed API uses [slot, H, V, K], unlike legacy non-indexed PLA
