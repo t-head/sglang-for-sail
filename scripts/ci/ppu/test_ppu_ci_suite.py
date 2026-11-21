@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -35,6 +36,109 @@ class TestPPUCISuite(CustomTestCase):
         self.assertEqual(
             list((RUNNER.parent / "registered").rglob("test_ppu_ci_*.py")), []
         )
+
+    def test_gdn_registrations_use_declared_suites(self):
+        spec = importlib.util.spec_from_file_location("gdn_suite_runner", RUNNER)
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        registered = RUNNER.parent / "registered"
+        paths = [
+            "unit/layers/attention/test_gdn_pla_prefill.py",
+            "unit/layers/attention/test_mamba_track_state_dtype.py",
+            "kernels/ops/attention/test_gdn_pla_prefill.py",
+        ]
+        tests = collect_tests([str(registered / path) for path in paths])
+        self.assertEqual(len(tests), len(paths))
+        # Validate our registrations without repairing unrelated baseline suites.
+        runner.validate_all_suites(tests)
+        self.assertCountEqual(
+            [test.backend for test in tests],
+            [HWBackend.CPU, HWBackend.CPU, HWBackend.PPU],
+        )
+
+    def test_gdn_ci_runs_only_related_files_and_propagates_failures(self):
+        """GDN coverage must run before unrelated collection and reject skips."""
+        source = Path(__file__).with_name("build_and_test.sh").read_text()
+        begin = "# GDN PLA regression tests: begin"
+        end = "# GDN PLA regression tests: end"
+        self.assertEqual(source.count(begin), 1)
+        self.assertEqual(source.count(end), 1)
+        self.assertLess(source.index(end), source.index('cd "$artifacts"'))
+        script = (
+            "\n".join(source.splitlines()[:2])
+            + "\n"
+            + source.split(begin, 1)[1].split(end, 1)[0]
+        )
+        files = [
+            ("gdn-contract", "unit/layers/attention/test_gdn_pla_prefill.py", 3),
+            ("gdn-state", "unit/layers/attention/test_mamba_track_state_dtype.py", 7),
+            ("gdn-ppu", "kernels/ops/attention/test_gdn_pla_prefill.py", 5),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo with spaces"
+            bin_dir = root / "bin"
+            bin_dir.mkdir(parents=True)
+            python = bin_dir / "python3"
+            python.write_text(
+                '#!/bin/sh\nif [ "$1" = "-c" ]; then echo "$FIXTURE_CAPABILITY"; else exec "$FIXTURE_PYTHON" "$@"; fi\n'
+            )
+            python.chmod(0o755)
+            for name, path, count in files:
+                file = root / "test/registered" / path
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.write_text(
+                    "import os, sys\n"
+                    f"name = {name!r}\n"
+                    "with open(os.environ['FIXTURE_RUN_LOG'], 'a') as f: f.write(name + '\\n')\n"
+                    "mode = os.environ['FIXTURE_MODE'] if name == os.environ['FIXTURE_TARGET'] else 'ok'\n"
+                    f"count = 0 if mode == 'wrong-count' else {count}\n"
+                    "if mode != 'empty':\n"
+                    " print(f'Ran {count} tests in 0.001s', file=sys.stderr)\n"
+                    " print('OK (skipped=1)' if mode == 'skipped' else 'OK', file=sys.stderr)\n"
+                    "sys.exit(7 if mode == 'nonzero' else 0)\n"
+                )
+            cases = [("8.9", "", "ok", 0), ("8.0", "", "ok", 0)]
+            cases.extend(
+                ("8.9", name, mode, 7 if mode == "nonzero" else 1)
+                for name, _, _ in files
+                for mode in ("nonzero", "empty", "wrong-count", "skipped")
+            )
+            for index, (capability, target, mode, expected) in enumerate(cases):
+                with self.subTest(capability=capability, target=target, mode=mode):
+                    artifacts = root / f"artifacts-{index}"
+                    artifacts.mkdir()
+                    run_log = artifacts / "calls.log"
+                    result = subprocess.run(
+                        ["bash", "-c", script],
+                        env=dict(
+                            os.environ,
+                            repo=str(root),
+                            artifacts=str(artifacts),
+                            PATH=str(bin_dir) + os.pathsep + os.environ["PATH"],
+                            FIXTURE_PYTHON=sys.executable,
+                            FIXTURE_CAPABILITY=capability,
+                            FIXTURE_RUN_LOG=str(run_log),
+                            FIXTURE_TARGET=target,
+                            FIXTURE_MODE=mode,
+                        ),
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    self.assertEqual(
+                        result.returncode, expected, result.stdout + result.stderr
+                    )
+                    called = (
+                        run_log.read_text().splitlines() if run_log.exists() else []
+                    )
+                    expected_names = [name for name, _, _ in files]
+                    if capability != "8.9":
+                        expected_names = []
+                    elif target:
+                        expected_names = expected_names[
+                            : expected_names.index(target) + 1
+                        ]
+                    self.assertEqual(called, expected_names)
 
     def test_ppu_suite_contains_both_speculative_sanity_files(self):
         registered = RUNNER.parent / "registered"

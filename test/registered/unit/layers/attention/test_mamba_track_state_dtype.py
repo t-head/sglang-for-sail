@@ -1,4 +1,5 @@
 import unittest
+from itertools import product
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -151,6 +152,7 @@ class TestTrackMambaStateDtype(CustomTestCase):
         )
         batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
+            extend_seq_lens_cpu=[2, 2],
             extend_prefix_lens=torch.tensor([0, 64]),
         )
         qkv = torch.arange(24, dtype=torch.float32).view(4, 6)
@@ -168,9 +170,16 @@ class TestTrackMambaStateDtype(CustomTestCase):
             track_ssm_final_src=torch.tensor([6]),
             track_ssm_final_dst=torch.tensor([5]),
         )
-        for snapshot in (False, True):
+        for snapshot, with_intermediate in product((False, True), repeat=2):
             for contiguous in (True, False):
-                with self.subTest(snapshot=snapshot, contiguous=contiguous):
+                with self.subTest(
+                    snapshot=snapshot,
+                    contiguous=contiguous,
+                    with_intermediate=with_intermediate,
+                ):
+                    metadata.track_ssm_h_src = (
+                        torch.tensor([0]) if with_intermediate else None
+                    )
                     backend = object.__new__(GDNAttnBackend)
                     backend.forward_metadata = metadata
                     backend.mis_metadata = None
@@ -191,6 +200,10 @@ class TestTrackMambaStateDtype(CustomTestCase):
 
                     def extend(q, k, v, g, beta, **kwargs):
                         self.assertEqual(kwargs["layer_id"], layer.layer_id)
+                        self.assertEqual(kwargs["seq_lens_cpu"], [2, 2])
+                        self.assertEqual(
+                            kwargs["requires_intermediate_states"], with_intermediate
+                        )
                         self.assertIs(
                             kwargs["extend_prefix_lens"], batch.extend_prefix_lens
                         )
@@ -201,7 +214,7 @@ class TestTrackMambaStateDtype(CustomTestCase):
                             kwargs["ssm_states"].is_contiguous(), contiguous
                         )
                         kwargs["ssm_states"][kwargs["cache_indices"]] = 5
-                        if snapshot:
+                        if snapshot and with_intermediate:
                             self.assertIs(
                                 kwargs["track_chunk_idx"], metadata.track_chunk_idx
                             )
@@ -239,8 +252,99 @@ class TestTrackMambaStateDtype(CustomTestCase):
                     )
                     self.assertTrue(torch.all(conv_states[indices] == 7))
                     self.assertTrue(torch.all(ssm_states[[6, 2, 5]] == 5))
-                    expected = DOUBLE_ROUND_PROBE if snapshot else 2.0
+                    expected = (
+                        (DOUBLE_ROUND_PROBE if snapshot else 2.0)
+                        if with_intermediate
+                        else 0.0
+                    )
                     self.assertTrue(torch.all(ssm_states[4] == expected))
+
+    def test_strided_prefill_padding_never_scatter_writes_the_last_slot(self):
+        layer = SimpleNamespace(
+            layer_id=3,
+            q_dim=2,
+            k_dim=2,
+            v_dim=2,
+            num_q_heads=1,
+            num_k_heads=1,
+            num_v_heads=1,
+            head_q_dim=2,
+            head_k_dim=2,
+            head_v_dim=2,
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            extend_seq_lens_cpu=[2, 2],
+            extend_prefix_lens=torch.tensor([0, 0]),
+        )
+        slots = torch.tensor([1, -1])
+        conv = torch.arange(8 * 6 * 2, dtype=torch.float32).view(8, 6, 2)[::2]
+        state = torch.arange(8 * 4, dtype=torch.float32).view(8, 1, 2, 2)[::2]
+        before_conv, before_state = conv.clone(), state.clone()
+        backend = object.__new__(GDNAttnBackend)
+        backend.forward_metadata = ForwardMetadata(
+            query_start_loc=torch.tensor([0, 2, 4]), mamba_cache_indices=slots
+        )
+        backend.mis_metadata = None
+        backend.req_to_token_pool = SimpleNamespace(
+            mamba2_layer_cache=lambda _: SimpleNamespace(conv=[conv], temporal=state)
+        )
+
+        def convolve(_layer, _batch, x, states, indices):
+            torch.testing.assert_close(states[1], torch.zeros_like(states[1]))
+            states[indices] = 7
+            return x
+
+        def extend(q, k, v, g, beta, **kw):
+            torch.testing.assert_close(
+                kw["ssm_states"][1], torch.zeros_like(kw["ssm_states"][1])
+            )
+            kw["ssm_states"][kw["cache_indices"]] = 5
+            return v, None, None
+
+        backend._convolve_prefill = Mock(side_effect=convolve)
+        backend._prefill_gates = Mock(return_value=(None, None))
+        backend.kernel_dispatcher = object.__new__(GDNKernelDispatcher)
+        backend.kernel_dispatcher.extend_kernel = SimpleNamespace(
+            supports_track_state_snapshot=False, extend=extend
+        )
+        with (
+            patch.object(gdn_backend, "is_cpu", return_value=False),
+            patch.object(gdn_backend, "is_cuda", return_value=False),
+            patch.object(gdn_backend, "is_hip", return_value=False),
+            patch.object(gdn_backend, "is_xpu", return_value=False),
+            patch.object(gdn_backend, "is_npu", return_value=False),
+        ):
+            backend.forward_extend(
+                layer,
+                batch,
+                torch.arange(24, dtype=torch.float32).view(4, 6),
+                None,
+                None,
+            )
+        torch.testing.assert_close(
+            conv[[0, 2, 3]], before_conv[[0, 2, 3]], atol=0, rtol=0
+        )
+        torch.testing.assert_close(
+            state[[0, 2, 3]], before_state[[0, 2, 3]], atol=0, rtol=0
+        )
+        self.assertTrue(torch.all(conv[1] == 7))
+        self.assertTrue(torch.all(state[1] == 5))
+
+    def test_missing_intermediate_source_keeps_final_state_tracking(self):
+        metadata = ForwardMetadata(
+            query_start_loc=torch.tensor([0, 1]),
+            mamba_cache_indices=torch.tensor([1]),
+            has_mamba_track_mask=True,
+            track_ssm_h_src=None,
+            track_ssm_final_src=torch.tensor([1]),
+            track_ssm_final_dst=torch.tensor([2]),
+        )
+        states = torch.tensor([[[[0.0]]], [[[7.0]]], [[[0.0]]]])
+        MambaAttnBackendBase._track_mamba_state_extend(
+            object.__new__(GDNAttnBackend), None, None, states, metadata
+        )
+        torch.testing.assert_close(states.flatten(), torch.tensor([0.0, 7.0, 7.0]))
 
 
 if __name__ == "__main__":

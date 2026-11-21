@@ -1026,8 +1026,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
             and (not conv_states.is_contiguous() or not ssm_states.is_contiguous())
         )
         if needs_state_gather:
-            conv_states_contig = conv_states[cache_indices].contiguous()
-            ssm_states_contig = ssm_states[cache_indices].contiguous()
+            valid_state_rows = cache_indices >= 0
+            safe_state_indices = cache_indices.clamp_min(0)
+            conv_states_contig = conv_states[safe_state_indices].contiguous()
+            ssm_states_contig = ssm_states[safe_state_indices].contiguous()
+            for states in (conv_states_contig, ssm_states_contig):
+                states.masked_fill_(
+                    ~valid_state_rows.view(-1, *([1] * (states.ndim - 1))), 0
+                )
             state_cache_indices = torch.arange(
                 cache_indices.shape[0],
                 device=cache_indices.device,
@@ -1166,6 +1172,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             h_track_buf = None
             if (
                 forward_metadata.has_mamba_track_mask
+                and forward_metadata.track_ssm_h_src is not None
                 and forward_metadata.track_ssm_h_src.numel() > 0
                 and self.kernel_dispatcher.extend_kernel.supports_track_state_snapshot
             ):
@@ -1186,6 +1193,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states=ssm_states_contig,
                 cache_indices=state_cache_indices,
                 query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                requires_intermediate_states=(
+                    forward_metadata.has_mamba_track_mask
+                    and forward_metadata.track_ssm_h_src is not None
+                    and forward_metadata.track_ssm_h_src.numel() > 0
+                ),
                 state_checkpoint_cu_starts=(
                     forward_metadata.state_checkpoint_cu_starts
                 ),
@@ -1213,8 +1226,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             if needs_state_gather:
                 # Scatter the in-place-updated contiguous copies back to the
                 # strided envelope pool (advanced indexing handles the strides).
-                conv_states[cache_indices] = conv_states_contig
-                ssm_states[cache_indices] = ssm_states_contig
+                valid_slots = cache_indices[valid_state_rows]
+                conv_states[valid_slots] = conv_states_contig[valid_state_rows]
+                ssm_states[valid_slots] = ssm_states_contig[valid_state_rows]
 
             if forward_metadata.has_mamba_track_mask:
                 self._track_mamba_state_extend(

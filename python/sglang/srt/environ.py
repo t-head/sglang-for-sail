@@ -2326,13 +2326,10 @@ class Envs:
     SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 = EnvBoolWithAlias(
         True, deprecated_name="SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8"
     )
-    # SAIL PLA CUDA: master switch for every SAIL PLA kernel on PPU -- the KDA
-    # decode / MTP fast paths and, since the KDA prefill integration, the KDA
-    # prefill/extend path (kda_flashkda.FlashKDAKernel ->
-    # pla.prefill.flashkdapro.flashkda_fwd). PPU defaults it to True in
-    # platform_hook, so PLA is on out of the box; set it to 0 to send decode
-    # and prefill back to the community Triton kernels together. An explicit
-    # --linear-attn-prefill-backend still wins for the prefill side alone.
+    # Shared SAIL PLA switch for GDN/KDA prefill and existing decode/MTP
+    # paths. PPU platform initialization defaults it to True; an explicit 0
+    # selects the original Triton paths. Per-path state/Graph compatibility
+    # guards and explicitly selected non-Triton prefill backends still apply.
     SGLANG_SAIL_PLA_CUDA = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_SAIL_FLA_CUDA"
     )

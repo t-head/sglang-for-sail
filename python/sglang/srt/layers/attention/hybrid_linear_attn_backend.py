@@ -1047,7 +1047,10 @@ class MambaAttnBackendBase(AttentionBackend):
         if forward_metadata.has_mamba_track_mask:
             # Triton always returns h; FlashInfer returns it only when checkpoints
             # were requested. Aligned-only tracking reads the final state below.
-            if forward_metadata.track_ssm_h_src.numel() > 0:
+            if (
+                forward_metadata.track_ssm_h_src is not None
+                and forward_metadata.track_ssm_h_src.numel() > 0
+            ):
                 if h_track_buf is not None:
                     ssm_states[forward_metadata.track_ssm_h_dst] = h_track_buf[
                         forward_metadata.track_ssm_h_batch_src
