@@ -3344,6 +3344,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     downcast_to_mxfp4_indexer,
                 )
 
+                # K may be allocated on alt_stream and consumed on this stream.
+                # Keep its storage live across Q quantization allocations.
+                key.record_stream(torch.cuda.current_stream())
                 q_packed, q_sf = downcast_to_mxfp4_indexer(query, -1)
                 q_fp8 = (q_packed, q_sf)
                 q_scale = None
