@@ -37,7 +37,11 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4.dequant_k_cache import DIM_NOPE, DIM_ROPE
+from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
+    DIM_NOPE,
+    DIM_ROPE,
+    dequantize_k_cache_paged_dsv4,
+)
 from sglang.srt.environ import envs
 from sglang.srt.utils.common import async_h2d
 
@@ -73,29 +77,34 @@ class SparsePrefillKVBuffer:
 
     Callers overwrite the rows they read, except head rows ``get_with_head``
     reports as filled, so token buckets and compression ratios can safely share
-    one buffer. Sparse prefill executes eagerly and serially on the supported
-    paths, which makes it safe to replace the scratch allocation when a larger
-    extent is needed.
+    one buffer. Eager scratch can grow or be released before compaction;
+    allocations referenced by captured graphs stay alive when scratch changes.
     """
 
     def __init__(self, device: torch.device):
         self.device = device
         self._buffer: Optional[torch.Tensor] = None
         self._head_source: Optional[tuple] = None
+        self._buffer_used_by_graph = False
+        # A graph may reference a buffer allocated before capture. Retain each
+        # captured allocation even when a later eager forward grows scratch.
+        self._graph_buffers: list[torch.Tensor] = []
 
     def get(
         self,
         num_tokens: int,
         dtype: torch.dtype = torch.bfloat16,
+        *,
+        retain_for_graph: bool = False,
     ) -> torch.Tensor:
         self._head_source = None
-        return self._reserve(num_tokens, dtype)
+        return self._reserve(num_tokens, dtype, retain_for_graph)
 
     def get_with_head(
-        self, num_tokens: int, head_source: tuple
+        self, num_tokens: int, head_source: tuple, *, retain_for_graph: bool = False
     ) -> Tuple[torch.Tensor, bool]:
         """Returns the rows and whether the head already holds ``head_source``."""
-        buffer = self._reserve(num_tokens, torch.bfloat16)
+        buffer = self._reserve(num_tokens, torch.bfloat16, retain_for_graph)
         head_filled = head_source == self._head_source
         self._head_source = head_source
         return buffer, head_filled
@@ -104,7 +113,28 @@ class SparsePrefillKVBuffer:
         """Per forward: the next forward's tensors may reuse freed addresses."""
         self._head_source = None
 
-    def _reserve(self, num_tokens: int, dtype: torch.dtype) -> torch.Tensor:
+    def can_reuse_bf16(self, num_tokens: int) -> bool:
+        buffer = self._buffer
+        return (
+            buffer is not None
+            and buffer.dtype == torch.bfloat16
+            and buffer.shape[0] >= num_tokens
+        )
+
+    def release_eager_bf16(self) -> None:
+        """Discard scratch space before compaction, not a captured address."""
+        buffer = self._buffer
+        if (
+            buffer is not None
+            and buffer.dtype == torch.bfloat16
+            and not self._buffer_used_by_graph
+        ):
+            self._buffer = None
+            self.forget_head()
+
+    def _reserve(
+        self, num_tokens: int, dtype: torch.dtype, retain_for_graph: bool
+    ) -> torch.Tensor:
         assert num_tokens > 0
         current_capacity = self._buffer.shape[0] if self._buffer is not None else 0
         current_dtype = self._buffer.dtype if self._buffer is not None else None
@@ -115,7 +145,68 @@ class SparsePrefillKVBuffer:
                 device=self.device,
             )
             self._head_source = None
+            self._buffer_used_by_graph = False
+        if retain_for_graph and not self._buffer_used_by_graph:
+            self._graph_buffers.append(self._buffer)
+            self._buffer_used_by_graph = True
         return self._buffer[:num_tokens]
+
+
+def should_compact_sparse_prefill_kv(num_rows: int, index_count: int) -> bool:
+    # Keep the ordinary path (including shared-head reuse) for smaller gathers.
+    # Even if no indices repeat, the compact BF16 workspace is at most half as
+    # large. Leave room for the temporary index tensors used by the remap.
+    return num_rows * WORKSPACE_DIM * 2 >= 4 * (1 << 30) and 2 * index_count <= num_rows
+
+
+def compact_sparse_prefill_kv(
+    indices: torch.Tensor,
+    lengths: torch.Tensor,
+    compressed_slots: Optional[torch.Tensor],
+    swa_slots: torch.Tensor,
+    compressed_cache: Optional[torch.Tensor],
+    swa_cache: torch.Tensor,
+    compressed_page_size: Optional[int],
+    swa_page_size: int,
+    compressed_layout,
+    swa_layout,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather only referenced BF16 rows, preserving per-query order and repeats."""
+    num_compressed = 0 if compressed_slots is None else compressed_slots.numel()
+    cols = torch.arange(indices.shape[-1], device=indices.device)
+    valid = (indices >= 0) & (cols < lengths.reshape(-1, 1))
+    unique, inverse = torch.unique(
+        indices[valid].long(), sorted=True, return_inverse=True
+    )
+    compressed_count = (
+        torch.searchsorted(unique, num_compressed).item() if num_compressed else 0
+    )
+    workspace = torch.empty(
+        (max(unique.numel(), 1), 1, WORKSPACE_DIM),
+        dtype=torch.bfloat16,
+        device=indices.device,
+    )
+    if compressed_count:
+        dequantize_k_cache_paged_dsv4(
+            compressed_cache,
+            compressed_slots[unique[:compressed_count]],
+            page_size=compressed_page_size,
+            out=workspace[:compressed_count],
+            layout=compressed_layout,
+        )
+    if compressed_count < unique.numel():
+        dequantize_k_cache_paged_dsv4(
+            swa_cache,
+            swa_slots[unique[compressed_count:] - num_compressed],
+            page_size=swa_page_size,
+            out=workspace[compressed_count:],
+            layout=swa_layout,
+        )
+    if not unique.numel():
+        workspace.zero_()
+    remapped = torch.full_like(indices, -1)
+    remapped[valid] = inverse.to(indices.dtype)
+    return workspace, remapped
 
 
 @dataclass
