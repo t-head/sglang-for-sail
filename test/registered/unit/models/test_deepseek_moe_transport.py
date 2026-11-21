@@ -9,10 +9,57 @@ import torch
 
 from sglang.srt.layers.layer_boundary.layout import Layout, SumGroup
 from sglang.srt.layers.layer_boundary.row_transport import TransportRows
+from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.models.deepseek_common import moe_transport
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+
+
+class TestScatteredTailCounts(CustomTestCase):
+    def test_shards_rebind_tail_counts_and_restore_on_error(self):
+        """A 128-row replay tail must not mask the last rank using its old count of 30."""
+        for rows, real, expected in (
+            (128, 128, [32, 32, 32, 32]),
+            (130, 129, [33, 33, 32, 31]),
+        ):
+            for rank in range(4):
+                with self.subTest(rows=rows, rank=rank):
+                    old = torch.tensor(30, dtype=torch.int32)
+                    batch = SimpleNamespace(
+                        global_num_token_non_padded=torch.tensor(
+                            real, dtype=torch.int32
+                        ),
+                        num_token_non_padded=old,
+                        dp_padding_mode=None,
+                    )
+                    with (
+                        get_parallel().override(
+                            attn_tp_size=4, attn_tp_rank=rank, attn_dp_size=1
+                        ),
+                        get_flags().moe.override(a2a_backend=MoeA2ABackend.MEGAMOE),
+                    ):
+                        transport = moe_transport.MoeRowTransport(
+                            SimpleNamespace(),
+                            torch.ones(rows, 2),
+                            batch,
+                            None,
+                            None,
+                            use_cp=False,
+                            moe_gather=False,
+                            attn_scatter=True,
+                        )
+                        with (
+                            self.assertRaisesRegex(RuntimeError, "expert failure"),
+                            transport.scope(),
+                        ):
+                            self.assertEqual(
+                                batch.num_token_non_padded.item(), expected[rank]
+                            )
+                            raise RuntimeError("expert failure")
+                    self.assertIs(batch.num_token_non_padded, old)
 
 
 class TestOverlappedTransport(unittest.TestCase):

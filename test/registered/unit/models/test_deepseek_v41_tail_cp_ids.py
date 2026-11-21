@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.attention import deepseek_v4_backend
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
     LateLayerTail,
@@ -24,6 +25,49 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+class TestEagerTailCounts(CustomTestCase):
+    def test_compacted_tail_bounds_and_restores_counts(self):
+        """An eager 128-row tail must not retain its full 129-row extent."""
+        for graph in (False, True):
+            with self.subTest(graph=graph):
+                global_count = torch.tensor(129, dtype=torch.int32)
+                local_count = torch.tensor(30, dtype=torch.int32)
+                batch = NS(
+                    attn_cp_metadata=None,
+                    global_num_token_non_padded_cpu=129,
+                    global_num_token_non_padded=global_count,
+                    num_token_non_padded=local_count,
+                )
+                backend = object.__new__(DeepseekV4AttnBackend)
+                backend.forward_metadata = object()
+                original_metadata = backend.forward_metadata
+                backend.tail_forward_metadata = NS(
+                    late_layer_tail=NS(
+                        real_rows_count=128 if graph else None,
+                        extend_seq_lens_cpu=[128],
+                        cp_metadata=None,
+                    ),
+                    core_attn_metadata=NS(),
+                )
+                backend._bcg_tail_num_token_non_padded = None
+                backend.token_to_kv_pool = NS(request_window=None)
+                with (
+                    patch.object(
+                        deepseek_v4_backend, "get_local_dp_buffer_len", return_value=132
+                    ),
+                    patch.object(deepseek_v4_backend, "set_local_dp_buffer_len"),
+                ):
+                    saved = backend.enter_late_layer_tail(batch)
+                    self.assertEqual(batch.global_num_token_non_padded_cpu, 128)
+                    self.assertEqual(batch.global_num_token_non_padded.item(), 128)
+                    self.assertEqual(batch.num_token_non_padded.item(), 128)
+                    backend.exit_late_layer_tail(saved, batch)
+                self.assertIs(backend.forward_metadata, original_metadata)
+                self.assertEqual(batch.global_num_token_non_padded_cpu, 129)
+                self.assertIs(batch.global_num_token_non_padded, global_count)
+                self.assertIs(batch.num_token_non_padded, local_count)
 
 
 class TestDSV41TailCPRoutingIDs(CustomTestCase):
