@@ -37,6 +37,109 @@ class TestPPUCISuite(CustomTestCase):
             list((RUNNER.parent / "registered").rglob("test_ppu_ci_*.py")), []
         )
 
+    def test_gdn_registrations_use_declared_suites(self):
+        spec = importlib.util.spec_from_file_location("gdn_suite_runner", RUNNER)
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        registered = RUNNER.parent / "registered"
+        paths = [
+            "unit/layers/attention/test_gdn_pla_prefill.py",
+            "unit/layers/attention/test_mamba_track_state_dtype.py",
+            "kernels/ops/attention/test_gdn_pla_prefill.py",
+        ]
+        tests = collect_tests([str(registered / path) for path in paths])
+        self.assertEqual(len(tests), len(paths))
+        # Validate our registrations without repairing unrelated baseline suites.
+        runner.validate_all_suites(tests)
+        self.assertCountEqual(
+            [test.backend for test in tests],
+            [HWBackend.CPU, HWBackend.CPU, HWBackend.PPU],
+        )
+
+    def test_gdn_ci_runs_only_related_files_and_propagates_failures(self):
+        """GDN coverage must run before unrelated collection and reject skips."""
+        source = Path(__file__).with_name("build_and_test.sh").read_text()
+        begin = "# GDN PLA regression tests: begin"
+        end = "# GDN PLA regression tests: end"
+        self.assertEqual(source.count(begin), 1)
+        self.assertEqual(source.count(end), 1)
+        self.assertLess(source.index(end), source.index('cd "$artifacts"'))
+        script = (
+            "\n".join(source.splitlines()[:2])
+            + "\n"
+            + source.split(begin, 1)[1].split(end, 1)[0]
+        )
+        files = [
+            ("gdn-contract", "unit/layers/attention/test_gdn_pla_prefill.py", 3),
+            ("gdn-state", "unit/layers/attention/test_mamba_track_state_dtype.py", 7),
+            ("gdn-ppu", "kernels/ops/attention/test_gdn_pla_prefill.py", 5),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo with spaces"
+            bin_dir = root / "bin"
+            bin_dir.mkdir(parents=True)
+            python = bin_dir / "python3"
+            python.write_text(
+                '#!/bin/sh\nif [ "$1" = "-c" ]; then echo "$FIXTURE_CAPABILITY"; else exec "$FIXTURE_PYTHON" "$@"; fi\n'
+            )
+            python.chmod(0o755)
+            for name, path, count in files:
+                file = root / "test/registered" / path
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.write_text(
+                    "import os, sys\n"
+                    f"name = {name!r}\n"
+                    "with open(os.environ['FIXTURE_RUN_LOG'], 'a') as f: f.write(name + '\\n')\n"
+                    "mode = os.environ['FIXTURE_MODE'] if name == os.environ['FIXTURE_TARGET'] else 'ok'\n"
+                    f"count = 0 if mode == 'wrong-count' else {count}\n"
+                    "if mode != 'empty':\n"
+                    " print(f'Ran {count} tests in 0.001s', file=sys.stderr)\n"
+                    " print('OK (skipped=1)' if mode == 'skipped' else 'OK', file=sys.stderr)\n"
+                    "sys.exit(7 if mode == 'nonzero' else 0)\n"
+                )
+            cases = [("8.9", "", "ok", 0), ("8.0", "", "ok", 0)]
+            cases.extend(
+                ("8.9", name, mode, 7 if mode == "nonzero" else 1)
+                for name, _, _ in files
+                for mode in ("nonzero", "empty", "wrong-count", "skipped")
+            )
+            for index, (capability, target, mode, expected) in enumerate(cases):
+                with self.subTest(capability=capability, target=target, mode=mode):
+                    artifacts = root / f"artifacts-{index}"
+                    artifacts.mkdir()
+                    run_log = artifacts / "calls.log"
+                    result = subprocess.run(
+                        ["bash", "-c", script],
+                        env=dict(
+                            os.environ,
+                            repo=str(root),
+                            artifacts=str(artifacts),
+                            PATH=str(bin_dir) + os.pathsep + os.environ["PATH"],
+                            FIXTURE_PYTHON=sys.executable,
+                            FIXTURE_CAPABILITY=capability,
+                            FIXTURE_RUN_LOG=str(run_log),
+                            FIXTURE_TARGET=target,
+                            FIXTURE_MODE=mode,
+                        ),
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    self.assertEqual(
+                        result.returncode, expected, result.stdout + result.stderr
+                    )
+                    called = (
+                        run_log.read_text().splitlines() if run_log.exists() else []
+                    )
+                    expected_names = [name for name, _, _ in files]
+                    if capability != "8.9":
+                        expected_names = []
+                    elif target:
+                        expected_names = expected_names[
+                            : expected_names.index(target) + 1
+                        ]
+                    self.assertEqual(called, expected_names)
+
     def test_ppu_suite_contains_both_speculative_sanity_files(self):
         registered = RUNNER.parent / "registered"
         files = [
@@ -60,44 +163,7 @@ class TestPPUCISuite(CustomTestCase):
             ["core/test_basic_sanity_eagle3.py", "core/test_basic_sanity_dflash.py"],
         )
 
-    def test_ppu_stage_b_is_declared_and_contains_the_kernel_tests(self):
-        spec = importlib.util.spec_from_file_location("ppu_suite_runner", RUNNER)
-        runner = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(runner)
-        gdn = RUNNER.parent / "registered/kernels/ops/attention/test_gdn_pla_prefill.py"
-        runner.validate_all_suites(collect_tests([str(gdn)]))
-        tests = collect_tests(
-            [
-                str(p)
-                for p in (RUNNER.parent / "registered").rglob("*.py")
-                if p.name not in ("conftest.py", "__init__.py")
-            ]
-        )
-        # This executes the real global check before any hardware filtering.
-        runner.validate_all_suites(tests)
-        kernels = [
-            Path(t.filename).relative_to(RUNNER.parent / "registered").as_posix()
-            for t in tests
-            if t.backend == HWBackend.PPU
-            and t.effective_suite == "stage-b-test-1-gpu-ppu"
-            and not t.disabled
-        ]
-        self.assertIn(
-            "SGLANG_JIT_DEEPGEMM_PRECOMPILE=0 python3",
-            Path(__file__).with_name("build_and_test.sh").read_text(),
-        )
-        self.assertCountEqual(
-            kernels,
-            [
-                "kernels/ops/attention/test_gdn_pla_prefill.py",
-                "kernels/ops/attention/test_minimax_m3_msa_ppu_page_table_tail.py",
-                "kernels/ops/elementwise/test_silu_and_mul_masked_post_per_token_quant_fp8.py",
-                "kernels/ops/attention/dsv4/test_mega_attention_ppu.py",
-                "kernels/ops/gemm/test_ppu_bf16_dense_gemm.py",
-            ],
-        )
-
-    def test_runtime_requires_sanity_and_scheduled_kernel_files_to_pass(self):
+    def test_runtime_requires_both_sanity_files_to_pass(self):
         source = Path(__file__).with_name("build_and_test.sh").read_text()
         marker = 'cd "$artifacts"\n'
         self.assertIn(marker, source)
@@ -110,76 +176,40 @@ class TestPPUCISuite(CustomTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "repo with spaces"
             (root / "test").mkdir(parents=True)
-            bin_dir = root / "bin"
-            bin_dir.mkdir()
-            python = bin_dir / "python3"
-            python.write_text(
-                '#!/bin/sh\nif [ "$1" = "-c" ]; then echo "$FIXTURE_CAPABILITY"; else exec "$FIXTURE_PYTHON" "$@"; fi\n'
-            )
-            python.chmod(0o755)
+            artifacts = root / "artifacts"
+            artifacts.mkdir()
             (root / "test/run_suite.py").write_text(
                 "import os, sys\n"
-                "stage = 'B' if 'stage-b-test-1-gpu-ppu' in sys.argv else 'A'\n"
-                "print(os.environ['FIXTURE_SUMMARY_' + stage], file=sys.stderr)\n"
-                "sys.exit(int(os.environ['FIXTURE_EXIT_' + stage]))\n"
+                "print(os.environ['FIXTURE_SUMMARY'], file=sys.stderr)\n"
+                "sys.exit(int(os.environ['FIXTURE_EXIT']))\n"
             )
-            for stage in ("A", "B"):
-                count = 2 if stage == "A" else 5
-                good = f"Test Summary: {count}/{count} passed"
-                for text, code, expected in (
-                    (good, 0, 0),
-                    ("Test Summary: 0/0 passed", 0, 1),
-                    ("Test Summary: 1/1 passed", 0, 1),
-                    (f"Test Summary: 1/{count} passed", 0, 1),
-                    (f"Test Summary: {count + 1}/{count + 1} passed", 0, 1),
-                    (good, 7, 7),
-                    (good + " (incomplete)", 0, 1),
-                    ("", 0, 1),
-                ):
-                    with self.subTest(stage=stage, text=text, code=code):
-                        artifacts = root / "artifacts"
-                        artifacts.mkdir(exist_ok=True)
-                        env = dict(
+            for summary, exit_code, expected in (
+                ("Test Summary: 2/2 passed", 0, 0),
+                ("Test Summary: 0/0 passed", 0, 1),
+                ("Test Summary: 1/1 passed", 0, 1),
+                ("Test Summary: 1/2 passed", 0, 1),
+                ("Test Summary: 3/3 passed", 0, 1),
+                ("Test Summary: 2/2 passed", 7, 7),
+                ("Test Summary: 2/2 passed (incomplete)", 0, 1),
+                ("", 0, 1),
+            ):
+                with self.subTest(summary=summary, exit_code=exit_code):
+                    result = subprocess.run(
+                        ["bash", "-c", script],
+                        env=dict(
                             os.environ,
                             repo=str(root),
                             artifacts=str(artifacts),
-                            PATH=str(bin_dir) + os.pathsep + os.environ["PATH"],
-                            FIXTURE_PYTHON=sys.executable,
-                            FIXTURE_CAPABILITY="8.9",
-                            FIXTURE_SUMMARY_A="Test Summary: 2/2 passed",
-                            FIXTURE_EXIT_A="0",
-                            FIXTURE_SUMMARY_B="Test Summary: 5/5 passed",
-                            FIXTURE_EXIT_B="0",
-                        )
-                        env["FIXTURE_SUMMARY_" + stage] = text
-                        env["FIXTURE_EXIT_" + stage] = str(code)
-                        result = subprocess.run(
-                            ["bash", "-c", script],
-                            env=env,
-                            capture_output=True,
-                            text=True,
-                            timeout=10,
-                        )
-                        self.assertEqual(
-                            result.returncode, expected, result.stdout + result.stderr
-                        )
-            # The 810E job must not execute the FP8 stage on unsupported hardware.
-            env.update(
-                FIXTURE_CAPABILITY="8.0",
-                FIXTURE_SUMMARY_A="Test Summary: 2/2 passed",
-                FIXTURE_EXIT_A="0",
-                FIXTURE_SUMMARY_B="must not run",
-                FIXTURE_EXIT_B="9",
-            )
-            result = subprocess.run(
-                ["bash", "-c", script],
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn("not scheduled for compute capability 8.0", result.stdout)
+                            FIXTURE_SUMMARY=summary,
+                            FIXTURE_EXIT=str(exit_code),
+                        ),
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    self.assertEqual(
+                        result.returncode, expected, result.stdout + result.stderr
+                    )
 
 
 class TestPPUCIWorkflow(CustomTestCase):

@@ -19,7 +19,7 @@ from sglang.srt.layers.attention.minimax_sparse_ops.msa_ppu import (
 from sglang.test.ci.ci_register import register_ppu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_ppu_ci(est_time=120, suite="stage-b-test-1-gpu-ppu")
+register_ppu_ci(est_time=120, suite="stage-a-test-1-gpu-ppu")
 
 PAGE = 128
 HEAD_DIM = 128

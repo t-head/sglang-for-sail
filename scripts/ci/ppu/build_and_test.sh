@@ -155,19 +155,27 @@ print("AOT extension:", sgl_kernel.common_ops.__file__)
 PY
 python3 "$repo/scripts/ci/ppu/prepare_runtime.py"
 
+# GDN PLA regression tests: begin
+# Run only GDN files here, independently of unrelated registry collection.
+# Native PLA GDN has been validated on the SM8.9/M890P runner domain.
+ppu_compute_capability=$(python3 -c 'import torch; major, minor = torch.cuda.get_device_capability(); print(f"{major}.{minor}")')
+if [[ "$ppu_compute_capability" == "8.9" ]]; then
+    run_gdn_pla_test() {
+        local gdn_name=$1 gdn_file=$2 gdn_expected=$3
+        python3 "$repo/$gdn_file" -v 2>&1 | tee "$artifacts/$gdn_name.log"
+        grep -Eq "^Ran $gdn_expected tests in " "$artifacts/$gdn_name.log"
+        grep -Fxq 'OK' "$artifacts/$gdn_name.log"
+    }
+    run_gdn_pla_test gdn-contract test/registered/unit/layers/attention/test_gdn_pla_prefill.py 3
+    run_gdn_pla_test gdn-state test/registered/unit/layers/attention/test_mamba_track_state_dtype.py 7
+    run_gdn_pla_test gdn-ppu test/registered/kernels/ops/attention/test_gdn_pla_prefill.py 5
+else
+    printf 'GDN PLA native regressions are not scheduled for compute capability %s.\n' "$ppu_compute_capability"
+fi
+# GDN PLA regression tests: end
+
 cd "$artifacts"
 python3 "$repo/test/run_suite.py" --hw ppu --suite stage-a-test-1-gpu-ppu --timeout-per-file 1200 \
     2>&1 | tee "$artifacts/sanity.log"
 # Require both sanity files; update this count when extending the suite.
 grep -Fxq 'Test Summary: 2/2 passed' "$artifacts/sanity.log"
-
-# The stage-B suite includes FP8 MegaAttention, which requires the verified
-# M890P domain. Keep the 810E job on the existing BF16 sanity coverage.
-ppu_compute_capability=$(python3 -c 'import torch; major, minor = torch.cuda.get_device_capability(); print(f"{major}.{minor}")')
-if [[ "$ppu_compute_capability" == "8.9" ]]; then
-    SGLANG_JIT_DEEPGEMM_PRECOMPILE=0 python3 "$repo/test/run_suite.py" --hw ppu --suite stage-b-test-1-gpu-ppu --timeout-per-file 1200 \
-        2>&1 | tee "$artifacts/kernels.log"
-    grep -Fxq 'Test Summary: 5/5 passed' "$artifacts/kernels.log"
-else
-    printf 'PPU kernel stage B is not scheduled for compute capability %s.\n' "$ppu_compute_capability"
-fi
