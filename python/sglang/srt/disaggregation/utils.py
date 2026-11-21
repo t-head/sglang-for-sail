@@ -163,13 +163,70 @@ def get_qsa_pending_state_indices(req: Req) -> np.ndarray:
     return np.array([int(req_pool_idx)], dtype=np.int32)
 
 
-def should_bypass_dsa_cp_prefix_cache(*, is_dsa: bool = True) -> bool:
-    """Whether PD DSA prefill CP must bypass the legacy radix cache."""
+def dsa_cp_prefix_cache_enabled() -> bool:
+    """Experimental switch: keep the radix cache on under PD DSA prefill CP."""
+    return envs.SGLANG_DSA_CP_PREFIX_CACHE.get()
+
+
+def supports_dsa_cp_prefix_cache() -> bool:
+    """Whether the deployment is the supported DSA prefill-CP scenario.
+
+    With interleave CP all ranks share logical token indices. Replicated
+    pools read their local layers; split pools read an owner broadcast.
+    """
     return (
-        is_dsa
-        and get_disagg().disaggregation_mode != "null"
+        get_disagg().disaggregation_mode == "prefill"
         and get_parallel().enable_prefill_cp
+        and get_parallel().cp_strategy == "interleave"
     )
+
+
+def should_bypass_dsa_cp_prefix_cache(
+    *, is_dsa: bool = True
+) -> bool:
+    """Whether PD DSA prefill CP must bypass the legacy radix cache."""
+    if not is_dsa:
+        return False
+    if (
+        get_disagg().disaggregation_mode == "null"
+        or not get_parallel().enable_prefill_cp
+    ):
+        # Not the PD prefill-CP scenario at all: today's behavior (no bypass).
+        return False
+    if dsa_cp_prefix_cache_enabled() and supports_dsa_cp_prefix_cache():
+        # Experimental un-bypass. Everything else (e.g. a non-interleave
+        # strategy) keeps bypassing the radix cache.
+        return False
+    return True
+
+
+def validate_dsa_cp_prefix_cache_geometry(
+    *,
+    page_size: int,
+    index_kpool: int,
+    cache_layer_split: bool,
+    hicache_layout: Optional[str] = None,
+    hicache_io_backend: Optional[str] = None,
+) -> None:
+    """Fail before constructing a cache whose page ownership is unsupported.
+
+    A pooled indexer page can contain slots from multiple ordinary KV pages.
+    Reusing one such KV page while extending a divergent suffix can overwrite
+    the shared indexer page. The unpooled layout retains page ownership across
+    divergent suffixes.
+    """
+    if page_size != 64 or index_kpool != 1:
+        raise ValueError(
+            "SGLANG_DSA_CP_PREFIX_CACHE=1 requires page_size == 64, "
+            "index_kpool == 1; "
+            f"got {page_size=}, {index_kpool=}, {cache_layer_split=}."
+        )
+    if cache_layer_split and hicache_layout is not None and (
+        hicache_layout != "layer_first" or hicache_io_backend != "kernel"
+    ):
+        raise ValueError(
+            "DSA LayerSplit with HiCache requires layer_first layout and kernel I/O."
+        )
 
 
 class DisaggregationMode(Enum):

@@ -383,6 +383,12 @@ class DSAIndexerPoolHost(HostKVCache):
         *,
         is_draft: bool = False,
     ):
+        # Every CP rank may have a scratch copy of this layer, even when
+        # only the owner will actually submit an H2D transfer.
+        if not is_draft and self._is_device_layer_sharded(device_pool):
+            device_pool.invalidate_index_buffer_for_layer(
+                device_pool.start_layer + layer_id
+            )
         if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
             return
         assert not getattr(self, "_is_dummy", False), (
