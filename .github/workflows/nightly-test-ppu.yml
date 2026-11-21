@@ -274,6 +274,7 @@ jobs:
       matrix: ${{ fromJSON(needs.plan.outputs.models) }}
     env:
       MODEL_KEY: ${{ matrix.model }}
+      RECIPE_PPU_COUNT: ${{ matrix.ppu_count || 8 }}
       PPU_CI_SOURCE_SHA: ${{ needs.plan.outputs.source-sha }}
       PPU_CI_RECIPE_RUNTIME_IMAGE: ${{ inputs.runtime_image || 'download.t-head.cn/docker_test/sglang:release-v0.5.23-20261116-cf244d4' }}
     steps:

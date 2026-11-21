@@ -1,0 +1,32 @@
+schema_version: ppu-serving/v1
+ppu:
+  framework: sglang
+  visibility: public
+  assets: {model: kimi-k2.6-mxfp4-fp8, tokenizer: kimi-k2.6-mxfp4-fp8}
+  hf_model_id: T-HEAD/Kimi-K2.6-MXFP4-FP8
+  golden_model_key: kimi_k2_6_mxfp4
+  topology: {kind: single_node, nodes: 1, devices_per_node: 8}
+  external_env: [DG_USE_MOE_DYNAMIC_TILE, HGGC_EMBEDDED_COPY_THRESHOLD]
+model:
+  model_id: moonshotai/Kimi-K2.6
+  base_args:
+    - --tp-size
+    - "8"
+    - --context-length
+    - "16384"
+    - --mem-fraction-static
+    - "0.9"
+    - --prefill-attention-backend
+    - fa3
+    - --decode-attention-backend
+    - flashmla
+    - --cuda-graph-max-bs-decode
+    - "16"
+    - --disable-prefill-cuda-graph
+    - --disable-custom-all-reduce
+    - --trust-remote-code
+  base_env:
+    DG_USE_MOE_DYNAMIC_TILE: "1"
+    HGGC_EMBEDDED_COPY_THRESHOLD: "0x10000"
+variants:
+  default: {precision: mxfp4}

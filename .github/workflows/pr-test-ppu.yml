@@ -13,6 +13,10 @@ on:
         description: "Verify Linux selftests and both cluster preflight paths"
         type: boolean
         default: false
+      model_filter:
+        description: "Comma-separated Fast Sanity policy keys. Empty runs all models."
+        type: string
+        default: ''
       run_all_tests:
         description: "Run Recipe CI even without PPU path changes"
         required: false
@@ -330,6 +334,7 @@ jobs:
     with:
       ref: ${{ needs.check-changes.outputs.source-sha }}
       tier: ${{ inputs.preflight_only && 'cluster_preflight' || 'fast_sanity' }}
+      model_filter: ${{ github.event_name == 'workflow_dispatch' && inputs.model_filter || '' }}
       skip_wheel_build: true
       wheel_artifact_id: ${{ needs.ppu-build.outputs.wheel-artifact-id }}
 

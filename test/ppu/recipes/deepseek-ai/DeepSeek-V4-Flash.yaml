@@ -38,3 +38,12 @@ model:
     HGGC_EMBEDDED_COPY_THRESHOLD: "0x10000"
 variants:
   default: {precision: mxfp4}
+presets:
+  tp8:
+    remove_args:
+      - --attn-dp-size
+      - --enable-dp-lm-head
+      - --moe-a2a-backend
+      - --deepep-mode
+    env:
+      SGLANG_OPT_FLASHMLA_SPARSE_PREFILL: "0"
