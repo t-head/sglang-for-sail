@@ -20,14 +20,22 @@ from ppu_recipe import (
     _load_yaml,
     resolve_recipe,
     validate_paths,
+    validate_policy_structure,
 )
 from recipe_bundle import sha256, wheel_inventory
 from recipe_cluster_config import load_settings
 from recipe_cluster_diagnostics import diagnostic_codes
 from recipe_publish import publish, validate
 from recipe_report import legacy_result
-from recipe_runner import cached_model_path, metrics_zero, read_eval_reviews, run
-from recipe_select import select
+from recipe_report import main as report_recipe
+from recipe_runner import (
+    cached_model_path,
+    metrics_zero,
+    probes,
+    read_eval_reviews,
+    run,
+)
+from recipe_select import cluster_width, select
 
 
 def fast_result():
@@ -51,25 +59,331 @@ def fast_result():
 
 
 class RecipeContractTest(unittest.TestCase):
-    def test_default_fast_selects_both_models(self):
+    def test_fast_probe_accepts_reasoning_only_completion_with_complete_sse(self):
+        sampling = {"temperature": 1.0, "top_p": 1.0, "top_k": -1}
+        settings = {"prompt": "Compute 6 * 7.", "max_tokens": 16, **sampling}
+        answer = {
+            "message": {"content": None, "reasoning_content": "reasoning text"},
+            "finish_reason": "length",
+        }
+        stream = io.BytesIO(
+            b'data: {"choices":[{"delta":{"reasoning_content":"R"},"finish_reason":null}]}\n\n'
+            b'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\n'
+            b"data: [DONE]\n\n"
+        )
+        stream.headers = Mock()
+        stream.headers.get_content_type.return_value = "text/event-stream"
+        with tempfile.TemporaryDirectory() as temp:
+            results = Path(temp) / "results"
+            results.mkdir()
+            with patch("recipe_runner.RESULTS", results):
+                response = io.BytesIO(json.dumps({"choices": [answer]}).encode())
+                with patch(
+                    "recipe_runner.request", side_effect=(response, stream)
+                ) as request:
+                    probes(settings, fast=True)
+                for call in request.call_args_list:
+                    payload = json.loads(call.args[1])
+                    self.assertEqual({key: payload[key] for key in sampling}, sampling)
+                self.assertEqual(
+                    json.loads((results / "chat-probe-response.json").read_text()),
+                    answer,
+                )
+                for fast, choice in (
+                    (True, dict(answer, finish_reason=None)),
+                    (True, dict(answer, message={"content": " "})),
+                    (False, answer),
+                ):
+                    with self.subTest(fast=fast, choice=choice):
+                        response = io.BytesIO(
+                            json.dumps({"choices": [choice]}).encode()
+                        )
+                        with patch("recipe_runner.request", return_value=response):
+                            with self.assertRaisesRegex(
+                                ValueError, "non-streaming response"
+                            ):
+                                probes(settings, fast=fast)
+
+    def test_default_fast_selects_all_models(self):
         self.assertEqual(
             select("fast_sanity", ""),
             {
                 "include": [
-                    {"model": "deepseek-v4-flash"},
-                    {"model": "glm-5.3"},
+                    {"model": "deepseek-v4-flash-tp8", "ppu_count": 8},
+                    {"model": "deepseek-v4-flash", "ppu_count": 8},
+                    {"model": "deepseek-v4-pro", "ppu_count": 8},
+                    {"model": "deepseek-v4.1-flash", "ppu_count": 8},
+                    {"model": "glm-5.3-flash", "ppu_count": 2},
+                    {"model": "glm-5.3-tp4", "ppu_count": 4},
+                    {"model": "glm-5.3", "ppu_count": 8},
+                    {"model": "kimi-k2.6", "ppu_count": 8},
+                    {"model": "minimax-m3-fp8", "ppu_count": 8},
+                    {"model": "minimax-m3", "ppu_count": 8},
+                    {"model": "qwen3.8-27b", "ppu_count": 2},
+                    {"model": "qwen3.8-flash-next-tp4", "ppu_count": 4},
+                    {"model": "qwen3.8-flash-next", "ppu_count": 8},
                 ]
             },
         )
 
     def test_nightly_exact_filter(self):
         self.assertEqual(
-            select("model_sanity", "glm-5.3"), {"include": [{"model": "glm-5.3"}]}
+            select("model_sanity", "glm-5.3"),
+            {"include": [{"model": "glm-5.3", "ppu_count": 8}]},
+        )
+        self.assertEqual(
+            select("model_sanity", "deepseek-v4-flash-tp8"),
+            {"include": [{"model": "deepseek-v4-flash-tp8", "ppu_count": 8}]},
         )
         with self.assertRaises(ValueError):
             select("model_sanity", "glm")
         with self.assertRaises(ValueError):
             select("model_sanity", "glm-5.3,glm-5.3")
+        with self.assertRaises(ValueError):
+            select("model_sanity", "qwen3.8-27b")
+
+    def test_plan_rejects_width_mismatch_and_multiple_nodes(self):
+        policy = DEFAULT_POLICY_ROOT / "models/qwen3.8-27b.yaml"
+        for topology in (
+            {"kind": "single_node", "nodes": 1, "devices_per_node": 8},
+            {"kind": "multi_node_ep", "nodes": 2, "devices_per_node": 2},
+        ):
+            with (
+                self.subTest(topology=topology),
+                patch(
+                    "recipe_select._load_yaml",
+                    side_effect=[_load_yaml(policy), {"ppu": {"topology": topology}}],
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "unsupported cluster topology"):
+                    cluster_width(policy, "fast_sanity")
+
+    def test_glm_tp4_preserves_the_pinned_model_identity(self):
+        recipes = REPO_ROOT / "test/ppu/recipes/zai-org"
+        tp8 = resolve_recipe(recipes / "GLM-5.3.yaml")
+        tp4 = resolve_recipe(recipes / "GLM-5.3-TP4.yaml")
+        self.assertEqual(tp4["model_id"], tp8["model_id"])
+        self.assertEqual(tp4["hf_model_id"], tp8["hf_model_id"])
+        self.assertEqual(tp4["server_env"], tp8["server_env"])
+        self.assertEqual((tp4["ppu_count"], tp8["ppu_count"]), (4, 8))
+
+    def test_deepseek_v41_fast_uses_pure_tp8(self):
+        model = "deepseek-v4.1-flash"
+        policy = DEFAULT_POLICY_ROOT / f"models/{model}.yaml"
+        recipe = REPO_ROOT / _load_yaml(policy)["recipe"]
+        resolved = resolve_recipe(recipe, policy_path=policy, tier="fast_sanity")
+        flags = resolved["flags"]
+        self.assertEqual(resolved["ppu_count"], 8)
+        self.assertEqual(flags[flags.index("--tp-size") + 1], "8")
+        self.assertIsNone(resolved["layer_override"])
+        for flag in (
+            "--attn-dp-size",
+            "--dp-size",
+            "--enable-dp-lm-head",
+            "--moe-a2a-backend",
+            "--deepep-mode",
+        ):
+            self.assertNotIn(flag, flags)
+        with self.assertRaises(ValueError):
+            select("model_sanity", model)
+
+    def test_minimax_fp8_selects_the_fp8_checkpoint(self):
+        model = "minimax-m3-fp8"
+        policy_path = DEFAULT_POLICY_ROOT / f"models/{model}.yaml"
+        recipe = REPO_ROOT / _load_yaml(policy_path)["recipe"]
+        config = resolve_recipe(recipe, policy_path=policy_path, tier="fast_sanity")
+        self.assertEqual(
+            config["hf_model_id"],
+            "T-HEAD/MiniMax-M3-Quant-W-FP8-PerChannel-A-FP8-PerToken",
+        )
+        self.assertEqual(config["ppu_count"], 8)
+        self.assertTrue(config["dummy_weights"])
+        self.assertIsNone(config["layer_override"])
+
+    def test_minimax_nightly_uses_published_quantized_reference(self):
+        self.assert_nightly_reference("minimax-m3", width=8, correct=1284)
+        self.assert_nightly_reference("minimax-m3-fp8", width=8, correct=1284)
+
+    def test_deepseek_pro_can_run_full_gsm8k_against_published_reference(self):
+        self.assert_nightly_reference("deepseek-v4-pro", width=8, correct=1285)
+
+    def test_kimi_nightly_uses_published_tp8_reference(self):
+        self.assert_nightly_reference("kimi-k2.6", width=8, correct=1291)
+
+    def test_glm_flash_nightly_uses_tp2_and_full_gsm8k_reference(self):
+        self.assert_nightly_reference("glm-5.3-flash", width=2, correct=1279)
+
+    def test_glm_nightly_has_separate_tp4_reference(self):
+        self.assert_nightly_reference("glm-5.3-tp4", width=4, correct=1282)
+
+    def test_fast_sanity_policy_rejects_an_unknown_cache_value(self):
+        policy = _load_yaml(DEFAULT_POLICY_ROOT / "models/qwen3.8-flash-next.yaml")
+        policy["tiers"]["fast_sanity"]["cache"] = "auto"
+        with self.assertRaisesRegex(ValidationError, r"fast_sanity\.cache"):
+            validate_policy_structure(policy, context="test")
+
+    def test_qwen_flash_next_fast_uses_the_eight_device_deepep_profile(self):
+        policy = DEFAULT_POLICY_ROOT / "models/qwen3.8-flash-next.yaml"
+        recipe = REPO_ROOT / _load_yaml(policy)["recipe"]
+        resolved = resolve_recipe(recipe, policy_path=policy, tier="fast_sanity")
+        self.assertEqual(resolved["ppu_count"], 8)
+        self.assertIsNone(resolved["layer_override"])
+        flags = resolved["flags"]
+        for name, value in (
+            ("--tp-size", "8"),
+            ("--attn-dp-size", "8"),
+            ("--attention-backend", "triton"),
+            ("--moe-a2a-backend", "deepep"),
+            ("--speculative-algorithm", "NEXTN"),
+            ("--load-format", "dummy"),
+        ):
+            self.assertEqual(flags[flags.index(name) + 1], value)
+        self.assertIn("--disable-radix-cache", flags)
+        self.assertIn("--ple-offload-embedding", flags)
+        self.assertNotIn("--dp-size", flags)
+        self.assertNotIn("--page-size", flags)
+        self.assertNotIn("--mamba-radix-cache-strategy", flags)
+
+    def test_qwen_flash_next_dp8_nightly_keeps_nextn_and_enables_paged_cache(self):
+        model = "qwen3.8-flash-next"
+        self.assertEqual(
+            select("model_sanity", model),
+            {"include": [{"model": model, "ppu_count": 8}]},
+        )
+        policy = DEFAULT_POLICY_ROOT / f"models/{model}.yaml"
+        config = resolve_recipe(
+            REPO_ROOT / _load_yaml(policy)["recipe"],
+            policy_path=policy,
+            tier="model_sanity",
+        )
+        self.assertEqual(config["golden_model_key"], "qwen3.8-flash-next-dp8-ep")
+        self.assertFalse(config["dummy_weights"])
+        flags = config["flags"]
+        for name, value in (
+            ("--tp-size", "8"),
+            ("--attn-dp-size", "8"),
+            ("--moe-a2a-backend", "deepep"),
+            ("--attention-backend", "triton"),
+            ("--linear-attn-prefill-backend", "triton"),
+            ("--linear-attn-decode-backend", "triton"),
+            ("--linear-attn-verify-backend", "triton"),
+            ("--speculative-algorithm", "NEXTN"),
+            ("--speculative-num-steps", "2"),
+            ("--speculative-eagle-topk", "1"),
+            ("--speculative-draft-model-quantization", "unquant"),
+            ("--page-size", "64"),
+            ("--mamba-radix-cache-strategy", "extra_buffer"),
+        ):
+            self.assertEqual(flags[flags.index(name) + 1], value)
+        self.assertIn("--enable-dp-lm-head", flags)
+        for name in (
+            "--disable-radix-cache",
+            "--load-format",
+            "--disable-overlap-schedule",
+        ):
+            self.assertNotIn(name, flags)
+        stages = _load_yaml(policy)["tiers"]["model_sanity"]["stages"]
+        stage = next(stage for stage in stages if stage["kind"] == "evalscope")
+        self.assertIsNone(stage["limit"])
+        self.assertEqual(stage["seed"], 42)
+        self.assertEqual(stage["eval_batch_size"], 128)
+        golden_path = (
+            REPO_ROOT
+            / f"test/ppu/golden/accuracy_{config['golden_model_key']}_890p.json"
+        )
+        golden = json.loads(golden_path.read_text())
+        self.assertEqual(golden["model"], config["golden_model_key"])
+        self.assertEqual(golden["checkpoint"], config["hf_model_id"])
+        self.assertEqual(golden["serving"]["ppu_count"], config["ppu_count"])
+        self.assertEqual(golden["serving"]["data_parallel_size"], 8)
+        self.assertTrue(golden["serving"]["enable_expert_parallel"])
+        self.assertEqual(golden["generation"], stage["generation"])
+        self.assertEqual(golden["dataset"]["dataset_id"], stage["dataset"])
+        self.assertEqual(golden["dataset"]["num_expected"], 1319)
+        self.assertEqual(golden["score_num"], 1287)
+        self.assertEqual(golden["score"], 0.9757)
+
+    def test_qwen_flash_next_tp4_uses_pure_tensor_parallelism(self):
+        model = "qwen3.8-flash-next-tp4"
+        self.assertEqual(
+            select("fast_sanity", model),
+            {"include": [{"model": model, "ppu_count": 4}]},
+        )
+        policy = DEFAULT_POLICY_ROOT / f"models/{model}.yaml"
+        recipe = REPO_ROOT / _load_yaml(policy)["recipe"]
+        config = resolve_recipe(recipe, policy_path=policy, tier="fast_sanity")
+        dp8 = resolve_recipe(recipe.with_name("Qwen3.8-Flash-Next.yaml"))
+        self.assertEqual(config["hf_model_id"], dp8["hf_model_id"])
+        self.assertEqual(config["resolved_tokenizer"], dp8["resolved_tokenizer"])
+        self.assertIsNone(config["layer_override"])
+        flags = config["flags"]
+        for name, value in (
+            ("--tp-size", "4"),
+            ("--context-length", "16384"),
+            ("--attention-backend", "triton"),
+            ("--speculative-algorithm", "NEXTN"),
+            ("--load-format", "dummy"),
+        ):
+            self.assertEqual(flags[flags.index(name) + 1], value)
+        for name in (
+            "--dp-size",
+            "--attn-dp-size",
+            "--enable-dp-lm-head",
+            "--moe-a2a-backend",
+            "--moe-dense-tp-size",
+        ):
+            self.assertNotIn(name, flags)
+        self.assertIn("--disable-radix-cache", flags)
+
+    def test_qwen_flash_next_tp4_nightly_uses_real_weights_and_paged_mamba_cache(self):
+        model = "qwen3.8-flash-next-tp4"
+        self.assert_nightly_reference(model, width=4, correct=1285)
+        policy = DEFAULT_POLICY_ROOT / f"models/{model}.yaml"
+        recipe = REPO_ROOT / _load_yaml(policy)["recipe"]
+        config = resolve_recipe(recipe, policy_path=policy, tier="model_sanity")
+        flags = config["flags"]
+        self.assertEqual(flags[flags.index("--attention-backend") + 1], "triton")
+        self.assertEqual(flags[flags.index("--page-size") + 1], "64")
+        self.assertEqual(
+            flags[flags.index("--mamba-radix-cache-strategy") + 1], "extra_buffer"
+        )
+        for flag in (
+            "--disable-radix-cache",
+            "--speculative-algorithm",
+            "--load-format",
+        ):
+            self.assertNotIn(flag, flags)
+
+    def assert_nightly_reference(self, model, *, width, correct):
+        self.assertEqual(
+            select("model_sanity", model),
+            {"include": [{"model": model, "ppu_count": width}]},
+        )
+        policy_path = DEFAULT_POLICY_ROOT / f"models/{model}.yaml"
+        policy = _load_yaml(policy_path)
+        config = resolve_recipe(
+            REPO_ROOT / policy["recipe"], policy_path=policy_path, tier="model_sanity"
+        )
+        reference_path = (
+            REPO_ROOT
+            / "test/ppu/golden"
+            / f"accuracy_{config['golden_model_key']}_890p.json"
+        )
+        reference = json.loads(reference_path.read_text())
+        stage = next(
+            stage
+            for stage in policy["tiers"]["model_sanity"]["stages"]
+            if stage["kind"] == "evalscope"
+        )
+        self.assertEqual(config["hf_model_id"], reference["checkpoint"])
+        self.assertEqual(config["ppu_count"], reference["serving"]["ppu_count"])
+        self.assertEqual(stage["dataset"], reference["dataset"]["dataset_id"])
+        self.assertEqual(stage["generation"], reference["generation"])
+        self.assertEqual(reference["tolerance"], {"mode": "band", "abs": 0.02})
+        self.assertEqual(reference["dataset"]["num_expected"], 1319)
+        self.assertEqual(reference["score_num"], correct)
+        self.assertIsNone(stage["limit"])
+        self.assertFalse(config["dummy_weights"])
 
     def test_policy_switches(self):
         policy = DEFAULT_POLICY_ROOT / "models/glm-5.3.yaml"
@@ -99,11 +413,30 @@ class RecipeContractTest(unittest.TestCase):
             timings["cold_start_s"] = 3.0
             yield
 
-        for model, ready_timeout in (("glm-5.3", 1350), ("deepseek-v4-flash", 1000)):
+        for model, ready_timeout, width in (
+            ("glm-5.3", 1350, 8),
+            ("glm-5.3-tp4", 1350, 4),
+            ("glm-5.3-flash", 1000, 2),
+            ("deepseek-v4-flash", 1000, 8),
+            ("deepseek-v4-flash-tp8", 1000, 8),
+            ("deepseek-v4-pro", 1000, 8),
+            ("kimi-k2.6", 1000, 8),
+            ("minimax-m3", 1000, 8),
+            ("minimax-m3-fp8", 1000, 8),
+            ("qwen3.8-27b", 1000, 2),
+            ("qwen3.8-flash-next", 1350, 8),
+            ("qwen3.8-flash-next-tp4", 1350, 4),
+        ):
             with (
                 self.subTest(model=model),
                 tempfile.TemporaryDirectory() as temp,
-                patch.dict(os.environ, {"PPU_RECIPE_CONTAINER_MODEL": temp}),
+                patch.dict(
+                    os.environ,
+                    {
+                        "PPU_RECIPE_CONTAINER_MODEL": temp,
+                        "RECIPE_PPU_COUNT": str(width),
+                    },
+                ),
                 patch("recipe_runner.RESULTS", Path(temp) / "results"),
                 patch("recipe_runner.server", side_effect=ready) as server,
                 patch("recipe_runner.probes") as probes,
@@ -114,18 +447,73 @@ class RecipeContractTest(unittest.TestCase):
                 self.assertEqual(server.call_count, 1)
                 config, label, _, timeout = server.call_args.args
                 self.assertEqual((label, timeout), ("fast_full", ready_timeout))
+                self.assertEqual(config["ppu_count"], width)
                 self.assertIn("dummy", config["flags"])
                 self.assertNotIn("--json-model-override-args", config["flags"])
                 probes.assert_called_once()
                 self.assertIsNone(result["layer_override"])
                 self.assertNotIn("fallback_reason", result)
 
+    def test_model_sanity_startup_budget_accounts_for_slow_weight_loads(self):
+        for model, width, expected_timeout in (
+            ("glm-5.3-flash", 2, 6600),
+            ("minimax-m3", 8, 6600),
+            ("minimax-m3-fp8", 8, 6600),
+            ("deepseek-v4-pro", 8, 6000),
+            ("kimi-k2.6", 8, 6000),
+            ("glm-5.3", 8, 4500),
+            ("glm-5.3-tp4", 4, 4500),
+            ("qwen3.8-flash-next", 8, 5100),
+            ("qwen3.8-flash-next-tp4", 4, 5100),
+            ("deepseek-v4-flash", 8, 2400),
+        ):
+            with (
+                self.subTest(model=model),
+                tempfile.TemporaryDirectory() as temp,
+                patch.dict(
+                    os.environ,
+                    {
+                        "PPU_RECIPE_CONTAINER_MODEL": temp,
+                        "RECIPE_PPU_COUNT": str(width),
+                    },
+                ),
+                patch("recipe_runner.RESULTS", Path(temp) / "results"),
+                patch(
+                    "recipe_runner.server", side_effect=RuntimeError("stop at launch")
+                ) as launch,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "stop at launch"):
+                    run(
+                        DEFAULT_POLICY_ROOT / f"models/{model}.yaml",
+                        "model_sanity",
+                        0,
+                    )
+                config, tier, _, timeout = launch.call_args.args
+                self.assertEqual((tier, timeout), ("model_sanity", expected_timeout))
+                self.assertNotIn("dummy", config["flags"])
+
+    def test_worker_rejects_recipe_with_wrong_allocation(self):
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            patch.dict(
+                os.environ,
+                {"PPU_RECIPE_CONTAINER_MODEL": "unused", "RECIPE_PPU_COUNT": "8"},
+            ),
+            patch("recipe_runner.RESULTS", Path(temp) / "results"),
+            patch("recipe_runner.server") as server,
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "incorrect recipe identity or device width"
+            ):
+                run(DEFAULT_POLICY_ROOT / "models/qwen3.8-27b.yaml", "fast_sanity", 0)
+            server.assert_not_called()
+
     def test_cached_model_requires_the_exact_snapshot_offline(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             checkpoint = root / "checkpoint"
             checkpoint.mkdir()
-            snapshot = root / "snapshot"
+            snapshot = root / ("a" * 40)
             snapshot.symlink_to(checkpoint, target_is_directory=True)
             for name in ("config.json", "tokenizer.json"):
                 (checkpoint / name).write_text("{}")
@@ -148,7 +536,8 @@ class RecipeContractTest(unittest.TestCase):
                     cached_model_path(repo_id, "main")
                 download.assert_not_called()
                 self.assertEqual(
-                    cached_model_path(repo_id, revision), str(checkpoint.resolve())
+                    cached_model_path(repo_id, revision),
+                    (str(checkpoint.resolve()), revision),
                 )
                 download.assert_called_once_with(
                     repo_id=repo_id,
@@ -159,6 +548,92 @@ class RecipeContractTest(unittest.TestCase):
                 shard.unlink()
                 with self.assertRaisesRegex(ValueError, "missing shards"):
                     cached_model_path(repo_id, revision)
+
+    def test_kimi_snapshot_accepts_only_complete_tiktoken_metadata(self):
+        repo_id = "T-HEAD/Kimi-K2.6-MXFP4-FP8"
+        revision = "d" * 40
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            snapshot = root / revision
+            snapshot.mkdir()
+            config = snapshot / "config.json"
+            config.write_text(json.dumps({"model_type": "kimi_k25"}))
+            for name in (
+                "tokenizer_config.json",
+                "tokenization_kimi.py",
+                "tool_declaration_ts.py",
+            ):
+                (snapshot / name).write_text("fixture")
+            (snapshot / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": {"weight": "weight.safetensors"}})
+            )
+            (snapshot / "weight.safetensors").write_bytes(b"fixture")
+            download = Mock(return_value=str(snapshot))
+            with (
+                patch.dict(os.environ, {"HF_HUB_CACHE": str(root)}),
+                patch.dict(
+                    sys.modules,
+                    {"huggingface_hub": SimpleNamespace(snapshot_download=download)},
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "lacks tokenizer metadata"):
+                    cached_model_path(repo_id, revision)
+                (snapshot / "tiktoken.model").write_bytes(b"fixture")
+                self.assertEqual(
+                    cached_model_path(repo_id, revision),
+                    (str(snapshot.resolve()), revision),
+                )
+                config.write_text(json.dumps({"model_type": "qwen3"}))
+                with self.assertRaisesRegex(ValueError, "lacks tokenizer metadata"):
+                    cached_model_path(repo_id, revision)
+
+    def test_new_model_ref_is_resolved_to_a_concrete_revision(self):
+        repo_id = "example/quantized-model"
+        revision = "b" * 40
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "models--example--quantized-model"
+            ref = repo / "refs/main"
+            ref.parent.mkdir(parents=True)
+            ref.write_text(revision)
+            snapshot = repo / "snapshots" / revision
+            snapshot.mkdir(parents=True)
+            for name in ("config.json", "tokenizer.json"):
+                (snapshot / name).write_text("{}")
+            (snapshot / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": {"weight": "weight.safetensors"}})
+            )
+            (snapshot / "weight.safetensors").write_bytes(b"fixture")
+            download = Mock(return_value=str(snapshot))
+            with (
+                patch.dict(os.environ, {"HF_HUB_CACHE": str(root)}),
+                patch.dict(
+                    sys.modules,
+                    {
+                        "huggingface_hub": SimpleNamespace(snapshot_download=download),
+                        "huggingface_hub.file_download": SimpleNamespace(
+                            repo_folder_name=Mock(return_value=repo.name)
+                        ),
+                        "huggingface_hub.utils": SimpleNamespace(
+                            validate_repo_id=Mock()
+                        ),
+                    },
+                ),
+            ):
+                self.assertEqual(
+                    cached_model_path(repo_id, None),
+                    (str(snapshot.resolve()), revision),
+                )
+                download.assert_called_once_with(
+                    repo_id=repo_id,
+                    revision=revision,
+                    cache_dir=root,
+                    local_files_only=True,
+                )
+                ref.write_text("not-a-revision")
+                with self.assertRaisesRegex(ValueError, "pinned model snapshot"):
+                    cached_model_path(repo_id, None)
+                self.assertEqual(download.call_count, 1)
 
     def test_deepseek_attention_parallelism_uses_eight_devices(self):
         policy = DEFAULT_POLICY_ROOT / "models/deepseek-v4-flash.yaml"
@@ -173,6 +648,31 @@ class RecipeContractTest(unittest.TestCase):
                 page_size = int(flags[flags.index("--page-size") + 1])
                 chunk_size = int(flags[flags.index("--chunked-prefill-size") + 1])
                 self.assertEqual(chunk_size % (8 * page_size), 0)
+
+    def test_deepseek_tp8_uses_same_checkpoint_and_paged_short_prefill(self):
+        policy = DEFAULT_POLICY_ROOT / "models/deepseek-v4-flash-tp8.yaml"
+        recipe = REPO_ROOT / _load_yaml(policy)["recipe"]
+        default_policy = DEFAULT_POLICY_ROOT / "models/deepseek-v4-flash.yaml"
+        for tier in ("fast_sanity", "model_sanity"):
+            with self.subTest(tier=tier):
+                resolved = resolve_recipe(recipe, policy_path=policy, tier=tier)
+                default = resolve_recipe(recipe, policy_path=default_policy, tier=tier)
+                self.assertEqual(resolved["preset"], "tp8")
+                self.assertEqual(resolved["ppu_count"], 8)
+                self.assertEqual(resolved["hf_model_id"], default["hf_model_id"])
+                self.assertNotEqual(resolved["config_digest"], default["config_digest"])
+                sparse_prefill = "SGLANG_OPT_FLASHMLA_SPARSE_PREFILL"
+                self.assertEqual(resolved["server_env"][sparse_prefill], "0")
+                self.assertNotIn(sparse_prefill, default["server_env"])
+                flags = resolved["flags"]
+                self.assertEqual(flags[flags.index("--tp-size") + 1], "8")
+                for flag in (
+                    "--attn-dp-size",
+                    "--enable-dp-lm-head",
+                    "--moe-a2a-backend",
+                    "--deepep-mode",
+                ):
+                    self.assertNotIn(flag, flags)
 
     def test_required_parser_fails_if_runtime_unavailable(self):
         with patch("ppu_recipe._build_sglang_serve_parser", side_effect=ImportError):
@@ -238,6 +738,33 @@ class RunEvidenceTest(unittest.TestCase):
             summary.write_text("".join(json.dumps(row) + "\n" for row in rows))
             with self.assertRaisesRegex(ValueError, "duplicate"):
                 read_eval_reviews(Path(root), 1319, 0.9689, 1319)
+
+    def test_report_publishes_failure_when_worker_outputs_are_unreadable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            destination = Path(temp) / "public.json"
+            for outcome in ("failure", "success"):
+                with (
+                    self.subTest(outcome=outcome),
+                    patch.dict(
+                        os.environ,
+                        {
+                            "PPU_CI_ARTIFACT_DIR": temp,
+                            "RECIPE_OUTCOME": outcome,
+                            "TIER": "fast_sanity",
+                            "MODEL_KEY": "glm-5.3",
+                            "PPU_CI_SOURCE_SHA": "a" * 40,
+                        },
+                    ),
+                    patch.object(sys, "argv", ["recipe_report", str(destination)]),
+                    patch("recipe_report.retain", side_effect=PermissionError),
+                    patch.object(Path, "is_file", side_effect=PermissionError),
+                ):
+                    self.assertEqual(report_recipe(), 1)
+                    result = json.loads(destination.read_text())
+                    self.assertEqual(result["outcome"], "fail")
+                    self.assertEqual(result["failure_phase"], "private_retention")
+                    self.assertFalse(result["private_retention"])
+                validate(result)
 
     def test_fast_evidence_accepts_direct_full_and_previous_fallback(self):
         result = fast_result()
@@ -444,9 +971,21 @@ class ClusterConfigBootstrapTest(unittest.TestCase):
 class ClusterTransportTest(unittest.TestCase):
     def test_scheduler_streams_stay_private(self):
         injected = "/" + "nas" + "_aisw/fixture " + ".".join(("10", "4", "5", "6"))
-        result = fast_result()
-        for tampered in (False, True):
-            with self.subTest(tampered=tampered), tempfile.TemporaryDirectory() as temp:
+        for model, width, tampered in (
+            ("glm-5.3", 8, False),
+            ("glm-5.3-tp4", 4, False),
+            ("deepseek-v4-flash", 8, False),
+            ("deepseek-v4-flash-tp8", 8, False),
+            ("deepseek-v4.1-flash", 8, False),
+            ("qwen3.8-27b", 2, False),
+            ("qwen3.8-flash-next-tp4", 4, False),
+            ("glm-5.3", 8, True),
+        ):
+            with (
+                self.subTest(model=model, tampered=tampered),
+                tempfile.TemporaryDirectory() as temp,
+            ):
+                result = dict(fast_result(), model=model)
                 root = Path(temp)
                 workspace = root / "checkout"
                 staging = root / "staging"
@@ -458,6 +997,7 @@ class ClusterTransportTest(unittest.TestCase):
                     folder.mkdir(parents=True)
                 scripts = workspace / "scripts/ci/ppu"
                 shutil.copytree(REPO_ROOT / "scripts/ci/ppu", scripts)
+                shutil.copytree(DEFAULT_POLICY_ROOT, workspace / "test/ppu/policy")
                 (scripts / "recipe_bundle.py").write_text("# Verified separately\n")
                 (payloads / "recipe-manifest.json").write_text(
                     json.dumps({"recipe_tree_sha256": result["recipe_tree_sha256"]})
@@ -498,9 +1038,13 @@ class ClusterTransportTest(unittest.TestCase):
                 for tool in tools.iterdir():
                     tool.chmod(0o700)
                 (backend / "submit.sh").write_text(
-                    'test "$INPUT_NNODES/$INPUT_NPROC_PER_NODE/$INPUT_NODE_SELECTOR" = "0/8/board-type=ZW-M890P" || exit 1\n'
+                    f'test "$INPUT_NNODES/$INPUT_NPROC_PER_NODE/$INPUT_NODE_SELECTOR" = "0/{width}/board-type=ZW-M890P" || exit 1\n'
                     'test -f "$SOURCE_STAGE_DIR" || exit 1\n'
-                    'jq -e --arg cache "$PPU_CI_HF_CACHE_ROOT" --arg revision "$PPU_CI_GLM53_MODEL_REVISION" \'.PPU_CI_HF_CACHE_ROOT == $cache and .PPU_CI_HF_MODEL_REVISION == $revision\' <<< "$USER_ENV_JSON" >/dev/null || exit 1\n'
+                    'jq -e --arg cache "$PPU_CI_HF_CACHE_ROOT" --arg model "$MODEL_KEY" '
+                    '--arg width "$INPUT_NPROC_PER_NODE" --arg revision "$EXPECTED_REVISION" '
+                    "'.PPU_CI_HF_CACHE_ROOT == $cache and .MODEL_KEY == $model and "
+                    '.RECIPE_PPU_COUNT == $width and (.PPU_CI_HF_MODEL_REVISION // "") == $revision\' '
+                    '<<< "$USER_ENV_JSON" >/dev/null || exit 1\n'
                     'printf "%s\\n" "$INJECTED_FIXTURE"\n'
                     'printf "job_status=scheduled\\nstart_time=1\\ndeadline=2\\nqueue_duration_seconds=7\\n" >> "$GITHUB_OUTPUT"\n'
                 )
@@ -525,7 +1069,8 @@ class ClusterTransportTest(unittest.TestCase):
                         )
                     ),
                     "TIER": "fast_sanity",
-                    "MODEL_KEY": "glm-5.3",
+                    "MODEL_KEY": model,
+                    "RECIPE_PPU_COUNT": str(width),
                     "GITHUB_OUTPUT": str(root / "gha-output"),
                     "PPU_PUBLIC_SUMMARY": str(root / "gha-summary"),
                     "GITHUB_WORKSPACE": str(workspace),
@@ -541,6 +1086,13 @@ class ClusterTransportTest(unittest.TestCase):
                     "PPU_CI_JIT_ROOT": str(root / "jit"),
                     "PPU_CI_HF_CACHE_ROOT": str(root / "cache"),
                     "PPU_CI_GLM53_MODEL_REVISION": "c" * 40,
+                    "PPU_CI_DSV4_FLASH_MODEL_REVISION": "d" * 40,
+                    "EXPECTED_REVISION": {
+                        "glm-5.3": "c" * 40,
+                        "glm-5.3-tp4": "c" * 40,
+                        "deepseek-v4-flash": "d" * 40,
+                        "deepseek-v4-flash-tp8": "d" * 40,
+                    }.get(model, ""),
                     "PPU_CI_RECIPE_RUNTIME_IMAGE": result["runtime_image"],
                     "INJECTED_FIXTURE": injected,
                 }

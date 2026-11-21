@@ -78,6 +78,7 @@ ALLOWED_PRESET_SLOTS = frozenset(
         "decode_nographs",
         "dp_ep_low_latency",
         "eval_longctx",
+        "model_sanity",
         "prefill_long",
         "tp8",
     }
@@ -301,6 +302,7 @@ def resolve_recipe(
     dummy_weights: bool = False,
     layer_override: Any = _UNSET,
     assets_map_path: Path | None = None,
+    cache_revision: str | None = None,
     host: str = "127.0.0.1",
     port: int = 9985,
     served_model_name: str | None = None,
@@ -495,6 +497,8 @@ def resolve_recipe(
         "flags": _canonical_flags(ordered),
         "server_env": dict(sorted(server_env.items())),
     }
+    if cache_revision is not None:
+        digest_payload["cache_revision"] = cache_revision
     config_digest = hashlib.sha256(
         json.dumps(digest_payload, separators=(",", ":"), sort_keys=True).encode(
             "utf-8"
@@ -1024,9 +1028,9 @@ def validate_policy_structure(
                 raise ValidationError(
                     f"{context}: invalid fast sanity weight or layer policy"
                 )
-            if fs["cache"] != "enabled":
+            if fs["cache"] not in ("enabled", "disabled"):
                 raise ValidationError(
-                    f"{context}.tiers.fast_sanity.cache must be 'enabled'"
+                    f"{context}.tiers.fast_sanity.cache must be 'enabled' or 'disabled'"
                 )
         if "model_sanity" in tiers:
             ms = _check_keys(
