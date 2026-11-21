@@ -108,6 +108,10 @@ def is_layer_skipped(
         fused_mapping if proj_name in fused_mapping else _FALLBACK_FUSED_SHARDS
     )
     if proj_name in effective_fused:
+        # Some checkpoints serialize the fused tensor itself, including vision
+        # QKV. An exclusion for the whole module also excludes all its shards.
+        if any(_module_path_match(ignored, prefix) for ignored in ignored_layers):
+            return True
         shard_prefixes = [
             prefix.replace(proj_name, shard_proj_name)
             for shard_proj_name in effective_fused[proj_name]
