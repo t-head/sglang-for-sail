@@ -1,0 +1,44 @@
+{
+  "schema_version": 2,
+  "model": "qwen3.8-flash-next-dp8-ep",
+  "chip": "890p",
+  "checkpoint": "T-HEAD/Qwen3.8-Flash-Next-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken",
+  "checkpoint_tail": "T-HEAD/Qwen3.8-Flash-Next-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken",
+  "benchmark": "gsm8k",
+  "evalscope_version": "1.15.0",
+  "dataset": {
+    "dataset_id": "gsm8k@2026-11",
+    "few_shot_num": 4,
+    "few_shot_random": false,
+    "subset_list": [
+      "main"
+    ],
+    "num_expected": 1319
+  },
+  "serving": {
+    "ppu_count": 8,
+    "tensor_parallel_size": 8,
+    "data_parallel_size": 8,
+    "enable_expert_parallel": true,
+    "gpu_memory_utilization": 0.9,
+    "max_model_len": 262144,
+    "seed": null
+  },
+  "generation": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "max_tokens": 10240,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+    "repetition_penalty": 1.0
+  },
+  "score": 0.9757,
+  "score_num": 1287,
+  "tolerance": {
+    "mode": "band",
+    "abs": 0.02
+  },
+  "measured_at": "2026-11-20T20:58:22Z",
+  "baseline_origin": "SGLang 890P attention-DP8 and DeepEP with BF16 NEXTN draft; candidate 2c6208bc6928544d5ee01beca841a01a3beaa625; https://github.com/t-head/sglang-for-sail/actions/runs/44804538498/artifacts/14669601247"
+}

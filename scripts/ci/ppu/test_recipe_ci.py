@@ -120,6 +120,8 @@ class RecipeContractTest(unittest.TestCase):
                     {"model": "minimax-m3-fp8", "ppu_count": 8},
                     {"model": "minimax-m3", "ppu_count": 8},
                     {"model": "qwen3.8-27b", "ppu_count": 2},
+                    {"model": "qwen3.8-flash-next-tp4", "ppu_count": 4},
+                    {"model": "qwen3.8-flash-next", "ppu_count": 8},
                 ]
             },
         )
@@ -215,12 +217,142 @@ class RecipeContractTest(unittest.TestCase):
         self.assert_nightly_reference("glm-5.3-tp4", width=4, correct=1282)
 
     def test_fast_sanity_policy_rejects_an_unknown_cache_value(self):
-        policy = _load_yaml(DEFAULT_POLICY_ROOT / "models/glm-5.3.yaml")
-        policy["tiers"]["fast_sanity"]["cache"] = "disabled"
-        validate_policy_structure(policy, context="test")
+        policy = _load_yaml(DEFAULT_POLICY_ROOT / "models/qwen3.8-flash-next.yaml")
         policy["tiers"]["fast_sanity"]["cache"] = "auto"
         with self.assertRaisesRegex(ValidationError, r"fast_sanity\.cache"):
             validate_policy_structure(policy, context="test")
+
+    def test_qwen_flash_next_fast_uses_the_eight_device_deepep_profile(self):
+        policy = DEFAULT_POLICY_ROOT / "models/qwen3.8-flash-next.yaml"
+        recipe = REPO_ROOT / _load_yaml(policy)["recipe"]
+        resolved = resolve_recipe(recipe, policy_path=policy, tier="fast_sanity")
+        self.assertEqual(resolved["ppu_count"], 8)
+        self.assertIsNone(resolved["layer_override"])
+        flags = resolved["flags"]
+        for name, value in (
+            ("--tp-size", "8"),
+            ("--attn-dp-size", "8"),
+            ("--attention-backend", "triton"),
+            ("--moe-a2a-backend", "deepep"),
+            ("--speculative-algorithm", "NEXTN"),
+            ("--load-format", "dummy"),
+        ):
+            self.assertEqual(flags[flags.index(name) + 1], value)
+        self.assertIn("--disable-radix-cache", flags)
+        self.assertIn("--ple-offload-embedding", flags)
+        self.assertNotIn("--dp-size", flags)
+        self.assertNotIn("--page-size", flags)
+        self.assertNotIn("--mamba-radix-cache-strategy", flags)
+
+    def test_qwen_flash_next_dp8_nightly_keeps_nextn_and_enables_paged_cache(self):
+        model = "qwen3.8-flash-next"
+        self.assertEqual(
+            select("model_sanity", model),
+            {"include": [{"model": model, "ppu_count": 8}]},
+        )
+        policy = DEFAULT_POLICY_ROOT / f"models/{model}.yaml"
+        config = resolve_recipe(
+            REPO_ROOT / _load_yaml(policy)["recipe"],
+            policy_path=policy,
+            tier="model_sanity",
+        )
+        self.assertEqual(config["golden_model_key"], "qwen3.8-flash-next-dp8-ep")
+        self.assertFalse(config["dummy_weights"])
+        flags = config["flags"]
+        for name, value in (
+            ("--tp-size", "8"),
+            ("--attn-dp-size", "8"),
+            ("--moe-a2a-backend", "deepep"),
+            ("--attention-backend", "triton"),
+            ("--linear-attn-prefill-backend", "triton"),
+            ("--linear-attn-decode-backend", "triton"),
+            ("--linear-attn-verify-backend", "triton"),
+            ("--speculative-algorithm", "NEXTN"),
+            ("--speculative-num-steps", "2"),
+            ("--speculative-eagle-topk", "1"),
+            ("--speculative-draft-model-quantization", "unquant"),
+            ("--page-size", "64"),
+            ("--mamba-radix-cache-strategy", "extra_buffer"),
+        ):
+            self.assertEqual(flags[flags.index(name) + 1], value)
+        self.assertIn("--enable-dp-lm-head", flags)
+        for name in (
+            "--disable-radix-cache",
+            "--load-format",
+            "--disable-overlap-schedule",
+        ):
+            self.assertNotIn(name, flags)
+        stages = _load_yaml(policy)["tiers"]["model_sanity"]["stages"]
+        stage = next(stage for stage in stages if stage["kind"] == "evalscope")
+        self.assertIsNone(stage["limit"])
+        self.assertEqual(stage["seed"], 42)
+        self.assertEqual(stage["eval_batch_size"], 128)
+        golden_path = (
+            REPO_ROOT
+            / f"test/ppu/golden/accuracy_{config['golden_model_key']}_890p.json"
+        )
+        golden = json.loads(golden_path.read_text())
+        self.assertEqual(golden["model"], config["golden_model_key"])
+        self.assertEqual(golden["checkpoint"], config["hf_model_id"])
+        self.assertEqual(golden["serving"]["ppu_count"], config["ppu_count"])
+        self.assertEqual(golden["serving"]["data_parallel_size"], 8)
+        self.assertTrue(golden["serving"]["enable_expert_parallel"])
+        self.assertEqual(golden["generation"], stage["generation"])
+        self.assertEqual(golden["dataset"]["dataset_id"], stage["dataset"])
+        self.assertEqual(golden["dataset"]["num_expected"], 1319)
+        self.assertEqual(golden["score_num"], 1287)
+        self.assertEqual(golden["score"], 0.9757)
+
+    def test_qwen_flash_next_tp4_uses_pure_tensor_parallelism(self):
+        model = "qwen3.8-flash-next-tp4"
+        self.assertEqual(
+            select("fast_sanity", model),
+            {"include": [{"model": model, "ppu_count": 4}]},
+        )
+        policy = DEFAULT_POLICY_ROOT / f"models/{model}.yaml"
+        recipe = REPO_ROOT / _load_yaml(policy)["recipe"]
+        config = resolve_recipe(recipe, policy_path=policy, tier="fast_sanity")
+        dp8 = resolve_recipe(recipe.with_name("Qwen3.8-Flash-Next.yaml"))
+        self.assertEqual(config["hf_model_id"], dp8["hf_model_id"])
+        self.assertEqual(config["resolved_tokenizer"], dp8["resolved_tokenizer"])
+        self.assertIsNone(config["layer_override"])
+        flags = config["flags"]
+        for name, value in (
+            ("--tp-size", "4"),
+            ("--context-length", "16384"),
+            ("--attention-backend", "triton"),
+            ("--speculative-algorithm", "NEXTN"),
+            ("--load-format", "dummy"),
+        ):
+            self.assertEqual(flags[flags.index(name) + 1], value)
+        for name in (
+            "--dp-size",
+            "--attn-dp-size",
+            "--enable-dp-lm-head",
+            "--moe-a2a-backend",
+            "--moe-dense-tp-size",
+        ):
+            self.assertNotIn(name, flags)
+        self.assertIn("--disable-radix-cache", flags)
+
+    def test_qwen_flash_next_tp4_nightly_uses_real_weights_and_paged_mamba_cache(self):
+        model = "qwen3.8-flash-next-tp4"
+        self.assert_nightly_reference(model, width=4, correct=1285)
+        policy = DEFAULT_POLICY_ROOT / f"models/{model}.yaml"
+        recipe = REPO_ROOT / _load_yaml(policy)["recipe"]
+        config = resolve_recipe(recipe, policy_path=policy, tier="model_sanity")
+        flags = config["flags"]
+        self.assertEqual(flags[flags.index("--attention-backend") + 1], "triton")
+        self.assertEqual(flags[flags.index("--page-size") + 1], "64")
+        self.assertEqual(
+            flags[flags.index("--mamba-radix-cache-strategy") + 1], "extra_buffer"
+        )
+        for flag in (
+            "--disable-radix-cache",
+            "--speculative-algorithm",
+            "--load-format",
+        ):
+            self.assertNotIn(flag, flags)
 
     def assert_nightly_reference(self, model, *, width, correct):
         self.assertEqual(
@@ -292,6 +424,8 @@ class RecipeContractTest(unittest.TestCase):
             ("minimax-m3", 1000, 8),
             ("minimax-m3-fp8", 1000, 8),
             ("qwen3.8-27b", 1000, 2),
+            ("qwen3.8-flash-next", 1350, 8),
+            ("qwen3.8-flash-next-tp4", 1350, 4),
         ):
             with (
                 self.subTest(model=model),
@@ -329,6 +463,8 @@ class RecipeContractTest(unittest.TestCase):
             ("kimi-k2.6", 8, 6000),
             ("glm-5.3", 8, 4500),
             ("glm-5.3-tp4", 4, 4500),
+            ("qwen3.8-flash-next", 8, 5100),
+            ("qwen3.8-flash-next-tp4", 4, 5100),
             ("deepseek-v4-flash", 8, 2400),
         ):
             with (
@@ -842,6 +978,7 @@ class ClusterTransportTest(unittest.TestCase):
             ("deepseek-v4-flash-tp8", 8, False),
             ("deepseek-v4.1-flash", 8, False),
             ("qwen3.8-27b", 2, False),
+            ("qwen3.8-flash-next-tp4", 4, False),
             ("glm-5.3", 8, True),
         ):
             with (
