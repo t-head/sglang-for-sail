@@ -3170,6 +3170,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and q_lora.shape[0] > 0
             and q_lora.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
         )
+        forward_mode = forward_batch.forward_mode
+        use_paged_topk = (
+            forward_mode.is_decode_or_idle()
+            or forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend_v2()
+        )
 
         # Determine if should skip topk based on sequence length
         # We can only skip the logits computation if cuda graph is not involved
@@ -3348,12 +3354,19 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 q_fp8 = (q_packed, q_sf)
                 q_scale = None
                 k_fp8, k_scale = None, None
-                self._store_index_k_cache(
-                    forward_batch=forward_batch,
-                    layer_id=layer_id,
-                    key=key,
-                    act_quant=act_quant,
-                )
+                store_on_alt_stream = enable_dual_stream and use_paged_topk
+                main_stream = torch.cuda.current_stream()
+                store_stream = self.alt_stream if store_on_alt_stream else None
+                with torch.cuda.stream(store_stream):
+                    self._store_index_k_cache(
+                        forward_batch=forward_batch,
+                        layer_id=layer_id,
+                        key=key,
+                        act_quant=act_quant,
+                    )
+                if store_on_alt_stream:
+                    # Wait for the K cache write before MQA reads it on the main stream.
+                    main_stream.wait_stream(self.alt_stream)
 
             elif self.bf16_indexer:
                 q_fp8, q_scale = query, 1
@@ -3518,11 +3531,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
                     return maybe_capture_indexer_topk(layer_id, topk_result)
 
-            if (
-                forward_batch.forward_mode.is_decode_or_idle()
-                or forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend_v2()
-            ):
+            if use_paged_topk:
                 topk_result = self._get_topk_paged(
                     forward_batch, layer_id, q_fp8, weights, metadata
                 )
