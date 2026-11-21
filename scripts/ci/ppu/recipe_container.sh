@@ -47,10 +47,14 @@ if [[ "${1:-}" == validate ]]; then
 fi
 phase platform_check
 python3 -I -B - <<'PY'
+import os
+
 import torch
 from sglang.srt.platforms import current_platform
+
+expected_width = int(os.environ.get("RECIPE_PPU_COUNT", "8"))
 assert current_platform.is_sail(), "candidate must select the SAIL platform"
-assert torch.cuda.device_count() == 8, "candidate must see eight devices"
+assert torch.cuda.device_count() == expected_width, "candidate device count must match the Recipe allocation"
 PY
 # The wrapper adds only the checked-in executor directory to the isolated path.
 python3 -I -B - "$@" <<'PY'
