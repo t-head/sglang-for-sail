@@ -49,9 +49,9 @@ def create_attention_graph_variants(hf_config) -> Optional[AttentionGraphVariant
         get_dsa_index_topk,
         is_deepseek_dsa,
     )
-    from sglang.srt.utils import is_hip
+    from sglang.srt.utils import is_hip, is_sail
 
-    if is_hip() and is_deepseek_dsa(hf_config):
+    if (is_hip() or is_sail()) and is_deepseek_dsa(hf_config):
         # KPool has no dense-skip path: both variants run the full indexer.
         # Capture it once, keeping the regular DSA dense/sparse split intact.
         if get_dsa_index_kpool(hf_config) > 1:
