@@ -41,6 +41,7 @@ struct alignas(16) SiluMulMxfp4Params2D {
   int32_t N_padded;  // ceil to kBlockN (for grid sizing)
   int32_t num_tokens;
   float swiglu_limit;
+  const int32_t* __restrict__ row_experts;
 };
 
 __device__ __forceinline__ uint32_t
@@ -124,7 +125,7 @@ __device__ __forceinline__ void cp_async_wait_group() {
   asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
 }
 
-template <int kBlockN, bool kApplySwigluLimit, bool kIsFullBlock>
+template <int kBlockN, bool kApplySwigluLimit, bool kIsFullBlock, bool kUseValidPrefix>
 __global__ __launch_bounds__(kBlockN / kElemPerThread) void silu_and_mul_post_quant_mxfp4_kernel(
     const SiluMulMxfp4Params2D __grid_constant__ params) {
   constexpr int kThreadsPerBlock = kBlockN / kElemPerThread;
@@ -156,12 +157,15 @@ __global__ __launch_bounds__(kBlockN / kElemPerThread) void silu_and_mul_post_qu
 
   const int n_tokens = params.num_tokens;
   const int token_stride = gridDim.y;
+  if constexpr (kUseValidPrefix) {
+    if (params.row_experts[token_block_id] < 0) return;
+  }
 
   constexpr int kCpAsync16PerThread = kElemPerThread / 8;
   static_assert(kElemPerThread % 8 == 0, "kElemPerThread must be multiple of 8 for cp.async.16");
 
   auto issue_token_load = [&](int stage, int t) {
-    if (t < n_tokens) {
+    if (t < n_tokens && (!kUseValidPrefix || params.row_experts[t] >= 0)) {
       const __nv_bfloat16* row_base = params.input + t * params.stride_input_n;
       if constexpr (kIsFullBlock) {
         const __nv_bfloat16* gate_ptr = row_base + thread_n_offset;
@@ -206,7 +210,7 @@ __global__ __launch_bounds__(kBlockN / kElemPerThread) void silu_and_mul_post_qu
   }
 
   int compute_stage = 0;
-  for (int t = token_block_id; t < n_tokens; t += token_stride) {
+  for (int t = token_block_id; t < n_tokens && (!kUseValidPrefix || params.row_experts[t] >= 0); t += token_stride) {
     issue_token_load(issue_stage, t_load);
     issue_stage = (issue_stage + 1) % kStages;
     t_load += token_stride;
@@ -335,13 +339,14 @@ __global__ __launch_bounds__(kBlockN / kElemPerThread) void silu_and_mul_post_qu
   }
 }
 
-template <int kBlockN, bool kApplySwigluLimit>
+template <int kBlockN, bool kApplySwigluLimit, bool kUseValidPrefix>
 struct SiluMulMxfp4TP {
   static void
   run(const tvm::ffi::TensorView input,
       const tvm::ffi::TensorView output,
       const tvm::ffi::TensorView output_scale,
-      double swiglu_limit) {
+      double swiglu_limit,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> row_experts) {
     using namespace host;
 
     const int64_t num_tokens = input.size(0);
@@ -350,6 +355,7 @@ struct SiluMulMxfp4TP {
     const int32_t N_padded = ((N + kBlockN - 1) / kBlockN) * kBlockN;
     const int hidden_blocks = N_padded / kBlockN;
 
+    RuntimeCheck(row_experts.has_value() == kUseValidPrefix, "row_experts / prefix mismatch");
     RuntimeCheck(num_tokens > 0, "num_tokens must be positive");
     RuntimeCheck(N > 0 && N % 2 == 0, "N must be positive and even, got N=", N);
 
@@ -375,15 +381,16 @@ struct SiluMulMxfp4TP {
         .N_padded = N_padded,
         .num_tokens = static_cast<int32_t>(num_tokens),
         .swiglu_limit = static_cast<float>(swiglu_limit),
+        .row_experts = kUseValidPrefix ? static_cast<const int32_t*>(row_experts.value().data_ptr()) : nullptr,
     };
 
     auto device = input.device();
     if (N == N_padded) {
       LaunchKernel(grid, threads, device)(
-          silu_and_mul_post_quant_mxfp4_kernel<kBlockN, kApplySwigluLimit, true>, params);
+          silu_and_mul_post_quant_mxfp4_kernel<kBlockN, kApplySwigluLimit, true, kUseValidPrefix>, params);
     } else {
       LaunchKernel(grid, threads, device)(
-          silu_and_mul_post_quant_mxfp4_kernel<kBlockN, kApplySwigluLimit, false>, params);
+          silu_and_mul_post_quant_mxfp4_kernel<kBlockN, kApplySwigluLimit, false, kUseValidPrefix>, params);
     }
   }
 };

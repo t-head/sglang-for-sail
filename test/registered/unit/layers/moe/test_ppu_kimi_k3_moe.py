@@ -233,10 +233,13 @@ def test_mxfp4_w4a16_mma_requires_tp_fused_for_fused_gemm1():
 
 
 @pytest.mark.parametrize("use_tp_fused", [False, True])
-@pytest.mark.parametrize("activation", ["situ", "silu"])
+@pytest.mark.parametrize(
+    "activation,valid_quant", [("situ", False), ("silu", False), ("silu", True)]
+)
 def test_w4a4_tp_quantization_ignores_import_time_sm(
-    monkeypatch, use_tp_fused, activation
+    monkeypatch, use_tp_fused, activation, valid_quant
 ):
+    monkeypatch.setattr(ppu_moe_module, "_MOE_VALID_QUANT", valid_quant)
     monkeypatch.delattr(ppu_moe_module, "downcast_to_mxfp4", raising=False)
     monkeypatch.delattr(ppu_moe_module, "silu_and_mul_post_quant_mxfp4", raising=False)
     hidden_states = torch.empty((2, 64), dtype=torch.bfloat16)
@@ -313,7 +316,10 @@ def test_w4a4_tp_quantization_ignores_import_time_sm(
         silu_quant.assert_not_called()
     else:
         downcast.assert_called_once()
-        silu_quant.assert_called_once_with(ANY, swiglu_limit=None)
+        expected_ids = expert_ids if use_tp_fused and valid_quant else None
+        silu_quant.assert_called_once_with(
+            ANY, swiglu_limit=None, expert_ids=expected_ids
+        )
         situ.assert_not_called()
     if use_tp_fused:
         fused_gemm.assert_called_once()

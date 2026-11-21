@@ -33,6 +33,8 @@ from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatchOutput,
 )
 
+_MOE_VALID_QUANT = envs.SGLANG_SAIL_DEEPGEMM_MOE_VALID_QUANT.get()
+
 # Add for nvtx profiling
 SGLANG_PROFILE_NVTX = envs.SGLANG_PROFILE_NVTX.get()
 SGLANG_PROFILE_NVTX_PRINT_TOPID = envs.SGLANG_PROFILE_NVTX_PRINT_TOPID.get()
@@ -983,7 +985,11 @@ def deep_moe_impl_fused(
             silu_and_mul_post_quant_mxfp4,
         )
 
-        a, a_scale = silu_and_mul_post_quant_mxfp4(out1, swiglu_limit=swiglu_limit)
+        a, a_scale = silu_and_mul_post_quant_mxfp4(
+            out1,
+            swiglu_limit=swiglu_limit,
+            expert_ids=expert_ids if use_fused_path and _MOE_VALID_QUANT else None,
+        )
     else:
         if activation == "situ":
             out2 = situ_and_mul(

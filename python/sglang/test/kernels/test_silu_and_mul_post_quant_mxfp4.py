@@ -58,6 +58,48 @@ def test_shapes(N: int, H: int, swiglu_limit: float | None) -> None:
     assert out_scale_view.dtype == torch.uint16
 
 
+@pytest.mark.parametrize(
+    "valid_rows", [2, 1, 0], ids=["all-valid", "mixed", "all-invalid"]
+)
+@pytest.mark.parametrize("H,block_n,limit", [(256, 256, None), (96, 128, 8.0)])
+def test_valid_prefix(valid_rows, H, block_n, limit) -> None:
+    _check_valid_prefix(2, valid_rows, H, block_n, limit)
+
+
+def test_valid_prefix_across_token_stride() -> None:
+    # With a row stride of 4, block 0 processes rows 0 and 4; rows 5–7 are padding.
+    _check_valid_prefix(8, 5, H=512, block_n=512, limit=None)
+
+
+def _check_valid_prefix(num_rows, valid_rows, H, block_n, limit) -> None:
+    from sglang.kernels.ops.elementwise.silu_mul_quant import (
+        _jit_tp_module,
+        silu_and_mul_post_quant_mxfp4,
+    )
+
+    torch.manual_seed(42)
+    gateup = torch.randn((num_rows, 2 * H), dtype=torch.bfloat16, device="cuda")
+    expert_ids = torch.arange(num_rows - 1, -1, -1, dtype=torch.int32, device="cuda")
+    expert_ids[valid_rows:] = -1
+    ref_quant, ref_scale = silu_and_mul_post_quant_mxfp4(gateup, swiglu_limit=limit)
+    quant, scale = silu_and_mul_post_quant_mxfp4(
+        gateup, swiglu_limit=limit, expert_ids=expert_ids
+    )
+    assert torch.equal(quant[:valid_rows], ref_quant[:valid_rows])
+    assert torch.equal(scale[:valid_rows], ref_scale[:valid_rows])
+
+    # The public op allocates uninitialized outputs. Reuse its buffers with
+    # known contents to check that the kernel leaves both tails untouched.
+    quant.fill_(0xA5)
+    scale.fill_(0xA5A5)
+    module = _jit_tp_module(limit is not None, block_n, True)
+    module.run(gateup, quant, scale.t(), limit or 0.0, expert_ids)
+    assert torch.equal(quant[:valid_rows], ref_quant[:valid_rows])
+    assert torch.equal(scale[:valid_rows], ref_scale[:valid_rows])
+    assert (quant[valid_rows:] == 0xA5).all()
+    assert (scale[valid_rows:] == 0xA5A5).all()
+
+
 def test_empty() -> None:
     from sglang.kernels.ops.elementwise.silu_mul_quant import (
         silu_and_mul_post_quant_mxfp4,
