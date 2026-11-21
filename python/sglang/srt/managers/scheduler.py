@@ -3239,9 +3239,6 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        # initialize before returning
-        self.init_req_max_new_tokens(req)
-
         # Validate prompt length
         error_msg = validate_input_length(
             req,
@@ -3250,8 +3247,14 @@ class Scheduler(
         )
         if error_msg:
             req.set_finish_with_abort(error_msg)
+            # Normalize the one-token abort request before queue processing.
+            self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
             return
+
+        # Auto-truncation must happen before computing the allocator budget.
+        # An untruncated prompt may be impossible even though its prefix fits.
+        self.init_req_max_new_tokens(req)
 
         if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
             # When return_logprob is False, logprob_start_len should be ignored
@@ -3749,6 +3752,7 @@ class Scheduler(
             get_serving().allow_auto_truncate,
         )
         if error_msg:
+            req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
 

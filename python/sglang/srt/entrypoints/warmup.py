@@ -127,13 +127,20 @@ async def voice_chat(disaggregation_mode: str, tokenizer_manager: TokenizerManag
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
 
 
-@warmup("prefill_shapes")
-async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerManager):
-    """Warmup Triton kernels across a wide range of prefill seq_lens (up to 32K).
+def _prefill_warmup_sizes(tokenizer_manager: TokenizerManager) -> List[int]:
+    # Both request checks reject equality. Reserved output slots belong to the
+    # context check; the scheduler's published input limit is already separate.
+    max_input = 32768
+    context_len = getattr(tokenizer_manager, "context_len", None)
+    if context_len is not None:
+        reserved = getattr(tokenizer_manager, "num_reserved_tokens", 0) or 0
+        max_input = min(max_input, context_len - reserved - 1)
+    max_req_input_len = getattr(tokenizer_manager, "max_req_input_len", None)
+    if max_req_input_len is not None:
+        max_input = min(max_input, max_req_input_len - 1)
+    if max_input < 1:
+        return []
 
-    Uses power-of-2 sizes plus intermediate points to cover the shape space
-    that fused_moe, attention extend, and other Triton kernels may encounter.
-    """
     page_size = 64
     sizes = set()
     base = 64
@@ -144,7 +151,18 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
         if mid <= 32768:
             sizes.add(mid)
         base *= 2
-    sizes = sorted(sizes)
+    sizes = {size for size in sizes if size <= max_input}
+    # Retain the original 18 shapes for large contexts. For bounded deployments,
+    # include the legal endpoint so an unaligned final chunk is not missed.
+    if max_input < 32768:
+        sizes.add(max_input)
+    return sorted(sizes)
+
+
+@warmup("prefill_shapes")
+async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerManager):
+    """Warm legal power-of-two/intermediate Prefill lengths, capped at 32K."""
+    sizes = _prefill_warmup_sizes(tokenizer_manager)
 
     for size in tqdm.tqdm(sizes, desc="Warmup prefill shapes (up to 32K)"):
         generate_req_input = GenerateReqInput(
