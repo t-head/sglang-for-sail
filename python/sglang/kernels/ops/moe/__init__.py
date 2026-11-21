@@ -33,7 +33,15 @@ register_kernel(
         backend=KernelBackend.DEEPGEMM,
         target="sglang.kernels.ops.moe.mega_gate:bf16_mega_gate",
         capabilities=frozenset(
-            {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))}
+            {
+                CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9)),
+                CapabilityRequirement.cuda(
+                    min_sm=(8, 0), max_sm=(8, 0), name_contains="ZW"
+                ),
+                CapabilityRequirement.cuda(
+                    min_sm=(8, 9), max_sm=(8, 9), name_contains="ZW"
+                ),
+            }
         ),
     )
 )

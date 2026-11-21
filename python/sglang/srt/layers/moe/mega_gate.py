@@ -9,10 +9,12 @@ import torch
 from sglang.kernels.ops.moe.mega_gate import bf16_mega_gate
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.moe import glm53_sail_gate
 from sglang.srt.layers.moe.topk import (
     TopKConfig,
     _post_process_topk_ids,
     apply_routing_simulation,
+    is_routed_scaling_factor_fused_in_topk,
     routing_simulation_enabled,
 )
 from sglang.srt.models.deepseek_common.utils import _device_sm
@@ -37,7 +39,7 @@ class MegaGateRouting(NamedTuple):
 
 def mega_gate_supported(moe) -> bool:
     if (
-        (_device_sm < 89 if _is_sail else _device_sm // 10 != 10)
+        (_device_sm < 80 if _is_sail else _device_sm // 10 != 10)
         or moe.config.model_type != "deepseek_v41"
         or moe.topk.enable_waterfill
         or moe.num_fused_shared_experts
@@ -116,6 +118,32 @@ def _captures_routed_experts(moe) -> bool:
     )
 
 
+def try_run_mega_gate(
+    moe, hidden_states: torch.Tensor, forward_batch=None
+) -> Optional[MegaGateRouting]:
+    """Select the GLM policy, then use the shared MegaGate execution path."""
+    if (
+        torch.compiler.is_compiling()
+        or not envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.get()
+        or moe.config.model_type != "glm_moe_dsa"
+        or moe.is_hash
+        or hidden_states.shape[0] == 0
+    ):
+        return None
+    routing_inputs = moe.topk.routing_inputs()
+    if not glm53_sail_gate.can_route(moe, hidden_states, routing_inputs[1]):
+        return None
+    # GLM keeps its existing Prefill/Decode/Verify policy. The DeepSeek entry
+    # continues to use should_use_mega_gate and its graph-related restrictions.
+    return run_mega_gate(
+        moe,
+        hidden_states,
+        None,
+        forward_batch=forward_batch,
+        routing_inputs=routing_inputs,
+    )
+
+
 @functools.lru_cache
 def _ones(num_experts: int, device: torch.device) -> torch.Tensor:
     return torch.ones(num_experts, dtype=torch.int32, device=device)
@@ -180,9 +208,19 @@ def _gate_row_masks(moe, num_tokens, bound, image_input_ids, device, forward_bat
 
 
 def run_mega_gate(
-    moe, hidden_states, input_ids, buf=None, forward_batch=None
+    moe,
+    hidden_states,
+    input_ids,
+    buf=None,
+    forward_batch=None,
+    *,
+    routing_inputs=None,
 ) -> Optional[MegaGateRouting]:
-    bound, dispatch_info = moe.topk.routing_inputs()
+    """Execute an admitted route, reusing inputs already resolved by its policy."""
+    bound, dispatch_info = (
+        moe.topk.routing_inputs() if routing_inputs is None else routing_inputs
+    )
+    is_glm = moe.config.model_type == "glm_moe_dsa"
     if dispatch_info is not None and dispatch_info.ep_dispatch_algorithm in (
         "lp",
         "fake",
@@ -218,6 +256,8 @@ def run_mega_gate(
     # The benchmark override writes logical ids, so with EPLB it must run before the remap.
     in_buffer = (
         buf is not None
+        # SAIL GLM pre-dispatch still copies real IDs/weights on every dtype.
+        and not is_glm
         and not _captures_routed_experts(moe)
         and not (dispatch_info is not None and routing_simulation_enabled())
     )
@@ -226,14 +266,21 @@ def run_mega_gate(
         # NOTE(kpham-sgl): MegaMoE reads physical expert slots from this buffer, so
         # under EPLB the gate must map logical ids in-kernel to stay on this path.
         to_physical_map, logical_count = _physical_dispatch_maps(dispatch_info)
+    kernel_scale = routed_scaling_factor if in_buffer or fused_in_topk else 1.0
+    if is_glm:
+        config = moe.topk.topk_config
+        kernel_scale = (
+            config.routed_scaling_factor
+            if is_routed_scaling_factor_fused_in_topk(config)
+            else 1.0
+        )
     weights, ids = bf16_mega_gate(
         hidden_states,
         moe.gate.weight,
-        moe.config.num_experts_per_tok,
-        routed_scaling_factor=(
-            routed_scaling_factor if in_buffer or fused_in_topk else 1.0
-        ),
+        moe.topk.topk_config.top_k if is_glm else moe.config.num_experts_per_tok,
+        routed_scaling_factor=kernel_scale,
         ep_rank=get_parallel().moe_ep_rank,
+        scoring_func="sigmoid" if is_glm else "sqrtsoftplus",
         bias=moe.gate.e_score_correction_bias,
         image_bias=moe.gate.e_score_correction_bias_vl if image is not None else None,
         image_token_mask=image,
@@ -280,7 +327,10 @@ def run_mega_gate(
         ids,
         weights,
         config,
-        hidden_states.new_empty((0, moe.gate.weight.shape[0])),
+        hidden_states.new_empty(
+            (0, moe.gate.weight.shape[0]),
+            dtype=torch.float32 if is_glm else hidden_states.dtype,
+        ),
         moe.layer_id,
         num_token_non_padded=bound,
         expert_location_dispatch_info=dispatch_info,

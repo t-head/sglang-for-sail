@@ -26,7 +26,11 @@ from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
-from sglang.srt.layers.moe.mega_gate import run_mega_gate, should_use_mega_gate
+from sglang.srt.layers.moe.mega_gate import (
+    run_mega_gate,
+    should_use_mega_gate,
+    try_run_mega_gate,
+)
 from sglang.srt.layers.moe.mega_moe_sm90 import (
     is_sm90_fp8_mega_moe_available,
     run_sm90_mega_routed,
@@ -381,7 +385,10 @@ def _run_mega_routed(
     hidden_size = moe.config.hidden_size
 
     routing = None
-    if should_use_mega_gate(moe, hidden_states, forward_batch):
+    if getattr(moe.config, "model_type", None) == "glm_moe_dsa":
+        if num_tokens:
+            routing = try_run_mega_gate(moe, hidden_states, forward_batch)
+    elif should_use_mega_gate(moe, hidden_states, forward_batch):
         import deep_gemm
 
         # CUDA fp8xfp4 can skip the top-k copy (kCopyTopk); PPU pre-dispatch

@@ -4,12 +4,12 @@ on:
   push:
     branches: [ main ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, release/v0.5.23 ]
     types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
     inputs:
       run_all_tests:
-        description: "Build and run both sanity files even without PPU path changes"
+        description: "Build and run the Stage A tests even without PPU path changes"
         required: false
         type: boolean
         default: true
@@ -62,7 +62,8 @@ jobs:
       contents: read
       pull-requests: read
     outputs:
-      ppu: ${{ steps.filter.outputs.ppu == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
+      ppu: ${{ steps.filter.outputs.ppu == 'true' || steps.filter.outputs.mega_gate == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
+      mega_gate: ${{ steps.filter.outputs.mega_gate == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
       source-sha: ${{ steps.source.outputs.sha }}
     steps:
       - name: Checkout code
@@ -92,6 +93,17 @@ jobs:
         if: steps.run-mode.outputs.run_all_tests != 'true'
         with:
           filters: |
+            mega_gate:
+              - ".github/workflows/pr-test-ppu.yml"
+              - "scripts/ci/ppu/**"
+              - "python/sglang/kernels/ops/moe/{__init__,mega_gate}.py"
+              - "python/sglang/kernels/spec.py"
+              - "python/sglang/srt/layers/moe/{glm53_sail_gate,mega_gate,mega_moe,topk}.py"
+              - "python/sglang/srt/model_executor/model_runner_components/moe_ep_setup.py"
+              - "python/sglang/srt/models/deepseek_v2.py"
+              - "python/sglang/srt/state_capturer/routed_experts.py"
+              - "test/registered/kernels/ops/moe/test_glm_sigmoid_mega_gate.py"
+              - "test/registered/unit/layers/moe/test_glm53_sail_gate.py"
             ppu:
               - ".github/workflows/pr-test-ppu.yml"
               - "scripts/ci/ppu/**"
@@ -131,6 +143,7 @@ jobs:
       image: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-hggcrt3-py312-20261005
     env:
       PPU_CI_SOURCE_SHA: ${{ needs.check-changes.outputs.source-sha }}
+      PPU_CI_MEGA_GATE: ${{ needs.check-changes.outputs.mega_gate }}
       MAX_JOBS: "2"
       SGL_KERNEL_COMPILE_THREADS: "2"
     outputs:
@@ -229,6 +242,7 @@ jobs:
 
       - name: Run both speculative sanity files in isolated Docker
         env:
+          PPU_CI_MEGA_GATE: ${{ matrix.runner == '8-ppu-m890p' && needs.check-changes.outputs.mega_gate == 'true' }}
           CONFIG_PPU_CI_DEVICE: ${{ vars.PPU_CI_DEVICE }}
           CONFIG_PPU_CI_TARGET_MODEL_PATH: ${{ vars.PPU_CI_TARGET_MODEL_PATH }}
           CONFIG_PPU_CI_EAGLE3_MODEL_PATH: ${{ vars.PPU_CI_EAGLE3_MODEL_PATH }}
@@ -261,7 +275,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions: {}
     steps:
-      - name: Require successful native build and both PPU sanity files when requested
+      - name: Require successful native build and the PPU tests when requested
         env:
           NEEDS_JSON: ${{ toJson(needs) }}
           PPU_IN_SCOPE: ${{ needs.check-changes.outputs.ppu }}
@@ -274,10 +288,10 @@ jobs:
           fi
           if [[ "$PPU_IN_SCOPE" == "true" ]]; then
             if [[ "$BUILD_RESULT" != "success" || "$SANITY_RESULT" != "success" ]]; then
-              printf '%s\n' '::error::PPU scope requires a successful native build and both PPU sanity files.'
+              printf '%s\n' '::error::PPU scope requires a successful native build and the PPU tests.'
               exit 1
             fi
-            printf '%s\n' 'Native build and both PPU sanity files passed.'
+            printf '%s\n' 'Native build and the PPU tests passed.'
           else
             printf '%s\n' 'PPU is outside this run scope; no PPU tests were requested.'
           fi
