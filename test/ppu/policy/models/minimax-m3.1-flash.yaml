@@ -1,0 +1,15 @@
+schema_version: ppu-test-policy/v1
+model_id: MiniMaxAI/MiniMax-M3.1-Flash
+recipe: test/ppu/recipes/MiniMaxAI/MiniMax-M3.1-Flash.yaml
+hardware: zhenwu_m890
+tiers:
+  fast_sanity:
+    dummy_weights: true
+    cache: disabled
+    probe:
+      prompt: "Compute 6 * 7 and reply with the integer only."
+      max_tokens: 16
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+      seed: 42

@@ -12,7 +12,7 @@ from pathlib import Path
 from recipe_diagnostics import PHASES
 
 REGISTRY = "download.t-head.cn/docker_test/sglang"
-MODELS = {"glm-5.3", "deepseek-v4-flash"}
+MODEL_POLICY_ROOT = Path(__file__).resolve().parents[3] / "test/ppu/policy/models"
 LEGACY_SCHEMA = "ppu-legacy-sanity/v1"
 LEGACY_CASES = {
     "test_basic_sanity_dflash.py": "dflash",
@@ -105,7 +105,8 @@ def validate(payload):
         raise ValueError("unexpected result field")
     if (
         payload["schema"] != "ppu-sanity/v1"
-        or payload["model"] not in MODELS
+        or not re.fullmatch(r"[a-z0-9][a-z0-9.-]*", payload["model"])
+        or not (MODEL_POLICY_ROOT / f"{payload['model']}.yaml").is_file()
         or payload["route"] != "native-build + sglang-release-runtime"
         or not re.fullmatch(r"[0-9a-f]{40}", payload["source_sha"])
         or payload["outcome"] not in {"pass", "fail"}

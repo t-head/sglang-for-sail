@@ -1,0 +1,20 @@
+schema_version: ppu-serving/v1
+ppu:
+  framework: sglang
+  visibility: public
+  assets: {model: qwen3.8-27b, tokenizer: qwen3.8-27b}
+  hf_model_id: Qwen/Qwen3.8-27B
+  topology: {kind: single_node, nodes: 1, devices_per_node: 2}
+model:
+  model_id: Qwen/Qwen3.8-27B
+  base_args:
+    - --tp-size
+    - "2"
+    - --dtype
+    - bfloat16
+    - --context-length
+    - "16384"
+    - --disable-custom-all-reduce
+    - --trust-remote-code
+variants:
+  default: {precision: bf16}
