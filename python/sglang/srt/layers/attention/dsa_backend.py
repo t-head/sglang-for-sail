@@ -580,6 +580,28 @@ def _validate_flashmla_sparse_q8_backend(
         )
 
 
+def _validate_flashmla_sparse_fp8_kv_backend(
+    *,
+    prefill_impl: str,
+    kv_cache_store_fp8: bool,
+    qk_rope_head_dim: int,
+) -> None:
+    # Sparse FlashMLA prefill reads the fp8 pool through the framework dequant
+    # (dequantize_k_cache_paged_dsa), which packs the rope half into the row
+    # (kv_lora_rank + qk_rope_head_dim). A NoPE / zero-RoPE model has no rope
+    # half to dequantize into, and the fp8 packed layout for that case is not
+    # supported by the kernel side yet, so refuse it at launch instead of
+    # failing inside the first prefix extend. Mirrors the flashmla_sparse_q8
+    # refusal above.
+    if prefill_impl == "flashmla_sparse" and kv_cache_store_fp8:
+        if qk_rope_head_dim == 0:
+            raise ValueError(
+                "--dsa-prefill-backend flashmla_sparse does not support an "
+                "fp8_e4m3 KV cache for NoPE MLA models (qk_rope_head_dim=0) yet; "
+                "use --kv-cache-dtype bfloat16."
+            )
+
+
 class DeepseekSparseAttnBackend(
     DSAMetadataManagementMixin,
     DeepseekSparseAttnBackendKPoolMixin,
@@ -848,6 +870,11 @@ class DeepseekSparseAttnBackend(
             device_sm_major=self.device_sm_major,
             hisparse_enabled=self.hisparse_coordinator is not None,
             mixed_chunk_enabled=get_schedule().enable_mixed_chunk,
+        )
+        _validate_flashmla_sparse_fp8_kv_backend(
+            prefill_impl=self.dsa_prefill_impl,
+            kv_cache_store_fp8=self.dsa_kv_cache_store_fp8,
+            qk_rope_head_dim=self.qk_rope_head_dim,
         )
 
         if self.dsa_prefill_impl == "triton_sparse_mla":

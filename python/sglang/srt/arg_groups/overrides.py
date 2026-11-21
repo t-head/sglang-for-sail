@@ -1515,6 +1515,40 @@ def _ppu_flashmla_fp8_kv_cache_fallback(view: Any) -> dict:
             and view.dsa_prefill_backend == view.dsa_decode_backend == "flashmla_kv"
         ):
             return {}
+        # Sparse FlashMLA prefill + FlashMLA KV decode: the sparse kernel only
+        # consumes bf16, and the framework dequantizes the fp8 prefix KV
+        # (dequantize_k_cache_paged_dsa) in front of it while the pool itself is
+        # still written as fp8 (quantize on write). The capacity win survives
+        # and the decode phase uses the fp8-capable KV kernel, so this
+        # combination is supported and must not be forced back to
+        # compute-dtype KV.
+        # Four restrictions keep the exemption to what is actually validated:
+        #  * Both phases really run DSA. The sub-backend flags below only pick
+        #    kernels inside the DSA backend; with a non-DSA phase (e.g.
+        #    --attention-backend triton --prefill-attention-backend dsa) the
+        #    decode would run a kernel that asserts the fp8 DSA store is off
+        #    (MLATokenToKVPool.set_kv_buffer), so it must still fall back.
+        #  * device_sm == 89. Above SM89 the k-pool tail route can hand the
+        #    sparse prefill to another kernel (_resolve_kpool_tail_backend maps
+        #    sm_10x to trtllm and sm_9x to fa3), which is a different,
+        #    unvalidated path for an fp8-stored pool.
+        #  * --enable-mixed-chunk off. A mixed batch is not an EXTEND batch, so
+        #    get_topk_transform_method() keeps it on PAGED top-k and the fp8
+        #    prefix dequant -- which only lives in the RAGGED branch -- never
+        #    runs; the bf16-only sparse kernel would be handed the fp8 pool.
+        #  * --enable-hisparse off. The HiSparse backend whitelist is keyed on
+        #    the KV dtype (flashmla_sparse is only allowed for compute-dtype
+        #    KV), and that validation runs after this pass, so keeping fp8 here
+        #    would turn a working HiSparse deployment into a startup error.
+        if (
+            get_platform().device_sm == 89
+            and attention_backends_of(view) == ("dsa", "dsa")
+            and not getattr(view, "enable_mixed_chunk", False)
+            and not getattr(view, "enable_hisparse", False)
+            and view.dsa_prefill_backend == "flashmla_sparse"
+            and view.dsa_decode_backend == "flashmla_kv"
+        ):
+            return {}
 
     incompatible = []
     if view.decode_attention_backend == "flashmla":
