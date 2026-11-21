@@ -2054,6 +2054,16 @@ class ModelConfig:
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _verify_quantization(self) -> None:
+        # Qwen4Exp can bundle a BF16 MTP draft inside an MXFP4 target.
+        # An explicit draft opt-out must survive target checkpoint detection.
+        if (
+            self.is_draft_model
+            and self.is_draft_quantization_explicit
+            and self.quantization is None
+            and _hf_arch(self.hf_config) == "Qwen4ExpForCausalLMMTP"
+        ):
+            return
+
         supported_quantization = [*QUANTIZATION_METHODS]
         rocm_supported_quantization = [
             "awq",
