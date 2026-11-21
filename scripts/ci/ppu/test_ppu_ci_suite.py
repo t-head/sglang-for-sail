@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,13 +13,18 @@ from unittest.mock import patch
 
 import yaml
 
-from sglang.test.ci.ci_register import HWBackend, collect_tests, ut_parse_one_file
-from sglang.test.test_utils import CustomTestCase
-
 RUNNER = Path(__file__).resolve().parents[3] / "test/run_suite.py"
+REGISTRY_MODULE = "sglang.test.ci.ci_register"
+registry_path = RUNNER.parent.parent / "python/sglang/test/ci/ci_register.py"
+registry_spec = importlib.util.spec_from_file_location(REGISTRY_MODULE, registry_path)
+registry = importlib.util.module_from_spec(registry_spec)
+# The infrastructure tests need the real registration parser but no inference runtime.
+with patch.dict(sys.modules, {REGISTRY_MODULE: registry}):
+    registry_spec.loader.exec_module(registry)
+    from run_speculative_sanity import select_tests
 
 
-class TestPPUCISuite(CustomTestCase):
+class TestPPUCISuite(unittest.TestCase):
     def test_manual_checks_are_not_ci_registered(self):
         files = list(Path(__file__).parent.glob("test_ppu_ci_*.py"))
         self.assertCountEqual(
@@ -31,26 +37,14 @@ class TestPPUCISuite(CustomTestCase):
         )
         for path in files:
             with self.subTest(path=path.name):
-                self.assertEqual(ut_parse_one_file(str(path)), ([], True))
+                self.assertEqual(registry.ut_parse_one_file(str(path)), ([], True))
         self.assertEqual(
             list((RUNNER.parent / "registered").rglob("test_ppu_ci_*.py")), []
         )
 
     def test_ppu_suite_contains_both_speculative_sanity_files(self):
         registered = RUNNER.parent / "registered"
-        files = [
-            str(path)
-            for path in registered.rglob("*.py")
-            if path.name not in ("conftest.py", "__init__.py")
-        ]
-        tests = collect_tests(files)
-        ppu_tests = [
-            test
-            for test in tests
-            if test.backend == HWBackend.PPU
-            and test.effective_suite == "stage-a-test-1-gpu-ppu"
-            and not test.disabled
-        ]
+        ppu_tests = select_tests(RUNNER.parent.parent)
         self.assertCountEqual(
             [
                 Path(test.filename).relative_to(registered).as_posix()
@@ -71,10 +65,10 @@ class TestPPUCISuite(CustomTestCase):
         )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "repo with spaces"
-            (root / "test").mkdir(parents=True)
+            (root / "scripts/ci/ppu").mkdir(parents=True)
             artifacts = root / "artifacts"
             artifacts.mkdir()
-            (root / "test/run_suite.py").write_text(
+            (root / "scripts/ci/ppu/run_speculative_sanity.py").write_text(
                 "import os, sys\n"
                 "print(os.environ['FIXTURE_SUMMARY'], file=sys.stderr)\n"
                 "sys.exit(int(os.environ['FIXTURE_EXIT']))\n"
@@ -108,11 +102,12 @@ class TestPPUCISuite(CustomTestCase):
                     )
 
 
-class TestPPUCIWorkflow(CustomTestCase):
+class TestPPUCIWorkflow(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         path = RUNNER.parent.parent / ".github/workflows/pr-test-ppu.yml"
-        cls.jobs = yaml.safe_load(path.read_text())["jobs"]
+        cls.workflow = yaml.safe_load(path.read_text())
+        cls.jobs = cls.workflow["jobs"]
 
     def test_runtime_image_is_only_configured_by_runner_environment(self):
         path = RUNNER.parent.parent / ".github/workflows/pr-test-ppu.yml"
@@ -133,6 +128,8 @@ class TestPPUCIWorkflow(CustomTestCase):
             ("python/sglang/test/ci/ci_register.py", False),
             ("python/sglang/test/ci/ci_utils.py", False),
             ("test/run_suite.py", False),
+            ("test/registered/core/test_basic_sanity_eagle3.py", False),
+            ("test/registered/core/test_basic_sanity_dflash.py", False),
             (".github/workflows/pr-test-ppu.yml", True),
             ("scripts/ci/ppu/run_test.sh", True),
             ("python/sglang/srt/platforms/sail.py", True),
@@ -144,37 +141,85 @@ class TestPPUCIWorkflow(CustomTestCase):
                     expected,
                 )
 
-    def test_device_jobs_require_build_but_not_manual_checks(self):
-        self.assertNotIn("ppu-ci-selftest", self.jobs)
-        self.assertCountEqual(
-            self.jobs["ppu-build"]["needs"], ["check-changes", "pr-gate"]
+    def test_release_code_and_explicit_label_are_in_scope(self):
+        check = self.jobs["check-changes"]
+        step = next(step for step in check["steps"] if step.get("id") == "filter")
+        patterns = yaml.safe_load(step["with"]["filters"])["release-code"]
+        for path in (
+            "python/sglang/srt/managers/scheduler.py",
+            "python/sglang/kernels/aot/csrc/elementwise/topk.cu",
+            "sgl-kernel/csrc/elementwise/example.cu",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(
+                    any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)
+                )
+        output = check["outputs"]["ppu"]
+        self.assertIn("steps.filter.outputs.release-code == 'true'", output)
+        self.assertIn("startsWith(github.base_ref, 'release/')", output)
+        self.assertIn("needs.pr-gate.outputs.approved == 'true'", output)
+
+    def test_cluster_jobs_use_fresh_approval_and_thead_cpu_runner(self):
+        for name, cluster_jobs in (
+            ("pr-test-ppu", ("ppu-cluster-config", "ppu-legacy-sanity")),
+            ("nightly-test-ppu", ("cluster-preflight", "recipe-sanity")),
+        ):
+            with self.subTest(workflow=name):
+                source = RUNNER.parent.parent / f".github/workflows/{name}.yml"
+                workflow = yaml.load(source.read_text(), Loader=yaml.BaseLoader)
+                self.assertIn("pull_request_target", workflow["on"])
+                self.assertNotIn("pull_request", workflow["on"])
+                jobs = workflow["jobs"]
+                self.assertEqual(
+                    jobs["pr-gate"]["uses"], "./.github/workflows/ppu-approval.yml"
+                )
+                for job in cluster_jobs:
+                    self.assertEqual(jobs[job]["runs-on"], "k8s-runner-group-cpu-thead")
+
+    def test_device_jobs_require_build_and_cpu_checks(self):
+        selftests = self.jobs["ppu-ci-selftest"]
+        self.assertEqual(selftests["runs-on"], "ubuntu-latest")
+        self.assertCountEqual(selftests["needs"], ["check-changes", "pr-gate"])
+        self.assertIn(
+            "bash scripts/ci/ppu/run_selftests.sh", selftests["steps"][-1]["run"]
         )
+        for job in ("ppu-build", "ppu-cluster-config"):
+            self.assertCountEqual(
+                self.jobs[job]["needs"], ["check-changes", "ppu-ci-selftest"]
+            )
         self.assertCountEqual(
-            self.jobs["ppu-sanity"]["needs"], ["check-changes", "pr-gate", "ppu-build"]
+            self.jobs["ppu-legacy-sanity"]["needs"],
+            ["check-changes", "pr-gate", "ppu-build", "ppu-cluster-config"],
         )
         self.assertCountEqual(
             self.jobs["pr-test-ppu-finish"]["needs"],
-            ["pr-gate", "check-changes", "ppu-build", "ppu-sanity"],
+            [
+                "pr-gate",
+                "check-changes",
+                "ppu-ci-selftest",
+                "ppu-build",
+                "ppu-cluster-config",
+                "ppu-fast-sanity",
+            ],
         )
         self.assertEqual(
-            self.jobs["ppu-sanity"]["if"], "needs.check-changes.outputs.ppu == 'true'"
+            self.jobs["ppu-legacy-sanity"]["if"],
+            "inputs.run_legacy_sanity == true && needs.check-changes.outputs.ppu == 'true'",
         )
-        self.assertEqual(
+        self.assertIn(
+            "needs.pr-gate.result == 'failure'",
             self.jobs["pr-test-ppu-finish"]["if"],
-            "always() && needs.check-changes.result != 'skipped'",
         )
         runtime = RUNNER.parent.parent / "scripts/ci/ppu/build_and_test.sh"
         self.assertNotIn("--hw cpu", runtime.read_text())
 
     def test_jobs_check_out_the_triggering_ref_and_verify_the_pinned_sha(self):
-        # Device jobs check out the triggering ref like the other PR test
-        # workflows; the scripts' HEAD == PPU_CI_SOURCE_SHA checks are covered by
-        # test_build_rejects_wrong_revision_and_uncommitted_inputs below and by
-        # test_source_identity_includes_untracked_and_ignored_inputs in
-        # test_ppu_ci_docker.py.
-        expected = self.jobs["check-changes"]["steps"][0]["with"]["ref"]
-        self.assertEqual(expected, "${{ inputs.ref || github.sha }}")
-        for name in ("ppu-build", "ppu-sanity"):
+        check = self.jobs["check-changes"]
+        self.assertIn("github.sha", check["steps"][0]["with"]["ref"])
+        self.assertIn(
+            "github.event.pull_request.head.sha", check["outputs"]["source-sha"]
+        )
+        for name in ("ppu-build", "ppu-legacy-sanity"):
             with self.subTest(job=name):
                 job = self.jobs[name]
                 checkout = next(
@@ -182,48 +227,79 @@ class TestPPUCIWorkflow(CustomTestCase):
                     for step in job["steps"]
                     if step.get("uses", "").startswith("actions/checkout@")
                 )
-                self.assertEqual(checkout["with"]["ref"], expected)
+                self.assertEqual(
+                    checkout["with"]["ref"],
+                    "${{ needs.check-changes.outputs.source-sha }}",
+                )
                 self.assertEqual(
                     job["env"]["PPU_CI_SOURCE_SHA"],
                     "${{ needs.check-changes.outputs.source-sha }}",
                 )
 
-    def test_sanity_runs_on_every_ppu_generation_with_distinct_artifacts(self):
-        sanity = self.jobs["ppu-sanity"]
-        self.assertEqual(sanity["runs-on"], "${{ matrix.runner }}")
+    def test_sanity_runs_on_every_ppu_generation_with_private_retention(self):
+        sanity = self.jobs["ppu-legacy-sanity"]
+        self.assertEqual(sanity["runs-on"], "k8s-runner-group-cpu-thead")
         self.assertIs(sanity["strategy"]["fail-fast"], False)
         self.assertEqual(
-            sanity["strategy"]["matrix"]["runner"], ["8-ppu-m890p", "16-ppu-zw810e"]
+            sanity["strategy"]["matrix"]["board"], ["ZW-M890P", "OAM-810E"]
         )
-        self.assertIn("matrix.runner", sanity["name"])
-        upload = next(
+        self.assertIn("matrix.board", sanity["name"])
+        uploads = [
             step
             for step in sanity["steps"]
-            if step.get("name") == "Upload runtime diagnostics"
+            if step.get("uses", "").startswith("actions/upload-artifact@")
+        ]
+        self.assertEqual(len(uploads), 1)
+        self.assertEqual(uploads[0]["with"]["path"], "ppu-public/legacy.json")
+        self.assertEqual(
+            uploads[0]["if"], "always() && steps.evidence.outputs.approved == 'true'"
         )
-        self.assertIn("${{ matrix.runner }}", upload["with"]["name"])
+        steps = {step["id"]: step for step in sanity["steps"] if "id" in step}
+        self.assertIn(
+            "recipe_publish.py --verify-only ppu-public/legacy.json",
+            steps["evidence"]["run"],
+        )
+        self.assertIn(
+            "exec bash scripts/ci/ppu/run_recipe_cluster.sh", steps["cluster"]["run"]
+        )
 
-    def test_finish_requires_successful_build_and_sanity_when_in_scope(self):
-        finish = self.jobs["pr-test-ppu-finish"]["steps"][0]
-        statuses = ("success", "failure", "cancelled", "skipped")
-        for build in statuses:
-            for sanity in statuses:
+    def test_legacy_mode_is_explicit_and_separate_from_recipe_ci(self):
+        path = RUNNER.parent.parent / ".github/workflows/pr-test-ppu.yml"
+        workflow = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+        for event in ("workflow_dispatch", "workflow_call"):
+            self.assertEqual(
+                workflow["on"][event]["inputs"]["run_legacy_sanity"]["default"], "false"
+            )
+        self.assertIn("inputs.run_legacy_sanity", workflow["concurrency"]["group"])
+        self.assertIn(
+            "inputs.run_legacy_sanity", self.jobs["check-changes"]["outputs"]["ppu"]
+        )
+        self.assertIn(
+            "inputs.run_legacy_sanity != true", self.jobs["ppu-fast-sanity"]["if"]
+        )
+        self.assertIn(
+            "legacy-only-pr-test-ppu-finish", self.jobs["pr-test-ppu-finish"]["name"]
+        )
+
+    def test_finish_requires_each_recipe_dependency_when_in_scope(self):
+        job = self.jobs["pr-test-ppu-finish"]
+        finish = job["steps"][0]
+        for dependency in job["needs"]:
+            for status in ("success", "failure", "cancelled", "skipped"):
                 for in_scope in (True, False):
-                    with self.subTest(build=build, sanity=sanity, in_scope=in_scope):
-                        needs = {
-                            name: {"result": "success"}
-                            for name in self.jobs["pr-test-ppu-finish"]["needs"]
-                        }
-                        needs["ppu-build"] = {"result": build}
-                        needs["ppu-sanity"] = {"result": sanity}
+                    with self.subTest(
+                        dependency=dependency, status=status, in_scope=in_scope
+                    ):
+                        needs = {name: {"result": "success"} for name in job["needs"]}
+                        needs[dependency] = {"result": status}
                         result = subprocess.run(
                             ["bash", "-e", "-o", "pipefail", "-c", finish["run"]],
                             env=dict(
                                 os.environ,
                                 NEEDS_JSON=json.dumps(needs),
+                                PREFLIGHT_ONLY="false",
+                                SANITY_RESULT="success",
                                 PPU_IN_SCOPE=str(in_scope).lower(),
-                                BUILD_RESULT=build,
-                                SANITY_RESULT=sanity,
                             ),
                             capture_output=True,
                             text=True,
@@ -232,17 +308,12 @@ class TestPPUCIWorkflow(CustomTestCase):
                         allowed = {"success"} if in_scope else {"success", "skipped"}
                         self.assertEqual(
                             result.returncode == 0,
-                            build in allowed and sanity in allowed,
+                            status in allowed,
                             result.stdout + result.stderr,
                         )
-        for variable, job in (
-            ("BUILD_RESULT", "ppu-build"),
-            ("SANITY_RESULT", "ppu-sanity"),
-        ):
-            self.assertEqual(finish["env"][variable], "${{ needs." + job + ".result }}")
 
 
-class TestPPUManualSelftests(CustomTestCase):
+class TestPPUManualSelftests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -357,7 +428,7 @@ class TestPPUManualSelftests(CustomTestCase):
                     (tools / missing).symlink_to(shutil.which(missing))
 
 
-class TestPPURuntimeCache(CustomTestCase):
+class TestPPURuntimeCache(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         path = RUNNER.parent.parent / "scripts/ci/ppu/prepare_runtime.py"
@@ -415,7 +486,7 @@ class TestPPURuntimeCache(CustomTestCase):
                     self.prepare.prepare_mmlu_cache(source, root / "missing")
 
 
-class TestPPUBuildProvenance(CustomTestCase):
+class TestPPUBuildProvenance(unittest.TestCase):
     def test_build_rejects_wrong_revision_and_uncommitted_inputs(self):
         """HEAD alone cannot identify a build that also consumes uncommitted files."""
         source = RUNNER.parent.parent / "scripts/ci/ppu/build_and_test.sh"
