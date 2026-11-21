@@ -78,7 +78,6 @@ from sglang.srt.eplb.expert_location import (
     get_global_expert_location_metadata,
     set_global_expert_location_metadata,
 )
-from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.kernel_plugins.amd.binding import (
     install_monokernel_forward,
 )
@@ -185,9 +184,14 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     resolve_sliding_window_size,
 )
 from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
+    build_eplb_async_host_mirror,
     check_quantized_moe_compatibility,
+    create_eplb_async_host_mirror,
+    create_expert_location_updater,
     init_lplb_solvers,
+    maybe_warmup_eplb_cpp_extensions,
     prebuild_deepep_v2_buffer,
+    prepare_eplb_async_layers,
     prepare_moe_topk,
 )
 from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (
@@ -211,6 +215,7 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_executor.runner_utils.nvtx_profile import RunnerNvtxProfiler
 from sglang.srt.model_executor.weight_checker import WeightChecker
 from sglang.srt.models.unlimited_ocr_v2_support.greedy_graph import UocrGreedyGraph
 from sglang.srt.observability.profile_utils import build_step_span_name
@@ -461,6 +466,7 @@ class ModelRunner:
 
         # Auxiliary hidden capture: from the draft, or --enable-return-aux-hidden-states.
         self.init_spec_aux_hidden_state()
+        self.init_nvtx_profiler()
 
         misc_utils.maybe_disable_chunked_prefix_cache(
             use_mla_backend=self.use_mla_backend,
@@ -630,6 +636,9 @@ class ModelRunner:
             get_model_runner=lambda: self,
         )
 
+    def init_nvtx_profiler(self):
+        self.nvtx_profiler = RunnerNvtxProfiler(is_draft_worker=self.is_draft_worker)
+
     def init_spec_aux_hidden_state(self):
         self.spec_aux_config: SpecAuxHiddenStateConfig = (
             resolve_spec_aux_hidden_state_config(
@@ -747,15 +756,25 @@ class ModelRunner:
                 port=self.dist_port,
             )
 
+    def maybe_warmup_eplb_cpp_extensions(self):
+        maybe_warmup_eplb_cpp_extensions(
+            model_config=self.model_config,
+            is_draft_worker=self.is_draft_worker,
+        )
+
     def initialize(self):
         self.init_memory_saver_adapter()
         self.maybe_init_remote_instance_transfer_engine()
         self.maybe_init_expert_location_metadata()
         self.maybe_init_lplb_solvers()
         self.maybe_init_eplb_manager()
-        self.expert_location_updater = ExpertLocationUpdater()
         self.maybe_init_elastic_ep()
         self.init_token_oracle()
+        self.maybe_init_eplb_async_host_mirror()
+        self.init_expert_location_updater()
+        self.maybe_warmup_eplb_cpp_extensions()
+
+        # Load the model
         self.sampler = create_sampler()
         self.load_model()
         if self.model_config.is_layer_types_hybrid_swa:
@@ -772,6 +791,7 @@ class ModelRunner:
         if self.is_draft_worker:
             disable_routed_experts_capture_for_draft(self.model)
         self.maybe_init_expert_backup_client()
+        self.prepare_eplb_async_layers()
         self.remote_instance_weight_transporter.maybe_register_and_publish_weight_info()
         self.layer_info: ModelLayerInfo = resolve_layer_indices(
             model=self.model,
@@ -848,9 +868,20 @@ class ModelRunner:
                 get_expert_location_updater=lambda: self.expert_location_updater,
                 get_expert_backup_client=lambda: self.expert_backup_client,
                 get_weight_updater=lambda: self.weight_updater,
+                get_forward_pass_id=lambda: self.forward_pass_id,
             )
             if get_exec().moe.enable_eplb and (not self.is_draft_worker)
             else None
+        )
+
+    def maybe_init_eplb_async_host_mirror(self):
+        self.eplb_async_host_mirror_manager = create_eplb_async_host_mirror(
+            model_config=self.model_config, is_draft_worker=self.is_draft_worker
+        )
+
+    def init_expert_location_updater(self):
+        self.expert_location_updater = create_expert_location_updater(
+            is_draft_worker=self.is_draft_worker
         )
 
     def maybe_init_elastic_ep(self):
@@ -878,6 +909,13 @@ class ModelRunner:
                 and get_exec().moe.elastic_ep_backend is not None
             )
             else None
+        )
+
+    def prepare_eplb_async_layers(self):
+        prepare_eplb_async_layers(
+            updater=self.expert_location_updater,
+            model=self.model,
+            is_draft_worker=self.is_draft_worker,
         )
 
     def maybe_apply_post_load_model_transforms(self):
@@ -1306,6 +1344,11 @@ class ModelRunner:
             self._finalize_elastic_ep_joiner(target_size)
 
         prebuild_deepep_v2_buffer(model=self.model)
+
+    def build_eplb_async_host_mirror(self):
+        build_eplb_async_host_mirror(
+            manager=self.eplb_async_host_mirror_manager, model=self.model
+        )
 
     def init_routed_experts_capturer(self):
         if self.is_draft_worker:
@@ -1921,6 +1964,8 @@ class ModelRunner:
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
         self.forward_pass_id += 1
+        # Transfer iteration info to eplb_async_runtime
+        self.on_forward_pass_start()
 
         # On the forward stream, outside every CUDA graph: orders a reused row's
         # reset after its previous request's last forward.
@@ -1963,6 +2008,7 @@ class ModelRunner:
         with (
             canary_ctx,
             step_span_ctx,
+            self.nvtx_profiler.forward_range(forward_batch, self.forward_pass_id),
             record_ctx,
             recorder.with_forward_pass(
                 self.forward_pass_id,
@@ -2008,8 +2054,8 @@ class ModelRunner:
         )
 
         # should_advance_eplb_counter is always True on non-hip platform
-        if self.eplb_manager is not None and should_advance_eplb_counter(forward_batch):
-            self.eplb_manager.on_forward_pass_end()
+        if should_advance_eplb_counter(forward_batch):
+            self.on_forward_pass_end()
 
         if dumper.may_enable:
             dumper.step()
@@ -2096,6 +2142,21 @@ class ModelRunner:
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None
 
+    # Transfer iteration info to eplb_async_runtime
+    def on_forward_pass_start(self):
+        if self.expert_location_updater is not None:
+            self.expert_location_updater.on_forward_pass_start()
+
+    def on_forward_pass_end(self):
+        if self.eplb_manager is not None:
+            # Trigger EPLB rebalance logic at the end of forward pass
+            self.eplb_manager.on_forward_pass_end()
+
+    # Give layer owner to GPU
+    def on_eplb_async_capture_start(self):
+        if self.expert_location_updater is not None:
+            self.expert_location_updater.on_capture_start()
+
     def _forward_raw(
         self,
         forward_batch: ForwardBatch,
@@ -2144,11 +2205,13 @@ class ModelRunner:
                 )
 
             # Replay cuda graph if applicable
+            self.nvtx_profiler.before_forward()
             if can_run_graph:
-                ret = self.decode_cuda_graph_runner.execute(
-                    forward_batch,
-                    pp_proxy_tensors=pp_proxy_tensors,
-                )
+                with self.nvtx_profiler.range("decode_cudagraph"):
+                    ret = self.decode_cuda_graph_runner.execute(
+                        forward_batch,
+                        pp_proxy_tensors=pp_proxy_tensors,
+                    )
                 return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
             # DP / MLP-sync padding + attn-tp normalization. Only the decode
@@ -2187,16 +2250,20 @@ class ModelRunner:
                 # TODO: the timing here is too broad -- it also includes
                 # load_batch time. Move it into the prefill cuda graph runner
                 # to capture only the model.forward part.
-                with device_timer_ctx(self.device_timer, category):
+                with (
+                    device_timer_ctx(self.device_timer, category),
+                    self.nvtx_profiler.range("forward_extend"),
+                ):
                     ret = self.prefill_cuda_graph_runner.execute(
                         forward_batch, **kwargs
                     )
                 can_run_graph = True
             else:
                 # Eager: decode / extend / idle dispatched inside the runner.
-                ret = self.eager_runner.execute(
-                    forward_batch, pp_proxy_tensors=pp_proxy_tensors
-                )
+                with self.nvtx_profiler.mode_range(forward_batch.forward_mode):
+                    ret = self.eager_runner.execute(
+                        forward_batch, pp_proxy_tensors=pp_proxy_tensors
+                    )
 
             if (
                 forward_batch.global_num_tokens_cpu is not None
@@ -2248,98 +2315,99 @@ class ModelRunner:
         Returns:
             A list of next_token_ids
         """
-        # LogitsProcessorOutput is normally invocation-scoped, but CUDA graph
-        # runners may reuse backing objects. Never leak an auxiliary result from
-        # a previous replay into a request with no observer state.
-        logits_output.auxiliary_device_output = None
-        observer = self.sampling_observer
-        # Preserve two-argument overrides when observation is inactive.
-        if observer is not None and observer.is_active(forward_batch.sampling_info):
-            observer_state = self._preprocess_logits(
-                logits_output,
-                forward_batch.sampling_info,
-                observer=observer,
-            )
-        else:
-            observer_state = self._preprocess_logits(
-                logits_output, forward_batch.sampling_info
-            )
+        with self.nvtx_profiler.sample_range(logits_output.next_token_logits):
+            # LogitsProcessorOutput is normally invocation-scoped, but CUDA graph
+            # runners may reuse backing objects. Never leak an auxiliary result from
+            # a previous replay into a request with no observer state.
+            logits_output.auxiliary_device_output = None
+            observer = self.sampling_observer
+            # Preserve two-argument overrides when observation is inactive.
+            if observer is not None and observer.is_active(forward_batch.sampling_info):
+                observer_state = self._preprocess_logits(
+                    logits_output,
+                    forward_batch.sampling_info,
+                    observer=observer,
+                )
+            else:
+                observer_state = self._preprocess_logits(
+                    logits_output, forward_batch.sampling_info
+                )
 
-        watermark_state = self.watermark_state
-        if (
-            watermark_state is not None
-            and forward_batch.sampling_info.has_watermark_candidates
-        ):
-            logprob_logits = (
-                logits_output.next_token_logits.clone()
-                if forward_batch.return_logprob
-                else None
-            )
-            req_pool_indices = forward_batch.req_pool_indices[
-                : logits_output.next_token_logits.shape[0]
-            ]
-            watermark_state.init_from_prompt(
-                req_pool_indices,
-                forward_batch.watermark_prompt_tail_ids,
-                forward_batch.watermark_context_hash_history,
-            )
-            watermark_state.force(
-                logits_output.next_token_logits,
-                req_pool_indices,
-                forward_batch.sampling_info,
-            )
-        else:
-            logprob_logits = None
+            watermark_state = self.watermark_state
+            if (
+                watermark_state is not None
+                and forward_batch.sampling_info.has_watermark_candidates
+            ):
+                logprob_logits = (
+                    logits_output.next_token_logits.clone()
+                    if forward_batch.return_logprob
+                    else None
+                )
+                req_pool_indices = forward_batch.req_pool_indices[
+                    : logits_output.next_token_logits.shape[0]
+                ]
+                watermark_state.init_from_prompt(
+                    req_pool_indices,
+                    forward_batch.watermark_prompt_tail_ids,
+                    forward_batch.watermark_context_hash_history,
+                )
+                watermark_state.force(
+                    logits_output.next_token_logits,
+                    req_pool_indices,
+                    forward_batch.sampling_info,
+                )
+            else:
+                logprob_logits = None
 
-        # Sample the next tokens
-        next_token_ids = None
-        if self.uocr_greedy_graph is not None:
-            next_token_ids = self.uocr_greedy_graph.recorded_ids(
-                logits_output, forward_batch, watermark_state=watermark_state
-            )
-        if next_token_ids is None:
-            next_token_ids = self.sampler(
-                logits_output,
-                forward_batch.sampling_info,
-                forward_batch.return_logprob,
-                forward_batch.top_logprobs_nums,
-                forward_batch.token_ids_logprobs,
-                # For prefill, we only use the position of the last token.
-                (
-                    forward_batch.positions
-                    if forward_batch.forward_mode.is_decode()
-                    else forward_batch.seq_lens - 1
-                ),
-                **(
-                    {"logprob_logits": logprob_logits}
-                    if logprob_logits is not None
-                    else {}
-                ),
-            )
-        if observer_state is not None:
-            logits_output.auxiliary_device_output = observer.after_sample(
-                observer_state,
-                next_token_ids,
-            )
-        if (c := self.canary_manager) is not None:
-            c.on_sampled(
-                logits_output=logits_output,
-                forward_batch=forward_batch,
+            # Sample the next tokens
+            next_token_ids = None
+            if self.uocr_greedy_graph is not None:
+                next_token_ids = self.uocr_greedy_graph.recorded_ids(
+                    logits_output, forward_batch, watermark_state=watermark_state
+                )
+            if next_token_ids is None:
+                next_token_ids = self.sampler(
+                    logits_output,
+                    forward_batch.sampling_info,
+                    forward_batch.return_logprob,
+                    forward_batch.top_logprobs_nums,
+                    forward_batch.token_ids_logprobs,
+                    # For prefill, we only use the position of the last token.
+                    (
+                        forward_batch.positions
+                        if forward_batch.forward_mode.is_decode()
+                        else forward_batch.seq_lens - 1
+                    ),
+                    **(
+                        {"logprob_logits": logprob_logits}
+                        if logprob_logits is not None
+                        else {}
+                    ),
+                )
+            if observer_state is not None:
+                logits_output.auxiliary_device_output = observer.after_sample(
+                    observer_state,
+                    next_token_ids,
+                )
+            if (c := self.canary_manager) is not None:
+                c.on_sampled(
+                    logits_output=logits_output,
+                    forward_batch=forward_batch,
+                    next_token_ids=next_token_ids,
+                )
+            self.ngram_embedding_manager.update_after_decode(
                 next_token_ids=next_token_ids,
+                forward_batch=forward_batch,
             )
-        self.ngram_embedding_manager.update_after_decode(
-            next_token_ids=next_token_ids,
-            forward_batch=forward_batch,
-        )
-        if (
-            watermark_state is not None
-            and forward_batch.sampling_info.has_watermark_candidates
-        ):
-            watermark_state.append(
-                req_pool_indices,
-                next_token_ids,
-            )
-        return next_token_ids
+            if (
+                watermark_state is not None
+                and forward_batch.sampling_info.has_watermark_candidates
+            ):
+                watermark_state.append(
+                    req_pool_indices,
+                    next_token_ids,
+                )
+            return next_token_ids
 
     def compute_logprobs_only(
         self,

@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
     update_pooled_paged_mqa_metadata,
 )
 from sglang.srt.layers.cp.interleave_kpool import local_query_inputs
+from sglang.srt.utils.device import is_sail
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
@@ -52,13 +53,19 @@ class DeepseekSparseAttnBackendKPoolMixin:
         if (
             topk_indices is None
             or self.dsa_index_kpool <= 1
+            # PPU int8: was or dsa_impl in ("fa3", "tilelang", "trtllm")
+            # [PPU-int8] allow flashmla_sparse for kpool on SM80
             or dsa_impl in ("fa3", "tilelang", "trtllm")
+            or (is_sail() and dsa_impl in ("flashmla_sparse", "flashmla_kv"))
         ):
             return
         raise NotImplementedError(
             "index_kpool > 1 appends tail tokens to topk_indices and is "
-            f"currently only supported by the FA3/TileLang/TRTLLM DSA {phase} "
-            "backend."
+            # [迁移自 v0.5.18_rel feat/glm-5.3-flash 28925f0d48] 旧代码：
+            # f"currently only supported by the FA3/TileLang/TRTLLM DSA {phase} "
+            # "backend."
+            f"currently only supported by the FA3/TileLang/TRTLLM/FlashMLA-sparse DSA {phase} "
+            "backend (plus FlashMLA-KV on PPU)."
         )
 
     def _resolve_kpool_tail_backend(
@@ -121,6 +128,9 @@ class DeepseekSparseAttnBackendKPoolMixin:
             kpool=self.dsa_index_kpool,
             physical_page_size=self.physical_page_size,
             index_page_size=index_page_size,
+            schedule_builder=(
+                self._build_paged_mqa_schedule_metadata if is_sail() else None
+            ),
             build_schedule_metadata=build_schedule_metadata,
         )
 
@@ -134,6 +144,9 @@ class DeepseekSparseAttnBackendKPoolMixin:
                 num_draft_tokens=1,
                 write_start=(forward_batch.seq_lens - 1).to(torch.int32),
                 index_page_size=index_page_size,
+                schedule_builder=(
+                    self._build_paged_mqa_schedule_metadata if is_sail() else None
+                ),
                 build_schedule_metadata=build_schedule_metadata,
             )
 
@@ -147,6 +160,9 @@ class DeepseekSparseAttnBackendKPoolMixin:
                 num_draft_tokens=self.speculative_num_draft_tokens,
                 write_start=forward_batch.seq_lens.to(torch.int32),
                 index_page_size=index_page_size,
+                schedule_builder=(
+                    self._build_paged_mqa_schedule_metadata if is_sail() else None
+                ),
                 build_schedule_metadata=build_schedule_metadata,
             )
 
@@ -169,6 +185,9 @@ class DeepseekSparseAttnBackendKPoolMixin:
                     forward_batch.seq_lens - self.speculative_num_draft_tokens
                 ).to(torch.int32),
                 index_page_size=index_page_size,
+                schedule_builder=(
+                    self._build_paged_mqa_schedule_metadata if is_sail() else None
+                ),
                 effective_n_per_batch=effective_n_per_batch,
                 build_schedule_metadata=build_schedule_metadata,
             )
@@ -190,6 +209,9 @@ class DeepseekSparseAttnBackendKPoolMixin:
             kpool=self.dsa_index_kpool,
             physical_page_size=self.physical_page_size,
             index_page_size=index_page_size,
+            schedule_builder=(
+                self._build_paged_mqa_schedule_metadata if is_sail() else None
+            ),
             build_schedule_metadata=build_schedule_metadata,
         )
 
@@ -211,6 +233,9 @@ class DeepseekSparseAttnBackendKPoolMixin:
                 device=self.device,
                 is_verify=not is_decode,
                 index_page_size=index_page_size,
+                schedule_builder=(
+                    self._build_paged_mqa_schedule_metadata if is_sail() else None
+                ),
                 is_v2=is_v2,
                 build_schedule_metadata=build_schedule_metadata,
             )
@@ -237,6 +262,9 @@ class DeepseekSparseAttnBackendKPoolMixin:
             kpool=self.dsa_index_kpool,
             physical_page_size=self.physical_page_size,
             index_page_size=index_page_size,
+            schedule_builder=(
+                self._build_paged_mqa_schedule_metadata if is_sail() else None
+            ),
             build_schedule_metadata=build_schedule_metadata,
         )
 
@@ -267,6 +295,9 @@ class DeepseekSparseAttnBackendKPoolMixin:
             num_draft_tokens=(1 if is_decode else self.speculative_num_draft_tokens),
             forward_mode=forward_mode,
             index_page_size=index_page_size,
+            schedule_builder=(
+                self._build_paged_mqa_schedule_metadata if is_sail() else None
+            ),
             effective_n_per_batch=effective_n_per_batch,
         )
 
@@ -288,6 +319,9 @@ class DeepseekSparseAttnBackendKPoolMixin:
             kpool=self.dsa_index_kpool,
             physical_page_size=self.physical_page_size,
             index_page_size=index_page_size,
+            schedule_builder=(
+                self._build_paged_mqa_schedule_metadata if is_sail() else None
+            ),
             build_schedule_metadata=build_schedule_metadata,
         )
 
@@ -311,4 +345,7 @@ class DeepseekSparseAttnBackendKPoolMixin:
             num_draft_tokens=self.speculative_num_draft_tokens if is_verify else 1,
             forward_mode=forward_mode,
             index_page_size=index_page_size,
+            schedule_builder=(
+                self._build_paged_mqa_schedule_metadata if is_sail() else None
+            ),
         )

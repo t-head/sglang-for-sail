@@ -16,6 +16,9 @@ from typing import Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa_nvtx import flashmla_kv_leaf_nvtx
+
 try:
     import flash_mla as _flashmla
     from flash_mla import FlashMLASchedMeta
@@ -31,6 +34,18 @@ _IMPORT_ERROR = ImportError(
 )
 
 
+# Add for nvtx profiling
+SGLANG_PROFILE_NVTX = envs.SGLANG_PROFILE_NVTX.get()
+SGLANG_PROFILE_NVTX_PRINT_SEQLEN = envs.SGLANG_PROFILE_NVTX_PRINT_SEQLEN.get()
+if SGLANG_PROFILE_NVTX:
+    try:
+        from torch.cuda.nvtx import range_pop as th_nvtx_range_pop
+        from torch.cuda.nvtx import range_push as th_nvtx_range_push
+    except ImportError as e:
+        SGLANG_PROFILE_NVTX = False
+        SGLANG_PROFILE_NVTX_PRINT_SEQLEN = False
+
+
 def get_mla_metadata(
     cache_seqlens: Optional[torch.Tensor] = None,
     num_q_tokens_per_head_k: Optional[int] = None,
@@ -38,12 +53,16 @@ def get_mla_metadata(
     num_heads_q: Optional[int] = None,
     is_fp8_kvcache: bool = False,
     topk: Optional[int] = None,
+    # Per-item kpool lengths for the scheduler metadata.
+    topk_length: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return MLA tile scheduler metadata for SAIL.
 
     Delegates to ``flash_mla.get_mla_metadata``.
 
-    Arguments mirror :func:`sglang.kernels.ops.attention.flash_mla_interface.get_mla_metadata`.
+    Arguments mirror the framework FlashMLA interface. The SAIL vendor build
+    returns a lazy scheduler object: actual per-query lengths reach the scheduler
+    through the first flash_mla_with_kvcache call (topk_length).
     """
     if _import_error is not None:
         raise _IMPORT_ERROR from _import_error
@@ -66,9 +85,11 @@ def get_mla_metadata(
         num_heads_q=num_heads_q,
         is_fp8_kvcache=is_fp8_kvcache,
         topk=topk,
+        topk_length=topk_length,
     )
 
 
+@flashmla_kv_leaf_nvtx
 def flash_mla_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -89,6 +110,9 @@ def flash_mla_with_kvcache(
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
     kv_format: Optional[str] = None,
+    *,
+    use_legacy: bool = True,
+    heads_per_group: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run FlashMLA decode attention on SAIL.
 
@@ -100,9 +124,16 @@ def flash_mla_with_kvcache(
     if _import_error is not None:
         raise _IMPORT_ERROR from _import_error
 
-    if kv_format not in (None, "V32"):
+    # The framework uses V32_NO_ROPE for zero-RoPE KV. The PPU library
+    # derives its supported layout from the tensors, not this framework hint.
+    if kv_format not in (None, "V32", "V32_NO_ROPE"):
         raise NotImplementedError(
             f"SAIL FlashMLA does not support explicit KV layout {kv_format!r}."
+        )
+
+    if heads_per_group:
+        raise NotImplementedError(
+            "SAIL FlashMLA does not support token packing (heads_per_group)."
         )
 
     if softmax_scale is None:
@@ -113,24 +144,51 @@ def flash_mla_with_kvcache(
             "FlashMLA dense FP8 with kvcache is not supported on SAIL."
         )
 
-    return _flashmla.flash_mla_with_kvcache(
-        q,
-        k_cache,
-        block_table,
-        cache_seqlens,
-        head_dim_v,
-        tile_scheduler_metadata,
-        num_splits,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        is_fp8_kvcache=is_fp8_kvcache,
-        indices=indices,
-        attn_sink=attn_sink,
-        extra_k_cache=extra_k_cache,
-        extra_indices_in_kvcache=extra_indices_in_kvcache,
-        topk_length=topk_length,
-        extra_topk_length=extra_topk_length,
-    )
+    nvtx_pushed = SGLANG_PROFILE_NVTX
+    if nvtx_pushed:
+        batch_size = len(cache_seqlens) if cache_seqlens is not None else q.shape[0]
+        if q.dim() == 4:
+            max_seqlen_q = q.shape[-3]
+        else:
+            max_seqlen_q = 1
+
+        if torch.cuda.is_current_stream_capturing():
+            nvtx_message = f"[FW_FMHA] --format=MLA,Forward,type:D,seqlen_q:{max_seqlen_q},head_dim:{q.shape[-1]},head_dim_v:{head_dim_v},num_heads_kv:{k_cache.shape[-2]},num_heads:{q.shape[-2]},batch_size:{batch_size},data_type:{q.dtype},causal:{causal}"
+        else:
+            if SGLANG_PROFILE_NVTX_PRINT_SEQLEN:
+                cu_seqlens_k_list = (
+                    cache_seqlens.flatten().cpu().tolist()
+                    if cache_seqlens is not None
+                    else "[]"
+                )
+                nvtx_message = f"[FW_FMHA] --format=MLA,Forward,type:P,seqlen_q:{max_seqlen_q},head_dim:{q.shape[-1]},head_dim_v:{head_dim_v},num_heads_kv:{k_cache.shape[-2]},num_heads:{q.shape[-2]},batch_size:{batch_size},data_type:{q.dtype},causal:{causal},num_blocks:{k_cache.shape[-4]},page_block_size:{k_cache.shape[-3]},cu_seqlens_k:{cu_seqlens_k_list}"
+            else:
+                nvtx_message = f"[FW_FMHA] --format=MLA,Forward,type:P,seqlen_q:{max_seqlen_q},head_dim:{q.shape[-1]},head_dim_v:{head_dim_v},num_heads_kv:{k_cache.shape[-2]},num_heads:{q.shape[-2]},batch_size:{batch_size},data_type:{q.dtype},causal:{causal}"
+        th_nvtx_range_push(nvtx_message)
+
+    try:
+        out, softmax_lse = _flashmla.flash_mla_with_kvcache(
+            q,
+            k_cache,
+            block_table,
+            cache_seqlens,
+            head_dim_v,
+            tile_scheduler_metadata,
+            num_splits,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            is_fp8_kvcache=is_fp8_kvcache,
+            indices=indices,
+            attn_sink=attn_sink,
+            extra_k_cache=extra_k_cache,
+            extra_indices_in_kvcache=extra_indices_in_kvcache,
+            topk_length=topk_length,
+            extra_topk_length=extra_topk_length,
+        )
+    finally:
+        if nvtx_pushed:
+            th_nvtx_range_pop()
+    return out, softmax_lse
 
 
 def flash_mla_sparse_fwd(
@@ -141,6 +199,8 @@ def flash_mla_sparse_fwd(
     d_v: int = 512,
     attn_sink: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
+    *,
+    use_legacy: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sparse prefill attention on SAIL.
 
@@ -157,4 +217,98 @@ def flash_mla_sparse_fwd(
         d_v=d_v,
         attn_sink=attn_sink,
         topk_length=topk_length,
+    )
+
+
+# PPU emits one FP32 scale per token / WV group, not packed per-32 UE8M0.
+_SAIL_MEGA_FIXED_PARAMS = dict(
+    is_rope_neox_style=False,
+    rope_dim=64,
+    num_per_channels=4096,
+    use_tma_aligned_col_major_sf=False,
+    round_sf=False,
+    use_packed_ue8m0=False,
+)
+
+
+def _load_mega():
+    try:
+        from flash_mla import fused_norm_rope_attn_rope_cast
+    except ImportError as error:
+        raise ImportError(
+            "SAIL FlashMLA MegaAttention requires a wheel providing "
+            "fused_norm_rope_attn_rope_cast."
+        ) from error
+    return fused_norm_rope_attn_rope_cast
+
+
+def flash_mla_mega_prefill(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    softmax_scale: float,
+    *,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    enable_q_norm: bool = False,
+    rms_norm_eps: float = 0.0,
+    use_legacy: bool = True,
+) -> Tuple[torch.Tensor, ...]:
+    """MegaAttention prefill over a bf16 ``kv``: (out_fp8, out_sf, max_logits, lse)."""
+    _mega = _load_mega()
+    # The SAIL wheel has one interleaved-cache kernel set, no use_legacy kwarg.
+    return _mega.prefill(
+        token_positions=positions,
+        cos_sin_cache=cos_sin_cache,
+        n_wv_group=q.shape[1] // 8,
+        q=q,
+        kv=kv,
+        indices=indices,
+        sm_scale=softmax_scale,
+        attn_sink=attn_sink,
+        topk_length=topk_length,
+        enable_q_norm=enable_q_norm,
+        rms_norm_eps=rms_norm_eps,
+        **_SAIL_MEGA_FIXED_PARAMS,
+    )
+
+
+def flash_mla_mega_decode(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    softmax_scale: float,
+    *,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    extra_kv: Optional[torch.Tensor] = None,
+    extra_indices: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
+    enable_q_norm: bool = False,
+    rms_norm_eps: float = 0.0,
+    use_legacy: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """MegaAttention decode over a paged cache: (out_fp8, out_sf, lse)."""
+    _mega = _load_mega()
+    # The SAIL wheel has one interleaved-cache kernel set, no use_legacy kwarg.
+    return _mega.decode(
+        token_positions=positions,
+        cos_sin_cache=cos_sin_cache,
+        n_wv_group=q.shape[1] // 8,
+        q=q,
+        k_cache=kv,
+        indices_in_kvcache=indices,
+        sm_scale=softmax_scale,
+        attn_sink=attn_sink,
+        topk_length=topk_length,
+        extra_k_cache=extra_kv,
+        extra_indices_in_kvcache=extra_indices,
+        extra_topk_length=extra_topk_length,
+        enable_q_norm=enable_q_norm,
+        rms_norm_eps=rms_norm_eps,
+        **_SAIL_MEGA_FIXED_PARAMS,
     )

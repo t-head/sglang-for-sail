@@ -31,6 +31,8 @@ from compressed_tensors.quantization import (
 )
 from pydantic import BaseModel
 
+from sglang.srt.environ import envs
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe import MoeRunnerConfig, get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -53,9 +55,11 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Fp8MoE,
     CompressedTensorsW8A8Int8,
+    CompressedTensorsW8A8Int8MoE,
     CompressedTensorsW8A8MXFp8,
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
+    CompressedTensorsWNA16DeepGemmMoE,
     CompressedTensorsWNA16MoE,
     CompressedTensorsWNA16TritonMoE,
     NPUCompressedTensorsW4A8Int8DynamicMoE,
@@ -72,20 +76,21 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
     should_ignore_layer,
 )
 from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
-from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_sail, is_xpu
+from sglang.srt.utils.log_utils import print_info_once
 
 _is_cpu = is_cpu()
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
+_is_sail = is_sail()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -144,6 +149,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         config: Optional[Dict[str, Any]] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         linear_fp8_config: Optional[Any] = None,
+        linear_quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
         self.ignore = ignore
@@ -156,6 +162,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.config = config
         self.packed_modules_mapping = packed_modules_mapping or {}
         self.linear_fp8_config = linear_fp8_config
+        self.linear_quant_config = linear_quant_config or linear_fp8_config
 
     @property
     def kv_cache_quant_algo(self) -> Optional[str]:
@@ -247,10 +254,9 @@ class CompressedTensorsConfig(QuantizationConfig):
         from sglang.srt.layers.linear import LinearBase
 
         if isinstance(layer, LinearBase):
-            # If linear_fp8_config is set, use FP8 for linear layers
-            # This allows mixed quantization: experts with int4, linear layers with fp8
-            if self.linear_fp8_config is not None:
-                return Fp8LinearMethod(self.linear_fp8_config)
+            # Dense layers can use a separate scheme from the routed experts.
+            if self.linear_quant_config is not None:
+                return self.linear_quant_config.get_quant_method(layer, prefix)
             scheme = self.get_linear_scheme(layer=layer, layer_name=prefix)
             if scheme is None:
                 return UnquantizedLinearMethod()
@@ -370,6 +376,20 @@ class CompressedTensorsConfig(QuantizationConfig):
                 weight_block_size=fp8_cfg.get("weight_block_size"),
             )
 
+        linear_quant_config = None
+        if "linear_quant_config" in config:
+            if linear_fp8_config is not None:
+                raise ValueError("Specify only one dense linear quantization config")
+            linear_cfg = config["linear_quant_config"]
+            if linear_cfg.get("quant_method") != "mxfp4_online":
+                raise ValueError("linear_quant_config currently supports mxfp4_online")
+            from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
+
+            linear_quant_config = Mxfp4Config(
+                ignored_layers=linear_cfg.get("ignored_layers"),
+                enable_online_linear=True,
+            )
+
         return cls(
             target_scheme_map=target_scheme_map,
             ignore=ignore,
@@ -380,6 +400,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             config=config,
             packed_modules_mapping=packed_modules_mapping,
             linear_fp8_config=linear_fp8_config,
+            linear_quant_config=linear_quant_config,
         )
 
     @classmethod
@@ -1094,6 +1115,21 @@ class CompressedTensorsConfig(QuantizationConfig):
                         return CompressedTensorsWNA16TritonMoE(
                             self, weight_quant=weight_quant
                         )
+                    if (
+                        _is_sail
+                        and envs.SGLANG_SAIL_DEEPGEMM_MOE.get()
+                        and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                        and weight_quant.type == QuantizationType.INT
+                        and weight_quant.num_bits == 4
+                        and weight_quant.group_size == 32
+                    ):
+                        logger.info_once(
+                            "Using CompressedTensorsWNA16DeepGemmMoE "
+                            "(moe_runner_backend=deep_gemm)"
+                        )
+                        return CompressedTensorsWNA16DeepGemmMoE(
+                            self, weight_quant=weight_quant
+                        )
                     logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")
                     return CompressedTensorsWNA16MoE(self, weight_quant=weight_quant)
             else:
@@ -1139,9 +1175,15 @@ class CompressedTensorsConfig(QuantizationConfig):
             if _is_npu:
                 logger.info_once("Using NPUCompressedTensorsW8A8Int8DynamicMoE")
                 return NPUCompressedTensorsW8A8Int8DynamicMoE(weight_quant, input_quant)
+            # PPU uses the generic Triton/DeepGEMM W8A8 INT8 MoE scheme
+            # (validated on GLM-5.3-Flash INT8 W8A8 workloads).
+            elif _is_sail:
+                print_info_once("Using CompressedTensorsW8A8Int8MoE (PPU)")
+                return CompressedTensorsW8A8Int8MoE(weight_quant, input_quant)
             else:
                 raise NotImplementedError(
-                    "The W8A8Int8 Fused MoE scheme is implemented only for NPU for now."
+                    "The W8A8Int8 Fused MoE scheme is implemented only for "
+                    "NPU and PPU for now."
                 )
         elif self._is_wint4afp8(weight_quant, input_quant):
             # On NPU prefer the dedicated NPU W4A8Int8 path when activations are INT8.

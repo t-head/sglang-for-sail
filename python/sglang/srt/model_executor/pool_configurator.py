@@ -11,11 +11,11 @@ from __future__ import annotations
 import logging
 from bisect import bisect_right
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.model_overrides.deepseek_v4 import (
     DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO,
 )
@@ -448,7 +448,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         effective_num_layers = (
             num_layers
-            if kvc.server_args.enable_hisparse
+            if get_memory().enable_hisparse
             else get_glm_dsa_layer_split_effective_num_layers(kvc, num_layers)
         )
 
@@ -542,16 +542,21 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             )
             num_indexer_kv = num_sparse - num_indexer_k_only
 
-            kv_heads = model_config.get_num_kv_heads(get_parallel().attn_tp_size)
+            kv_heads = model_config.get_num_kv_heads(tp_size, dcp_size)
             head_dim = model_config.head_dim
             indexer_head_dim = sparse_cfg["sparse_index_dim"]
             indexer_dtype_size = torch._utils._element_size(
                 get_minimax_sparse_index_dtype(
                     fp8_attn_gemm=m3_fp8_attn_gemm_enabled(
-                        resolving_view(kvc.server_args)
+                        SimpleNamespace(
+                            kv_cache_dtype=kvc.kv_cache_dtype_str,
+                            attention_backend=get_exec().kernel.attention_backend,
+                        )
                     ),
                     kv_cache_dtype=kvc.kv_cache_dtype,
                     model_dtype=kvc.model_dtype,
+                    model_config=model_config,
+                    page_size=kvc.pool_page_size,
                 )
             )
 
@@ -698,8 +703,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         indexer_size_per_token = ceil_div(
             DSATokenToKVPool.index_bytes_per_token_for(
                 index_head_dim,
-                get_exec().kernel.enable_fp4_indexer
-                or get_exec().kernel.enable_dsa_fp4_indexer,
+                DSATokenToKVPool.use_fp4_indexer_for_current_platform(
+                    get_dsa_index_kpool(kvc.model_config.hf_config)
+                ),
+                DSATokenToKVPool.use_bf16_indexer,
             ),
             get_dsa_index_kpool(kvc.model_config.hf_config),
         )
@@ -845,7 +852,11 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
                 index_elements = ceil_div(
                     DSATokenToKVPool.index_bytes_per_token_for(
-                        index_head_dim, get_exec().kernel.enable_fp4_indexer
+                        index_head_dim,
+                        DSATokenToKVPool.use_fp4_indexer_for_current_platform(
+                            get_dsa_index_kpool(model_config.hf_config)
+                        ),
+                        DSATokenToKVPool.use_bf16_indexer,
                     ),
                     get_dsa_index_kpool(model_config.hf_config),
                 )
@@ -1335,10 +1346,13 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         }
 
         self.num_layers_total = len(self.stage_compress_ratios)
-        # The low-ratio indexer pools are built with force_fp4=True
-        # (deepseek_v4_memory_pool), so they are fp4 whatever dtype c4 uses.
+        from sglang.srt.layers.attention.dsv4.indexer_quant import (
+            use_dsv41_int8_indexer,
+        )
+
+        # Match the low-ratio pool format independently of C4.
         self.low_ratio_index_bytes = get_dsv4_indexer_bytes_per_token(
-            self.indexer_head_dim, use_fp4_indexer=True
+            self.indexer_head_dim, use_fp4_indexer=not use_dsv41_int8_indexer()
         )
 
         # kvc.sliding_window_size is None on a runner without SWA layers.

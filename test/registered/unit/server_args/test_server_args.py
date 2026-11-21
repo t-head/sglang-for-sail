@@ -669,6 +669,7 @@ class TestPrepareServerArgs(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "overlap"):
                 args.resolve_once()
 
+    @override_platform(is_sail=False)
     def test_megamoe_requires_sm90_or_sm100(self):
         # is_hip is pinned as well: override_platform only replaces the facts it is
         # given, so on a ROCm host these would otherwise describe a machine that is
@@ -689,6 +690,35 @@ class TestPrepareServerArgs(CustomTestCase):
             is_cuda=True, is_sm90=False, is_sm100=True, is_hip=False
         ):
             ServerArgs(model_path="dummy", moe_a2a_backend="megamoe").resolve_once()
+
+    @patch("sglang.srt.arg_groups.mega_moe_hook._require_ppu_mega_moe_deep_gemm_apis")
+    def test_megamoe_requires_ppu_sm89_or_newer(self, require_apis):
+        from sglang.srt.arg_groups.model_override_base import resolved_view
+
+        for sm in (89, 90):
+            with override_platform(
+                is_cuda=False,
+                is_sm90=False,
+                is_sm100=False,
+                is_hip=False,
+                is_sail=True,
+                device_sm=sm,
+            ):
+                args = ServerArgs(model_path="dummy", moe_a2a_backend="megamoe")
+                args.resolve_once()
+                self.assertEqual(resolved_view(args).moe_a2a_backend, "megamoe")
+
+        with override_platform(
+            is_cuda=False,
+            is_sm90=False,
+            is_sm100=False,
+            is_hip=False,
+            is_sail=True,
+            device_sm=88,
+        ):
+            args = ServerArgs(model_path="dummy", moe_a2a_backend="megamoe")
+            with self.assertRaisesRegex(ValueError, "SM89"):
+                args.resolve_once()
 
     def test_megamoe_token_budget_must_cover_chunked_prefill(self):
         from sglang.srt.arg_groups.mega_moe_hook import validate_mega_moe_token_budget
@@ -753,6 +783,8 @@ class TestPrepareServerArgs(CustomTestCase):
             "MellumForCausalLM",
             "Qwen3MoeForCausalLM",
             "DeepseekV4ForCausalLM",
+            "GlmMoeDsaForCausalLM",
+            "Glm5NextForConditionalGeneration",
         ):
             self.assertTrue(mega_moe_needs_token_budget(arch, {}, None), arch)
         # MXFP4 DeepSeek-family models keep their runtime fallback.

@@ -1,5 +1,5 @@
 """The full top-k of the ratio-1/2 index layers outside the candidate scheme:
-DeepGEMM prefill on SM90 and SM100+, DeepGEMM decode on SM100+, torch elsewhere."""
+DeepGEMM prefill on SAIL, SM90 and SM100+, decode on SAIL and SM100+."""
 
 from __future__ import annotations
 
@@ -15,10 +15,11 @@ from sglang.kernels.ops.attention.dsa.litetopk_prefill import fp4_indexer_topk
 from sglang.kernels.ops.attention.dsv4.index_logits import (
     deep_gemm_fp4_paged_mqa_logits,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_from_metadata
 
 from .scoring import (
-    decode_scores,
+    decode_score_chunks,
     dense_prefill_topk,
     get_deep_gemm_decode_data,
     get_deep_gemm_prefill_data,
@@ -104,9 +105,17 @@ class FullTopKIndexer:
             inputs.layer_id, data.k_slots
         )
         if shard is None:
-            dense_prefill_topk(data, kv, out=out)
+            dense_prefill_topk(
+                data, kv, out=out, two_level=envs.SGLANG_OPT_DSV41_TOPK_CANDIDATES.get()
+            )
         else:
-            sharded_dense_prefill_topk(data, kv, out=out, shard=shard)
+            sharded_dense_prefill_topk(
+                data,
+                kv,
+                out=out,
+                shard=shard,
+                two_level=envs.SGLANG_OPT_DSV41_TOPK_CANDIDATES.get(),
+            )
         data.write_page_indices(inputs)
 
     def _prefill_lite_topk(
@@ -174,6 +183,7 @@ class FullTopKIndexer:
                         topk_plans[chunk_idx] if topk_plans is not None else None
                     ),
                 )
+                del logits  # release this chunk's logits before the next is scored
             return
         q, lens, table, indices = data.paged_logits_args(metadata)
         logits = deep_gemm_fp4_paged_mqa_logits(
@@ -192,24 +202,25 @@ class FullTopKIndexer:
         )
 
     def _torch_decode(self, inputs: DecodeInputs) -> None:
-        d = decode_scores(
+        for d in decode_score_chunks(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
             compute_topk_plan=not self.use_deep_select_decode,
-        )
-        if d is None:
-            return
-        if self.use_deep_select_decode:
-            metadata = inputs.paged_metadata
-            topk_page_transform(
-                d.scores,
-                inputs.indexer.index_topk,
-                page_table=metadata.page_table[: d.bs],
-                page_size=metadata.compressed_page_size,
-                end=d.lens.to(torch.int32),
-                sorted_index=False,
-                output_idx=inputs.out_page_indices[: d.bs],
-            )
-            return
-        select_decode(inputs, d, inputs.indexer.index_topk)
+        ):
+            if self.use_deep_select_decode:
+                metadata = inputs.paged_metadata
+                row_start = getattr(d, "row_start", 0)
+                rows = slice(row_start, row_start + d.bs)
+                topk_page_transform(
+                    d.scores,
+                    inputs.indexer.index_topk,
+                    page_table=metadata.page_table[rows],
+                    page_size=metadata.compressed_page_size,
+                    end=d.lens.to(torch.int32),
+                    sorted_index=False,
+                    output_idx=inputs.out_page_indices[rows],
+                )
+            else:
+                select_decode(inputs, d, inputs.indexer.index_topk)
+            del d  # release this chunk's logits before the next chunk is scored

@@ -78,6 +78,8 @@ class KVArgs:
     aux_data_lens: List[int]
     aux_item_lens: List[int]
     state_types: List[StateType]
+    # Recurrent state partitions the CP group rather than attention TP.
+    mamba_state_shard_on_attn_cp: bool = False
     # The sub-pool each state entry carries, parallel to state_types: entries
     # of one state type (every window travels as SWA) are told apart by it.
     state_sub_pools: List[Optional[str]]

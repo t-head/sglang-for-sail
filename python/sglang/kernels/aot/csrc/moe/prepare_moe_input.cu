@@ -5,7 +5,6 @@
 #include <flashinfer/vec_dtypes.cuh>
 #include <iostream>
 
-#include "cutlass/array.h"
 #include "utils.h"
 
 constexpr uint64_t THREADS_PER_EXPERT = 512;
@@ -180,7 +179,10 @@ __global__ void shuffleRowsKernel(
   if (blockIdx.x < num_dst_rows) {
     // Load 128-bits per thread
     constexpr uint64_t ELEM_PER_THREAD = 128 / sizeof(T) / 8;
-    using DataElem = cutlass::Array<T, ELEM_PER_THREAD>;
+    struct DataElem {
+      T data[ELEM_PER_THREAD];
+    };
+    static_assert(sizeof(DataElem) == 16);
 
     // Duplicate and permute rows
     auto const* source_row_ptr = reinterpret_cast<DataElem const*>(input + source_row_idx * num_cols);

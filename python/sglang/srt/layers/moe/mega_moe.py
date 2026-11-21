@@ -36,7 +36,7 @@ from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
-from sglang.srt.utils import is_hip, is_sm100_supported
+from sglang.srt.utils import is_hip, is_sail, is_sm100_supported
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -49,6 +49,7 @@ logger = logging.getLogger(__name__)
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 _is_hip = is_hip()
+_is_sail = is_sail()
 
 
 def _use_amd_flydsl_mega_moe() -> bool:
@@ -56,9 +57,22 @@ def _use_amd_flydsl_mega_moe() -> bool:
     return _is_hip and get_moe_a2a_backend().is_megamoe()
 
 
+def _ppu_mega_moe_mma_type(mma_type: str) -> str:
+    """Translate per-layer precision labels to the PPU DeepGEMM API."""
+    return {
+        "mxf4xmxf4": "fp4xfp4",
+        "fp8xmxfp4": "fp8xfp4",
+        "bf16xmxfp4": "bf16xfp4",
+    }.get(mma_type, mma_type)
+
+
 def _mega_moe_mma_type(experts) -> str:
     if experts._mega_moe_nvfp4:
         return "nvfp4xnvfp4"
+    if _is_sail and experts is not None:
+        mma_type = getattr(experts, "_mega_moe_mma_type", None)
+        if mma_type is not None:
+            return mma_type
     # Per layer: a draft may differ from the target (draft_model_build_scope).
     if experts._mega_moe_w4a4:
         return "mxf4xmxf4"
@@ -69,7 +83,7 @@ def _mega_moe_mma_type(experts) -> str:
 
 @functools.lru_cache(maxsize=1)
 def _mega_moe_max_num_sms() -> Optional[int]:
-    if _device_sm < 100:
+    if not _is_sail and _device_sm < 100:
         # The SM90 MegaMoE implementation does not use the whole-grid clustered
         # launch that needs a residency margin.
         return None
@@ -92,7 +106,8 @@ def _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
     # Stay under an outer context's budget instead of claiming SMs back from it.
     target_num_sms = min(max_num_sms, current_num_sms)
     # Round down: the clustered launch needs an even CTA count.
-    target_num_sms -= target_num_sms % 2
+    if not (_is_sail and _device_sm == 89):
+        target_num_sms -= target_num_sms % 2
     if target_num_sms == current_num_sms:
         yield
         return
@@ -138,6 +153,9 @@ def _get_mega_moe_symm_buffer(
     activation: str = "swiglu",
 ) -> SymmBuffer:
     import deep_gemm
+
+    if _is_sail:
+        mma_type = _ppu_mega_moe_mma_type(mma_type)
 
     with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
         key = (
@@ -201,10 +219,41 @@ def _destroy_mega_moe_localizer() -> None:
 def is_mega_moe_experts_ready(experts) -> bool:
     if not experts._mega_moe_weights_built:
         return False
+    if _is_sail:
+        return _device_sm >= 89 and _mega_moe_mma_type(experts) == "mxf4xmxf4"
     if _device_sm == 90:
         return is_sm90_fp8_mega_moe_available(experts)
     # The SM100 mega kernels exist for compute capability 10.x only.
     return _device_sm // 10 == 10
+
+
+_MEGA_HIT_LOGGER = logging.getLogger("mega_moe")
+
+
+# One-shot feature marker: the first batch the MegaMoE gate admits is the startup
+# warmup batch, so a single line proves the accelerated path is actually live.
+def _mega_moe_hit_state():
+    from sglang.srt.runtime_context import get_buffer
+
+    return get_buffer("mega_moe.hit_marker", lambda: {"logged": False})
+
+
+def _log_mega_moe_hit(moe) -> None:
+    # Only the summary of what is already on the object is reported (no extra
+    # lookups), and after the first hit the cost is a module-flag read.
+    state = _mega_moe_hit_state()
+    if state["logged"]:
+        return
+    state["logged"] = True
+    experts = moe.experts
+    _MEGA_HIT_LOGGER.warning(
+        "MEGA_MOE_HIT MegaMoE path is live (one-shot marker, per rank): "
+        "first_hit_layer=%s experts=%s mma=%s n_shared_experts=%s",
+        getattr(moe, "prefix", "?"),
+        getattr(experts, "num_experts", "?"),
+        _mega_moe_mma_type(experts),
+        getattr(moe, "n_shared_experts", "?"),
+    )
 
 
 def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool:
@@ -229,6 +278,7 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
         max_tokens_per_rank = hidden_states.shape[0]
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
     if max_tokens_per_rank <= cap:
+        _log_mega_moe_hit(moe)
         return True
     assert not getattr(moe.experts, "_mega_moe_weights_localized", False), (
         f"mega MoE: {max_tokens_per_rank} tokens per rank exceed "
@@ -572,17 +622,18 @@ def run_mega_routed_experts(
             activation=activation,
         )
 
+    topk_ids_dtype = torch.int64 if _is_sail else torch.int32
     if routing_in_buffer:
         assert num_tokens > 0 and _device_sm != 90 and mma_type == "fp8xfp4"
         topk_ids_in = topk_weights_in = None
     elif num_tokens > 0:
-        topk_ids_in = topk_ids.to(torch.int32)
+        topk_ids_in = topk_ids.to(topk_ids_dtype)
         topk_weights_in = topk_weights.to(torch.float32)
     else:
-        topk_ids_in = hidden_states.new_empty((0, top_k), dtype=torch.int32)
+        topk_ids_in = hidden_states.new_empty((0, top_k), dtype=topk_ids_dtype)
         topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
 
-    if _device_sm == 90:
+    if _device_sm == 90 and not _is_sail:
         return run_sm90_mega_routed(
             experts,
             hidden_states,
@@ -597,7 +648,7 @@ def run_mega_routed_experts(
 
     # Both FP8 types go through the JIT pre-dispatch below, which folds the scale
     # in-kernel; scaling here as well would apply it twice.
-    jit_pre_dispatch = mma_type in ("fp8xfp4", "fp8xfp8")
+    jit_pre_dispatch = not _is_sail and mma_type in ("fp8xfp4", "fp8xfp8")
     if routed_scaling_factor != 1.0:
         assert not routing_in_buffer
         if not jit_pre_dispatch:
@@ -605,7 +656,22 @@ def run_mega_routed_experts(
 
     global_num_tokens = _mega_moe_global_tokens_hint(buf)
     mega_kwargs = {"recipe": (1, 1, 32)}
-    if mma_type == "nvfp4xnvfp4":
+    if _is_sail:
+        deep_gemm.mega_moe_pre_dispatch(
+            hidden_states.contiguous(),
+            topk_ids_in.contiguous(),
+            topk_weights_in.contiguous(),
+            buf.x,
+            buf.x_sf,
+            buf.topk_idx,
+            buf.topk_weights,
+            num_tokens=num_tokens,
+            group_size=32,
+            mma_type=_ppu_mega_moe_mma_type(mma_type),
+        )
+        if mma_type != "mxf4xmxf4":
+            mega_kwargs = {}
+    elif mma_type == "nvfp4xnvfp4":
         # Per-token outer scales go to buf.x_scales; the kernel folds them with
         # the per-expert alphas in the L1 / L2 epilogues.
         deep_gemm.mega_moe_pre_dispatch(
@@ -644,7 +710,7 @@ def run_mega_routed_experts(
             buf.topk_weights,
             num_tokens=num_tokens,
             group_size=32,
-            mma_type=mma_type,
+            mma_type=_ppu_mega_moe_mma_type(mma_type) if _is_sail else mma_type,
         )
     else:
         shared_block_m = 0
@@ -681,7 +747,7 @@ def run_mega_routed_experts(
                 topk_weight_scale=routed_scaling_factor,
             )
 
-    if global_num_tokens is not None:
+    if global_num_tokens is not None and not _is_sail:
         mega_kwargs["global_num_tokens"] = global_num_tokens
     if eplb_load_row is not None:
         mega_kwargs["cumulative_local_expert_recv_stats"] = eplb_load_row
@@ -689,22 +755,35 @@ def run_mega_routed_experts(
     # Allocate at least one row so y has a non-null CUDA data_ptr;
     # the DeepGEMM tvm-ffi binding rejects nullptr in convert_to_torch_tensor().
     y = torch.empty(
-        (max(num_tokens, 1), hidden_size),
+        (num_tokens if _is_sail else max(num_tokens, 1), hidden_size),
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
+    kernel_kwargs = {
+        "activation": activation,
+        "activation_clamp": activation_clamp,
+        "fast_math": True,
+        **mega_kwargs,
+    }
+    if not _is_sail:
+        # PPU's fp4_fp4_mega_moe takes the shared experts outside the kernel.
+        kernel_kwargs["shared_l1_weights"] = shared_l1_weights
+        kernel_kwargs["shared_l2_weights"] = shared_l2_weights
     with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
-        deep_gemm.fp8_fp4_mega_moe(
+        if _is_sail:
+            mega_moe_kernel = {
+                "mxf4xmxf4": deep_gemm.fp4_fp4_mega_moe,
+                "fp8xmxfp4": deep_gemm.fp8_fp4_mega_moe,
+                "bf16xmxfp4": deep_gemm.bf16_fp4_mega_moe,
+            }[mma_type]
+        else:
+            mega_moe_kernel = deep_gemm.fp8_fp4_mega_moe
+        mega_moe_kernel(
             y,
             experts.mega_l1_weights,
             experts.mega_l2_weights,
             buf,
-            shared_l1_weights=shared_l1_weights,
-            shared_l2_weights=shared_l2_weights,
-            activation=activation,
-            activation_clamp=activation_clamp,
-            fast_math=True,
-            **mega_kwargs,
+            **kernel_kwargs,
         )
     return y[:num_tokens]
 

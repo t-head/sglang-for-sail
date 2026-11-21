@@ -5,6 +5,7 @@ import logging
 import math
 from dataclasses import dataclass, field
 from functools import partial
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import msgspec
@@ -2549,7 +2550,9 @@ class KVCacheConfigurator:
             max_running_requests=max_running_requests,
             kv_scale_ue8m0=is_kimi_k31(self.model_config.hf_config),
             fp8_cast_on_write=is_kimi_k31(self.model_config.hf_config),
-            use_fp4_indexer=get_exec().kernel.enable_fp4_indexer,
+            use_fp4_indexer=DSATokenToKVPool.use_fp4_indexer_for_current_platform(
+                get_dsa_index_kpool(self.model_config.hf_config)
+            ),
             **pool_kwargs,
         )
         return token_to_kv_pool
@@ -2740,10 +2743,15 @@ class KVCacheConfigurator:
             dtype=self.kv_cache_dtype,
             index_dtype=get_minimax_sparse_index_dtype(
                 fp8_attn_gemm=m3_fp8_attn_gemm_enabled(
-                    resolving_view(self.server_args)
+                    SimpleNamespace(
+                        kv_cache_dtype=self.kv_cache_dtype_str,
+                        attention_backend=get_exec().kernel.attention_backend,
+                    )
                 ),
                 kv_cache_dtype=self.kv_cache_dtype,
                 model_dtype=self.model_dtype,
+                model_config=self.model_config,
+                page_size=self.pool_page_size,
             ),
             head_num=self.model_config.get_num_kv_heads(
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
@@ -3070,7 +3078,10 @@ class KVCacheConfigurator:
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator],
     ) -> BaseTokenToKVPoolAllocator:
         # Initialize token_to_kv_pool_allocator
-        need_sort = get_disagg().disaggregation_mode in ("decode", "prefill")
+        need_sort = (
+            get_disagg().disaggregation_mode in ("decode", "prefill")
+            or envs.SGLANG_SORT_PAGE.get()
+        )
         if token_to_kv_pool_allocator is None:
             if _is_npu and (
                 get_exec().kernel.attention_backend == "ascend"
@@ -3400,16 +3411,13 @@ class KVCacheConfigurator:
         if get_memory().enable_unified_memory and self._unified_sized is not None:
             return min(self._unified_sized.max_running_requests, token_capacity // 2)
         # Estimate pool size (used as upper bound when user specifies max_running_requests)
-        estimated = int(token_capacity / self.model_config.context_len * 512)
-        estimated = max(min(estimated, 4096), 2048)
-
-        max_num_reqs = get_schedule().max_running_requests
-        if max_num_reqs is not None:
-            requested_per_worker = max(1, max_num_reqs // self.attn_dp_size)
-            max_num_reqs = min(requested_per_worker, token_capacity // 2)
-        else:
-            requested_per_worker = None
-            max_num_reqs = min(estimated, token_capacity // 2)
+        requested_per_worker, max_num_reqs = estimate_max_running_requests(
+            token_capacity=token_capacity,
+            context_len=self.model_config.context_len,
+            server_args=_resolved_req_to_token_sizing(),
+            attn_dp_size=self.attn_dp_size,
+            mamba_req_cap=None,
+        )
 
         capped_by_mamba = False
         if self.mambaish_config is not None:
@@ -3451,6 +3459,48 @@ class KVCacheConfigurator:
             )
         return max_num_reqs
 
+    def _estimate_req_to_token_pool_bytes(self, available_bytes: int) -> int:
+        """Bytes to carve out of the KV budget for the req_to_token map.
+
+        _init_pools allocates the req_to_token pool *before* the KV pools, out
+        of the same free memory the budget is measured against, but its size
+        (num_req_slots x max_context_len x int32) is not part of any per-token
+        cell_size. For long-context models this is gigabytes (e.g. a 1M-context
+        model hits the 2048-request floor and costs ~8 GiB), so KV pools sized
+        to the full budget OOM in the tail sub-pool.
+
+        One-iteration fixed point: a provisional token capacity T0 is an upper
+        bound (the budget only shrinks after the deduction), the request
+        estimate is monotone in token capacity and clamped to [2048, 4096], so
+        deducting for the T0 estimate and re-sizing yields T1 <= T0 whose own
+        request estimate never exceeds the deducted one -- a single pass never
+        under-deducts.
+        """
+        from sglang.srt.model_executor.pool_configurator import (
+            create_memory_pool_configurator,
+        )
+
+        mamba_req_cap = None
+        if self.mambaish_config is not None:
+            mamba_req_cap = (
+                get_schedule().max_mamba_cache_size // self._calculate_mamba_ratio()
+            )
+
+        configurator = create_memory_pool_configurator(self)
+        provisional = configurator.calculate_pool_sizes(
+            available_bytes, get_schedule().page_size
+        )
+        provisional_tokens = self._apply_token_constraints(
+            provisional.max_total_num_tokens
+        )
+        return estimate_req_to_token_pool_bytes(
+            token_capacity=provisional_tokens,
+            context_len=self.model_config.context_len,
+            server_args=_resolved_req_to_token_sizing(),
+            attn_dp_size=self.attn_dp_size,
+            mamba_req_cap=mamba_req_cap,
+        )
+
     def _resolve_memory_pool_config(
         self, pre_model_load_memory: int
     ) -> MemoryPoolConfig:
@@ -3460,10 +3510,22 @@ class KVCacheConfigurator:
         )
 
         available_bytes = self._profile_available_bytes(pre_model_load_memory)
-        config = self.config_from_budget(available_bytes)
         if get_memory().enable_unified_memory and not self.is_draft_worker:
+            # size_plan already includes the request table in its fixed terms.
+            config = self.config_from_budget(available_bytes)
             config.mem_fraction_static = get_schedule().mem_fraction_static
             return config
+        req_pool_bytes = (
+            0
+            if self.req_to_token_pool is not None
+            else self._estimate_req_to_token_pool_bytes(available_bytes)
+        )
+        if req_pool_bytes > 0:
+            logger.info(
+                f"Reserving {req_pool_bytes / (1 << 30):.2f} GB of the KV cache "
+                "budget for the req_to_token pool."
+            )
+        config = self.config_from_budget(max(available_bytes - req_pool_bytes, 0))
         config.max_running_requests = self.resolve_max_num_reqs(
             config.max_total_num_tokens
         )
@@ -3683,6 +3745,49 @@ class KVCacheConfigurator:
         stage_per_req = int(per_req * pp_layer_scale)
 
         has_spec_dec = not self.spec_algorithm.is_none()
+
+        # PD decode sizing must mirror what the decode pool actually allocates:
+        # HybridMambaDecodeReqToTokenPool raises the effective mamba pool to
+        # max(mamba_size, (size + pre_alloc_size) * slots_per_req) and builds
+        # the spec intermediate states for (size + pre_alloc_size + 1) slots
+        # (see sglang/srt/disaggregation/decode.py); under spec decoding the
+        # pool also folds the nextn draft layers into mamba_layer_ids (see
+        # _get_mamba_layer_ids_for_req_pool), which mamba_cache_per_req does
+        # not cover. Without charging both here, the profiled KV budget is
+        # overstated and the decode server OOMs while building the pools.
+        decode_pre_alloc_size = 0
+        decode_slots_per_req = 1
+        # Mirror _build_req_to_token_pool's gate: a role-switch launch builds
+        # HybridMambaDecodeReqToTokenPool on the prefill server too, so it must
+        # carry the same decode-side deductions. Unified memory builds
+        # UnifiedHybridReqToTokenPool instead, which charges pre_alloc once
+        # (size + pre_alloc) inside the unified byte buffer and sizes the spec
+        # intermediates by max_num_reqs; the slot raise mirrored here does not
+        # happen, so unified launches keep the pre-fix budget formulas.
+        disagg = get_disagg()
+        is_pd_decode = (
+            disagg.disaggregation_mode == "decode" or disagg.enable_pd_role_switch
+        ) and not get_memory().enable_unified_memory
+        if is_pd_decode:
+            decode_pre_alloc_size = disagg.disaggregation_decode_extra_slots or 0
+            ping_pong = 2 if not get_schedule().disable_overlap_schedule else 1
+            decode_slots_per_req = 1 + (
+                ping_pong if get_exec().mamba.enable_mamba_extra_buffer else 0
+            )
+        decode_stage_per_req = stage_per_req
+        decode_nextn_layers = 0
+        if is_pd_decode and has_spec_dec and all_mamba_layers:
+            decode_nextn_layers = len(getattr(config, "nextn_layer_ids", None) or [])
+            if decode_nextn_layers:
+                # _get_mamba_layer_ids_for_req_pool appends the full nextn layer
+                # list to every pipeline stage, so scale the per-stage layer
+                # share (max_stage_mamba_layers), not the global layer count.
+                decode_stage_per_req = int(
+                    stage_per_req
+                    * (max_stage_mamba_layers + decode_nextn_layers)
+                    / max_stage_mamba_layers
+                )
+
         # ReplaySSM drops the per-step intermediate_ssm scratch, so its mamba budget
         # no longer reserves the (1 + D/ratio) intermediate factor -- the whole
         # budget goes to persistent slots (K sized like non-spec), which is how the
@@ -3694,7 +3799,15 @@ class KVCacheConfigurator:
             self.hybrid_gdn_config is not None or self.hybrid_kda_config is not None
         )
         if replayssm_active:
-            record_len = get_exec().mamba.linear_replayssm_cache_len
+            # GDN sizes the fold window to the draft maximum; the KDA ring
+            # stays --linear-replayssm-cache-len long (mirrors MambaPool).
+            max_draft_tokens = max_speculative_num_draft_tokens()
+            if self.hybrid_kda_config is not None:
+                record_len = get_exec().mamba.linear_replayssm_cache_len
+            elif max_draft_tokens is not None:
+                record_len = max_draft_tokens
+            else:
+                record_len = get_exec().mamba.linear_replayssm_cache_len
             replayssm_ring_per_req = (
                 config.mamba2_cache_params.replayssm_ring_bytes_per_req(
                     record_len=record_len
@@ -3703,6 +3816,17 @@ class KVCacheConfigurator:
         else:
             replayssm_ring_per_req = 0
         replayssm_ring_per_req = int(replayssm_ring_per_req * pp_layer_scale)
+        if decode_nextn_layers:
+            # MambaPool allocates the replay rings over
+            # num_mamba_layers = len(mamba_layer_ids), which
+            # _get_mamba_layer_ids_for_req_pool extends with the nextn draft
+            # layers, so the ring bytes carry the same nextn factor as the
+            # per-slot state above.
+            replayssm_ring_per_req = int(
+                replayssm_ring_per_req
+                * (max_stage_mamba_layers + decode_nextn_layers)
+                / max_stage_mamba_layers
+            )
         request_scoped = replayssm_active and (
             self.hybrid_kda_config is None or host_only_mamba_checkpoint()
         )
@@ -3753,8 +3877,8 @@ class KVCacheConfigurator:
                     get_schedule().max_mamba_cache_size // ratio,
                 )
                 intermediate_size = (
-                    stage_per_req
-                    * (capped_reqs + 1)
+                    decode_stage_per_req
+                    * (capped_reqs + decode_pre_alloc_size + 1)
                     * get_spec().speculative_num_draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
@@ -3769,10 +3893,12 @@ class KVCacheConfigurator:
             )
             # Reserve intermediate memory based on capped max_num_reqs (+1: the
             # pool's padding slot). Skipped under replayssm and on PD prefill.
+            # PD decode builds the intermediate states for
+            # (size + pre_alloc_size + 1) slots.
             if reserves_spec_state:
                 intermediate_size = (
-                    stage_per_req
-                    * (get_schedule().max_mamba_cache_size + 1)
+                    decode_stage_per_req
+                    * (get_schedule().max_mamba_cache_size + decode_pre_alloc_size + 1)
                     * get_spec().speculative_num_draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
@@ -3807,7 +3933,9 @@ class KVCacheConfigurator:
                     max(1, get_schedule().max_running_requests // self.attn_dp_size),
                     get_schedule().max_mamba_cache_size // ratio,
                 )
-                intermediate_size = per_req * (capped_reqs + 1) * D
+                intermediate_size = (
+                    decode_stage_per_req * (capped_reqs + decode_pre_alloc_size + 1) * D
+                )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
                 per_slot = per_req + extra_per_slot
@@ -3834,11 +3962,38 @@ class KVCacheConfigurator:
                 f"(4) use GPUs with more memory."
             )
 
-        # +1 accounts for each pool's padding slot.
-        mamba_state_memory = (
-            (get_schedule().max_mamba_cache_size + 1) * (stage_per_req + extra_per_slot)
-            + fixed_state_bytes
-        ) / (1 << 30)
+        # +1 accounts for each pool's padding slot. PD decode charges the
+        # effective pool size after HybridMambaDecodeReqToTokenPool's bump and
+        # the nextn-inclusive per-slot bytes, matching the real allocation.
+        # The pool's request count is capped by the resolver at
+        # min(per-worker max_running_requests, K // ratio); bound the charge by
+        # the same cap instead of treating K as the request count, which would
+        # overcharge whenever the request count is below K.
+        main_slots = get_schedule().max_mamba_cache_size
+        main_per_slot = stage_per_req + extra_per_slot
+        if is_pd_decode:
+            decode_req_bound = main_slots // self._calculate_mamba_ratio()
+            if get_schedule().max_running_requests is not None:
+                decode_req_bound = min(
+                    decode_req_bound,
+                    max(1, get_schedule().max_running_requests // self.attn_dp_size),
+                )
+            main_slots = max(
+                main_slots,
+                (max(1, decode_req_bound) + decode_pre_alloc_size)
+                * decode_slots_per_req,
+            )
+            main_per_slot = decode_stage_per_req + extra_per_slot
+            if request_scoped:
+                # Replay rings use spec_state_size, including PD transfer slots.
+                previous_ring = replayssm_fixed_bytes
+                replayssm_fixed_bytes = replayssm_ring_per_req * (
+                    max(1, decode_req_bound) + decode_pre_alloc_size + 1
+                )
+                fixed_state_bytes += replayssm_fixed_bytes - previous_ring
+        mamba_state_memory = ((main_slots + 1) * main_per_slot + fixed_state_bytes) / (
+            1 << 30
+        )
         return total_rest_memory - mamba_state_memory
 
 
@@ -3919,3 +4074,117 @@ def _platform_kv_pool_required(*, base: type, message: str) -> type:
             raise ValueError(message)
 
     return PlatformKVPoolRequired
+
+
+@dataclass(frozen=True)
+class _ResolvedReqToTokenSizing:
+    max_running_requests: Optional[int]
+    disaggregation_mode: str
+    disaggregation_decode_extra_slots: Optional[int]
+    enable_pd_role_switch: bool
+
+
+def _resolved_req_to_token_sizing() -> _ResolvedReqToTokenSizing:
+    disagg = get_disagg()
+    return _ResolvedReqToTokenSizing(
+        max_running_requests=get_schedule().max_running_requests,
+        disaggregation_mode=disagg.disaggregation_mode,
+        disaggregation_decode_extra_slots=disagg.disaggregation_decode_extra_slots,
+        enable_pd_role_switch=disagg.enable_pd_role_switch,
+    )
+
+
+def _req_sizing_view(server_args):
+    # Runtime callers pass a narrow snapshot of the live bags. Standalone
+    # sizing callers can still supply a pre-publish ServerArgs resolution view.
+    if isinstance(server_args, _ResolvedReqToTokenSizing):
+        return server_args
+    return resolving_view(server_args)
+
+
+def estimate_max_running_requests(
+    token_capacity: int,
+    context_len: int,
+    server_args: ServerArgs | _ResolvedReqToTokenSizing,
+    attn_dp_size: int,
+    mamba_req_cap: Optional[int] = None,
+) -> tuple[Optional[int], int]:
+    """Single source of truth for the max_running_requests derivation.
+
+    Called twice per boot with the same formula so the two call sites can
+    never drift apart:
+    - KVCacheConfigurator._estimate_req_to_token_pool_bytes sizes the
+      req_to_token pool deduction during memory profiling (one-iteration
+      estimate from a provisional token capacity);
+    - KVCacheConfigurator.resolve_max_num_reqs resolves the final
+      max_running_requests once token capacity is fixed.
+
+    ``mamba_req_cap`` is the hybrid-mamba state-cache clamp
+    (max_mamba_cache_size // mamba_ratio); pass None for non-mamba models.
+    """
+    # Estimate pool size (used as upper bound when user specifies max_running_requests)
+    estimated = int(token_capacity / context_len * 512)
+    estimated = max(min(estimated, 4096), 2048)
+
+    # Read through the resolution view: hooks (e.g. the DSV4 default of 256)
+    # declare max_running_requests without writing the raw field, so a direct
+    # field read here would miss the declaration and silently fall into the
+    # estimated branch, desynchronizing the c128_state reservation (sized from
+    # the schedule bag) from the pool actually allocated (sized from this).
+    max_num_reqs = _req_sizing_view(server_args).max_running_requests
+    if max_num_reqs is not None:
+        requested_per_worker = max(1, max_num_reqs // attn_dp_size)
+        max_num_reqs = min(requested_per_worker, token_capacity // 2)
+    else:
+        requested_per_worker = None
+        max_num_reqs = min(estimated, token_capacity // 2)
+
+    if mamba_req_cap is not None:
+        max_num_reqs = min(max_num_reqs, mamba_req_cap)
+    return requested_per_worker, max_num_reqs
+
+
+def get_req_to_token_pool_num_slots(
+    max_num_reqs: int, server_args: ServerArgs | _ResolvedReqToTokenSizing
+) -> int:
+    """Rows in the req_to_token map for a given max_running_requests.
+
+    The +1 is the padding row at index 0 (ReqToTokenPool._alloc_size); decode
+    mode additionally subscribes rows for pre-allocated in-transfer requests
+    (DecodeReqToTokenPool._alloc_size).
+    """
+    num_slots = max_num_reqs + 1
+    # Read through the resolution view (matching estimate_max_running_requests
+    # above): disaggregation_mode / disaggregation_decode_extra_slots are
+    # resolvable disagg-bag fields, so a raw server_args.<field> read would miss
+    # hook declarations. The rest of this module reads them via get_disagg().
+    view = _req_sizing_view(server_args)
+    if view.disaggregation_mode == "decode" or getattr(
+        view, "enable_pd_role_switch", False
+    ):
+        num_slots += view.disaggregation_decode_extra_slots or 0
+    return num_slots
+
+
+def estimate_req_to_token_pool_bytes(
+    token_capacity: int,
+    context_len: int,
+    server_args: ServerArgs | _ResolvedReqToTokenSizing,
+    attn_dp_size: int,
+    mamba_req_cap: Optional[int] = None,
+) -> int:
+    """GPU bytes the req_to_token map will occupy for this token capacity
+    (num_slots x max_context_len x int32)."""
+    _, max_num_reqs = estimate_max_running_requests(
+        token_capacity=token_capacity,
+        context_len=context_len,
+        server_args=server_args,
+        attn_dp_size=attn_dp_size,
+        mamba_req_cap=mamba_req_cap,
+    )
+    max_context_len = context_len + get_req_to_token_extra_context_len()
+    return (
+        get_req_to_token_pool_num_slots(max_num_reqs, server_args)
+        * max_context_len
+        * 4  # int32
+    )

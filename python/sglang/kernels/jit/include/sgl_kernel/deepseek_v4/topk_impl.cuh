@@ -1094,6 +1094,157 @@ struct TopKRegister : TopKRadixBase<12> {
 // over global memory
 // ---------------------------------------------------------------------------
 
+template <uint32_t kLocalVecs_>
+struct TopKCandidate : TopKRadixBase<12> {
+  static constexpr uint32_t kLocalVecs = kLocalVecs_;
+  static constexpr uint32_t kBlockPositions = 8;  // columns per candidate block
+  static constexpr uint32_t kMaxVectors = kBlockSize * kLocalVecs;
+  static constexpr uint32_t kMaxBlocks = kMaxVectors * kVecSize / kBlockPositions;
+  using Smem = typename TopKRadixBase<12>::Smem;
+
+  template <bool kUsePDL>
+  SGL_DEVICE static void forward(  //
+      const TopKProblem& problem,
+      const int32_t* __restrict__ blocks,
+      const uint32_t num_blocks,
+      void* _smem) {
+    const auto tx = threadIdx.x;
+    const auto smem = static_cast<Smem*>(_smem);
+
+    init_histogram(smem->histogram, tx);
+    if (tx == 0) {
+      smem->count_eq = 0;
+      smem->count_gt = 0;
+    }
+    __syncthreads();
+    PDLWaitPrimary<kUsePDL>();
+
+    const auto seq_len = problem.seq_len;
+    const auto num_vectors = num_blocks * (kBlockPositions / kVecSize);
+    // Every block but the newest covers kBlockPositions columns; the newest is
+    // the row's partial one and is always a candidate (amax8_varlen marks it
+    // +inf), so the compact length is exact without scanning the ids.
+    const auto num_positions = (num_blocks - 1) * kBlockPositions + (seq_len - 1) % kBlockPositions + 1;
+    // Phase 1: gather the candidate columns into registers + build the histogram.
+    // A block past the row's causal length is never read (the gather count stops
+    // at the row's block count), so only the newest block can be partial.
+    vec_t local_vecs[kLocalVecs];
+#pragma unroll
+    for (uint32_t i = 0; i < kLocalVecs; ++i) {
+      const auto v = tx + kBlockSize * i;
+      if (v >= num_vectors) break;
+      const auto start = static_cast<uint32_t>(blocks[v >> 1]) * kBlockPositions + (v & 1u) * kVecSize;
+      local_vecs[i].load(problem.in, static_cast<int64_t>(start) / kVecSize);
+      if (start + kVecSize > seq_len) {
+#pragma unroll
+        for (uint32_t j = 0; j < kVecSize; ++j) {
+          if (start + j < seq_len) {
+            atomicAdd(&smem->histogram[extract_coarse_bin<kHistBits>(local_vecs[i][j])], 1);
+          }
+        }
+      } else {
+#pragma unroll
+        for (uint32_t j = 0; j < kVecSize; ++j) {
+          atomicAdd(&smem->histogram[extract_coarse_bin<kHistBits>(local_vecs[i][j])], 1);
+        }
+      }
+    }
+    __syncthreads();
+
+    // Phase 2: Find the threshold bin
+    find_threshold(problem.topk, num_positions, smem, [&](uint32_t threshold_bin) {
+      const auto [v_lo, v_hi] = coarse_bin_bounds<kHistBits>(threshold_bin);
+      smem->v_hi = v_hi;
+      smem->v_lo = v_lo;
+    });
+
+    // Phase 3: collect by two fp32 boundaries, emitting the gathered column
+    const auto topk = problem.topk;
+    const auto v_hi = smem->v_hi;
+    const auto v_lo = smem->v_lo;
+#pragma unroll
+    for (uint32_t i = 0; i < kLocalVecs; ++i) {
+      const auto v = tx + kBlockSize * i;
+      if (v >= num_vectors) break;
+      const auto start = static_cast<uint32_t>(blocks[v >> 1]) * kBlockPositions + (v & 1u) * kVecSize;
+#pragma unroll
+      for (uint32_t j = 0; j < kVecSize; ++j) {
+        const auto idx = start + j;
+        if (idx >= seq_len) continue;
+        const auto val = local_vecs[i][j];
+        if (val >= v_hi) {
+          const auto pos = atomicAdd(&smem->count_gt, 1);
+          if (pos < topk) [[likely]] {
+            problem.emit(pos, idx);
+          }
+        } else if (val >= v_lo) {
+          const auto pos = atomicAdd(&smem->count_eq, 1);
+          if (pos < kMaxNumTie) [[likely]] {
+            smem->tie_values[pos] = {val, idx};
+          }
+        }
+      }
+    }
+
+    // Phase 4: Handle ties.
+    __syncthreads();
+    const auto count_gt = smem->count_gt;
+    const auto count_eq = smem->count_eq;
+    const auto remain_topk = count_gt < topk ? topk - count_gt : 0;
+    const auto tie_count = min(count_eq, kMaxNumTie);
+    if constexpr (kExact) {
+      if (count_eq > kMaxNumTie) {
+        // Re-select over the gathered window only. The generic cold scan reads
+        // the whole row, which is incorrect for this restricted-block API.
+        // A value/index key also keeps exact ties deterministic in mode 2.
+        uint64_t prefix = 0;
+        uint32_t remaining = topk;
+        for (int bit = 63; bit >= 0; --bit) {
+          if (tx == 0) smem->count_eq = 0;
+          __syncthreads();
+          const uint64_t trial = prefix | (uint64_t{1} << bit);
+          uint32_t count = 0;
+#pragma unroll
+          for (uint32_t i = 0; i < kLocalVecs; ++i) {
+            const auto v = tx + kBlockSize * i;
+            if (v >= num_vectors) break;
+            const auto start = static_cast<uint32_t>(blocks[v >> 1]) * kBlockPositions + (v & 1u) * kVecSize;
+#pragma unroll
+            for (uint32_t j = 0; j < kVecSize; ++j) {
+              if (start + j >= seq_len) continue;
+              const auto bits = __float_as_uint(local_vecs[i][j]);
+              const auto ordered = (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
+              const uint64_t key = (static_cast<uint64_t>(ordered) << 32) | (UINT_MAX - (start + j));
+              count += key >= trial;
+            }
+          }
+          atomicAdd(&smem->count_eq, count);
+          __syncthreads();
+          if (smem->count_eq >= remaining) prefix = trial;
+        }
+        if (tx == 0) smem->count_gt = 0;
+        __syncthreads();
+#pragma unroll
+        for (uint32_t i = 0; i < kLocalVecs; ++i) {
+          const auto v = tx + kBlockSize * i;
+          if (v >= num_vectors) break;
+          const auto start = static_cast<uint32_t>(blocks[v >> 1]) * kBlockPositions + (v & 1u) * kVecSize;
+#pragma unroll
+          for (uint32_t j = 0; j < kVecSize; ++j) {
+            if (start + j >= seq_len) continue;
+            const auto bits = __float_as_uint(local_vecs[i][j]);
+            const auto ordered = (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
+            const uint64_t key = (static_cast<uint64_t>(ordered) << 32) | (UINT_MAX - (start + j));
+            if (key >= prefix) problem.emit(atomicAdd(&smem->count_gt, 1), start + j);
+          }
+        }
+        return;
+      }
+    }
+    handle_tie(smem->tie_values, problem, count_gt, tie_count, remain_topk, &smem->tie_handle);
+  }
+};
+
 struct TopKStreaming : TopKRadixBase<12> {
   /// Collect pass of a row whose threshold bin overflows: emits what lies above the
   /// bin and histograms the bin's members by refine_ties' first digit, then lets

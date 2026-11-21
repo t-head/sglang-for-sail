@@ -92,6 +92,8 @@ class Fp4Indexer(Indexer):
         weights: torch.Tensor,
         ks: torch.Tensor,
         ke: torch.Tensor,
+        *,
+        force_unfused_topk: bool = False,
     ) -> torch.Tensor:
         from deep_gemm import fp8_fp4_mqa_logits
 
@@ -100,7 +102,7 @@ class Fp4Indexer(Indexer):
         if q_fp4.shape[1] > num_heads:
             q_sf = torch.nn.functional.pad(q_sf, (0, q_fp4.shape[1] - num_heads))
         k, k_scale = kv
-        return fp8_fp4_mqa_logits(
+        logits = fp8_fp4_mqa_logits(
             (q_fp4, q_sf),
             (k.view(torch.int8), k_scale.view(torch.int32)),
             weights,
@@ -108,6 +110,7 @@ class Fp4Indexer(Indexer):
             ke,
             clean_logits=False,
         )
+        return logits.float() if force_unfused_topk else logits
 
     def _write_index_k_cache(
         self,

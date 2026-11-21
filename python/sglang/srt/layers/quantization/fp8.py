@@ -121,6 +121,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_sail,
     is_xpu,
     log_info_on_rank0,
     print_info_once,
@@ -139,6 +140,7 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_npu = is_npu()
+_is_sail = is_sail()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
@@ -440,6 +442,12 @@ class Fp8Config(QuantizationConfig):
                 )
 
                 return NPUBlockFp8MoEMethod(self)
+            if self.is_fp4_experts and _is_sail and not self.dequant_fp4_to_fp8:
+                from sglang.srt.layers.quantization.mxfp4 import (
+                    Mxfp4MoEMethod,
+                )
+
+                return Mxfp4MoEMethod(prefix=prefix)
 
             fp8_method = Fp8MoEMethod(self)
 
@@ -1707,10 +1715,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if moe_runner_backend.is_auto():
             if moe_a2a_backend is None:
                 moe_a2a_backend = get_moe_a2a_backend()
-            if not (
-                moe_a2a_backend.is_deepep()
-                or moe_a2a_backend.is_mooncake()
-                or moe_a2a_backend.is_nixl()
+            if (
+                not (
+                    moe_a2a_backend.is_deepep()
+                    or moe_a2a_backend.is_mooncake()
+                    or moe_a2a_backend.is_nixl()
+                )
+                and not envs.SGLANG_SAIL_DEEPGEMM_MOE.get()
             ):
                 return False
             from sglang.srt.layers import deep_gemm_wrapper
@@ -3302,6 +3313,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         configured_backend = get_moe_runner_backend()
         moe_runner_backend = self._resolve_moe_runner_backend()
+
+        if moe_runner_backend.is_deep_gemm() and _is_sail:
+            import sglang.srt.layers.moe.moe_runner.ppu_deepgemm_moe  # noqa: F401
+
         if (
             configured_backend.is_flashinfer_cutlass()
             or configured_backend.is_flashinfer_cutedsl()

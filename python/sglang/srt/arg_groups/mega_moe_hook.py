@@ -15,6 +15,33 @@ from sglang.srt.utils.common import ceil_align, parse_connector_type
 
 logger = logging.getLogger(__name__)
 
+# The PPU path drives DeepGEMM's MXFP4 MegaMoE kernels directly instead of the
+# MoE runner, so the build has to expose all four entry points.
+_PPU_MEGA_MOE_DEEP_GEMM_APIS = (
+    "get_symm_buffer_for_mega_moe",
+    "mega_moe_pre_dispatch",
+    "fp4_fp4_mega_moe",
+    "transform_weights_for_mega_moe",
+)
+
+
+def _require_ppu_mega_moe_deep_gemm_apis() -> None:
+    try:
+        import deep_gemm
+    except ImportError as exc:
+        raise ValueError(
+            "--moe-a2a-backend megamoe on PPU requires the PPU DeepGEMM build"
+        ) from exc
+
+    missing = [
+        name for name in _PPU_MEGA_MOE_DEEP_GEMM_APIS if not hasattr(deep_gemm, name)
+    ]
+    if missing:
+        raise ValueError(
+            "--moe-a2a-backend megamoe on PPU requires a DeepGEMM build with the "
+            "PPU MegaMoE entry points; missing: " + ", ".join(missing)
+        )
+
 
 def handle_mega_moe(server_args: ServerArgs) -> None:
     handle_moe_runner_backend_alias(server_args)
@@ -33,7 +60,11 @@ def check_mega_moe_compat(server_args: ServerArgs) -> None:
             "--enable-single-batch-overlap."
         )
     platform = get_platform()
-    if not (
+    if platform.is_sail:
+        if platform.device_sm < 89:
+            raise ValueError("--moe-a2a-backend megamoe on PPU requires SM89 or newer.")
+        _require_ppu_mega_moe_deep_gemm_apis()
+    elif not (
         (platform.is_cuda and (platform.is_sm90 or platform.is_sm100))
         or platform.is_hip
     ):
@@ -50,6 +81,8 @@ MEGA_MOE_NO_FALLBACK_ARCHS = frozenset(
     {
         "DeepseekV4ForCausalLM",
         "KimiK31ForConditionalGeneration",
+        "GlmMoeDsaForCausalLM",
+        "Glm5NextForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "MellumForCausalLM",
         "Qwen2MoeForCausalLM",

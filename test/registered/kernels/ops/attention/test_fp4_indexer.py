@@ -111,7 +111,10 @@ def test_fp4_fused_norm_rope_store_layout(num_tokens: int) -> None:
     reason="fused_q_indexer_rope_hadamard_fp4_quant is not supported by Intel GPU",
 )
 @pytest.mark.parametrize("batch_size", [1, 5, 17])
-def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int) -> None:
+@pytest.mark.parametrize("input_scale", [0.0, 1e-7, 1.0])
+def test_fp4_fused_q_indexer_rope_hadamard_quant(
+    batch_size: int, input_scale: float
+) -> None:
     torch.manual_seed(batch_size + 200)
     num_heads = 8
     rope_dim = 64
@@ -119,6 +122,7 @@ def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int) -> None:
     q = torch.randn(
         batch_size, num_heads, HEAD_DIM, device=get_device(), dtype=torch.bfloat16
     )
+    q.mul_(input_scale)
     weight = torch.randn(
         batch_size, num_heads, device=get_device(), dtype=torch.bfloat16
     )
@@ -217,6 +221,36 @@ def test_index_q_rope_pack_prefill_matches_decode_kernel(kind, pos_dtype) -> Non
     parts = [call(slice(i, i + 128)) for i in range(0, tokens, 128)]
     for j, name in enumerate(("payload", "scale", "weights")):
         assert torch.equal(whole[j], torch.cat([p[j] for p in parts])), name
+
+
+@pytest.mark.skipif(_is_xpu, reason="The fused FP4 Q path requires CUDA")
+@pytest.mark.parametrize("batch_size", [1, 5, 17])
+@pytest.mark.parametrize("num_heads", [32, 64])
+def test_fp4_fused_q_bf16_weights_match_fp32_path(batch_size, num_heads):
+    """Fusing the final gate cast must not change quantized queries or scales."""
+    torch.manual_seed(batch_size + num_heads)
+    q = torch.randn(
+        batch_size, num_heads, HEAD_DIM, device=get_device(), dtype=torch.bfloat16
+    )
+    weight = torch.randn(
+        batch_size, num_heads, device=get_device(), dtype=torch.bfloat16
+    )
+    positions = torch.arange(batch_size, device=get_device(), dtype=torch.int32)
+    freqs = precompute_freqs_cis(64, 64, 0, 10000, 1, 32, 1).to(get_device())
+    scale = HEAD_DIM**-0.5 * num_heads**-0.5
+    (q_old, sf_old), w_old = fused_q_indexer_rope_hadamard_fp4_quant(
+        q, weight, scale, freqs, positions
+    )
+    (q_new, sf_new), w_new = fused_q_indexer_rope_hadamard_fp4_quant(
+        q, weight, scale, freqs, positions, weights_dtype=torch.bfloat16
+    )
+    torch.testing.assert_close(q_new, q_old, rtol=0, atol=0)
+    torch.testing.assert_close(sf_new, sf_old, rtol=0, atol=0)
+    assert w_new.dtype == torch.bfloat16
+    torch.testing.assert_close(w_new, w_old.to(torch.bfloat16), rtol=0, atol=0)
+    torch.testing.assert_close(
+        w_new.squeeze(-1), (weight.float() * scale).to(torch.bfloat16), rtol=0, atol=0
+    )
 
 
 def _make_logits_case(rows: int, heads: int, width: int, seed: int = 719):

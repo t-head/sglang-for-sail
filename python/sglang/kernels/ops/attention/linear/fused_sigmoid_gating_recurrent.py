@@ -14,6 +14,8 @@ from sglang.srt.utils import (
     is_hip,
     is_sm90_supported,
 )
+from sglang.srt.utils.device import is_sail
+from sglang.srt.utils.log_utils import print_info_once
 
 _is_hip = is_hip()
 _is_gfx95 = is_gfx95_supported()
@@ -758,6 +760,81 @@ def fused_sigmoid_gating_delta_rule_update(
         initial_state_source is None or initial_state_source.dtype == torch.bfloat16
     )
 
+    # Keep the full target layout/ReplaySSM guards. Older PLA builds require
+    # FP32 state; unsupported state dtypes continue through the Triton path.
+    if (
+        is_sail()
+        and envs.SGLANG_SAIL_PLA_CUDA.get()
+        and (is_kda or lower_bound is None)
+        and all(
+            t is None or t.dtype == torch.float32
+            for t in (initial_state_source, intermediate_states_buffer)
+        )
+        and not cache_ring
+        and ring_indices is None
+        and not match_cutedsl_decode
+        and all(
+            t is None
+            for t in (replayssm_rawv, replayssm_rawk, replayssm_g, replayssm_beta)
+        )
+        and (initial_state_source is None or initial_state_source.is_contiguous())
+        and (
+            intermediate_states_buffer is None
+            or (
+                intermediate_states_buffer.is_contiguous()
+                and cache_steps == cache_stride_steps
+            )
+        )
+    ):
+        from pla.decode import fused_sigmoid_gating_delta_rule_forward_k_last
+
+        print_info_once(
+            f"USE PPU SAIL CUDA PLA kernel: fused_sigmoid_gating_delta_rule_forward_k_last"
+        )
+
+        # A missing KDA bound denotes the softplus gate; never replace it by
+        # zero, which would select the bounded formula with zero decay.
+        kda_lower_bound = lower_bound if is_kda else None
+
+        def _sail_gate_cast(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if t is None:
+                return None
+            return t.to(q.dtype) if not disable_state_update else t
+
+        output = fused_sigmoid_gating_delta_rule_forward_k_last(
+            _sail_gate_cast(A_log),
+            a,
+            _sail_gate_cast(dt_bias),
+            softplus_beta,
+            softplus_threshold,
+            q,
+            k,
+            v,
+            b,
+            initial_state_source,
+            initial_state_indices,
+            scale,
+            use_qk_l2norm_in_kernel,
+            cu_seqlens,
+            is_kda,
+            disable_state_update,
+            intermediate_states_buffer,
+            intermediate_state_indices,
+            cache_steps,
+            retrieve_parent_token,
+            kda_lower_bound,
+        )
+        return output
+
+    if is_sail() and envs.SGLANG_SAIL_PLA_CUDA.get():
+        print_info_once(
+            "PPU PLA does not support this ReplaySSM layout or state dtype; "
+            "using the Triton recurrent kernel."
+        )
+
+    print_info_once(
+        f"USE Community SGLang Triton Kernel: fused_sigmoid_gating_delta_rule_update_kernel"
+    )
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
         a=a,

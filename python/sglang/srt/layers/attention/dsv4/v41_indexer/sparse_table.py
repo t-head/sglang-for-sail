@@ -1,4 +1,4 @@
-"""The candidate scheme carried by a DeepGEMM sparse table (SM100): a source
+"""The candidate scheme carried by a DeepGEMM sparse table (SM100 or PPU SM89+): a source
 publishes its blocks with the schedule ``fp8_fp4_paged_sparse_mqa_logits`` needs,
 a consumer scores only those blocks out of the index-K pool."""
 
@@ -23,13 +23,12 @@ from sglang.kernels.ops.attention.dsv4.index_logits import (
     sparse_logits,
 )
 from sglang.kernels.ops.attention.dsv4.topk import (
-    topk_transform_paged_v2,
+    topk_transform_candidates,
+    topk_transform_paged,
     topk_transform_sparse,
 )
-from sglang.srt.layers.attention.dsv4.indexer import (
-    topk_transform_paged_bf16,
-    topk_transform_paged_from_metadata,
-)
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_bf16
 from sglang.srt.layers.attention.dsv4.metadata import expand_index_page_table
 from sglang.srt.utils.device import async_h2d
 
@@ -304,13 +303,12 @@ class SparseTableBackend:
                 metadata.compressed_page_size,
             )
         else:
-            topk_transform_paged_v2(
+            topk_transform_paged(
                 logits,
                 seq_lens,
                 metadata.page_table,
                 inputs.out_page_indices,
                 metadata.compressed_page_size,
-                metadata.topk_metadata,
             )
         # per row: block count for the block top-k, sparse-row length for the consumers
         with torch.cuda.stream(self.alt_stream):
@@ -355,9 +353,7 @@ class SparseTableBackend:
         block_chunks = []
         phys_block_chunks = []
         valid_len_chunks = []
-        topk_plans = metadata.topk_metadata_chunks
-        assert not metadata.use_topk_v2 or topk_plans is not None
-        for chunk_idx, (rows, plan) in enumerate(metadata.row_chunks()):
+        for rows, plan in metadata.row_chunks():
             q, lens, table, indices = data.paged_logits_args(metadata, rows)
             logits = deep_gemm_fp4_paged_mqa_logits(
                 q,
@@ -369,21 +365,28 @@ class SparseTableBackend:
                 metadata.max_compressed_seq_len,
                 indices=indices,
             )
-            topk_transform_paged_from_metadata(
-                logits,
-                metadata,
-                inputs.out_page_indices,
-                None,
-                rows=rows,
-                topk_metadata=(
-                    topk_plans[chunk_idx] if topk_plans is not None else None
-                ),
-            )
+            if logits.dtype == torch.bfloat16:
+                topk_transform_paged_bf16(
+                    logits,
+                    seq_lens[rows],
+                    metadata.page_table[rows],
+                    inputs.out_page_indices[rows],
+                    metadata.compressed_page_size,
+                )
+            else:
+                topk_transform_paged(
+                    logits,
+                    seq_lens[rows],
+                    metadata.page_table[rows],
+                    inputs.out_page_indices[rows],
+                    metadata.compressed_page_size,
+                )
             chunk_seq_lens = seq_lens[rows]
             nblocks, row_valid_lens = candidate_row_lens(
                 chunk_seq_lens, self.topk_blocks
             )
             blocks = amax_topk_blocks(logits, chunk_seq_lens, nblocks, self.topk_blocks)
+            del logits  # last use; release it before scoring the next chunk
             phys_blocks = sort_candidate_blocks(
                 blocks,
                 chunk_seq_lens,
@@ -515,12 +518,29 @@ def select_prefill_rows(
     each output per scored row, with ``nblocks`` matching the view."""
     lens_all = data.compress_lens
     zero_offsets = torch.zeros_like(lens_all)
+    topk_blocks = out_blocks.shape[1]
+    two_level = (
+        envs.SGLANG_OPT_DSV41_TOPK_CANDIDATES.get()
+        and 0 < out_positions.shape[1] < topk_blocks
+    )
     for tile, logits in score_tiles(data, kv):
         lens = lens_all[tile]
-        topk_ragged(logits, lens, out=out_positions[tile], offsets=zero_offsets[tile])
         select_prefill_block_ids(
             logits, lens, nblocks[tile], out_blocks[tile], offsets=zero_offsets[tile]
         )
+        if two_level and logits.dtype == torch.float32:
+            topk_transform_candidates(
+                logits,
+                lens,
+                out_blocks[tile],
+                out_offsets=zero_offsets[tile],
+                out_indices=out_positions[tile],
+            )
+        else:
+            topk_ragged(
+                logits, lens, out=out_positions[tile], offsets=zero_offsets[tile]
+            )
+        del logits
 
 
 # TODO(dark): support fusion of publish + topk of publish layer

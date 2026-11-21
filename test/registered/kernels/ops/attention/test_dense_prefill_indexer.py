@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.kernels.ops.attention.dsv4 import index_logits
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     candidate_topk,
     topk_among_blocks,
@@ -25,6 +26,7 @@ from sglang.srt.layers.attention.dsv4.v41_indexer import (
     sparse_table,
 )
 from sglang.srt.layers.attention.dsv4.v41_indexer.types import PrefillInputs
+from sglang.srt.utils.device import is_sail
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -796,7 +798,7 @@ class TestCandidateScores(CustomTestCase):
             lens=lens[tok],
             slots=torch.arange(129, device="cuda"),
         )
-        indexer = Mock()
+        indexer = Mock(use_int8=False)
         indexer.scores.side_effect = AssertionError("full scoring was used")
         budget = 2 * q.shape[1] * blocks.shape[1] * CANDIDATE_BLOCK_SIZE * 2
         with patch.object(scoring, "_TORCH_SCORE_BUDGET_BYTES", budget):
@@ -839,7 +841,7 @@ class TestCandidateScores(CustomTestCase):
             s = torch.einsum("bhd,nd->bhn", q, k)
             return (s.relu() * weights.unsqueeze(-1)).sum(1).float()
 
-        indexer = Mock()
+        indexer = Mock(use_int8=False)
         indexer.scores.side_effect = full_scores
         too_wide = blocks.repeat(1, 4)
         with patch.object(
@@ -863,6 +865,79 @@ class TestCandidateScores(CustomTestCase):
         for chunk in chunks:
             self.assertFalse(chunk.candidate_only)
             self.assertTrue(torch.equal(chunk.scores, expected[chunk.tok]))
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available()
+    and (torch.cuda.get_device_capability()[0] == 10 or is_sail()),
+    "requires SM100, or the PPU dense-indexer path",
+)
+class TestDensePrefillTopkTwoLevel(CustomTestCase):
+    """The plain-layer top-k selects the same positions through the two-level
+    candidate structure. Both contexts below exceed the block window
+    (``ceil(ctx / 8) > k``), so the second level really reads a subset.
+
+    Separate from ``TestDensePrefillIndexer`` because that class is SM100-only,
+    while this path also runs (and is what the PPU prefill uses) on PPU.
+    """
+
+    # The candidate level ranks fp32 logits only; with the bf16 default (SM100,
+    # PPU) both sides would take DeepSelect, whose pick among tied bf16 scores is
+    # unspecified, so pin fp32 to compare the two levels on untied values.
+    @patch.object(index_logits, "index_logits_dtype", lambda: torch.float32)
+    def test_two_level_matches_dense(self):
+        for ratio in (1, 2):
+            with self.subTest(ratio=ratio):
+                inputs = make_inputs([(8, 8192), (4, 40000)], ratio=ratio)
+                data = scoring.DeepGEMMPrefillData(
+                    k_slots=torch.arange(inputs["kv"][0].shape[0], device="cuda"),
+                    request_starts=inputs["starts"],
+                    lens_per_request=[n for _, n in inputs["request_lengths"]],
+                    rows_per_request=[q for q, _ in inputs["request_lengths"]],
+                    compress_lens=inputs["lengths"],
+                    q_fp4=inputs["q"][0],
+                    q_sf=inputs["q"][1],
+                    weights=inputs["weights"],
+                )
+                self.assertGreater(
+                    int(data.compress_lens.max()) // 8,
+                    inputs["topk"],
+                    "the context must exceed the block window",
+                )
+                rows, k = data.compress_lens.shape[0], inputs["topk"]
+                dense = torch.full((rows, k), -1, dtype=torch.int32, device="cuda")
+                scoring.dense_prefill_topk(
+                    data, inputs["kv"], out=dense, two_level=False
+                )
+                two_level = torch.full_like(dense, -1)
+                scoring.dense_prefill_topk(
+                    data, inputs["kv"], out=two_level, two_level=True
+                )
+                # Selection is exact, so with untied fp32 scores the two sides
+                # agree on the position set; only the emit order is unspecified.
+                for row in range(rows):
+                    self.assertEqual(
+                        int((dense[row] >= 0).sum()), int((two_level[row] >= 0).sum())
+                    )
+                    torch.testing.assert_close(
+                        dense[row][dense[row] >= 0].sort().values,
+                        two_level[row][two_level[row] >= 0].sort().values,
+                    )
+                del inputs, data
+
+    def test_low_scoring_newest_block_does_not_evict_kth_token(self):
+        logits = torch.full((1, 32), -100.0, device="cuda")
+        logits[0, 0], logits[0, 8], logits[0, 16] = 10.0, 9.0, 8.0
+        data = Mock(
+            request_starts=torch.zeros(1, dtype=torch.int32, device="cuda"),
+            compress_lens=torch.tensor([32], dtype=torch.int32, device="cuda"),
+        )
+        out = torch.empty((1, 2), dtype=torch.int32, device="cuda")
+        with patch.object(
+            scoring, "score_tiles", return_value=iter([(slice(None), logits)])
+        ):
+            scoring.dense_prefill_topk(data, None, out=out, two_level=True)
+        self.assertEqual(set(out[0].tolist()), {0, 8})
 
 
 if __name__ == "__main__":

@@ -142,3 +142,19 @@ register_kernel(
         ),
     )
 )
+
+for _fn in (
+    "rmsnorm_per_token_quant_fp8",
+    "rmsnorm_per_token_quant_int8",
+    "fused_rmsnorm_per_token_quant_fp8",
+    "fused_rmsnorm_per_token_quant_int8",
+):
+    register_kernel(
+        KernelSpec(
+            op=f"layernorm.{_fn}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.layernorm.rmsnorm_per_token_quant:{_fn}",
+            capabilities=CUDA_ONLY,
+        )
+    )
+del _fn

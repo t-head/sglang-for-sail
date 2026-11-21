@@ -2131,6 +2131,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         static_forward_batch = ForwardBatch(
             forward_mode=pcg_forward_mode,
+            # DP sync may relabel IDLE/DECODE as EXTEND to participate in the
+            # same graph. Eager breaks still need the logical request mode.
+            _original_forward_mode=forward_batch._original_forward_mode,
             batch_size=bs,
             input_ids=input_ids,
             input_embeds=input_embeds,

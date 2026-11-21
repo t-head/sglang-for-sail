@@ -46,6 +46,7 @@ from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_executor.runner_utils.nvtx_profile import profile_mtp_stage
 from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
@@ -132,6 +133,7 @@ from sglang.srt.utils.device import (
     is_hip,
     is_musa,
     is_npu,
+    is_sail,
     is_xpu,
 )
 from sglang.srt.utils.log_utils import log_info_on_rank0
@@ -141,6 +143,7 @@ _is_npu = is_npu()
 _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_hip = is_hip()
+_is_sail = is_sail()
 _is_xpu = is_xpu()
 
 
@@ -348,7 +351,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             and self.topk == 1
         )
         # GLM-5.2 MTP IndexShare: seed reused indexer top-k from draft-extend
-        # (last verified token), not draft-decode step 0.
+        # (last verified token), not draft-decode step 0. The backend gate is
+        # applied in init_attention_backend(), after speculative backend names
+        # are resolved from ServerArgs.
         self.dsa_index_topk = getattr(hf_config, "index_topk", None)
         self.dsa_seed_topk_width = (
             get_dsa_mtp_topk_width(hf_config)
@@ -438,6 +443,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.speculative_num_steps,
             seed_dsa_topk_from_draft_extend=self.seed_dsa_topk_from_draft_extend,
             qsa_profile=parse_qsa_profile(self.draft_runner.model_config.hf_config),
+        )
+        dsa_index_share_backend = (
+            draft_backend_factory.resolve_decode_backend_type() in ("dsa", "nsa")
+            and draft_backend_factory.resolve_draft_extend_backend_type()
+            in ("dsa", "nsa")
+        )
+        self.index_share_for_mtp_iteration = (
+            self.index_share_for_mtp_iteration and dsa_index_share_backend
+        )
+        self.seed_dsa_topk_from_draft_extend = (
+            self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
+        )
+        draft_backend_factory.seed_dsa_topk_from_draft_extend = (
+            self.seed_dsa_topk_from_draft_extend
         )
 
         # Initialize decode attention backend
@@ -700,6 +719,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"avail mem={after_mem:.2f} GB.",
             )
 
+    @profile_mtp_stage("mtp_draft_decode", draft_decode=True)
     def draft(self, batch: ScheduleBatch, *, with_topology: bool = False):
         draft_input: EagleDraftInput = batch.spec_info
         forward_batch, can_run_decode_cuda_graph, iteration_ids = prepare_for_draft(
@@ -742,9 +762,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         with canary_outside_ctx:
             # Run draft
             if can_run_decode_cuda_graph:
-                parent_list, top_scores_index, draft_tokens, draft_probs = (
-                    self.cuda_graph_runner.execute(forward_batch)
-                )
+                with self.target_worker.model_runner.nvtx_profiler.range(
+                    "draft_decode_cudagraph"
+                ):
+                    parent_list, top_scores_index, draft_tokens, draft_probs = (
+                        self.cuda_graph_runner.execute(forward_batch)
+                    )
                 if draft_probs is not None:
                     # draft_probs is the one graph output read after the target
                     # forward rather than by it, and it points into the graph's
@@ -760,7 +783,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     # Skip attention backend init for 1-step draft,
                     # `draft_forward` only does sample in this case.
                     self.draft_attn_backend.init_forward_metadata(forward_batch)
-                    forward_batch.mark_forward_metadata_ready()
+                    if _is_sail:
+                        from sglang.srt.layers.attention.dsa_backend import (
+                            DeepseekSparseAttnMultiStepBackend,
+                        )
+
+                        forward_batch.mark_forward_metadata_ready(
+                            replan_equivalent=isinstance(
+                                self.draft_attn_backend,
+                                DeepseekSparseAttnMultiStepBackend,
+                            )
+                        )
+                    else:
+                        forward_batch.mark_forward_metadata_ready()
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.draft_forward(forward_batch)
                 )
@@ -1059,6 +1094,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def draft_extend(self):
         pass
 
+    @profile_mtp_stage("mtp_draft_extend_prefill")
     def _draft_extend_for_prefill(
         self,
         batch: ScheduleBatch,
@@ -1209,6 +1245,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.dsa_extend_topk_buf = buf
         return buf[:num_tokens]
 
+    @profile_mtp_stage("mtp_draft_extend_decode")
     def _draft_extend_for_decode(
         self,
         batch: ScheduleBatch,
@@ -2130,6 +2167,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
             dw._rebuild_topk1_chain_buffers()
 
+    @profile_mtp_stage("mtp_target_verify")
     def verify(self, batch: ScheduleBatch, pp_proxy_tensors=None, grammar_barrier=None):
         # SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING: the compact top-k branch, when
         # every request allows it, in the post-verify graphs and the eager verify
