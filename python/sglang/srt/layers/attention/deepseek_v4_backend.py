@@ -3747,12 +3747,17 @@ class DeepseekV4AttnBackend(
         if tail is not None:
             q_lens_cpu = tail.local_lens_cpu
             req_global, pos_global = tail.req_global, tail.pos_global
+            # The tail's own rows are the last min(SWA_WINDOW, len) of each
+            # request, so its lengths -- not the full extend's -- are the ones
+            # that describe `total` here (both come from `tail_lens`).
+            global_lens_cpu = tail.extend_seq_lens_cpu
         else:
             q_lens_cpu = interleave_rows_per_request(
                 _as_int_list(forward_batch.extend_seq_lens_cpu),
                 get_parallel().attn_cp_rank,
                 get_parallel().attn_cp_size,
             )
+            global_lens_cpu = _as_int_list(forward_batch.extend_seq_lens_cpu)
             req_global = token_req_indices(forward_batch, num_tokens=total)
             pos_global = forward_batch.positions[:total].to(torch.int64)
         num_local = sum(q_lens_cpu)
@@ -3760,7 +3765,44 @@ class DeepseekV4AttnBackend(
             x_global = cp_materialize_global_token_order(
                 x.contiguous(), forward_batch, torch.cuda.current_stream()
             )[:total]
-            self._low_ratio_compress_torch(layer, x_global, req_global, pos_global)
+            if (
+                layer.compressor.use_fused_compress
+                and layer.compress_ratio in (1, 2)
+            ):
+                # Only build the offsets on the branch that consumes them: on the
+                # torch fallback they are unused, and their validation would turn
+                # "the flag is off" from a safe fallback into a new failure mode.
+                offsets = self._low_ratio_cp_extend_offsets(
+                    global_lens_cpu,
+                    total,
+                    int(cp_meta.bs),
+                    forward_batch.positions.device,
+                )
+            else:
+                offsets = None
+            if offsets is not None:
+                # Same fused kernel the non-CP extend path uses; only the row
+                # partition differs, and it is request-contiguous either way.
+                # The ring contract is asserted here, inside the branch it
+                # guards, so a fallback configuration keeps the old behaviour.
+                if layer.compress_ratio > 1:
+                    ring_size = self.token_to_kv_pool.get_attention_compress_states(
+                        layer.layer_id
+                    ).ring_size
+                    if not self._low_ratio_cp_ring_write_is_well_formed(
+                        req_global, pos_global, ring_size, offsets[1].tolist()
+                    ):
+                        raise AssertionError(
+                            "prefill CP low-ratio: the ring write-back would park "
+                            "two different (req, pos) rows in one slot; the fused "
+                            "kernel's row partition does not match the global "
+                            "request layout."
+                        )
+                self._low_ratio_compress_fused(
+                    layer, x_global, req_global, pos_global, extend_offsets=offsets
+                )
+            else:
+                self._low_ratio_compress_torch(layer, x_global, req_global, pos_global)
         if run_indexer and layer.indexer is not None:
             # A rank's local rows are not the batch's, so no req_rows to pass.
             self._low_ratio_index_topk(
@@ -3819,6 +3861,158 @@ class DeepseekV4AttnBackend(
                     and layer.compressor.use_fused_compress
                 ),
             )
+
+    def _low_ratio_cp_extend_offsets(
+        self,
+        lens_cpu: Optional[List[int]],
+        total: int,
+        num_reqs: int,
+        device: torch.device,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Per-request (first row, row count) for the **global** row order in use.
+
+        The prefill-CP branch works on ``x_global``, which is the whole prompt in
+        global request-major order, but the per-rank lengths it already has
+        (``q_lens_cpu`` / ``tail.local_lens_cpu``) count only *this rank's* rows.
+        Handing those to the kernel would partition the rows wrongly and pair
+        positions across requests, so the offsets are rebuilt from a *global*
+        length list instead.
+
+        The caller passes the list that matches the rows it materialized, because
+        the two CP sub-branches do not share one:
+
+        * no tail: the whole extend, ``forward_batch.extend_seq_lens_cpu``, whose
+          sum is ``attn_cp_metadata.total_seq_lens``
+          (``cp/interleave.py:build_metadata`` and ``cp_utils.py`` both compute
+          ``total_seq_lens`` as exactly this sum).
+        * late-layer tail: the tail overlaps only each request's last
+          ``SWA_WINDOW`` tokens, so the matching list is
+          ``tail.extend_seq_lens_cpu``. Reaching for the full extend here would
+          describe rows that were never materialized.
+
+        The ``sum == total`` assertion below is what keeps that coupling honest:
+        it pins the caller's choice to the rows actually handed to the kernel, so
+        a mismatched pairing fails loudly instead of writing wrong slots.
+        """
+        lens_cpu = _as_int_list(lens_cpu)
+        if not lens_cpu or not total:
+            return None
+        if sum(lens_cpu) != total:
+            raise AssertionError(
+                "prefill CP low-ratio: the global lengths do not cover the "
+                f"materialized rows (sum(lens)={sum(lens_cpu)}, total={total}); "
+                "refusing to build fused offsets from a mismatched row partition."
+            )
+        lens = torch.tensor(lens_cpu, dtype=torch.int32, device=device)
+        start_loc = torch.cumsum(lens, dim=0, dtype=torch.int32) - lens
+        assert start_loc.shape[0] == num_reqs, (
+            "prefill CP low-ratio: offset count must be the request count "
+            f"({start_loc.shape[0]} vs cp_metadata.bs={num_reqs})"
+        )
+        return start_loc, lens
+
+    def _low_ratio_cp_ring_write_is_well_formed(
+        self, req, pos, ring_size: int, lens_cpu: List[int]
+    ) -> bool:
+        """Development guard: the CP row partition and the ring contract agree.
+
+        ``c2.cuh``'s ``c2_prefill_store_kernel`` documents the contract: "Each
+        request's last ``ring_size`` rows park their ``| kv | score |`` at
+        ``req * ring_size + pos % ring_size`` ... those rows are consecutive
+        positions, so their slots are distinct." The torch path enforces the same
+        thing with ``keep[:-ring] &= (req[:-ring] != req[ring:]) | pad[ring:]`` and
+        the comment that it "leaves each write a distinct live slot, even when a
+        prefill chunk is longer than the ring".
+
+        Slots DO repeat across a whole call -- one request contributes several
+        positions sharing ``pos % ring_size``. That is expected: the pooling
+        kernel reads those rows, and the write-back runs as a separate kernel
+        afterwards precisely because a chunk mixing parity would otherwise read
+        and write one slot. What must hold is that the rows the write-back
+        actually stores (each request's last ``min(len, ring_size)``) have
+        distinct slots.
+
+        In this caller that invariant is *structural*: ``req``/``pos`` are built
+        from the same global lengths used to build ``lens_cpu``, so within a
+        request the positions are consecutive and their slots cannot collide.
+        This check therefore guards against a future edit that breaks that
+        single-source property -- it is a development guard, not a data-dependent
+        safety net. It runs only on the fused branch, so a configuration that
+        falls back to torch keeps the pre-existing behaviour exactly.
+
+        Every rank computes the same slots from the same global ``req``/``pos``,
+        which is what makes "every rank writes the whole prompt's compressed
+        state" idempotent.
+        """
+        if ring_size <= 0 or req.numel() == 0:
+            return True
+        lens = _as_int_list(lens_cpu)
+        if lens is None or sum(lens) != req.numel():
+            # Fail closed. This guard exists to catch a row partition that does
+            # not match the request layout; when it cannot evaluate that -- no
+            # lengths, or lengths that do not cover the rows -- the honest answer
+            # is "not verified", not "fine". Returning True here would hand the
+            # caller a green light it did not earn, which is worse than having no
+            # guard at all for a correctness property.
+            raise AssertionError(
+                "prefill CP low-ratio: cannot verify the ring write-back "
+                f"(lens={'unavailable' if lens is None else sum(lens)}, "
+                f"rows={req.numel()}); refusing to treat it as verified."
+            )
+        # Keep this off the host sync path: gather only the rows the write-back
+        # stores (num_reqs * ring_size elements, e.g. 96 * 8) instead of pulling
+        # the whole ~12k-row batch to the host. An earlier revision pulled the
+        # full batch twice per call, which in a CPU-bound prefill path defeated
+        # the purpose of the change it was guarding.
+        req_l = _as_int_list(req)
+        pos_l = _as_int_list(pos)
+        if req_l is None or pos_l is None:
+            # CUDA tensors are the normal case; transfer only the tail rows.
+            return self._low_ratio_cp_ring_tail_is_distinct(req, pos, ring_size, lens)
+        if len(req_l) != len(pos_l):
+            # sum(lens) == len(req) was already asserted above, so the host path
+            # only needs to confirm req and pos describe the same rows.
+            return False
+        seen: Dict[int, Tuple[int, int]] = {}
+        start = 0
+        for n in lens:
+            for row in range(max(start, start + n - ring_size), start + n):
+                slot = req_l[row] * ring_size + pos_l[row] % ring_size
+                pair = (req_l[row], pos_l[row])
+                if seen.setdefault(slot, pair) != pair:
+                    return False
+            start += n
+        return True
+
+    def _low_ratio_cp_ring_tail_is_distinct(self, req, pos, ring_size, lens) -> bool:
+        """Device-side form of the check: only the last ``ring_size`` rows per
+        request are ever written back, so those are the only rows that must have
+        distinct ring slots. Collecting just those rows keeps the transfer at
+        ``num_reqs * ring_size`` elements rather than the whole batch.
+        """
+        total = sum(lens)
+        if total != req.shape[0]:
+            return False
+        ridx: List[torch.Tensor] = []
+        start = 0
+        for n in lens:
+            if n <= 0:
+                continue
+            lo = max(start, start + n - ring_size)
+            ridx.append(torch.arange(lo, start + n, device=req.device))
+            start += n
+        if not ridx:
+            return True
+        rows = torch.cat(ridx)
+        t_req = req.index_select(0, rows).to(torch.int64).cpu().tolist()
+        t_pos = pos.index_select(0, rows).to(torch.int64).cpu().tolist()
+        seen: Dict[int, Tuple[int, int]] = {}
+        for r, p in zip(t_req, t_pos):
+            slot = r * ring_size + p % ring_size
+            pair = (r, p)
+            if seen.setdefault(slot, pair) != pair:
+                return False
+        return True
 
     def _low_ratio_in_prefill_graph(self) -> bool:
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
