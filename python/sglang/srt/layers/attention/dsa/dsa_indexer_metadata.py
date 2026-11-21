@@ -151,12 +151,42 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
             cu_seqlens_q_topk = None
         elif cu_seqlens_q is not None:
             cu_seqlens_q = cu_seqlens_q.to(torch.int32)
+            # >>> E20-1 E19-family point-source guard
+            # output_size below is a host-side row count while cu_seqlens_q may
+            # live in a device buffer that refreshes independently under
+            # breakable-graph replay; when a matching CPU ledger exists, rebuild
+            # the ledger from it so sum(repeats) == output_size by construction
+            # (same Python frame, live or captured).  Outside graph capture, an
+            # eager check turns a would-be device-side assert into a Python
+            # error raised before launch (no context poisoning).
+            _e20_n_rows = logits.shape[0]
+            _e20_host = self.get_dsa_extend_len_cpu()
+            if (
+                not torch.cuda.is_current_stream_capturing()
+                and _e20_host is not None
+                and len(_e20_host) == cu_seqlens_q.numel()
+                and sum(int(v) for v in _e20_host) == _e20_n_rows
+            ):
+                cu_seqlens_q = torch.tensor(
+                    [int(v) for v in _e20_host],
+                    dtype=cu_seqlens_q.dtype,
+                    device=cu_seqlens_q.device,
+                )
+            elif not torch.cuda.is_current_stream_capturing():
+                _e20_sum = int(cu_seqlens_q.sum().item())
+                if _e20_sum != _e20_n_rows:
+                    raise RuntimeError(
+                        "E20-1 guard: repeat_interleave ledger tear at "
+                        "dsa_indexer_metadata.topk_transform: "
+                        "sum(repeats)=%d != output_size=%d" % (_e20_sum, _e20_n_rows)
+                    )
+            # <<< E20-1 (F1: rebuild gated out of capture streams)
             cu_seqlens_q_topk = compute_cu_seqlens(cu_seqlens_q)
             cu_topk_indices_offset = torch.repeat_interleave(
                 cu_seqlens_q_topk[:-1],
                 cu_seqlens_q,
                 # Avoid reading sum(cu_seqlens_q) back to the host.
-                output_size=logits.shape[0],
+                output_size=_e20_n_rows,
             )
         else:
             cu_seqlens_q_topk = self.attn_metadata.cu_seqlens_q

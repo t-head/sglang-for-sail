@@ -265,13 +265,27 @@ class Mamba2Metadata(ForwardMetadata):
         _seq_idx_output_size = (
             num_prefill_tokens if extend_seq_lens_cpu is not None else None
         )
+        # >>> E19 M-B v2 point-source fix (torch.long, review before use)
+        # Both ledgers for repeat_interleave now come from the same CPU-side
+        # batch list, so the device-side query_start_loc (a static buffer that
+        # can lag one generation behind under BCG replay / DP-rewrite paths)
+        # can no longer tear against output_size => Repeat.cu:20 assertion.
+        if extend_seq_lens_cpu is not None:
+            _seq_idx_repeats = torch.tensor(
+                [int(v) for v in extend_seq_lens_cpu[:num_prefills]],
+                dtype=torch.long,
+                device=query_start_loc.device,
+            )
+        else:
+            _seq_idx_repeats = query_start_loc.diff()
         seq_idx = torch.repeat_interleave(
             torch.arange(
                 num_prefills, dtype=torch.int32, device=query_start_loc.device
             ),
-            query_start_loc.diff(),
+            _seq_idx_repeats,
             output_size=_seq_idx_output_size,
         )
+        # <<< E19 M-B point-source fix
         seq_idx.unsqueeze_(0)
 
         # We compute metadata for chunked prefill once at the top level model
