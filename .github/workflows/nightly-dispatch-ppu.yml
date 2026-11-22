@@ -1,0 +1,45 @@
+name: Nightly Dispatch (PPU)
+
+on:
+  schedule:
+    - cron: '23 18 * * *'
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: 'Target branch or 40-char commit SHA (default: yuhe/v1.0.0)'
+        type: string
+        default: 'yuhe/v1.0.0'
+      model_filter:
+        description: 'Optional comma-separated Recipe model policy slugs (blank = all)'
+        type: string
+        default: ''
+      image_tag:
+        description: 'Allowed runtime image tag (tag only, no registry or repository prefix)'
+        type: string
+        default: ''
+      image_digest:
+        description: 'Optional immutable runtime image digest (sha256:<64-hex>)'
+        type: string
+        default: ''
+      skip_wheel_build:
+        description: 'Skip wheel build and run directly inside the prebuilt runtime image'
+        type: boolean
+        default: false
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+jobs:
+  release-v100:
+    if: >-
+      github.repository == 't-head/sglang-for-sail' &&
+      (github.event_name != 'schedule' || vars.PPU_NIGHTLY_SCHEDULE_DISABLED != 'true')
+    uses: t-head/sglang-for-sail/.github/workflows/nightly-test-ppu.yml@yuhe/v1.0.0
+    with:
+      target_ref: ${{ inputs.target_ref || 'yuhe/v1.0.0' }}
+      model_filter: ${{ inputs.model_filter || '' }}
+      image_tag: ${{ inputs.image_tag || '' }}
+      image_digest: ${{ inputs.image_digest || '' }}
+      skip_wheel_build: ${{ inputs.skip_wheel_build == true }}
