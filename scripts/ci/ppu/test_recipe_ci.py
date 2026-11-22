@@ -1130,25 +1130,33 @@ class ClusterTransportTest(unittest.TestCase):
     def test_cluster_diagnostics_classifies_server_logs_and_startup_phases(self):
         import recipe_cluster_diagnostics
         import recipe_diagnostics
+        import recipe_runner
 
+        self.assertEqual(recipe_runner.bench_module_name(), "sglang.benchmark.serving")
         for phase in ("server_exit", "readiness_timeout"):
             self.assertIn(phase, recipe_diagnostics.PHASES)
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
-            model_dir = root / "sglang-for-sail/45014946019-1/fast_sanity/qwen3.8-27b"
-            model_dir.mkdir(parents=True)
-            (model_dir / "index.json").write_text("{}")
-            (model_dir / "sglang_serve_fast_full.log").write_text(
+            fast_dir = root / "sglang-for-sail/45014946019-1/fast_sanity/qwen3.8-27b"
+            fast_dir.mkdir(parents=True)
+            (fast_dir / "index.json").write_text("{}")
+            (fast_dir / "sglang_serve_fast_full.log").write_text(
                 "ModuleNotFoundError: No module named 'blake3'\n"
             )
-            records = recipe_cluster_diagnostics.recent_failures(root, 45014946020)
+            nightly_dir = root / "sglang-for-sail/45055310116-1/model_sanity/glm-5.3"
+            nightly_dir.mkdir(parents=True)
+            (nightly_dir / "index.json").write_text("{}")
+            (nightly_dir / "bench-warmup-1.log").write_text(
+                "/usr/bin/python3: No module named sglang.bench_serving\n"
+            )
+            records = recipe_cluster_diagnostics.recent_failures(root, 45055310117)
             self.assertEqual(
                 records,
                 [
                     {
-                        "run_id": 45014946019,
-                        "tier": "fast_sanity",
-                        "model": "qwen3.8-27b",
+                        "run_id": 45055310116,
+                        "tier": "model_sanity",
+                        "model": "glm-5.3",
                         "codes": ["python_import"],
                     }
                 ],
