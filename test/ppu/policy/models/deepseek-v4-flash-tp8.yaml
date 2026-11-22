@@ -1,0 +1,60 @@
+schema_version: ppu-test-policy/v1
+model_id: deepseek-ai/DeepSeek-V4-Flash
+recipe: test/ppu/recipes/deepseek-ai/DeepSeek-V4-Flash.yaml
+hardware: zhenwu_m890
+accuracy_gate:
+  method: golden_band
+  golden_band_abs: 0.02
+  golden_source: framework_repo
+  save_per_question: true
+tiers:
+  fast_sanity:
+    preset: tp8
+    dummy_weights: true
+    cache: enabled
+    probe:
+      prompt: "Compute 6 * 7 and reply with the integer only."
+      max_tokens: 16
+      temperature: 0.0
+  model_sanity:
+    stages:
+      - id: sanity
+        kind: sanity
+        preset: tp8
+        cache: enabled
+        probe:
+          prompt: "Compute 6 * 7 and reply with the integer only."
+          expected_substring: "42"
+          max_tokens: 128
+          temperature: 0.0
+          seed: 42
+      - id: eval-gsm8k
+        kind: evalscope
+        cache: enabled
+        dataset: gsm8k@2026-11
+        limit: null
+        seed: 42
+        eval_batch_size: 128
+        generation:
+          temperature: 1.0
+          top_p: 1.0
+          max_tokens: 10240
+      - id: bench-micro
+        kind: bench
+        cache: enabled
+        cache_mode: sanity_throughput_guard
+        engine: sglang_bench
+        input:
+          source: client_random
+          input_length: 4096
+          output_length: 512
+          range_ratio: 1.0
+        concurrencies:
+          - 1
+          - 16
+        request_count_by_concurrency:
+          1: 8
+          16: 32
+        warmup_count_by_concurrency:
+          1: 2
+          16: 8

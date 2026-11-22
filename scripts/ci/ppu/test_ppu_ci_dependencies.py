@@ -7,8 +7,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from sglang.test.test_utils import CustomTestCase
-
 SCRIPT = Path(__file__).resolve().parents[3] / "scripts/ci/ppu/check_dependencies.py"
 ADDITIONS = {
     "sailify": "1.0.0",
@@ -28,7 +26,7 @@ WHEELS = {
 }
 
 
-class TestPPUCIDependencies(CustomTestCase):
+class TestPPUCIDependencies(unittest.TestCase):
     def check_snapshots(self, before, after):
         with tempfile.TemporaryDirectory() as directory:
             paths = [Path(directory) / name for name in ("before.json", "after.json")]

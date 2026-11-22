@@ -1,0 +1,49 @@
+name: PPU revision approval
+on:
+  workflow_call:
+    inputs:
+      label:
+        required: true
+        type: string
+      ref:
+        type: string
+        default: ''
+    outputs:
+      approved:
+        value: ${{ jobs.approval.outputs.approved }}
+      sha:
+        value: ${{ jobs.approval.outputs.sha }}
+permissions:
+  contents: read
+  pull-requests: read
+jobs:
+  approval:
+    runs-on: ubuntu-latest
+    outputs:
+      approved: ${{ steps.policy.outputs.result }}
+      sha: ${{ steps.policy.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          sparse-checkout: scripts/ci/ppu
+          persist-credentials: false
+      - uses: actions/github-script@v8
+        id: policy
+        env:
+          WORKLOAD_LABEL: ${{ inputs.label }}
+          CANDIDATE_REF: ${{ inputs.ref }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        with:
+          script: |
+            const approved = require('./scripts/ci/ppu/ppu_approval.cjs');
+            const res = await approved.resolve({
+              github,
+              context,
+              label: process.env.WORKLOAD_LABEL,
+              ref: process.env.CANDIDATE_REF,
+              workflowSha: process.env.WORKFLOW_SHA,
+            });
+            core.setOutput('sha', res.sha);
+            return res.approved;
