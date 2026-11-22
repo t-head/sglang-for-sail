@@ -1,5 +1,8 @@
 name: Nightly Dispatch (PPU)
 
+# Merge order: land the companion yuhe/v1.0.0 nightly-test-ppu.yml PR declaring
+# target_ref, image_tag, and image_digest before merging this dispatcher PR.
+
 on:
   schedule:
     - cron: '23 18 * * *'
