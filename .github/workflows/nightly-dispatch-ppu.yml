@@ -1,0 +1,17 @@
+name: Nightly Dispatch (PPU)
+
+on:
+  schedule:
+    - cron: '23 18 * * *'
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+jobs:
+  release-v100:
+    if: github.repository == 't-head/sglang-for-sail'
+    uses: t-head/sglang-for-sail/.github/workflows/nightly-test-ppu.yml@yuhe/v1.0.0
+    with:
+      ref: yuhe/v1.0.0
