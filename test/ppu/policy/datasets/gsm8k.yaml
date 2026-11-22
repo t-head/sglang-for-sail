@@ -1,0 +1,12 @@
+schema_version: ppu-dataset/v1
+id: gsm8k
+version: "2026-11"
+dataset_asset: evalscope-gsm8k-offline
+subset_list:
+  - main
+few_shot_num: 4
+few_shot_random: false
+num_expected: 1319
+scoring: evalscope-default
+filters:
+  remove_until: "</think>"
