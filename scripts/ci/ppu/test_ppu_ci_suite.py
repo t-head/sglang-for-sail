@@ -176,6 +176,25 @@ class TestPPUCIWorkflow(unittest.TestCase):
                 )
                 for job in cluster_jobs:
                     self.assertEqual(jobs[job]["runs-on"], "k8s-runner-group-cpu-thead")
+        approval = yaml.load(
+            (RUNNER.parent.parent / ".github/workflows/ppu-approval.yml").read_text(),
+            Loader=yaml.BaseLoader,
+        )
+        self.assertIn("sha", approval["on"]["workflow_call"]["outputs"])
+        nightly = yaml.load(
+            (RUNNER.parent.parent / ".github/workflows/nightly-test-ppu.yml").read_text(),
+            Loader=yaml.BaseLoader,
+        )
+        plan_checkout = nightly["jobs"]["plan"]["steps"][0]["with"]["ref"]
+        self.assertTrue(
+            plan_checkout.startswith("${{ needs.pr-gate.outputs.sha ||"),
+            plan_checkout,
+        )
+        pr_checkout = self.jobs["check-changes"]["steps"][0]["with"]["ref"]
+        self.assertTrue(
+            pr_checkout.startswith("${{ needs.pr-gate.outputs.sha ||"),
+            pr_checkout,
+        )
 
     def test_protected_recipe_job_forwards_matrix_device_count(self):
         source = RUNNER.parent.parent / ".github/workflows/nightly-test-ppu.yml"

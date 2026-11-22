@@ -88,19 +88,24 @@ jobs:
            (needs.pr-gate.outputs.approved == 'true' ||
             ((startsWith(github.base_ref, 'release/') || github.base_ref == 'yuhe/v1.0.0') &&
              steps.filter.outputs.release-code == 'true'))) }}
-      source-sha: ${{ github.event.pull_request.head.sha || steps.source.outputs.sha }}
+      source-sha: ${{ github.event.pull_request.head.sha || needs.pr-gate.outputs.sha || steps.source.outputs.sha }}
     steps:
       - name: Checkout the non-PR source
         if: github.event_name != 'pull_request_target'
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.sha || inputs.ref || github.sha }}
+          ref: ${{ needs.pr-gate.outputs.sha || (github.event_name == 'workflow_dispatch' && github.sha) || inputs.ref || github.sha }}
           persist-credentials: false
 
       - name: Pin the source revision for every job
         id: source
         if: github.event_name != 'pull_request_target'
-        run: printf 'sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        env:
+          APPROVED_SHA: ${{ needs.pr-gate.outputs.sha }}
+        run: |
+          sha="$(git rev-parse HEAD)"
+          [[ -z "${APPROVED_SHA:-}" || "$sha" == "$APPROVED_SHA" ]]
+          printf 'sha=%s\n' "$sha" >> "$GITHUB_OUTPUT"
 
       - name: Determine run mode
         id: run-mode

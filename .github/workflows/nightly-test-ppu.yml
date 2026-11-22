@@ -113,7 +113,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
-          ref: ${{ github.event.pull_request.head.sha || (github.event_name == 'workflow_dispatch' && github.sha) || inputs.ref || github.sha }}
+          ref: ${{ needs.pr-gate.outputs.sha || github.event.pull_request.head.sha || (github.event_name == 'workflow_dispatch' && github.sha) || inputs.ref || github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -125,6 +125,7 @@ jobs:
       - name: Select models and candidate wheel inputs
         id: plan
         env:
+          APPROVED_SHA: ${{ needs.pr-gate.outputs.sha }}
           MODEL_FILTER: ${{ inputs.model_filter || '' }}
           SKIP_BUILD: ${{ inputs.skip_wheel_build || false }}
           WHEEL_RUN: ${{ inputs.wheel_artifact_run_id || '' }}
@@ -134,6 +135,7 @@ jobs:
         run: |
           set -euo pipefail
           source=$(git rev-parse HEAD)
+          [[ -z "${APPROVED_SHA:-}" || "$source" == "$APPROVED_SHA" ]]
           models=$(python3 -B scripts/ci/ppu/recipe_select.py "$TIER" --model-filter "$MODEL_FILTER")
           if [[ "$SKIP_BUILD" == true ]]; then
             if [[ -n "$WHEEL_ID" ]]; then

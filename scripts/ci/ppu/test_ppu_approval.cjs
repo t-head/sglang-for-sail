@@ -46,9 +46,18 @@ function fixture(label = "run-ci-ppu") {
             commit: {sha: branch === "yuhe/v1.0.0" ? yuheSha : head},
           },
         }),
+        listBranches: Symbol("listBranches"),
       },
     },
     paginate: async (route, args) => {
+      if (route === github.rest.repos.listBranches) {
+        assert.deepEqual(args, {owner: repo.owner, repo: repo.repo, protected: true, per_page: 100});
+        return [
+          {name: "main", protected: true, commit: {sha: other}},
+          {name: base, protected: true, commit: {sha: head}},
+          {name: "release/v1.0.0", protected: true, commit: {sha: head}},
+        ];
+      }
       assert.equal(route, github.rest.issues.listEventsForTimeline);
       assert.deepEqual(args, {owner: repo.owner, repo: repo.repo, issue_number: 268, per_page: 100});
       return timeline;
@@ -178,4 +187,31 @@ test("default branch sail_ci_cd schedule can call yuhe/v1.0.0 and protected rele
   f.branchActivity["refs/heads/yuhe/v1.0.0"].actor.login = "maintainer";
   f.branchActivity["refs/heads/yuhe/v1.0.0"].after = head;
   assert.equal(await approved({...f, ref: "yuhe/v1.0.0"}), false);
+});
+
+test("resolve returns pinned target SHA and admits nested schedule SHA but rejects unapproved SHA", async t => {
+  const f = fixture("run-ci-ppu");
+  const original = process.env.GITHUB_REF_PROTECTED;
+  t.after(() => {
+    if (original === undefined) delete process.env.GITHUB_REF_PROTECTED;
+    else process.env.GITHUB_REF_PROTECTED = original;
+  });
+  f.repo.defaultBranch = "sail_ci_cd";
+  f.context.ref = "refs/heads/sail_ci_cd";
+  f.context.eventName = "schedule";
+  process.env.GITHUB_REF_PROTECTED = "false";
+
+  const parentGate = await approved.resolve({...f, ref: "yuhe/v1.0.0"});
+  assert.deepEqual(parentGate, {approved: true, sha: yuheSha});
+  const nestedGate = await approved.resolve({...f, ref: parentGate.sha});
+  assert.deepEqual(nestedGate, {approved: true, sha: yuheSha});
+
+  const releaseGate = await approved.resolve({...f, ref: "release/v1.0.0"});
+  assert.deepEqual(releaseGate, {approved: true, sha: head});
+  const nestedReleaseGate = await approved.resolve({...f, ref: releaseGate.sha});
+  assert.deepEqual(nestedReleaseGate, {approved: true, sha: head});
+
+  // Unapproved 40-char SHA must fail closed.
+  const unapprovedSha = "d".repeat(40);
+  assert.deepEqual(await approved.resolve({...f, ref: unapprovedSha}), {approved: false, sha: ""});
 });
