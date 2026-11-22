@@ -27,7 +27,7 @@ export PPU_CI_WHEEL_DIR="$PWD/wheels" PPU_CI_RECIPE_SOURCE_DIR="$PWD"
 [[ $(git rev-parse HEAD) == "${PPU_CI_SOURCE_SHA:?}" ]]
 if [[ "$TIER" == legacy ]]; then
     export SGLANG_TEST_METRICS_FILE="$PPU_CI_ARTIFACT_DIR/suite-metrics.jsonl"
-    bash scripts/ci/ppu/build_and_test.sh test
+    bash scripts/ci/ppu/build_and_test.sh legacy
     exit
 fi
 printf '%s\n' wheel_verification > "$PPU_CI_ARTIFACT_DIR/worker-phase.txt"

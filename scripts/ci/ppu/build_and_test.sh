@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-phase=${1:?Usage: build_and_test.sh build|test}
+phase=${1:?Usage: build_and_test.sh build|test|legacy}
 case "$phase" in
-    build|test) ;;
+    build|test|legacy) ;;
     *) printf 'Unknown phase: %s\n' "$phase" >&2; exit 2 ;;
 esac
 : "${PPU_CI_ARTIFACT_DIR:?}"
@@ -103,6 +103,10 @@ fi
 : "${PPU_CI_TARGET_MODEL_PATH:?}"
 : "${PPU_CI_EAGLE3_MODEL_PATH:?}"
 : "${PPU_CI_DFLASH_MODEL_PATH:?}"
+if [[ "$phase" == test ]]; then
+    : "${PPU_CI_MLA_MODEL_PATH:?}"
+    : "${PPU_CI_SMALL_MODEL_PATH:?}"
+fi
 : "${PPU_CI_EVAL_CACHE:?}"
 export HOME
 HOME=$(mktemp -d)
@@ -156,7 +160,14 @@ PY
 python3 "$repo/scripts/ci/ppu/prepare_runtime.py"
 
 cd "$artifacts"
-python3 "$repo/scripts/ci/ppu/run_speculative_sanity.py" \
-    2>&1 | tee "$artifacts/sanity.log"
-# Require both sanity files; update this count when extending the suite.
-grep -Fxq 'Test Summary: 2/2 passed' "$artifacts/sanity.log"
+if [[ "$phase" == legacy ]]; then
+    python3 "$repo/scripts/ci/ppu/run_speculative_sanity.py" \
+        2>&1 | tee "$artifacts/sanity.log"
+    # Require both speculative sanity files in legacy Pod mode.
+    grep -Fxq 'Test Summary: 2/2 passed' "$artifacts/sanity.log"
+else
+    python3 "$repo/test/run_suite.py" --hw ppu --suite extra-test-1-gpu-ppu --timeout-per-file 1200 \
+        2>&1 | tee "$artifacts/sanity.log"
+    # Require all five model sanity files and all five kernel regressions.
+    grep -Fxq 'Test Summary: 10/10 passed' "$artifacts/sanity.log"
+fi

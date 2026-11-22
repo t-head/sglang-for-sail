@@ -42,6 +42,41 @@ class TestPPUCISuite(unittest.TestCase):
             list((RUNNER.parent / "registered").rglob("test_ppu_ci_*.py")), []
         )
 
+    def test_ppu_suite_contains_model_and_kernel_regressions(self):
+        registered = RUNNER.parent / "registered"
+        files = [
+            str(path)
+            for path in registered.rglob("*.py")
+            if path.name not in ("conftest.py", "__init__.py")
+        ]
+        tests = registry.collect_tests(files)
+        ppu_tests = [
+            test
+            for test in tests
+            if test.backend == registry.HWBackend.PPU
+            and test.effective_suite == "extra-test-1-gpu-ppu"
+            and test.disabled is None
+            and not test.nightly
+        ]
+        self.assertCountEqual(
+            [
+                Path(test.filename).relative_to(registered).as_posix()
+                for test in ppu_tests
+            ],
+            [
+                "core/test_basic_sanity_eagle3.py",
+                "core/test_basic_sanity_dflash.py",
+                "core/test_basic_sanity.py",
+                "radix_cache/test_radix_attention.py",
+                "ppu/test_sail_attention_backends.py",
+                "kernels/ops/attention/test_dsa_tilelang_sparse_layout.py",
+                "kernels/ops/attention/test_minimax_m3_msa_ppu_page_table_tail.py",
+                "kernels/ops/activation/test_silu_and_mul_masked_post_per_token_quant_fp8.py",
+                "kernels/ops/communication/test_engram_gather_peer.py",
+                "kernels/ops/gemm/test_ppu_bf16_dense_gemm.py",
+            ],
+        )
+
     def test_ppu_suite_contains_both_speculative_sanity_files(self):
         registered = RUNNER.parent / "registered"
         ppu_tests = select_tests(RUNNER.parent.parent)
@@ -53,7 +88,7 @@ class TestPPUCISuite(unittest.TestCase):
             ["core/test_basic_sanity_eagle3.py", "core/test_basic_sanity_dflash.py"],
         )
 
-    def test_runtime_requires_both_sanity_files_to_pass(self):
+    def test_runtime_requires_expected_sanity_files_to_pass(self):
         source = Path(__file__).with_name("build_and_test.sh").read_text()
         marker = 'cd "$artifacts"\n'
         self.assertIn(marker, source)
@@ -66,40 +101,63 @@ class TestPPUCISuite(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "repo with spaces"
             (root / "scripts/ci/ppu").mkdir(parents=True)
+            (root / "test").mkdir(parents=True)
             artifacts = root / "artifacts"
             artifacts.mkdir()
-            (root / "scripts/ci/ppu/run_speculative_sanity.py").write_text(
+            fixture = (
                 "import os, sys\n"
                 "print(os.environ['FIXTURE_SUMMARY'], file=sys.stderr)\n"
                 "sys.exit(int(os.environ['FIXTURE_EXIT']))\n"
             )
-            for summary, exit_code, expected in (
-                ("Test Summary: 2/2 passed", 0, 0),
-                ("Test Summary: 0/0 passed", 0, 1),
-                ("Test Summary: 1/1 passed", 0, 1),
-                ("Test Summary: 1/2 passed", 0, 1),
-                ("Test Summary: 3/3 passed", 0, 1),
-                ("Test Summary: 2/2 passed", 7, 7),
-                ("Test Summary: 2/2 passed (incomplete)", 0, 1),
-                ("", 0, 1),
+            (root / "scripts/ci/ppu/run_speculative_sanity.py").write_text(fixture)
+            (root / "test/run_suite.py").write_text(fixture)
+            for phase, cases in (
+                (
+                    "legacy",
+                    (
+                        ("Test Summary: 2/2 passed", 0, 0),
+                        ("Test Summary: 0/0 passed", 0, 1),
+                        ("Test Summary: 1/1 passed", 0, 1),
+                        ("Test Summary: 1/2 passed", 0, 1),
+                        ("Test Summary: 3/3 passed", 0, 1),
+                        ("Test Summary: 2/2 passed", 7, 7),
+                        ("Test Summary: 2/2 passed (incomplete)", 0, 1),
+                        ("", 0, 1),
+                    ),
+                ),
+                (
+                    "test",
+                    (
+                        ("Test Summary: 10/10 passed", 0, 0),
+                        ("Test Summary: 9/9 passed", 0, 1),
+                        ("Test Summary: 9/10 passed", 0, 1),
+                        ("Test Summary: 10/10 passed", 7, 7),
+                        ("Test Summary: 10/10 passed (incomplete)", 0, 1),
+                        ("", 0, 1),
+                    ),
+                ),
             ):
-                with self.subTest(summary=summary, exit_code=exit_code):
-                    result = subprocess.run(
-                        ["bash", "-c", script],
-                        env=dict(
-                            os.environ,
-                            repo=str(root),
-                            artifacts=str(artifacts),
-                            FIXTURE_SUMMARY=summary,
-                            FIXTURE_EXIT=str(exit_code),
-                        ),
-                        capture_output=True,
-                        text=True,
-                        timeout=10,
-                    )
-                    self.assertEqual(
-                        result.returncode, expected, result.stdout + result.stderr
-                    )
+                for summary, exit_code, expected in cases:
+                    with self.subTest(
+                        phase=phase, summary=summary, exit_code=exit_code
+                    ):
+                        result = subprocess.run(
+                            ["bash", "-c", script],
+                            env=dict(
+                                os.environ,
+                                phase=phase,
+                                repo=str(root),
+                                artifacts=str(artifacts),
+                                FIXTURE_SUMMARY=summary,
+                                FIXTURE_EXIT=str(exit_code),
+                            ),
+                            capture_output=True,
+                            text=True,
+                            timeout=10,
+                        )
+                        self.assertEqual(
+                            result.returncode, expected, result.stdout + result.stderr
+                        )
 
 
 class TestPPUCIWorkflow(unittest.TestCase):
@@ -182,7 +240,9 @@ class TestPPUCIWorkflow(unittest.TestCase):
         )
         self.assertIn("sha", approval["on"]["workflow_call"]["outputs"])
         nightly = yaml.load(
-            (RUNNER.parent.parent / ".github/workflows/nightly-test-ppu.yml").read_text(),
+            (
+                RUNNER.parent.parent / ".github/workflows/nightly-test-ppu.yml"
+            ).read_text(),
             Loader=yaml.BaseLoader,
         )
         plan_checkout = nightly["jobs"]["plan"]["steps"][0]["with"]["ref"]
@@ -352,6 +412,10 @@ class TestPPUCIWorkflow(unittest.TestCase):
                         )
 
 
+@unittest.skipUnless(
+    sys.platform == "linux" and shutil.which("flock"),
+    "PPU infrastructure selftests require Linux and util-linux flock",
+)
 class TestPPUManualSelftests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()

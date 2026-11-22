@@ -14,11 +14,14 @@ import unittest
 import uuid
 from pathlib import Path
 
+import yaml
+
 if sys.platform == "linux":
     import fcntl
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "scripts/ci/ppu/run_test.sh"
+WORKFLOW = REPO / ".github/workflows/pr-test-ppu-extra.yml"
 # Finish before GitHub's ~7.5s SIGINT + 2.5s SIGTERM force-kill window.
 CANCELLATION_BUDGET = 7.5
 SHA = "a" * 40
@@ -166,8 +169,6 @@ class TestPPUCIDocker(unittest.TestCase):
         self.launcher = script_dir / "run_test.sh"
         if SCRIPT.exists():
             shutil.copyfile(SCRIPT, self.launcher)
-        wrapper = SCRIPT.with_name("run_legacy_private.sh")
-        shutil.copyfile(wrapper, script_dir / wrapper.name)
         self.bin = self.root / "bin"
         self.bin.mkdir()
         for name, body in (("docker", DOCKER), ("git", GIT)):
@@ -188,7 +189,9 @@ class TestPPUCIDocker(unittest.TestCase):
         self.home.mkdir()
         self.runner_temp = self.root / "runner temp"
         self.runner_temp.mkdir()
-        self.models = [self.root / name for name in ("target", "eagle3", "dflash")]
+        self.models = [
+            self.root / name for name in ("target", "eagle3", "dflash", "mla", "small")
+        ]
         for model in self.models:
             model.mkdir()
             (model / "config.json").write_text("{}")
@@ -225,6 +228,8 @@ class TestPPUCIDocker(unittest.TestCase):
             PPU_CI_TARGET_MODEL_PATH=str(self.models[0]),
             PPU_CI_EAGLE3_MODEL_PATH=str(self.models[1]),
             PPU_CI_DFLASH_MODEL_PATH=str(self.models[2]),
+            PPU_CI_MLA_MODEL_PATH=str(self.models[3]),
+            PPU_CI_SMALL_MODEL_PATH=str(self.models[4]),
             PPU_CI_EVAL_CACHE=str(self.cache),
         )
         os.mkfifo(self.root / "ready.fifo")
@@ -443,7 +448,6 @@ class TestPPUCIDocker(unittest.TestCase):
         for event in events:
             if event["args"][0] in ("stop", "rm"):
                 self.assertEqual(event["args"][-1], name)
-        self.assertEqual(commands.count("run"), 1)
         ownership = events[-1]["args"]
         self.assertEqual(ownership[0], "run")
         self.assertIn(f"{os.getuid()}:{os.getgid()}", ownership)
@@ -451,10 +455,7 @@ class TestPPUCIDocker(unittest.TestCase):
         self.assertIn("NVIDIA_VISIBLE_DEVICES=void", ownership)
         self.assertIn(IMAGE_ID, ownership)
         self.assertFalse((self.root / "container.json").exists())
-        mount = ownership[ownership.index("--mount") + 1]
-        mount_fields = dict(part.split("=", 1) for part in mount.split(","))
-        recovered = Path(mount_fields["source"])
-        self.assertTrue((recovered / "ownership-recovered").is_file())
+        self.assertEqual(len(list(self.artifacts.glob("*/ownership-recovered"))), 1)
         with self.lock.open("a") as handle:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return create
@@ -492,9 +493,11 @@ class TestPPUCIDocker(unittest.TestCase):
             "/models/target": self.models[0],
             "/models/eagle3": self.models[1],
             "/models/dflash": self.models[2],
+            "/models/mla": self.models[3],
+            "/models/small": self.models[4],
             "/eval-cache": self.cache,
         }
-        self.assertEqual(len(mounts), 7)
+        self.assertEqual(len(mounts), 9)
         for target, source in expected.items():
             self.assertIn(f"type=bind,source={source},target={target},readonly", mounts)
         private = next(mount for mount in mounts if "target=/artifacts" in mount)
@@ -523,17 +526,24 @@ class TestPPUCIDocker(unittest.TestCase):
         self.assertEqual(list(self.home.iterdir()), [])
 
     def start_blocked(self, **updates):
+        workflow = yaml.safe_load(WORKFLOW.read_text())
+        step = next(
+            step
+            for step in workflow["jobs"]["ppu-sanity"]["steps"]
+            if step.get("name")
+            == "Run PPU sanity and kernel regressions in isolated Docker"
+        )
         env = {
             **self.env,
             "BLOCK_TEST": "1",
             "RUNNER_TEMP": str(self.root / "runner-a"),
-            "GITHUB_RUN_ID": "12",
-            "GITHUB_RUN_ATTEMPT": "1",
             **updates,
         }
-        # Sourcing exercises the explicit exec used by the local Docker wrapper.
+        for key in step["env"]:
+            env[key] = env.pop(key.removeprefix("CONFIG_"), "")
+        # Sourcing prevents bash -c's implicit exec from masking the wrapper bug.
         step_script = self.root / "workflow-step.sh"
-        step_script.write_text("exec bash scripts/ci/ppu/run_legacy_private.sh\n")
+        step_script.write_text(step["run"])
         process = subprocess.Popen(
             [
                 "bash",
@@ -609,12 +619,7 @@ class TestPPUCIDocker(unittest.TestCase):
                 process.send_signal(sig)
                 output, errors = process.communicate(timeout=CANCELLATION_BUDGET)
                 self.assertEqual(process.returncode, code, output + errors)
-                self.assertEqual(output, "")
-                destinations = (self.home / ".sglang-ppu-ci-results").glob("legacy.*")
-                destination = max(
-                    destinations, key=lambda path: path.stat().st_mtime_ns
-                )
-                self.assert_private_pull_log((destination / "launcher.log").read_text())
+                self.assert_private_pull_log(output)
                 self.assert_image_reference_is_private(
                     subprocess.CompletedProcess([], code, output, errors)
                 )
