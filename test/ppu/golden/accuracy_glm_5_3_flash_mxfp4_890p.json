@@ -1,0 +1,35 @@
+{
+  "schema_version": 2,
+  "model": "glm_5_3_flash_mxfp4",
+  "chip": "890p",
+  "checkpoint": "T-HEAD/GLM-5.3-Flash-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken",
+  "checkpoint_tail": "T-HEAD/GLM-5.3-Flash-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken",
+  "benchmark": "gsm8k",
+  "evalscope_version": "",
+  "dataset": {
+    "dataset_id": "gsm8k@2026-11",
+    "few_shot_num": 4,
+    "few_shot_random": false,
+    "subset_list": ["main"],
+    "num_expected": 1319
+  },
+  "serving": {
+    "ppu_count": 2,
+    "tensor_parallel_size": 2,
+    "data_parallel_size": 1,
+    "enable_expert_parallel": false,
+    "gpu_memory_utilization": null,
+    "max_model_len": 16384,
+    "seed": null
+  },
+  "generation": {
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "max_tokens": 10240
+  },
+  "score": 0.9697,
+  "score_num": 1279,
+  "tolerance": {"mode": "band", "abs": 0.02},
+  "measured_at": "2026-11-19T17:18:17+00:00",
+  "baseline_origin": "vLLM SAIL PR #334, commit 9d41a08c2bd09a586d751f9ed848366b39e06ded; Zhenwu M890 TP2"
+}
