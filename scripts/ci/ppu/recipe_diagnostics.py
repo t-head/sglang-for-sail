@@ -13,6 +13,8 @@ PHASES = {
     "recipe_validation",
     "model_cache_check",
     "server_startup",
+    "server_exit",
+    "readiness_timeout",
     "chat_probe",
     "gsm8k_eval",
     "cache_flush",

@@ -10,6 +10,7 @@ from pathlib import Path
 SCRIPT = Path(__file__).resolve().parents[3] / "scripts/ci/ppu/check_dependencies.py"
 ADDITIONS = {
     "sailify": "1.0.0",
+    "blake3": "1.0.0",
     "sgl-eval": "0.1.2",
     "math-verify": "0.9.0",
     "latex2sympy2-extended": "1.11.0",
@@ -18,6 +19,7 @@ ADDITIONS = {
 }
 WHEELS = {
     "sailify": "sailify-1.0.0-py3-none-any.whl",
+    "blake3": "blake3-1.0.0-cp312-cp312-linux_x86_64.whl",
     "sgl-eval": "sgl_eval-0.1.2-py3-none-any.whl",
     "math-verify": "Math.Verify-0.9.0-py3-none-any.whl",
     "latex2sympy2-extended": "latex2sympy2_extended-1.11.0-py3-none-any.whl",
@@ -129,6 +131,7 @@ class TestPPUCIDependencies(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             result.stdout,
+            "blake3==1.0.0\n"
             "sgl-eval==0.1.2\n"
             "math-verify==0.9.0\n"
             "latex2sympy2-extended==1.11.0\n"
@@ -157,11 +160,11 @@ class TestPPUCIDependencies(unittest.TestCase):
 
     def test_missing_wheels_cli_skips_preinstalled_distributions(self):
         for installed in (
-            {"Sailify": "vendor-version", "SGL.Eval": "0.1.2"},
-            {**ADDITIONS, "sailify": "vendor-version"},
+            {"Sailify": "vendor-version", "blake3": "1.0.8", "SGL.Eval": "0.1.2"},
+            {**ADDITIONS, "sailify": "vendor-version", "blake3": "1.0.8"},
         ):
             with self.subTest(installed=installed):
-                missing = list(WHEELS.values())[2:] if "SGL.Eval" in installed else []
+                missing = list(WHEELS.values())[3:] if "SGL.Eval" in installed else []
                 result, wheel_dir = self.run_isolated_cli(
                     "missing-wheels", installed, missing
                 )
@@ -173,7 +176,7 @@ class TestPPUCIDependencies(unittest.TestCase):
 
     def test_cli_rejects_preinstalled_evaluator_pin_conflicts(self):
         for name, version in ADDITIONS.items():
-            if name == "sailify":
+            if name in {"sailify", "blake3"}:
                 continue
             with self.subTest(name=name):
                 result, _ = self.run_isolated_cli(

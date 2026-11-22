@@ -7,8 +7,10 @@ from importlib import metadata
 from pathlib import Path
 
 BUILD_TARGETS = {"sglang", "sgl-kernel", "sglang-kernel"}
+COMPAT_ADDITIONS = {"sailify", "blake3"}
 PINNED_ADDITIONS = {
     "sailify": "1.0.0",
+    "blake3": "1.0.0",
     "sgl-eval": "0.1.2",
     "math-verify": "0.9.0",
     "latex2sympy2-extended": "1.11.0",
@@ -37,7 +39,7 @@ def snapshot():
 
 def validate_evaluators(packages):
     for name, version in PINNED_ADDITIONS.items():
-        if name == "sailify" or name not in packages:
+        if name in COMPAT_ADDITIONS or name not in packages:
             continue
         installed = packages[name]["version"]
         if installed != version:

@@ -1127,6 +1127,33 @@ class ClusterTransportTest(unittest.TestCase):
                 (original_log,) = retained.glob("cluster.*/launcher.log")
                 self.assertIn(injected, original_log.read_text())
 
+    def test_cluster_diagnostics_classifies_server_logs_and_startup_phases(self):
+        import recipe_cluster_diagnostics
+        import recipe_diagnostics
+
+        for phase in ("server_exit", "readiness_timeout"):
+            self.assertIn(phase, recipe_diagnostics.PHASES)
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            model_dir = root / "sglang-for-sail/45014946019-1/fast_sanity/qwen3.8-27b"
+            model_dir.mkdir(parents=True)
+            (model_dir / "index.json").write_text("{}")
+            (model_dir / "sglang_serve_fast_full.log").write_text(
+                "ModuleNotFoundError: No module named 'blake3'\n"
+            )
+            records = recipe_cluster_diagnostics.recent_failures(root, 45014946020)
+            self.assertEqual(
+                records,
+                [
+                    {
+                        "run_id": 45014946019,
+                        "tier": "fast_sanity",
+                        "model": "qwen3.8-27b",
+                        "codes": ["python_import"],
+                    }
+                ],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
