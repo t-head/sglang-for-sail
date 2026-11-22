@@ -19,7 +19,7 @@ model:
     - --moe-dense-tp-size
     - "1"
     - --attention-backend
-    - triton
+    - fa3
     - --mem-fraction-static
     - "0.9"
     - --max-running-requests
@@ -32,6 +32,8 @@ model:
     - "2"
     - --speculative-eagle-topk
     - "1"
+    - --speculative-num-draft-tokens
+    - "3"
     - --linear-attn-prefill-backend
     - triton
     - --linear-attn-decode-backend
@@ -43,7 +45,15 @@ model:
     - --ple-offload-embedding
     - --reasoning-parser
     - auto
+    - --dist-timeout
+    - "3600"
+    - --watchdog-timeout
+    - "3600"
     - --trust-remote-code
+  base_env:
+    NCCL_CUMEM_ENABLE: "1"
+    SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK: "512"
+    SGLANG_SAIL_DEEPEP_RECV_HOOK: "0"
 variants:
   default: {precision: mxfp4}
 presets:

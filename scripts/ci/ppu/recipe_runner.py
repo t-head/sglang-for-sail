@@ -3,6 +3,7 @@
 
 import argparse
 import contextlib
+import importlib.util
 import json
 import math
 import os
@@ -302,6 +303,17 @@ def evaluate(stage, config):
     }
 
 
+def bench_module_name():
+    if (REPO_ROOT / "python/sglang/benchmark/serving.py").is_file():
+        return "sglang.benchmark.serving"
+    return (
+        "sglang.benchmark.serving"
+        if importlib.util.find_spec("sglang") is not None
+        and importlib.util.find_spec("sglang.benchmark.serving") is not None
+        else "sglang.bench_serving"
+    )
+
+
 def bench(stage, config, concurrency, requests, label):
     phase("micro_e2e")
     output = RESULTS / f"bench-{label}-{concurrency}.jsonl"
@@ -311,7 +323,7 @@ def bench(stage, config, concurrency, requests, label):
         "-I",
         "-B",
         "-m",
-        "sglang.bench_serving",
+        bench_module_name(),
         "--backend",
         "sglang",
         "--host",

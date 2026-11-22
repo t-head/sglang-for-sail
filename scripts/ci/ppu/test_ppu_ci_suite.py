@@ -375,9 +375,20 @@ class TestPPUCIWorkflow(unittest.TestCase):
         self.assertEqual(dispatch_filter["type"], "string")
         self.assertEqual(dispatch_filter["default"], "")
         self.assertNotIn("model_filter", triggers["workflow_call"]["inputs"])
+        dispatch_model_sanity = triggers["workflow_dispatch"]["inputs"][
+            "run_model_sanity"
+        ]
+        self.assertEqual(dispatch_model_sanity["type"], "boolean")
+        self.assertEqual(dispatch_model_sanity["default"], "false")
+        self.assertNotIn("run_model_sanity", triggers["workflow_call"]["inputs"])
+        self.assertIn("inputs.run_model_sanity", workflow["concurrency"]["group"])
         self.assertEqual(
             self.jobs["ppu-fast-sanity"]["with"]["model_filter"],
             "${{ github.event_name == 'workflow_dispatch' && inputs.model_filter || '' }}",
+        )
+        self.assertEqual(
+            self.jobs["ppu-fast-sanity"]["with"]["tier"],
+            "${{ inputs.preflight_only && 'cluster_preflight' || (github.event_name == 'workflow_dispatch' && inputs.run_model_sanity && 'model_sanity' || 'fast_sanity') }}",
         )
 
     def test_finish_requires_each_recipe_dependency_when_in_scope(self):
