@@ -1,0 +1,35 @@
+schema_version: ppu-serving/v1
+ppu:
+  framework: sglang
+  visibility: public
+  assets: {model: deepseek-v4.1-flash-1017-mxfp4, tokenizer: deepseek-v4.1-flash-1017-mxfp4}
+  hf_model_id: T-HEAD/DeepSeek-V4.1-Flash-1017-MXFP4-FP8-Engram-MXFP8
+  golden_model_key: deepseek_v41_flash_1017_mxfp4
+  topology: {kind: single_node, nodes: 1, devices_per_node: 8}
+  external_env: [DG_USE_MOE_DYNAMIC_TILE, HGGC_EMBEDDED_COPY_THRESHOLD]
+model:
+  model_id: deepseek-ai/DeepSeek-V4.1-Flash
+  base_args:
+    - --tp-size
+    - "8"
+    - --attention-backend
+    - dsv4
+    - --page-size
+    - "256"
+    - --mem-fraction-static
+    - "0.8"
+    - --chunked-prefill-size
+    - "10240"
+    - --cuda-graph-max-bs-decode
+    - "64"
+    - --disable-prefill-cuda-graph
+    - --reasoning-parser
+    - deepseek-v4
+    - --disable-custom-all-reduce
+    - --disable-shared-experts-fusion
+    - --trust-remote-code
+  base_env:
+    DG_USE_MOE_DYNAMIC_TILE: "1"
+    HGGC_EMBEDDED_COPY_THRESHOLD: "0x10000"
+variants:
+  default: {precision: mxfp4}

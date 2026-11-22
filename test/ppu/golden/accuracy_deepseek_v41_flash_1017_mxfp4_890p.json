@@ -1,0 +1,35 @@
+{
+  "schema_version": 2,
+  "model": "deepseek_v41_flash_1017_mxfp4",
+  "chip": "890p",
+  "checkpoint": "T-HEAD/DeepSeek-V4.1-Flash-1017-MXFP4-FP8-Engram-MXFP8",
+  "checkpoint_tail": "T-HEAD/DeepSeek-V4.1-Flash-1017-MXFP4-FP8-Engram-MXFP8",
+  "benchmark": "gsm8k",
+  "evalscope_version": "1.14.1",
+  "dataset": {
+    "dataset_id": "gsm8k@2026-11",
+    "few_shot_num": 4,
+    "few_shot_random": false,
+    "subset_list": ["main"],
+    "num_expected": 1319
+  },
+  "serving": {
+    "ppu_count": 8,
+    "tensor_parallel_size": 8,
+    "data_parallel_size": 1,
+    "enable_expert_parallel": false,
+    "gpu_memory_utilization": 0.9,
+    "max_model_len": null,
+    "seed": null
+  },
+  "generation": {
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "max_tokens": 10240
+  },
+  "score": 0.9712,
+  "score_num": 1281,
+  "tolerance": {"mode": "band", "abs": 0.02},
+  "measured_at": "2026-11-20T01:57:33+00:00",
+  "baseline_origin": "vLLM SAIL PR #325, commit 933d833bc5918e340e0ed19206d0a78f908df593; Zhenwu M890 TP8"
+}
