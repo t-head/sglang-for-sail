@@ -7,19 +7,28 @@ on:
     types: [labeled, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
-      ref:
+      target_ref:
+        description: Target branch or 40-char commit SHA (blank uses default/caller ref)
         type: string
         default: ''
       model_filter:
+        description: Optional comma-separated Recipe model policy slugs (blank = all)
         type: string
         default: ''
-      runtime_image:
+      image_tag:
+        description: Allowed runtime image tag (tag only, no registry or repository prefix)
         type: string
-        default: download.t-head.cn/docker_test/sglang:release-v0.5.23-20261116-cf244d4
+        default: ''
+      image_digest:
+        description: Optional immutable runtime image digest (sha256:<64-hex>)
+        type: string
+        default: ''
       skip_wheel_build:
+        description: Skip wheel build (reuse wheel_artifact_run_id or run directly in prebuilt image)
         type: boolean
         default: false
       wheel_artifact_run_id:
+        description: Optional prior run ID to reuse built wheels from when skip_wheel_build is true
         type: string
         default: ''
   workflow_call:
@@ -30,12 +39,18 @@ on:
       ref:
         type: string
         default: ''
+      target_ref:
+        type: string
+        default: ''
       model_filter:
         type: string
         default: ''
-      runtime_image:
+      image_tag:
         type: string
-        default: download.t-head.cn/docker_test/sglang:release-v0.5.23-20261116-cf244d4
+        default: ''
+      image_digest:
+        type: string
+        default: ''
       tier:
         type: string
         default: model_sanity
@@ -73,7 +88,7 @@ jobs:
     uses: ./.github/workflows/ppu-approval.yml
     with:
       label: ${{ inputs.tier == 'fast_sanity' && 'run-ci-ppu' || 'run-ci-ppu-nightly' }}
-      ref: ${{ inputs.ref || '' }}
+      ref: ${{ inputs.target_ref || inputs.ref || '' }}
 
   cluster-preflight:
     outputs:
@@ -109,11 +124,12 @@ jobs:
       models: ${{ steps.plan.outputs.models }}
       input-artifact-id: ${{ steps.plan.outputs.artifact }}
       input-run-id: ${{ steps.plan.outputs.run_id }}
+      skip-wheel-install: ${{ steps.plan.outputs.skip_wheel_install }}
     steps:
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
-          ref: ${{ needs.pr-gate.outputs.sha || github.event.pull_request.head.sha || (github.event_name == 'workflow_dispatch' && github.sha) || inputs.ref || github.sha }}
+          ref: ${{ needs.pr-gate.outputs.sha || github.event.pull_request.head.sha || (github.event_name == 'workflow_dispatch' && github.sha) || inputs.target_ref || inputs.ref || github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -126,7 +142,11 @@ jobs:
         id: plan
         env:
           APPROVED_SHA: ${{ needs.pr-gate.outputs.sha }}
+          INPUT_REF: ${{ inputs.ref || '' }}
+          INPUT_TARGET_REF: ${{ inputs.target_ref || '' }}
           MODEL_FILTER: ${{ inputs.model_filter || '' }}
+          IMAGE_TAG: ${{ inputs.image_tag || '' }}
+          IMAGE_DIGEST: ${{ inputs.image_digest || '' }}
           SKIP_BUILD: ${{ inputs.skip_wheel_build || false }}
           WHEEL_RUN: ${{ inputs.wheel_artifact_run_id || '' }}
           WHEEL_ID: ${{ inputs.wheel_artifact_id || '' }}
@@ -136,17 +156,28 @@ jobs:
           set -euo pipefail
           source=$(git rev-parse HEAD)
           [[ -z "${APPROVED_SHA:-}" || "$source" == "$APPROVED_SHA" ]]
+          if [[ -n "$INPUT_REF" && -n "$INPUT_TARGET_REF" && "$INPUT_REF" != "$INPUT_TARGET_REF" ]]; then
+            echo "::error::Conflicting ref and target_ref inputs" >&2
+            exit 1
+          fi
+          python3 -B scripts/ci/ppu/recipe_image.py validate-inputs \
+            --image-tag "$IMAGE_TAG" --image-digest "$IMAGE_DIGEST"
           models=$(python3 -B scripts/ci/ppu/recipe_select.py "$TIER" --model-filter "$MODEL_FILTER")
+          SKIP_WHEEL_INSTALL=false
           if [[ "$SKIP_BUILD" == true ]]; then
             if [[ -n "$WHEEL_ID" ]]; then
               [[ "$WHEEL_ID" =~ ^[0-9]+$ && -z "$WHEEL_RUN" ]]
               WHEEL_RUN="$GITHUB_RUN_ID"
-            else
+            elif [[ -n "$WHEEL_RUN" ]]; then
               [[ "$WHEEL_RUN" =~ ^[0-9]+$ ]]
               WHEEL_ID=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$WHEEL_RUN/artifacts" |
                 jq -er --arg prefix "ppu-wheels-$WHEEL_RUN-" \
                   '[.[].artifacts[] | select(.expired | not) | select(.name | startswith($prefix))] |
                     max_by(.id).id')
+            else
+              [[ -z "$PR_HEAD" ]]
+              [[ -n "$IMAGE_TAG" || -n "$IMAGE_DIGEST" ]]
+              SKIP_WHEEL_INSTALL=true
             fi
           else
             [[ -z "$WHEEL_RUN" && -z "$WHEEL_ID" ]]
@@ -167,11 +198,12 @@ jobs:
               done
             fi
           fi
-          printf 'source=%s\nmodels=%s\nartifact=%s\nrun_id=%s\n' "$source" "$models" "$WHEEL_ID" "$WHEEL_RUN" >> "$GITHUB_OUTPUT"
+          printf 'source=%s\nmodels=%s\nartifact=%s\nrun_id=%s\nskip_wheel_install=%s\n' \
+            "$source" "$models" "$WHEEL_ID" "$WHEEL_RUN" "$SKIP_WHEEL_INSTALL" >> "$GITHUB_OUTPUT"
 
   ppu-build:
     needs: plan
-    if: needs.plan.outputs.input-artifact-id == ''
+    if: needs.plan.outputs.input-artifact-id == '' && needs.plan.outputs.skip-wheel-install != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     container:
@@ -266,7 +298,8 @@ jobs:
       !cancelled() && needs.plan.result == 'success' &&
       (inputs.tier == 'fast_sanity' || needs.evalscope-wheels.result == 'success') &&
       (needs.ppu-build.result == 'success' ||
-       (needs.plan.outputs.input-artifact-id != '' && needs.ppu-build.result == 'skipped'))
+       ((needs.plan.outputs.input-artifact-id != '' || needs.plan.outputs.skip-wheel-install == 'true') &&
+        needs.ppu-build.result == 'skipped'))
     runs-on: k8s-runner-group-cpu-thead
     container:
       image: ghcr.io/actions/actions-runner:latest
@@ -278,7 +311,9 @@ jobs:
       MODEL_KEY: ${{ matrix.model }}
       RECIPE_PPU_COUNT: ${{ matrix.ppu_count || 8 }}
       PPU_CI_SOURCE_SHA: ${{ needs.plan.outputs.source-sha }}
-      PPU_CI_RECIPE_RUNTIME_IMAGE: ${{ inputs.runtime_image || 'download.t-head.cn/docker_test/sglang:release-v0.5.23-20261116-cf244d4' }}
+      PPU_CI_RUNTIME_IMAGE_TAG: ${{ inputs.image_tag || '' }}
+      PPU_CI_RUNTIME_IMAGE_DIGEST: ${{ inputs.image_digest || '' }}
+      PPU_CI_SKIP_WHEEL_INSTALL: ${{ needs.plan.outputs.skip-wheel-install }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -286,6 +321,7 @@ jobs:
           ref: ${{ needs.plan.outputs.source-sha }}
           persist-credentials: false
       - name: Fetch exact candidate bundle
+        if: needs.plan.outputs.skip-wheel-install != 'true'
         uses: actions/download-artifact@v4
         with:
           artifact-ids: ${{ needs.plan.outputs.input-artifact-id || needs.ppu-build.outputs.wheel-artifact-id }}

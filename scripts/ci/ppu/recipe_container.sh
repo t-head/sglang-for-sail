@@ -19,18 +19,22 @@ export SGLANG_DG_CACHE_DIR="$jit_dir/sglang" DG_JIT_CACHE_DIR="$jit_dir/deepgemm
 export DG_CACHE_DIR="$jit_dir/deepgemm" TRITON_CACHE_DIR="$jit_dir/triton"
 mkdir -p "$SGLANG_DG_CACHE_DIR" "$DG_JIT_CACHE_DIR" "$TRITON_CACHE_DIR"
 cd "$source_dir"
+skip_wheel_install="${PPU_CI_SKIP_WHEEL_INSTALL:-false}"
+[[ "$skip_wheel_install" == true || "$skip_wheel_install" == false ]] || exit 2
 checker=scripts/ci/ppu/check_dependencies.py
 python3 -I -B "$checker" snapshot "$artifact_dir/dependencies-before.json"
-# The release image owns the SDK, PyTorch, DeepGEMM, FlashMLA and EvalScope.
-python3 -I -B -m pip uninstall -y sgl-kernel >/dev/null 2>&1 || true
-python3 -I -B -m pip install --no-deps --no-index --force-reinstall "$wheel_dir/"*.whl
-missing=$(python3 -I -B "$checker" missing-wheels "$wheel_dir/runtime-deps")
-if [[ -n "$missing" ]]; then
-    mapfile -t extra <<< "$missing"
-    python3 -I -B -m pip install --no-deps --no-index "${extra[@]}"
+if [[ "$skip_wheel_install" == false ]]; then
+    # The release image owns the SDK, PyTorch, DeepGEMM, FlashMLA and EvalScope.
+    python3 -I -B -m pip uninstall -y sgl-kernel >/dev/null 2>&1 || true
+    python3 -I -B -m pip install --no-deps --no-index --force-reinstall "$wheel_dir/"*.whl
+    missing=$(python3 -I -B "$checker" missing-wheels "$wheel_dir/runtime-deps")
+    if [[ -n "$missing" ]]; then
+        mapfile -t extra <<< "$missing"
+        python3 -I -B -m pip install --no-deps --no-index "${extra[@]}"
+    fi
+    python3 -I -B "$checker" snapshot "$artifact_dir/dependencies-after.json"
+    python3 -I -B "$checker" check "$artifact_dir/dependencies-before.json" "$artifact_dir/dependencies-after.json"
 fi
-python3 -I -B "$checker" snapshot "$artifact_dir/dependencies-after.json"
-python3 -I -B "$checker" check "$artifact_dir/dependencies-before.json" "$artifact_dir/dependencies-after.json"
 if [[ "${2:-}" == model_sanity && -n "${PPU_CI_EVAL_WHEEL_DIR:-}" ]]; then
     phase eval_environment
     (cd "$PPU_CI_EVAL_WHEEL_DIR" && sha256sum -- *.whl | cmp -s SHA256SUMS -)
@@ -47,15 +51,47 @@ if [[ "${1:-}" == validate ]]; then
     exit 0
 fi
 phase platform_check
-python3 -I -B - <<'PY'
+python3 -I -B - "$artifact_dir/runtime-versions.json" <<'PY'
+import json
 import os
+import re
+import sys
+from importlib import metadata
+from pathlib import Path
 
+import sglang
 import torch
 from sglang.srt.platforms import current_platform
 
 expected_width = int(os.environ.get("RECIPE_PPU_COUNT", "8"))
 assert current_platform.is_sail(), "candidate must select the SAIL platform"
 assert torch.cuda.device_count() == expected_width, "candidate device count must match the Recipe allocation"
+
+
+def safe_version(dist_name, fallback=None):
+    try:
+        value = metadata.version(dist_name)
+    except metadata.PackageNotFoundError:
+        value = fallback
+    if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}", value):
+        return value
+    return None
+
+
+versions = {}
+sglang_ver = safe_version("sglang", getattr(sglang, "__version__", None))
+if not sglang_ver:
+    raise SystemExit("Unable to determine installed sglang version")
+versions["sglang"] = sglang_ver
+for pkg in ("sgl-kernel", "sglang-kernel"):
+    kernel_ver = safe_version(pkg)
+    if kernel_ver:
+        versions["sgl_kernel"] = kernel_ver
+        break
+torch_ver = safe_version("torch", getattr(torch, "__version__", None))
+if torch_ver:
+    versions["torch"] = torch_ver
+Path(sys.argv[1]).write_text(json.dumps(versions, sort_keys=True) + "\n", encoding="utf-8")
 PY
 # The wrapper adds only the checked-in executor directory to the isolated path.
 python3 -I -B - "$@" <<'PY'

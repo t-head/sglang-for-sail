@@ -101,10 +101,20 @@ def checkout_digest(source):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("pack", "check", "cache-key"))
+    parser.add_argument(
+        "mode", choices=("pack", "check", "cache-key", "checkout-digest")
+    )
     parser.add_argument("bundle", type=Path)
-    parser.add_argument("source")
+    parser.add_argument("source", nargs="?")
     args = parser.parse_args()
+    if args.mode == "checkout-digest":
+        source = str(args.bundle)
+        if not SHA.fullmatch(source):
+            raise ValueError("expected immutable 40-char source SHA")
+        print(checkout_digest(source))
+        return
+    if not args.source:
+        parser.error("source SHA is required")
     bundle = args.bundle.resolve()
     source = args.source
     if args.mode == "cache-key":
