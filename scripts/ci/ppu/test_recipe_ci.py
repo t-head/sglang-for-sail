@@ -232,12 +232,23 @@ class RecipeContractTest(unittest.TestCase):
         for name, value in (
             ("--tp-size", "8"),
             ("--attn-dp-size", "8"),
-            ("--attention-backend", "triton"),
+            ("--attention-backend", "fa3"),
             ("--moe-a2a-backend", "deepep"),
             ("--speculative-algorithm", "NEXTN"),
+            ("--speculative-num-draft-tokens", "3"),
+            ("--dist-timeout", "3600"),
+            ("--watchdog-timeout", "3600"),
             ("--load-format", "dummy"),
         ):
             self.assertEqual(flags[flags.index(name) + 1], value)
+        self.assertEqual(
+            resolved["server_env"],
+            {
+                "NCCL_CUMEM_ENABLE": "1",
+                "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+                "SGLANG_SAIL_DEEPEP_RECV_HOOK": "0",
+            },
+        )
         self.assertIn("--disable-radix-cache", flags)
         self.assertIn("--ple-offload-embedding", flags)
         self.assertNotIn("--dp-size", flags)
@@ -263,18 +274,29 @@ class RecipeContractTest(unittest.TestCase):
             ("--tp-size", "8"),
             ("--attn-dp-size", "8"),
             ("--moe-a2a-backend", "deepep"),
-            ("--attention-backend", "triton"),
+            ("--attention-backend", "fa3"),
             ("--linear-attn-prefill-backend", "triton"),
             ("--linear-attn-decode-backend", "triton"),
             ("--linear-attn-verify-backend", "triton"),
             ("--speculative-algorithm", "NEXTN"),
             ("--speculative-num-steps", "2"),
             ("--speculative-eagle-topk", "1"),
+            ("--speculative-num-draft-tokens", "3"),
             ("--speculative-draft-model-quantization", "unquant"),
+            ("--dist-timeout", "3600"),
+            ("--watchdog-timeout", "3600"),
             ("--page-size", "64"),
             ("--mamba-radix-cache-strategy", "extra_buffer"),
         ):
             self.assertEqual(flags[flags.index(name) + 1], value)
+        self.assertEqual(
+            config["server_env"],
+            {
+                "NCCL_CUMEM_ENABLE": "1",
+                "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+                "SGLANG_SAIL_DEEPEP_RECV_HOOK": "0",
+            },
+        )
         self.assertIn("--enable-dp-lm-head", flags)
         for name in (
             "--disable-radix-cache",
@@ -643,8 +665,25 @@ class RecipeContractTest(unittest.TestCase):
                 resolved = resolve_recipe(recipe, policy_path=policy, tier=tier)
                 self.assertEqual(resolved["ppu_count"], 8)
                 flags = resolved["flags"]
-                self.assertEqual(flags[flags.index("--attn-dp-size") + 1], "8")
-                self.assertEqual(flags[flags.index("--moe-a2a-backend") + 1], "deepep")
+                for name, value in (
+                    ("--attn-dp-size", "8"),
+                    ("--moe-a2a-backend", "deepep"),
+                    ("--deepep-mode", "auto"),
+                    ("--moe-dense-tp-size", "1"),
+                    ("--dist-timeout", "3600"),
+                    ("--watchdog-timeout", "3600"),
+                ):
+                    self.assertEqual(flags[flags.index(name) + 1], value)
+                self.assertEqual(
+                    resolved["server_env"],
+                    {
+                        "DG_USE_MOE_DYNAMIC_TILE": "1",
+                        "HGGC_EMBEDDED_COPY_THRESHOLD": "0x10000",
+                        "NCCL_CUMEM_ENABLE": "1",
+                        "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+                        "SGLANG_SAIL_DEEPEP_RECV_HOOK": "0",
+                    },
+                )
                 page_size = int(flags[flags.index("--page-size") + 1])
                 chunk_size = int(flags[flags.index("--chunked-prefill-size") + 1])
                 self.assertEqual(chunk_size % (8 * page_size), 0)
@@ -662,7 +701,14 @@ class RecipeContractTest(unittest.TestCase):
                 self.assertEqual(resolved["hf_model_id"], default["hf_model_id"])
                 self.assertNotEqual(resolved["config_digest"], default["config_digest"])
                 sparse_prefill = "SGLANG_OPT_FLASHMLA_SPARSE_PREFILL"
-                self.assertEqual(resolved["server_env"][sparse_prefill], "0")
+                self.assertEqual(
+                    resolved["server_env"],
+                    {
+                        "DG_USE_MOE_DYNAMIC_TILE": "1",
+                        "HGGC_EMBEDDED_COPY_THRESHOLD": "0x10000",
+                        sparse_prefill: "0",
+                    },
+                )
                 self.assertNotIn(sparse_prefill, default["server_env"])
                 flags = resolved["flags"]
                 self.assertEqual(flags[flags.index("--tp-size") + 1], "8")
@@ -671,6 +717,9 @@ class RecipeContractTest(unittest.TestCase):
                     "--enable-dp-lm-head",
                     "--moe-a2a-backend",
                     "--deepep-mode",
+                    "--moe-dense-tp-size",
+                    "--dist-timeout",
+                    "--watchdog-timeout",
                 ):
                     self.assertNotIn(flag, flags)
 
