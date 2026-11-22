@@ -5,17 +5,19 @@ const approved = require("./ppu_approval.cjs");
 
 const head = "a".repeat(40);
 const other = "b".repeat(40);
+const yuheSha = "c".repeat(40);
 const base = "release/v0.5.23";
 
 function fixture(label = "run-ci-ppu") {
-  const repo = {owner: "t-head", repo: "sglang-for-sail"};
+  const repo = {owner: "t-head", repo: "sglang-for-sail", defaultBranch: "main"};
   const pr = {
     number: 268, state: "open", draft: false, base: {ref: base},
     head: {sha: head, ref: "feature/topic", repo: {id: 123, owner: {login: "contributor"}, name: "fork"}},
     labels: [{name: "run-ci"}, {name: label}],
   };
   const context = {
-    repo, eventName: "pull_request_target", actor: "github-actions[bot]",
+    repo: {owner: repo.owner, repo: repo.repo},
+    eventName: "pull_request_target", actor: "github-actions[bot]",
     ref: "refs/heads/" + base, sha: other,
     payload: {action: "synchronize", pull_request: structuredClone(pr)},
   };
@@ -24,24 +26,38 @@ function fixture(label = "run-ci-ppu") {
     created_at: "2026-11-20T10:01:00Z",
   }];
   const change = {after: head, ref: "refs/heads/feature/topic", timestamp: "2026-11-20T10:00:00Z"};
+  const branchActivity = {
+    "refs/heads/sail_ci_cd": {after: other, ref: "refs/heads/sail_ci_cd", actor: {login: "maintainer"}},
+    "refs/heads/yuhe/v1.0.0": {after: yuheSha, ref: "refs/heads/yuhe/v1.0.0", actor: {login: "maintainer"}},
+  };
   const github = {
     rest: {
       pulls: {get: async () => ({data: pr})},
       issues: {listEventsForTimeline: Symbol("timeline")},
       repos: {
+        get: async () => ({data: {default_branch: repo.defaultBranch}}),
         getCollaboratorPermissionLevel: async ({username}) => ({
           data: {permission: username === "maintainer" ? "maintain" : "triage"},
         }),
-        getBranch: async ({branch}) => ({data: {name: branch, protected: branch === base}}),
+        getBranch: async ({branch}) => ({
+          data: {
+            name: branch,
+            protected: branch === base || branch === "release/v1.0.0",
+            commit: {sha: branch === "yuhe/v1.0.0" ? yuheSha : head},
+          },
+        }),
       },
     },
     paginate: async (route, args) => {
       assert.equal(route, github.rest.issues.listEventsForTimeline);
-      assert.deepEqual(args, {...repo, issue_number: 268, per_page: 100});
+      assert.deepEqual(args, {owner: repo.owner, repo: repo.repo, issue_number: 268, per_page: 100});
       return timeline;
     },
     request: async (route, args) => {
       assert.equal(route, "GET /repos/{owner}/{repo}/activity");
+      if (args.owner === repo.owner && args.repo === repo.repo && branchActivity[args.ref]) {
+        return {data: [branchActivity[args.ref]]};
+      }
       assert.deepEqual(args, {
         owner: "contributor", repo: "fork", ref: "refs/heads/feature/topic",
         direction: "desc", per_page: 1,
@@ -49,7 +65,7 @@ function fixture(label = "run-ci-ppu") {
       return {data: [change]};
     },
   };
-  return {github, context, label, pr, timeline, change};
+  return {github, context, label, pr, timeline, change, repo, branchActivity};
 }
 
 test("the same approved SHA works for either label notification and bot reruns", async () => {
@@ -133,4 +149,33 @@ test("a protected main schedule can call the protected release workflow", async 
     f.context.eventName = eventName;
     assert.equal(await approved(f), false);
   }
+});
+
+test("default branch sail_ci_cd schedule can call yuhe/v1.0.0 and protected release branches", async t => {
+  const f = fixture("run-ci-ppu-nightly");
+  const original = process.env.GITHUB_REF_PROTECTED;
+  t.after(() => {
+    if (original === undefined) delete process.env.GITHUB_REF_PROTECTED;
+    else process.env.GITHUB_REF_PROTECTED = original;
+  });
+  f.repo.defaultBranch = "sail_ci_cd";
+  f.context.ref = "refs/heads/sail_ci_cd";
+  f.context.eventName = "schedule";
+  process.env.GITHUB_REF_PROTECTED = "false";
+  assert.equal(await approved({...f, ref: "yuhe/v1.0.0"}), true);
+  assert.equal(await approved({...f, ref: "release/v1.0.0"}), true);
+  assert.equal(await approved({...f, ref: "release/unprotected"}), false);
+  assert.equal(await approved({...f, ref: "feature/untrusted"}), false);
+
+  // Reject when sail_ci_cd is not the repository default branch.
+  f.repo.defaultBranch = "main";
+  assert.equal(await approved({...f, ref: "yuhe/v1.0.0"}), false);
+  f.repo.defaultBranch = "sail_ci_cd";
+
+  // Reject when yuhe/v1.0.0 activity actor lacks write access or SHA mismatches.
+  f.branchActivity["refs/heads/yuhe/v1.0.0"].actor.login = "contributor";
+  assert.equal(await approved({...f, ref: "yuhe/v1.0.0"}), false);
+  f.branchActivity["refs/heads/yuhe/v1.0.0"].actor.login = "maintainer";
+  f.branchActivity["refs/heads/yuhe/v1.0.0"].after = head;
+  assert.equal(await approved({...f, ref: "yuhe/v1.0.0"}), false);
 });

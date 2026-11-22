@@ -14,6 +14,16 @@ async function canWrite(github, repo, username) {
   }
 }
 
+async function trustedBranchHead(github, repo, branch, sha) {
+  if (!sha) return false;
+  const branchRef = "refs/heads/" + branch;
+  const {data: [change]} = await github.request("GET /repos/{owner}/{repo}/activity", {
+    ...repo, ref: branchRef, direction: "desc", per_page: 1,
+  });
+  if (change?.ref !== branchRef || change.after !== sha) return false;
+  return canWrite(github, repo, change.actor?.login);
+}
+
 async function approvedPullRequest(github, context, label, ref) {
   const eventPR = context.payload.pull_request;
   if (!eventPR || (ref && ref !== eventPR.head.sha)) return false;
@@ -64,12 +74,24 @@ module.exports = async function ppuApproved({github, context, label, ref = ""}) 
     if (!rerunner) return false;
     return rerunner === context.actor || canWrite(github, context.repo, rerunner);
   }
-  if (process.env.GITHUB_REF_PROTECTED !== "true") return false;
-  if (context.eventName === "push") return ownRef;
-  if (context.eventName !== "schedule" || branch !== "main") return false;
+  const isProtectedCaller = process.env.GITHUB_REF_PROTECTED === "true";
+  if (context.eventName === "push") {
+    if (!ownRef) return false;
+    if (isProtectedCaller) return true;
+    return branch === "sail_ci_cd" && trustedBranchHead(github, context.repo, branch, context.sha);
+  }
+  if (context.eventName !== "schedule" || !["main", "sail_ci_cd"].includes(branch)) return false;
+  const {data: repository} = await github.rest.repos.get(context.repo);
+  if (repository.default_branch !== branch) return false;
+  if (!isProtectedCaller &&
+      !(branch === "sail_ci_cd" && await trustedBranchHead(github, context.repo, branch, context.sha))) {
+    return false;
+  }
   if (ownRef) return true;
   // The default-branch dispatcher calls the release workflow with a release branch.
-  if (!ref.startsWith("release/")) return false;
+  if (ref !== "yuhe/v1.0.0" && !ref.startsWith("release/")) return false;
   const {data: target} = await github.rest.repos.getBranch({...context.repo, branch: ref});
-  return target.name === ref && target.protected === true;
+  if (target.name !== ref) return false;
+  if (target.protected === true) return true;
+  return ref === "yuhe/v1.0.0" && trustedBranchHead(github, context.repo, ref, target.commit?.sha);
 };

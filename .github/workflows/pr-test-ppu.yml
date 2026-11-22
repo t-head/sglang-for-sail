@@ -2,10 +2,10 @@ name: PR Test (PPU)
 
 on:
   push:
-    branches: [ main ]
+    branches: [main, sail_ci_cd]
   # Use the protected base branch's workflow for privileged runner jobs.
   pull_request_target:
-    branches: [main, 'release/**']
+    branches: [main, sail_ci_cd, 'yuhe/v1.0.0', 'release/**']
     types: [opened, synchronize, reopened, labeled, ready_for_review]
   workflow_dispatch:
     inputs:
@@ -86,7 +86,8 @@ jobs:
           steps.run-mode.outputs.run_all_tests == 'true' ||
           (github.event_name == 'pull_request_target' &&
            (needs.pr-gate.outputs.approved == 'true' ||
-            (startsWith(github.base_ref, 'release/') && steps.filter.outputs.release-code == 'true'))) }}
+            ((startsWith(github.base_ref, 'release/') || github.base_ref == 'yuhe/v1.0.0') &&
+             steps.filter.outputs.release-code == 'true'))) }}
       source-sha: ${{ github.event.pull_request.head.sha || steps.source.outputs.sha }}
     steps:
       - name: Checkout the non-PR source

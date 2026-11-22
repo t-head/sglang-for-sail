@@ -157,6 +157,7 @@ class TestPPUCIWorkflow(unittest.TestCase):
         output = check["outputs"]["ppu"]
         self.assertIn("steps.filter.outputs.release-code == 'true'", output)
         self.assertIn("startsWith(github.base_ref, 'release/')", output)
+        self.assertIn("github.base_ref == 'yuhe/v1.0.0'", output)
         self.assertIn("needs.pr-gate.outputs.approved == 'true'", output)
 
     def test_cluster_jobs_use_fresh_approval_and_thead_cpu_runner(self):

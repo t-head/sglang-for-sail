@@ -3,7 +3,7 @@ name: Nightly Test (PPU)
 on:
   # Use the protected base branch's workflow for privileged runner jobs.
   pull_request_target:
-    branches: [main, 'release/**']
+    branches: [main, sail_ci_cd, 'yuhe/v1.0.0', 'release/**']
     types: [labeled, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
