@@ -17,7 +17,9 @@ ALLOWED_ROUTES = {
     "prebuilt-image",
 }
 VERSION_KEYS = {"sglang", "sgl_kernel", "torch"}
-VERSION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}")
+VERSION_RE = re.compile(
+    r"\d+(?:\.\d+){1,3}(?:(?:a|b|rc|\.post|\.dev)\d+){0,2}(?:\+[A-Za-z0-9_-]{1,24})?"
+)
 LEGACY_SCHEMA = "ppu-legacy-sanity/v1"
 LEGACY_CASES = {
     "test_basic_sanity_dflash.py": "dflash",

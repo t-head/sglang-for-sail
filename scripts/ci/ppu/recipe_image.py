@@ -95,14 +95,13 @@ def repo_allowed(candidate: str, allowlist: list[str]) -> bool:
 
 
 def _default_image_and_repo(env: dict[str, str]) -> tuple[str, str]:
-    default_ref = (
-        env.get("PPU_CI_K8S_RUNTIME_DIGEST", "").strip()
-        or env.get("PPU_CI_RUNTIME_IMAGE", "").strip()
-    )
+    # Recipe runs must never silently fall back to the legacy single-device
+    # PPU_CI_RUNTIME_IMAGE setting when Recipe runtime settings are omitted.
+    default_ref = env.get("PPU_CI_K8S_RUNTIME_DIGEST", "").strip()
     if not default_ref:
         explicit_repo = env.get("PPU_CI_RECIPE_IMAGE_REPO", "").strip()
         if not explicit_repo:
-            raise ValueError("runner runtime image configuration is missing")
+            raise ValueError("runner recipe runtime image configuration is missing")
         return "", validate_repo(explicit_repo)
     return default_ref, extract_repo(default_ref)
 
@@ -261,17 +260,18 @@ def docker_pull_and_verify(
         text=True,
         check=False,
     )
-    resolved_digest = ""
+    repo_digests: list[str] = []
     if inspect_digests.returncode == 0:
         prefix = f"{expected_repo}@"
         for line in inspect_digests.stdout.splitlines():
             line = line.strip()
             if line.startswith(prefix):
                 candidate = line[len(prefix) :]
-                if DIGEST_RE.fullmatch(candidate):
-                    resolved_digest = candidate
-                    break
-    if not resolved_digest and pull_log.is_file():
+                if DIGEST_RE.fullmatch(candidate) and candidate not in repo_digests:
+                    repo_digests.append(candidate)
+
+    pulled_digest = ""
+    if pull_log.is_file():
         for line in pull_log.read_text(encoding="utf-8", errors="replace").splitlines():
             parts = line.split()
             if (
@@ -279,11 +279,31 @@ def docker_pull_and_verify(
                 and parts[0] == "Digest:"
                 and DIGEST_RE.fullmatch(parts[1])
             ):
-                resolved_digest = parts[1]
-    if not DIGEST_RE.fullmatch(resolved_digest):
-        raise ValueError("docker pull did not produce a verified sha256 digest")
-    if expected_digest and resolved_digest != expected_digest:
-        raise ValueError("pulled runtime image digest does not match requested digest")
+                pulled_digest = parts[1]
+
+    if expected_digest:
+        if pulled_digest and pulled_digest != expected_digest:
+            raise ValueError(
+                "pulled runtime image digest does not match requested digest"
+            )
+        if repo_digests:
+            if expected_digest not in repo_digests:
+                raise ValueError(
+                    "pulled runtime image RepoDigests do not contain requested digest"
+                )
+        elif pulled_digest != expected_digest:
+            raise ValueError("docker pull did not verify requested sha256 digest")
+        resolved_digest = expected_digest
+    elif pulled_digest:
+        if repo_digests and pulled_digest not in repo_digests:
+            raise ValueError(
+                "pulled runtime image digest is not present in inspected RepoDigests"
+            )
+        resolved_digest = pulled_digest
+    elif len(repo_digests) == 1:
+        resolved_digest = repo_digests[0]
+    else:
+        raise ValueError("docker pull did not resolve a unique verified sha256 digest")
 
     public_digest = verify_pullable_image_id(
         f"{expected_repo}@{resolved_digest}",

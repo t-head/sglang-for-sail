@@ -4,6 +4,7 @@
 import argparse
 import gzip
 import hashlib
+import io
 import json
 import re
 import subprocess
@@ -62,26 +63,38 @@ def wheel_inventory(bundle, source):
         raise ValueError("wheel inventory checksum mismatch")
 
 
-def recipe_digest(archive):
+def _tar_recipe_digest(recipes):
     files = {}
-    with tarfile.open(archive, "r:gz") as recipes:
-        for member in recipes:
-            if member.isdir():
-                continue
-            name = member.name
-            if (
-                not member.isfile()
-                or not name.startswith(ROOT)
-                or ".." in name.split("/")
-                or name in files
-                or member.size > 1024 * 1024
-            ):
-                raise ValueError("unsafe recipe archive entry")
-            files[name] = hashlib.sha256(recipes.extractfile(member).read()).hexdigest()
+    for member in recipes:
+        if member.isdir():
+            continue
+        name = member.name
+        if (
+            not member.isfile()
+            or not name.startswith(ROOT)
+            or ".." in name.split("/")
+            or name in files
+            or member.size > 1024 * 1024
+        ):
+            raise ValueError("unsafe recipe archive entry")
+        files[name] = hashlib.sha256(recipes.extractfile(member).read()).hexdigest()
     if not files:
         raise ValueError("empty recipe tree")
     encoded = json.dumps(files, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def recipe_digest(archive):
+    with tarfile.open(archive, "r:gz") as recipes:
+        return _tar_recipe_digest(recipes)
+
+
+def git_tree_digest(source):
+    if not SHA.fullmatch(source):
+        raise ValueError("expected immutable 40-char source SHA")
+    content = subprocess.check_output(["git", "archive", source, ROOT])
+    with tarfile.open(fileobj=io.BytesIO(content), mode="r:") as recipes:
+        return _tar_recipe_digest(recipes)
 
 
 def checkout_digest(source):
@@ -93,7 +106,21 @@ def checkout_digest(source):
         meta, name = record.decode().split("\t", 1)
         if not meta.startswith(("100644 blob ", "100755 blob ")):
             raise ValueError("recipe files must be regular")
-        entries[name] = sha256(Path(name))
+        path = Path(name)
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("recipe files must be regular")
+        entries[name] = sha256(path)
+    root_dir = Path(ROOT)
+    if not root_dir.is_dir() or root_dir.is_symlink():
+        raise ValueError("recipe directory must be a regular directory")
+    disk_files = set()
+    for path in root_dir.rglob("*"):
+        if path.is_symlink():
+            raise ValueError("recipe tree must not contain symlinks")
+        if path.is_file():
+            disk_files.add(path.as_posix())
+    if disk_files != set(entries):
+        raise ValueError("recipe working tree contains unexpected or missing files")
     return hashlib.sha256(
         json.dumps(entries, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
@@ -111,7 +138,11 @@ def main():
         source = str(args.bundle)
         if not SHA.fullmatch(source):
             raise ValueError("expected immutable 40-char source SHA")
-        print(checkout_digest(source))
+        expected = git_tree_digest(source)
+        actual = checkout_digest(source)
+        if actual != expected:
+            raise ValueError("recipe working tree differs from committed source")
+        print(actual)
         return
     if not args.source:
         parser.error("source SHA is required")

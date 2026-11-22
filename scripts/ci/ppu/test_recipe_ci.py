@@ -1323,6 +1323,148 @@ exit 1
             validate({**base, "runtime_versions": {"torch": "2.13.0"}})
         with self.assertRaises(ValueError):
             validate({**base, "runtime_versions": {"sglang": "/private/path"}})
+        # PEP 440 local suffixes containing domains or IPv4 addresses must fail closed.
+        for bad_ver in (
+            "0.5.23+registry.internal",
+            "0.5.23+10.1.2.3",
+            "0.5.23+corp.example.com",
+        ):
+            with self.subTest(bad_ver=bad_ver):
+                with self.assertRaises(ValueError):
+                    validate({**base, "runtime_versions": {"sglang": bad_ver}})
+
+    def test_recipe_image_does_not_fallback_to_legacy_runtime_image(self):
+        import recipe_image
+
+        legacy_only = {
+            "PPU_CI_RUNTIME_IMAGE": "registry.internal/legacy/single-card:v1",
+        }
+        with self.assertRaises(ValueError):
+            recipe_image.resolve_target(legacy_only)
+        with self.assertRaises(ValueError):
+            recipe_image.resolve_target(legacy_only, image_tag="nightly-20261122")
+
+    def test_docker_pull_handles_multiple_repo_digests(self):
+        import recipe_image
+
+        older_digest = "sha256:" + "3" * 64
+        pulled_digest = "sha256:" + "2" * 64
+        image_id = "sha256:" + "f" * 64
+        env = {
+            "PPU_CI_K8S_RUNTIME_DIGEST": "registry.internal/team/sglang@sha256:"
+            + "a" * 64,
+            "PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS": "registry.internal/team/",
+        }
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            docker = bin_dir / "docker"
+            docker.write_text(
+                f"""#!/bin/bash
+if [[ "$1" == "pull" ]]; then
+  if [[ "${{OMIT_PULL_DIGEST:-0}}" != "1" ]]; then
+    echo "Digest: {pulled_digest}"
+  fi
+  exit 0
+fi
+if [[ "$1" == "image" && "$2" == "inspect" ]]; then
+  if [[ "$*" == *"{{.Id}}"* ]]; then
+    echo "{image_id}"
+    exit 0
+  fi
+  if [[ "$*" == *"RepoDigests"* ]]; then
+    printf '%s\\n%s\\n' \\
+      "registry.internal/team/sglang@{older_digest}" \\
+      "registry.internal/team/sglang@{pulled_digest}"
+    exit 0
+  fi
+fi
+exit 1
+""",
+                encoding="utf-8",
+            )
+            docker.chmod(0o755)
+            old_path = os.environ["PATH"]
+            try:
+                os.environ["PATH"] = f"{bin_dir}:{old_path}"
+                # Tag override must pick freshly pulled digest, not stale first entry.
+                pulled_tag = recipe_image.docker_pull_and_verify(
+                    env, root / "pull-tag.log", image_tag="nightly-20261122"
+                )
+                self.assertEqual(pulled_tag["public_digest"], f"@{pulled_digest}")
+                # Explicit digest matching second RepoDigests entry must succeed.
+                pulled_pin = recipe_image.docker_pull_and_verify(
+                    env,
+                    root / "pull-pin.log",
+                    image_tag="nightly-20261122",
+                    image_digest=pulled_digest,
+                )
+                self.assertEqual(pulled_pin["public_digest"], f"@{pulled_digest}")
+                # Ambiguous multi-RepoDigests without pull Digest line must fail closed.
+                os.environ["OMIT_PULL_DIGEST"] = "1"
+                with self.assertRaises(ValueError):
+                    recipe_image.docker_pull_and_verify(
+                        env, root / "pull-ambig.log", image_tag="nightly-20261122"
+                    )
+            finally:
+                os.environ.pop("OMIT_PULL_DIGEST", None)
+                os.environ["PATH"] = old_path
+
+    def test_checkout_digest_rejects_mutated_or_untracked_recipe_files(self):
+        with tempfile.TemporaryDirectory() as raw_root:
+            repo = Path(raw_root) / "repo"
+            repo.mkdir()
+            policy = repo / "test/ppu/policy/models/demo.yaml"
+            policy.parent.mkdir(parents=True)
+            policy.write_text("max_tokens: 16\n", encoding="utf-8")
+            git_env = {
+                **os.environ,
+                "GIT_AUTHOR_NAME": "Test",
+                "GIT_AUTHOR_EMAIL": "test@example.com",
+                "GIT_COMMITTER_NAME": "Test",
+                "GIT_COMMITTER_EMAIL": "test@example.com",
+            }
+            subprocess.run(["git", "init", "-q"], cwd=repo, env=git_env, check=True)
+            subprocess.run(["git", "add", "."], cwd=repo, env=git_env, check=True)
+            subprocess.run(
+                ["git", "commit", "-q", "-m", "init"], cwd=repo, env=git_env, check=True
+            )
+            sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+            ).strip()
+            bundle = REPO_ROOT / "scripts/ci/ppu/recipe_bundle.py"
+
+            # Clean checkout matches committed git blobs.
+            clean = subprocess.run(
+                [sys.executable, "-B", str(bundle), "checkout-digest", sha],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(clean.returncode, 0, clean.stderr)
+            self.assertEqual(len(clean.stdout.strip()), 64)
+
+            # Mutating a tracked policy file on disk must fail closed.
+            policy.write_text("max_tokens: 32\n", encoding="utf-8")
+            mutated = subprocess.run(
+                [sys.executable, "-B", str(bundle), "checkout-digest", sha],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(mutated.returncode, 0)
+
+            # Restoring tracked file but adding an untracked file under test/ppu/ must fail closed.
+            policy.write_text("max_tokens: 16\n", encoding="utf-8")
+            (repo / "test/ppu/extra.yaml").write_text("x: 1\n", encoding="utf-8")
+            untracked = subprocess.run(
+                [sys.executable, "-B", str(bundle), "checkout-digest", sha],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(untracked.returncode, 0)
 
     @unittest.skipUnless(
         all(shutil.which(tool) for tool in ("jq", "sha256sum")),

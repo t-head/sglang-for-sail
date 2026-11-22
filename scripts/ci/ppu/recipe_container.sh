@@ -68,13 +68,27 @@ assert current_platform.is_sail(), "candidate must select the SAIL platform"
 assert torch.cuda.device_count() == expected_width, "candidate device count must match the Recipe allocation"
 
 
+SAFE_VERSION_RE = re.compile(
+    r"\d+(?:\.\d+){1,3}(?:(?:a|b|rc|\.post|\.dev)\d+){0,2}(?:\+[A-Za-z0-9_-]{1,24})?"
+)
+BASE_VERSION_RE = re.compile(
+    r"\d+(?:\.\d+){1,3}(?:(?:a|b|rc|\.post|\.dev)\d+){0,2}"
+)
+
+
 def safe_version(dist_name, fallback=None):
     try:
         value = metadata.version(dist_name)
     except metadata.PackageNotFoundError:
         value = fallback
-    if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}", value):
+    if not isinstance(value, str):
+        return None
+    if SAFE_VERSION_RE.fullmatch(value):
         return value
+    if "+" in value:
+        base = value.split("+", 1)[0]
+        if BASE_VERSION_RE.fullmatch(base):
+            return base
     return None
 
 
