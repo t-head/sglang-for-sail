@@ -63,6 +63,7 @@ def server(config, label, timings, ready_timeout):
         try:
             while time.monotonic() - start < ready_timeout:
                 if process.poll() is not None:
+                    phase("server_exit")
                     raise StartupError("server_exit")
                 try:
                     with request("/health", timeout=3) as health:
@@ -74,6 +75,7 @@ def server(config, label, timings, ready_timeout):
                 except (URLError, TimeoutError):
                     time.sleep(1)
             else:
+                phase("readiness_timeout")
                 raise StartupError("readiness_timeout")
             timings["cold_start_s"] = round(time.monotonic() - start, 3)
             yield

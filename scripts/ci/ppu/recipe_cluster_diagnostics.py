@@ -54,7 +54,14 @@ def recent_failures(root, current_run):
                 if not (directory / "index.json").is_file():
                     continue
                 code = []
-                for filename in ("launcher.log", "runtime.log", "pod-status.json"):
+                for filename in (
+                    "launcher.log",
+                    "runtime.log",
+                    "pod-status.json",
+                    "sglang_serve_fast_full.log",
+                    "sglang_serve_fast_layers2.log",
+                    "sglang_serve_nightly.log",
+                ):
                     path = directory / filename
                     if path.is_file() and not path.is_symlink():
                         with path.open("rb") as stream:

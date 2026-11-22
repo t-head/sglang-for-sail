@@ -22,6 +22,7 @@ cd "$source_dir"
 checker=scripts/ci/ppu/check_dependencies.py
 python3 -I -B "$checker" snapshot "$artifact_dir/dependencies-before.json"
 # The release image owns the SDK, PyTorch, DeepGEMM, FlashMLA and EvalScope.
+python3 -I -B -m pip uninstall -y sgl-kernel >/dev/null 2>&1 || true
 python3 -I -B -m pip install --no-deps --no-index --force-reinstall "$wheel_dir/"*.whl
 missing=$(python3 -I -B "$checker" missing-wheels "$wheel_dir/runtime-deps")
 if [[ -n "$missing" ]]; then
