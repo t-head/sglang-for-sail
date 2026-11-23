@@ -1686,14 +1686,17 @@ class DeepseekV4AttnBackend(
                 cp_metadata = forward_batch.attn_cp_metadata
             assert cp_metadata is not None
             padded_num_tokens = sum(cp_metadata.per_rank_actual_token)
-            if (
-                swa_replay_start is not None
-                and swa_replay_start.shape[0] < padded_num_tokens
-            ):
-                swa_replay_start = torch.nn.functional.pad(
-                    swa_replay_start,
-                    (0, padded_num_tokens - swa_replay_start.shape[0]),
-                )
+        if (
+            swa_replay_start is not None
+            and swa_replay_start.shape[0] < padded_num_tokens
+        ):
+            # The tail layout floors the real tail rows only; a padded batch
+            # carries MLP-sync rows past the extend and the tail slice keeps
+            # them, so floor those rows at 0 like the folded replay path does.
+            swa_replay_start = torch.nn.functional.pad(
+                swa_replay_start,
+                (0, padded_num_tokens - swa_replay_start.shape[0]),
+            )
 
         num_write_tokens = (
             out_cache_loc.shape[0] if use_prefill_cuda_graph else num_tokens

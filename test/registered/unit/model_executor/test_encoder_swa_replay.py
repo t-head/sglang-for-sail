@@ -405,6 +405,59 @@ class TestFoldWithDecoderSwaTail(CustomTestCase):
         )
 
 
+class TestDecoderSwaTailPaddedBatchRows(CustomTestCase):
+    """Decoder SWA bounded replay over a batch padded past its extend: the tail
+    slice keeps the MLP-sync padding rows, so the per-row window floor must be
+    padded to the same row count. It used to fail a 130-vs-128 size check."""
+
+    def test_padding_rows_extend_the_floor_and_floor_at_zero(self):
+        fx = _Fixture()
+        backend = _backend(fx)
+        # A plain prefill: no folded replay rows and no request window.
+        backend.encoder_row_floor = None
+        backend.token_to_kv_pool = SimpleNamespace(
+            request_window=None,
+            full_to_swa_index_mapping=torch.arange(
+                fx.req_to_token.numel(), dtype=torch.int32
+            ),
+            translate_loc_from_full_to_swa=lambda loc: loc,
+        )
+        # One request whose whole extend is its tail, plus two MLP-sync rows the
+        # scheduler appended to the batch's out_cache_loc.
+        pad_rows = 2
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            extend_seq_lens_cpu=[SWA_WINDOW],
+            seq_lens_cpu=torch.tensor([SWA_WINDOW]),
+            seq_lens=torch.tensor([SWA_WINDOW]),
+            req_pool_indices=torch.tensor([1]),
+            out_cache_loc=torch.tensor(
+                [_loc(1, q) for q in range(SWA_WINDOW)] + [0] * pad_rows
+            ),
+            positions=torch.arange(SWA_WINDOW + pad_rows),
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            return_logprob=False,
+        )
+        with (
+            patch.object(DSV4AttnMetadata, "init_compression_metadata"),
+            patch.object(DSV4AttnMetadata, "init_flashmla_related"),
+        ):
+            metadata = backend._build_late_layer_tail_metadata(forward_batch)
+
+        core = metadata.core_attn_metadata
+        self.assertEqual(core.swa_page_indices.shape[0], SWA_WINDOW + pad_rows)
+        # The real rows keep their plain window; the padding rows floor at 0 and
+        # see the single padded token.
+        torch.testing.assert_close(
+            core.swa_topk_lengths,
+            torch.tensor(
+                [min(q, SWA_WINDOW) for q in range(1, SWA_WINDOW + 1)]
+                + [1] * pad_rows,
+                dtype=torch.int32,
+            ),
+        )
+
+
 def _extend_batch(fx):
     """The folded extend's forward batch, as the backend's metadata reads it."""
     fb = fx.folded.batch
