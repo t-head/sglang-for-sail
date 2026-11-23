@@ -36,13 +36,20 @@ read_output() {
 }
 
 record_runtime_image() {
-    local image_id digest
-    image_id=$(jq -er '.status.containerStatuses[] | select(.name == "worker") | .imageID' "$1") || return 1
-    digest=${image_id#docker-pullable://}
-    [[ "$digest" =~ ^download\.t-head\.cn/docker_test/sglang@sha256:[0-9a-f]{64}$ ]] || return 1
-    [[ "$INPUT_IMAGE" != *@sha256:* || "$digest" == "$INPUT_IMAGE" ]] || return 1
-    jq --arg image "$digest" '. + {runtime_image:$image}' wheels/recipe-manifest.json > "$raw/provenance.tmp" &&
-        mv -- "$raw/provenance.tmp" "$raw/provenance.json"
+    local public_digest
+    public_digest=$(python3 -B scripts/ci/ppu/recipe_image.py verify-pod "$1" \
+        --expected-repo "$EXPECTED_IMAGE_REPO" \
+        --expected-digest "$EXPECTED_IMAGE_DIGEST") || return 1
+    if [[ "$SKIP_WHEEL_INSTALL" == true ]]; then
+        jq -n --arg image "$public_digest" --arg tree "$RECIPE_TREE_SHA256" \
+            '{runtime_image:$image, recipe_tree_sha256:$tree, install_mode:"prebuilt_image"}' \
+            > "$raw/provenance.tmp" &&
+            mv -- "$raw/provenance.tmp" "$raw/provenance.json"
+    else
+        jq --arg image "$public_digest" '. + {runtime_image:$image, install_mode:"wheel_overlay"}' \
+            wheels/recipe-manifest.json > "$raw/provenance.tmp" &&
+            mv -- "$raw/provenance.tmp" "$raw/provenance.json"
+    fi
 }
 
 export JOB_NAME="" SOURCE_STAGE_DIR="" INPUT_JOB_STATUS=failed INPUT_WORKFLOW_STATUS=failure
@@ -126,7 +133,11 @@ phase runner_preflight
 command -v kubectl >/dev/null
 stage_root=${PPU_CI_K8S_STAGE_ROOT:?}
 [[ "$stage_root" == /* && -d "$stage_root" && ! -L "$stage_root" ]]
-[[ -d wheels && ! -L wheels ]]
+SKIP_WHEEL_INSTALL=${PPU_CI_SKIP_WHEEL_INSTALL:-false}
+[[ "$SKIP_WHEEL_INSTALL" == true || "$SKIP_WHEEL_INSTALL" == false ]]
+EXPECTED_IMAGE_REPO=""
+EXPECTED_IMAGE_DIGEST=""
+RECIPE_TREE_SHA256=""
 case "$mode" in
     fast_sanity|model_sanity)
         [[ "$MODEL_KEY" =~ ^[a-z0-9][a-z0-9.-]*$ && -f "test/ppu/policy/models/$MODEL_KEY.yaml" ]]
@@ -135,25 +146,37 @@ case "$mode" in
         INPUT_NPROC_PER_NODE=$RECIPE_PPU_COUNT
         INPUT_TIMEOUT_MINUTES=330
         [[ "$mode" != fast_sanity ]] || INPUT_TIMEOUT_MINUTES=30
-        INPUT_IMAGE=${PPU_CI_RECIPE_RUNTIME_IMAGE:?}
-        registry=download.t-head.cn/docker_test/sglang
-        if [[ "$INPUT_IMAGE" == "$registry:release-v0.5.23-20261116-cf244d4" ]]; then
-            release_digest=bcc10dbf0587c7dfc601d729008620cf923c926463eeac5d99c062d7517b24a5
-            INPUT_IMAGE=${PPU_CI_K8S_RUNTIME_DIGEST:-$registry@sha256:$release_digest}
-        fi
-        [[ "$INPUT_IMAGE" =~ ^download\.t-head\.cn/docker_test/sglang@sha256:[0-9a-f]{64}$ ]]
+        resolved_image_json=$(python3 -B scripts/ci/ppu/recipe_image.py resolve \
+            --image-tag "${PPU_CI_RUNTIME_IMAGE_TAG:-}" \
+            --image-digest "${PPU_CI_RUNTIME_IMAGE_DIGEST:-}")
+        INPUT_IMAGE=$(jq -er '.pull_ref' <<< "$resolved_image_json")
+        EXPECTED_IMAGE_REPO=$(jq -er '.expected_repo' <<< "$resolved_image_json")
+        EXPECTED_IMAGE_DIGEST=$(jq -r '.expected_digest // ""' <<< "$resolved_image_json")
+        PPU_CI_RECIPE_IMAGE_KEY=$(jq -er '.image_key' <<< "$resolved_image_json")
+        [[ "$PPU_CI_RECIPE_IMAGE_KEY" =~ ^[0-9a-f]{64}$ ]]
         [[ "${PPU_CI_JIT_ROOT:?}" == /* && "$PPU_CI_JIT_ROOT" != *[:,$'\r\n']* ]]
         export INPUT_HOST_VOLUMES="$PPU_CI_JIT_ROOT:/recipe-jit"
-        PPU_CI_RECIPE_IMAGE_KEY=${INPUT_IMAGE##*:}
         export PPU_CI_RECIPE_IMAGE_KEY
         export CONTAINER_OPTIONS='shm_size: "128Gi"'
         phase wheel_verification
-        python3 -B scripts/ci/ppu/recipe_bundle.py check wheels "$PPU_CI_SOURCE_SHA"
+        if [[ "$SKIP_WHEEL_INSTALL" == true ]]; then
+            [[ -n "${PPU_CI_RUNTIME_IMAGE_TAG:-}${PPU_CI_RUNTIME_IMAGE_DIGEST:-}" ]]
+            [[ ! -e wheels ]]
+            RECIPE_TREE_SHA256=$(python3 -B scripts/ci/ppu/recipe_bundle.py checkout-digest "$PPU_CI_SOURCE_SHA")
+            [[ "$RECIPE_TREE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+            export PPU_CI_RECIPE_TREE_SHA256="$RECIPE_TREE_SHA256"
+        else
+            [[ -d wheels && ! -L wheels ]]
+            python3 -B scripts/ci/ppu/recipe_bundle.py check wheels "$PPU_CI_SOURCE_SHA"
+        fi
+        export PPU_CI_SKIP_WHEEL_INSTALL="$SKIP_WHEEL_INSTALL"
         if [[ "$mode" == model_sanity ]]; then
             (cd evalscope-wheels && sha256sum -- *.whl | cmp -s SHA256SUMS -)
         fi
         ;;
     legacy)
+        [[ "$SKIP_WHEEL_INSTALL" == false ]]
+        [[ -d wheels && ! -L wheels ]]
         [[ "${PPU_CI_BOARD:?}" == ZW-M890P || "$PPU_CI_BOARD" == OAM-810E ]]
         INPUT_NODE_SELECTOR="board-type=$PPU_CI_BOARD"
         INPUT_NPROC_PER_NODE=1
@@ -180,7 +203,15 @@ if os.environ["TIER"] == "legacy":
         "PPU_CI_DFLASH_MODEL_PATH", "PPU_CI_EVAL_CACHE",
     ]
 else:
-    keys += ["MODEL_KEY", "RECIPE_PPU_COUNT", "PPU_CI_RECIPE_IMAGE_KEY", "PPU_CI_HF_CACHE_ROOT"]
+    keys += [
+        "MODEL_KEY",
+        "RECIPE_PPU_COUNT",
+        "PPU_CI_RECIPE_IMAGE_KEY",
+        "PPU_CI_HF_CACHE_ROOT",
+        "PPU_CI_SKIP_WHEEL_INSTALL",
+    ]
+    if os.environ.get("PPU_CI_SKIP_WHEEL_INSTALL") == "true":
+        keys += ["PPU_CI_RECIPE_TREE_SHA256"]
     if os.environ["TIER"] == "model_sanity":
         keys += ["PPU_CI_GSM8K_PATH"]
 values = {key: os.environ[key] for key in keys}
@@ -200,7 +231,11 @@ for key, value in values.items():
     if not value or any(ord(char) < 32 for char in value):
         raise ValueError("invalid worker input")
     if key.startswith("PPU_CI_") and key not in (
-        "PPU_CI_SOURCE_SHA", "PPU_CI_RECIPE_IMAGE_KEY", "PPU_CI_HF_MODEL_REVISION"
+        "PPU_CI_SOURCE_SHA",
+        "PPU_CI_RECIPE_IMAGE_KEY",
+        "PPU_CI_HF_MODEL_REVISION",
+        "PPU_CI_SKIP_WHEEL_INSTALL",
+        "PPU_CI_RECIPE_TREE_SHA256",
     ):
         if not PurePosixPath(value).is_absolute() or ".." in PurePosixPath(value).parts:
             raise ValueError("expected an absolute worker path")

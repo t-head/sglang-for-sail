@@ -11,8 +11,15 @@ from pathlib import Path
 
 from recipe_diagnostics import PHASES
 
-REGISTRY = "download.t-head.cn/docker_test/sglang"
 MODEL_POLICY_ROOT = Path(__file__).resolve().parents[3] / "test/ppu/policy/models"
+ALLOWED_ROUTES = {
+    "native-build + sglang-release-runtime",
+    "prebuilt-image",
+}
+VERSION_KEYS = {"sglang", "sgl_kernel", "torch"}
+VERSION_RE = re.compile(
+    r"\d+(?:\.\d+){1,3}(?:(?:a|b|rc|\.post|\.dev)\d+){0,2}(?:\+[A-Za-z0-9_-]{1,24})?"
+)
 LEGACY_SCHEMA = "ppu-legacy-sanity/v1"
 LEGACY_CASES = {
     "test_basic_sanity_dflash.py": "dflash",
@@ -94,6 +101,7 @@ def validate(payload):
         "tier",
         "source_sha",
         "runtime_image",
+        "runtime_versions",
         "route",
         "failure_phase",
         "private_retention",
@@ -107,7 +115,7 @@ def validate(payload):
         payload["schema"] != "ppu-sanity/v1"
         or not re.fullmatch(r"[a-z0-9][a-z0-9.-]*", payload["model"])
         or not (MODEL_POLICY_ROOT / f"{payload['model']}.yaml").is_file()
-        or payload["route"] != "native-build + sglang-release-runtime"
+        or payload["route"] not in ALLOWED_ROUTES
         or not re.fullmatch(r"[0-9a-f]{40}", payload["source_sha"])
         or payload["outcome"] not in {"pass", "fail"}
         or type(payload["private_retention"]) is not bool
@@ -117,9 +125,21 @@ def validate(payload):
         if key in payload and not re.fullmatch(r"[0-9a-f]{64}", payload[key]):
             raise ValueError("invalid digest")
     if "runtime_image" in payload and not re.fullmatch(
-        re.escape(REGISTRY) + r"@sha256:[0-9a-f]{64}", payload["runtime_image"]
+        r"@sha256:[0-9a-f]{64}", payload["runtime_image"]
     ):
         raise ValueError("invalid image identity")
+    if "runtime_versions" in payload:
+        versions = payload["runtime_versions"]
+        if (
+            type(versions) is not dict
+            or not versions
+            or set(versions) - VERSION_KEYS
+            or any(
+                type(val) is not str or not VERSION_RE.fullmatch(val)
+                for val in versions.values()
+            )
+        ):
+            raise ValueError("invalid runtime versions")
     for key in (
         "queue_s",
         "cold_start_s",
@@ -167,8 +187,12 @@ def validate(payload):
         raise ValueError("invalid correct count")
     if payload["outcome"] == "pass":
         required = (
-            (meta - {"failure_phase"}) | BASE | (tier_fields - {"fallback_reason"})
+            (meta - {"failure_phase", "runtime_versions"})
+            | BASE
+            | (tier_fields - {"fallback_reason"})
         )
+        if payload["route"] == "prebuilt-image":
+            required = required | {"runtime_versions"}
         if (
             not required.issubset(payload)
             or "failure_phase" in payload
@@ -178,6 +202,11 @@ def validate(payload):
             )
         ):
             raise ValueError("passing result lacks evidence")
+        if (
+            payload["route"] == "prebuilt-image"
+            and "sglang" not in payload["runtime_versions"]
+        ):
+            raise ValueError("prebuilt-image pass lacks sglang version fingerprint")
         if (
             tier == "fast_sanity"
             and "fallback_reason" in payload
