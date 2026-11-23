@@ -37,7 +37,7 @@ from sglang.srt.layers.attention.step5.metadata import (
     query_group_spans,
     selection_tile_rows,
 )
-from sglang.srt.utils.common import async_h2d
+from sglang.srt.utils.device import async_h2d
 
 
 def _score_group_spans(rows, lengths, device):

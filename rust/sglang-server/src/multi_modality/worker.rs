@@ -328,6 +328,7 @@ impl MmProcessor for Step3VlMmProcessor {
                 modality: MmModality::Image,
                 feature: item.feature,
                 hash: item.hash,
+                identity: None,
                 offsets: sglang_mm::step3_vl::image_token_runs(&input_ids, span, image_token_id),
                 model_specific_data,
                 aux,

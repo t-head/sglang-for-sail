@@ -39,7 +39,6 @@ from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
     get_model,
-    get_parallel,
     get_spec,
 )
 from sglang.srt.utils import is_npu
@@ -1972,9 +1971,13 @@ def _nixl_kv_packable(owner_view, draft_token_to_kv_pool) -> bool:
     gathered with one page size for K and V, and both are sliced with the
     full-attention head count, so K/V head dims and the head counts must match."""
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+    from sglang.srt.mem_cache.step5_kv_pool import Step5TokenToKVPool
     from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
     if draft_token_to_kv_pool is not None or not isinstance(owner_view, SWAKVPool):
+        return False
+    if isinstance(owner_view, Step5TokenToKVPool):
+        # Step5 FULL pages address compressed regions, not the SWA token slots.
         return False
     pools = (owner_view.full_kv_pool, owner_view.swa_kv_pool)
     return (

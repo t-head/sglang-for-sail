@@ -12,7 +12,7 @@ from sglang.kernels.ops.attention.step5.indexer_norm import (
     step5_indexer_norm_rope,
     supports_fused_fp8_cast,
 )
-from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
+from sglang.kernels.ops.gemm.tiny_gemm import can_use_tiny_gemm, tiny_gemm_bf16
 from sglang.srt.configs.step5 import get_step5_position_padding
 from sglang.srt.layers.attention.step5.compressor import compress_index_keys
 from sglang.srt.layers.attention.step5.metadata import Step5IndexerMetadata
@@ -242,13 +242,12 @@ class Step5Indexer(nn.Module):
             and weight_projection.weight.is_contiguous()
             and weight_projection.weight.dtype == torch.bfloat16
             and weight_projection.weight.data_ptr() % 32 == 0
+            and can_use_tiny_gemm(*weight_projection.weight.shape)
             and get_exec().kernel.bf16_gemm_backend == "auto"
             and not weight_projection._forward_hooks
             and not weight_projection._forward_pre_hooks
         ):
-            index_weights = tiny_gemm_bf16(
-                hidden_states, weight_projection.weight, max_m=4, n_split=1
-            )
+            index_weights = tiny_gemm_bf16(hidden_states, weight_projection.weight)
         else:
             index_weights, _ = weight_projection(hidden_states)
         return index_weights
