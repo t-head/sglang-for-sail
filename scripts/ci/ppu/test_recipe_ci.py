@@ -47,7 +47,7 @@ def fast_result():
         "recipe_tree_sha256": "0" * 64,
         "config_digest": "c" * 64,
         "outcome": "pass",
-        "runtime_image": "download.t-head.cn/docker_test/sglang@sha256:" + "d" * 64,
+        "runtime_image": "@sha256:" + "d" * 64,
         "route": "native-build + sglang-release-runtime",
         "parser_checked": True,
         "sse_verified": True,
@@ -1073,7 +1073,7 @@ class ClusterTransportTest(unittest.TestCase):
                             "containerStatuses": [
                                 {
                                     "name": "worker",
-                                    "imageID": "docker-pullable://"
+                                    "imageID": "docker-pullable://registry.internal/team/sglang"
                                     + result["runtime_image"],
                                 }
                             ]
@@ -1142,7 +1142,8 @@ class ClusterTransportTest(unittest.TestCase):
                         "deepseek-v4-flash": "d" * 40,
                         "deepseek-v4-flash-tp8": "d" * 40,
                     }.get(model, ""),
-                    "PPU_CI_RECIPE_RUNTIME_IMAGE": result["runtime_image"],
+                    "PPU_CI_K8S_RUNTIME_DIGEST": "registry.internal/team/sglang"
+                    + result["runtime_image"],
                     "INJECTED_FIXTURE": injected,
                 }
                 process = subprocess.run(
@@ -1172,6 +1173,13 @@ class ClusterTransportTest(unittest.TestCase):
                     self.assertFalse((root / "gha-output").exists())
                     self.assertNotIn(
                         injected, artifact.read_text() + job_summary.read_text()
+                    )
+                    self.assertNotIn(
+                        "registry.internal",
+                        artifact.read_text()
+                        + job_summary.read_text()
+                        + process.stdout
+                        + process.stderr,
                     )
                 (original_log,) = retained.glob("cluster.*/launcher.log")
                 self.assertIn(injected, original_log.read_text())
@@ -1214,6 +1222,501 @@ class ClusterTransportTest(unittest.TestCase):
                     }
                 ],
             )
+
+
+class RuntimeImageAndPrebuiltModeTest(unittest.TestCase):
+    def test_rejects_illegal_tags_digests_and_cross_repo_injection(self):
+        import recipe_image
+
+        env = {
+            "PPU_CI_K8S_RUNTIME_DIGEST": "registry.internal/team/sglang@sha256:"
+            + "a" * 64,
+            "PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS": "registry.internal/team/",
+        }
+        for bad_tag in (
+            "evil.example/sglang:nightly",
+            "team/sglang:nightly",
+            "nightly@sha256:" + "a" * 64,
+            "../escape",
+            "-flag",
+            ".hidden",
+            "has space",
+            "t" * 129,
+        ):
+            with self.subTest(bad_tag=bad_tag):
+                with self.assertRaises(ValueError):
+                    recipe_image.resolve_target(env, image_tag=bad_tag)
+        for bad_digest in (
+            "sha256:short",
+            "sha256:" + "A" * 64,
+            "evil.example/sglang@sha256:" + "a" * 64,
+        ):
+            with self.subTest(bad_digest=bad_digest):
+                with self.assertRaises(ValueError):
+                    recipe_image.resolve_target(env, image_digest=bad_digest)
+        with self.assertRaises(ValueError):
+            recipe_image.resolve_target(
+                {**env, "PPU_CI_RECIPE_IMAGE_REPO": "evil.example/sglang"},
+                image_tag="nightly-20261122",
+            )
+        with self.assertRaises(ValueError):
+            recipe_image.verify_pullable_image_id(
+                "docker-pullable://evil.example/sglang@sha256:" + "b" * 64,
+                env,
+                expected_repo="registry.internal/team/sglang",
+            )
+        with self.assertRaises(ValueError):
+            recipe_image.verify_pullable_image_id(
+                "docker-pullable://registry.internal/team/sglang@sha256:" + "b" * 64,
+                env,
+                expected_repo="registry.internal/team/sglang",
+                expected_digest="sha256:" + "c" * 64,
+            )
+
+    def test_resolves_tag_and_digest_and_verifies_docker_pull(self):
+        import recipe_image
+
+        digest = "sha256:" + "e" * 64
+        image_id = "sha256:" + "f" * 64
+        env = {
+            "PPU_CI_K8S_RUNTIME_DIGEST": "registry.internal/team/sglang@sha256:"
+            + "a" * 64,
+            "PPU_CI_RECIPE_IMAGE_REPO": "registry.internal/team/sglang-nightly",
+            "PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS": "registry.internal/team/",
+        }
+        tag_res = recipe_image.resolve_target(env, image_tag="nightly-20261122")
+        self.assertEqual(
+            tag_res["pull_ref"],
+            "registry.internal/team/sglang-nightly:nightly-20261122",
+        )
+        self.assertEqual(
+            tag_res["expected_repo"], "registry.internal/team/sglang-nightly"
+        )
+        self.assertEqual(tag_res["expected_digest"], "")
+        self.assertEqual(len(tag_res["image_key"]), 64)
+
+        dig_res = recipe_image.resolve_target(
+            env, image_tag="nightly-20261122", image_digest=digest
+        )
+        self.assertEqual(
+            dig_res["pull_ref"],
+            f"registry.internal/team/sglang-nightly@{digest}",
+        )
+        self.assertEqual(dig_res["expected_digest"], digest)
+
+        pub = recipe_image.verify_pullable_image_id(
+            f"docker-pullable://registry.internal/team/sglang-nightly@{digest}",
+            env,
+            expected_repo="registry.internal/team/sglang-nightly",
+            expected_digest=digest,
+        )
+        self.assertEqual(pub, f"@{digest}")
+        self.assertNotIn("registry.internal", pub)
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            calls_log = root / "docker-calls.log"
+            docker = bin_dir / "docker"
+            docker.write_text(
+                f"""#!/bin/bash
+echo "$*" >> "{calls_log}"
+if [[ "$1" == "pull" ]]; then
+  echo "Digest: {digest}"
+  exit 0
+fi
+if [[ "$1" == "image" && "$2" == "inspect" ]]; then
+  if [[ "$*" == *"{{.Id}}"* ]]; then
+    echo "{image_id}"
+    exit 0
+  fi
+  if [[ "$*" == *"RepoDigests"* ]]; then
+    echo "registry.internal/team/sglang-nightly@{digest}"
+    exit 0
+  fi
+fi
+exit 1
+""",
+                encoding="utf-8",
+            )
+            docker.chmod(0o755)
+            old_path = os.environ["PATH"]
+            try:
+                os.environ["PATH"] = f"{bin_dir}:{old_path}"
+                pulled = recipe_image.docker_pull_and_verify(
+                    env,
+                    root / "pull.log",
+                    image_tag="nightly-20261122",
+                    image_digest=digest,
+                )
+            finally:
+                os.environ["PATH"] = old_path
+            self.assertEqual(pulled["image_id"], image_id)
+            self.assertEqual(pulled["public_digest"], f"@{digest}")
+            self.assertIn(
+                f"pull registry.internal/team/sglang-nightly@{digest}",
+                calls_log.read_text(),
+            )
+
+    def test_prebuilt_image_evidence_requires_redacted_digest_and_sglang_version(self):
+        base = {
+            **fast_result(),
+            "route": "prebuilt-image",
+            "runtime_versions": {
+                "sglang": "0.5.23+sail",
+                "sgl_kernel": "0.3.1",
+                "torch": "2.13.0",
+            },
+        }
+        validate(base)
+        with self.assertRaises(ValueError):
+            validate(
+                {
+                    **base,
+                    "runtime_image": "private.internal/team/sglang@sha256:" + "d" * 64,
+                }
+            )
+        without_versions = {k: v for k, v in base.items() if k != "runtime_versions"}
+        with self.assertRaises(ValueError):
+            validate(without_versions)
+        with self.assertRaises(ValueError):
+            validate({**base, "runtime_versions": {"torch": "2.13.0"}})
+        with self.assertRaises(ValueError):
+            validate({**base, "runtime_versions": {"sglang": "/private/path"}})
+        # PEP 440 local suffixes containing domains or IPv4 addresses must fail closed.
+        for bad_ver in (
+            "0.5.23+registry.internal",
+            "0.5.23+10.1.2.3",
+            "0.5.23+corp.example.com",
+        ):
+            with self.subTest(bad_ver=bad_ver):
+                with self.assertRaises(ValueError):
+                    validate({**base, "runtime_versions": {"sglang": bad_ver}})
+
+    def test_recipe_image_does_not_fallback_to_legacy_runtime_image(self):
+        import recipe_image
+
+        legacy_only = {
+            "PPU_CI_RUNTIME_IMAGE": "registry.internal/legacy/single-card:v1",
+        }
+        with self.assertRaises(ValueError):
+            recipe_image.resolve_target(legacy_only)
+        with self.assertRaises(ValueError):
+            recipe_image.resolve_target(legacy_only, image_tag="nightly-20261122")
+
+    def test_docker_pull_handles_multiple_repo_digests(self):
+        import recipe_image
+
+        older_digest = "sha256:" + "3" * 64
+        pulled_digest = "sha256:" + "2" * 64
+        image_id = "sha256:" + "f" * 64
+        env = {
+            "PPU_CI_K8S_RUNTIME_DIGEST": "registry.internal/team/sglang@sha256:"
+            + "a" * 64,
+            "PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS": "registry.internal/team/",
+        }
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            docker = bin_dir / "docker"
+            docker.write_text(
+                f"""#!/bin/bash
+if [[ "$1" == "pull" ]]; then
+  if [[ "${{OMIT_PULL_DIGEST:-0}}" != "1" ]]; then
+    echo "Digest: {pulled_digest}"
+  fi
+  exit 0
+fi
+if [[ "$1" == "image" && "$2" == "inspect" ]]; then
+  if [[ "$*" == *"{{.Id}}"* ]]; then
+    echo "{image_id}"
+    exit 0
+  fi
+  if [[ "$*" == *"RepoDigests"* ]]; then
+    printf '%s\\n%s\\n' \\
+      "registry.internal/team/sglang@{older_digest}" \\
+      "registry.internal/team/sglang@{pulled_digest}"
+    exit 0
+  fi
+fi
+exit 1
+""",
+                encoding="utf-8",
+            )
+            docker.chmod(0o755)
+            old_path = os.environ["PATH"]
+            try:
+                os.environ["PATH"] = f"{bin_dir}:{old_path}"
+                # Tag override must pick freshly pulled digest, not stale first entry.
+                pulled_tag = recipe_image.docker_pull_and_verify(
+                    env, root / "pull-tag.log", image_tag="nightly-20261122"
+                )
+                self.assertEqual(pulled_tag["public_digest"], f"@{pulled_digest}")
+                # Explicit digest matching second RepoDigests entry must succeed.
+                pulled_pin = recipe_image.docker_pull_and_verify(
+                    env,
+                    root / "pull-pin.log",
+                    image_tag="nightly-20261122",
+                    image_digest=pulled_digest,
+                )
+                self.assertEqual(pulled_pin["public_digest"], f"@{pulled_digest}")
+                # Ambiguous multi-RepoDigests without pull Digest line must fail closed.
+                os.environ["OMIT_PULL_DIGEST"] = "1"
+                with self.assertRaises(ValueError):
+                    recipe_image.docker_pull_and_verify(
+                        env, root / "pull-ambig.log", image_tag="nightly-20261122"
+                    )
+            finally:
+                os.environ.pop("OMIT_PULL_DIGEST", None)
+                os.environ["PATH"] = old_path
+
+    def test_checkout_digest_rejects_mutated_or_untracked_recipe_files(self):
+        with tempfile.TemporaryDirectory() as raw_root:
+            repo = Path(raw_root) / "repo"
+            repo.mkdir()
+            policy = repo / "test/ppu/policy/models/demo.yaml"
+            policy.parent.mkdir(parents=True)
+            policy.write_text("max_tokens: 16\n", encoding="utf-8")
+            git_env = {
+                **os.environ,
+                "GIT_AUTHOR_NAME": "Test",
+                "GIT_AUTHOR_EMAIL": "test@example.com",
+                "GIT_COMMITTER_NAME": "Test",
+                "GIT_COMMITTER_EMAIL": "test@example.com",
+            }
+            subprocess.run(["git", "init", "-q"], cwd=repo, env=git_env, check=True)
+            subprocess.run(["git", "add", "."], cwd=repo, env=git_env, check=True)
+            subprocess.run(
+                ["git", "commit", "-q", "-m", "init"], cwd=repo, env=git_env, check=True
+            )
+            sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+            ).strip()
+            bundle = REPO_ROOT / "scripts/ci/ppu/recipe_bundle.py"
+
+            # Clean checkout matches committed git blobs.
+            clean = subprocess.run(
+                [sys.executable, "-B", str(bundle), "checkout-digest", sha],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(clean.returncode, 0, clean.stderr)
+            self.assertEqual(len(clean.stdout.strip()), 64)
+
+            # Mutating a tracked policy file on disk must fail closed.
+            policy.write_text("max_tokens: 32\n", encoding="utf-8")
+            mutated = subprocess.run(
+                [sys.executable, "-B", str(bundle), "checkout-digest", sha],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(mutated.returncode, 0)
+
+            # Restoring tracked file but adding an untracked file under test/ppu/ must fail closed.
+            policy.write_text("max_tokens: 16\n", encoding="utf-8")
+            (repo / "test/ppu/extra.yaml").write_text("x: 1\n", encoding="utf-8")
+            untracked = subprocess.run(
+                [sys.executable, "-B", str(bundle), "checkout-digest", sha],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(untracked.returncode, 0)
+
+    @unittest.skipUnless(
+        all(shutil.which(tool) for tool in ("jq", "sha256sum")),
+        "runner tools are required",
+    )
+    def test_cluster_transport_prebuilt_image_mode_skips_wheels_and_exports_fingerprint(
+        self,
+    ):
+        digest = "sha256:" + "e" * 64
+        tree_sha = "1" * 64
+        source_sha = "a" * 40
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "checkout"
+            staging = root / "staging"
+            retained = root / "retained"
+            tools = root / "bin"
+            backend = workspace / ".ppu-infra/cluster-run/scripts"
+            for folder in (staging, retained, tools, backend):
+                folder.mkdir(parents=True)
+            scripts = workspace / "scripts/ci/ppu"
+            shutil.copytree(REPO_ROOT / "scripts/ci/ppu", scripts)
+            shutil.copytree(DEFAULT_POLICY_ROOT, workspace / "test/ppu/policy")
+            (scripts / "recipe_bundle.py").write_text(
+                f"import sys\nif sys.argv[1] == 'checkout-digest': print('{tree_sha}')\n"
+            )
+            summary = {
+                "outcome": "pass",
+                "parser_checked": True,
+                "sse_verified": True,
+                "cold_start_s": 3.0,
+                "queue_s": 0,
+                "layer_override": None,
+                "config_digest": "c" * 64,
+            }
+            (workspace / "fixture.json").write_text(json.dumps(summary))
+            (workspace / "versions.json").write_text(
+                json.dumps({"sglang": "0.5.23+sail", "torch": "2.13.0"})
+            )
+            (tools / "git").write_text(
+                '#!/bin/bash\ncase "$1" in -C) echo 96e25147971f5d2a04d828f8ad508cae38a4fa8a;; '
+                f"*) echo {source_sha};; esac\n"
+            )
+            kube_content = json.dumps(
+                {
+                    "status": {
+                        "containerStatuses": [
+                            {
+                                "name": "worker",
+                                "imageID": f"docker-pullable://registry.internal/team/sglang@{digest}",
+                            }
+                        ]
+                    }
+                }
+            )
+            (tools / "kubectl").write_text(
+                f"#!/bin/bash\nif [[ \"$*\" == *'get pod '* ]]; then echo '{kube_content}'; fi\n"
+            )
+            (tools / "timeout").write_text('#!/bin/bash\nshift\nexec "$@"\n')
+            for tool in tools.iterdir():
+                tool.chmod(0o700)
+            (backend / "submit.sh").write_text(
+                f'test "$INPUT_IMAGE" = "registry.internal/team/sglang@{digest}" || exit 1\n'
+                'jq -e \'.PPU_CI_SKIP_WHEEL_INSTALL == "true" and .PPU_CI_RECIPE_TREE_SHA256 == "'
+                + tree_sha
+                + '"\' <<< "$USER_ENV_JSON" >/dev/null || exit 1\n'
+                'printf "job_status=scheduled\\nstart_time=1\\ndeadline=2\\nqueue_duration_seconds=5\\n" >> "$GITHUB_OUTPUT"\n'
+            )
+            (backend / "monitor.sh").write_text(
+                'mkdir -p "$PPU_CI_WORKER_ARTIFACT_DIR/results"\n'
+                'cp fixture.json "$PPU_CI_WORKER_ARTIFACT_DIR/results/summary.json"\n'
+                'cp versions.json "$PPU_CI_WORKER_ARTIFACT_DIR/runtime-versions.json"\n'
+                'echo job_status=succeeded >> "$GITHUB_OUTPUT"\n'
+            )
+            (backend / "cleanup.sh").write_text(
+                'unlink "$SOURCE_STAGE_DIR"\nrmdir "$(dirname "$SOURCE_STAGE_DIR")"\n'
+            )
+            export_env = {
+                **os.environ,
+                "PATH": os.pathsep.join(
+                    (
+                        str(tools),
+                        str(Path(sys.executable).parent),
+                        os.environ["PATH"],
+                    )
+                ),
+                "TIER": "fast_sanity",
+                "MODEL_KEY": "qwen3.8-27b",
+                "RECIPE_PPU_COUNT": "2",
+                "GITHUB_OUTPUT": str(root / "gha-output"),
+                "PPU_PUBLIC_SUMMARY": str(root / "gha-summary"),
+                "GITHUB_WORKSPACE": str(workspace),
+                "RUNNER_TEMP": str(root / "runner-temp"),
+                "GITHUB_RUN_ID": "99",
+                "GITHUB_RUN_ATTEMPT": "1",
+                "PPU_CI_K8S_CONFIG_SHA256": "",
+                "PPU_CI_K8S_LOADED_CONFIG_SHA256": "",
+                "PPU_CI_PRIVATE_RESULTS_ROOT": str(retained),
+                "PPU_CI_K8S_PRIVATE_WORKER_ROOT": str(retained),
+                "PPU_CI_K8S_STAGE_ROOT": str(staging),
+                "PPU_CI_SOURCE_SHA": source_sha,
+                "PPU_CI_JIT_ROOT": str(root / "jit"),
+                "PPU_CI_HF_CACHE_ROOT": str(root / "cache"),
+                "PPU_CI_K8S_RUNTIME_DIGEST": "registry.internal/team/sglang@sha256:"
+                + "a" * 64,
+                "PPU_CI_RUNTIME_IMAGE_TAG": "nightly-20261122",
+                "PPU_CI_RUNTIME_IMAGE_DIGEST": digest,
+                "PPU_CI_SKIP_WHEEL_INSTALL": "true",
+            }
+            process = subprocess.run(
+                ["bash", str(scripts / "run_recipe_cluster.sh")],
+                cwd=workspace,
+                env=export_env,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+            public_record = json.loads(
+                (workspace / "ppu-public/recipe.json").read_text()
+            )
+            self.assertEqual(public_record["route"], "prebuilt-image")
+            self.assertEqual(public_record["runtime_image"], f"@{digest}")
+            self.assertEqual(
+                public_record["runtime_versions"],
+                {"sglang": "0.5.23+sail", "torch": "2.13.0"},
+            )
+            self.assertNotIn(
+                "registry.internal",
+                (workspace / "ppu-public/recipe.json").read_text()
+                + (root / "gha-summary").read_text()
+                + process.stdout
+                + process.stderr,
+            )
+
+    def test_nightly_workflow_has_no_plaintext_runtime_image_and_exposes_safe_inputs(
+        self,
+    ):
+        import yaml
+
+        path = REPO_ROOT / ".github/workflows/nightly-test-ppu.yml"
+        raw = path.read_text(encoding="utf-8")
+        self.assertNotIn("docker_" + "test/sglang", raw)
+        self.assertNotIn("runtime_image:", raw)
+        workflow = yaml.load(raw, Loader=yaml.BaseLoader)
+        dispatch_inputs = workflow["on"]["workflow_dispatch"]["inputs"]
+        for key in (
+            "target_ref",
+            "model_filter",
+            "image_tag",
+            "image_digest",
+            "skip_wheel_build",
+        ):
+            self.assertIn(key, dispatch_inputs)
+            default = str(dispatch_inputs[key].get("default", ""))
+            self.assertNotIn(":", default)
+            self.assertNotIn("docker_", default)
+        call_inputs = workflow["on"]["workflow_call"]["inputs"]
+        for key in (
+            "ref",
+            "target_ref",
+            "model_filter",
+            "image_tag",
+            "image_digest",
+            "skip_wheel_build",
+        ):
+            self.assertIn(key, call_inputs)
+            default = str(call_inputs[key].get("default", ""))
+            self.assertNotIn(":", default)
+            self.assertNotIn("docker_", default)
+        expected_secrets = (
+            "PPU_CI_K8S_RUNTIME_DIGEST",
+            "PPU_CI_RECIPE_IMAGE_REPO",
+            "PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS",
+        )
+        call_secrets = workflow["on"]["workflow_call"]["secrets"]
+        recipe_env = workflow["jobs"]["recipe-sanity"]["env"]
+        pr_workflow = yaml.load(
+            (REPO_ROOT / ".github/workflows/pr-test-ppu.yml").read_text(
+                encoding="utf-8"
+            ),
+            Loader=yaml.BaseLoader,
+        )
+        pr_fast_secrets = pr_workflow["jobs"]["ppu-fast-sanity"]["secrets"]
+        for secret_key in expected_secrets:
+            self.assertEqual(
+                str(call_secrets[secret_key].get("required", "")).lower(), "false"
+            )
+            expected_expr = f"${{{{ secrets.{secret_key} }}}}"
+            self.assertEqual(recipe_env[secret_key], expected_expr)
+            self.assertEqual(pr_fast_secrets[secret_key], expected_expr)
 
 
 if __name__ == "__main__":

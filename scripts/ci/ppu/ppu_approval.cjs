@@ -85,6 +85,26 @@ async function approvedTargetBranch(github, repo, branch) {
     : DENIED;
 }
 
+async function approvedCrossBranchTarget(github, repo, ref, workflowSha) {
+  // The default-branch dispatcher calls the release workflow with a release branch
+  // or forwards a previously pinned 40-char SHA into a nested reusable workflow.
+  if (ref === "yuhe/v1.0.0" || ref.startsWith("release/")) {
+    return approvedTargetBranch(github, repo, ref);
+  }
+  if (!isSha(ref)) return DENIED;
+  const yuhe = await approvedTargetBranch(github, repo, "yuhe/v1.0.0");
+  if (yuhe.approved && yuhe.sha === ref) return yuhe;
+  if (workflowSha === ref && await trustedBranchHead(github, repo, "yuhe/v1.0.0", ref, 30)) {
+    return {approved: true, sha: ref};
+  }
+  const protectedBranches = await github.paginate(github.rest.repos.listBranches, {
+    ...repo, protected: true, per_page: 100,
+  });
+  return protectedBranches.some(item => item.name.startsWith("release/") && item.commit?.sha === ref)
+    ? {approved: true, sha: ref}
+    : DENIED;
+}
+
 async function resolve({github, context, label, ref = "", workflowSha = ""}) {
   const {owner, repo} = context.repo;
   if (owner.toLowerCase() !== "t-head" || repo.toLowerCase() !== "sglang-for-sail" ||
@@ -97,12 +117,17 @@ async function resolve({github, context, label, ref = "", workflowSha = ""}) {
   const branch = context.ref.slice("refs/heads/".length);
   const ownRef = !ref || ref === context.sha || ref === context.ref || ref === branch;
   if (context.eventName === "workflow_dispatch") {
-    if (!ownRef || !await canWrite(github, context.repo, context.actor)) return DENIED;
+    if (!await canWrite(github, context.repo, context.actor)) return DENIED;
     const rerunner = process.env.GITHUB_TRIGGERING_ACTOR;
     if (!rerunner) return DENIED;
-    return (rerunner === context.actor || await canWrite(github, context.repo, rerunner))
-      ? {approved: true, sha: context.sha}
-      : DENIED;
+    if (rerunner !== context.actor && !await canWrite(github, context.repo, rerunner)) {
+      return DENIED;
+    }
+    if (ownRef) return {approved: true, sha: context.sha};
+    if (!["main", "sail_ci_cd"].includes(branch)) return DENIED;
+    const {data: repository} = await github.rest.repos.get(context.repo);
+    if (repository.default_branch !== branch) return DENIED;
+    return approvedCrossBranchTarget(github, context.repo, ref, workflowSha);
   }
   const isProtectedCaller = process.env.GITHUB_REF_PROTECTED === "true";
   if (context.eventName === "push") {
@@ -120,23 +145,7 @@ async function resolve({github, context, label, ref = "", workflowSha = ""}) {
     return DENIED;
   }
   if (ownRef) return {approved: true, sha: context.sha};
-  // The default-branch dispatcher calls the release workflow with a release branch
-  // or forwards a previously pinned 40-char SHA into a nested reusable workflow.
-  if (ref === "yuhe/v1.0.0" || ref.startsWith("release/")) {
-    return approvedTargetBranch(github, context.repo, ref);
-  }
-  if (!isSha(ref)) return DENIED;
-  const yuhe = await approvedTargetBranch(github, context.repo, "yuhe/v1.0.0");
-  if (yuhe.approved && yuhe.sha === ref) return yuhe;
-  if (workflowSha === ref && await trustedBranchHead(github, context.repo, "yuhe/v1.0.0", ref, 30)) {
-    return {approved: true, sha: ref};
-  }
-  const protectedBranches = await github.paginate(github.rest.repos.listBranches, {
-    ...context.repo, protected: true, per_page: 100,
-  });
-  return protectedBranches.some(item => item.name.startsWith("release/") && item.commit?.sha === ref)
-    ? {approved: true, sha: ref}
-    : DENIED;
+  return approvedCrossBranchTarget(github, context.repo, ref, workflowSha);
 }
 
 async function ppuApproved(args) {
