@@ -136,8 +136,12 @@ trap 'exit 143' TERM
 
 python3 "$repo/scripts/ci/ppu/check_ppu_environment.py"
 python3 -c 'import torch; print("Runtime Torch:", torch.__version__, "SAIL build marker:", getattr(torch.version, "sail", None)); assert torch.cuda.device_count() == 1'
+triton_kernels_backup="$HOME/triton-kernels-backup"
+python3 "$checker" backup-triton-kernels "$triton_kernels_backup"
 python3 -m pip uninstall -y sgl-kernel
 python3 -m pip install --no-deps --no-index --force-reinstall "$wheel_dir/"*.whl
+python3 "$checker" restore-triton-kernels "$triton_kernels_backup"
+rm -rf -- "$triton_kernels_backup"
 missing_wheels=$(python3 "$checker" missing-wheels "$wheel_dir/runtime-deps")
 if [[ -n "$missing_wheels" ]]; then
     mapfile -t runtime_wheels <<< "$missing_wheels"

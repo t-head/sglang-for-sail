@@ -239,6 +239,72 @@ class TestPPUCIDependencies(unittest.TestCase):
                         },
                     )
 
+    def test_triton_kernels_backup_and_restore_handles_pip_wheel_replacement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            site = root / "site"
+            mxfp = site / "triton_kernels/numerics_details/mxfp.py"
+            mxfp.parent.mkdir(parents=True)
+            mxfp.write_text("def downcast_to_mxfp(*args):\n    return args\n")
+            pycache = site / "triton_kernels/__pycache__"
+            pycache.mkdir()
+            (pycache / "stale.pyc").write_bytes(b"bytecode")
+            backup = root / "backup"
+            env = {**os.environ, "PYTHONPATH": str(site)}
+
+            res = subprocess.run(
+                [
+                    sys.executable,
+                    "-S",
+                    str(SCRIPT),
+                    "backup-triton-kernels",
+                    str(backup),
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertTrue(
+                (backup / "triton_kernels/numerics_details/mxfp.py").is_file()
+            )
+            self.assertFalse((backup / "triton_kernels/__pycache__").exists())
+
+            # Simulate pip uninstall deleting .py files while leaving __pycache__ behind.
+            mxfp.unlink()
+            mxfp.parent.rmdir()
+            res = subprocess.run(
+                [
+                    sys.executable,
+                    "-S",
+                    str(SCRIPT),
+                    "restore-triton-kernels",
+                    str(backup),
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertTrue(mxfp.is_file())
+
+            # Simulate a newer runtime/wheel already providing its own triton_kernels.
+            mxfp.write_text("# newer\n")
+            res = subprocess.run(
+                [
+                    sys.executable,
+                    "-S",
+                    str(SCRIPT),
+                    "restore-triton-kernels",
+                    str(backup),
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertEqual(mxfp.read_text(), "# newer\n")
+
 
 if __name__ == "__main__":
     unittest.main()
