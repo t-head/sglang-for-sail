@@ -566,11 +566,10 @@ class Step3VLImageProcessor(SGLangBaseProcessor):
             image_token_regex=re.compile(r"(?:<im_patch>)"),
         ).build(_processor)
 
-
     @staticmethod
     def _load_rust(processor: Step3VLProcessor):
         mm = get_mm()
-        if mm.image_processor_backend != "auto" or mm.disable_fast_image_processor:
+        if mm.image_processor_backend != "auto":
             return None, None
         fields = step3_vl_rust_spec(processor)
         if fields is None:

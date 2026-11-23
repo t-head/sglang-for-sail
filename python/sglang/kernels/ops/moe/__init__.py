@@ -283,7 +283,6 @@ register_kernel(
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.moe.local_expert_map:local_expert_lookup",
         capabilities=frozenset({CapabilityRequirement.CUDA}),
-        description="int32 expert-id gather that folds in ATen's int64 index promotion.",
     )
 )
 register_kernel(

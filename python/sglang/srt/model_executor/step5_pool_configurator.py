@@ -606,9 +606,7 @@ class Step5PoolConfigurator(MemoryPoolConfigurator):
             or hf.layer_types_with_mtp[hf.num_hidden_layers :]
             != ["sliding_attention"] * hf.num_nextn_predict_layers
         ):
-            raise ValueError(
-                "invalid resolved stage partition or draft SWA layers"
-            )
+            raise ValueError("invalid resolved stage partition or draft SWA layers")
         heads = mc.get_num_kv_heads(ps.attn_tp_size, ps.attn_dcp_size)
         for name, value in (
             ("page size", kvc.page_size),
@@ -1173,7 +1171,10 @@ class Step5PoolConfigurator(MemoryPoolConfigurator):
             or kvc.kv_cache_dtype != torch.bfloat16
             or kvc.kv_cache_dtype_str not in (None, "auto", "bf16", "bfloat16")
             or kvc.device not in ("cpu", "cuda")
-            or (kvc.device == "cuda" and not current_platform.is_cuda())
+            or (
+                kvc.device == "cuda"
+                and not (current_platform.is_cuda() or current_platform.is_sail())
+            )
             or current_platform.is_out_of_tree()
             or get_exec().kernel.attention_backend == "ascend"
         ):
