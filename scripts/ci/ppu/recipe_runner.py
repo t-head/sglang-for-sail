@@ -3,6 +3,7 @@
 
 import argparse
 import contextlib
+import http.client
 import importlib.util
 import json
 import math
@@ -73,7 +74,7 @@ def server(config, label, timings, ready_timeout):
                     with request("/health_generate", timeout=10) as generated:
                         if generated.status == 200:
                             break
-                except (URLError, TimeoutError):
+                except (URLError, TimeoutError, http.client.HTTPException, OSError):
                     time.sleep(1)
             else:
                 phase("readiness_timeout")
