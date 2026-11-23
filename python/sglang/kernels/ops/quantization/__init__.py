@@ -163,6 +163,15 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
+        op="quantization.sail_mxfp4_quantize",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.quantization.sail_mxfp4_quant:sail_mxfp4_quantize",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="quantization.quantize_fp4_indexer_tensor",
         backend=KernelBackend.TRITON,
         target=(

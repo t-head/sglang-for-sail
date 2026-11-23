@@ -304,22 +304,23 @@ class Mxfp4Config(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config):
-
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_mxfp4_serialized = "mxfp4" in quant_method
+        ignored_layers = cls.get_from_keys_or(
+            config, ["ignore", "ignored_layers", "modules_to_not_convert"], None
+        )
 
         if _is_hip:
-            if is_gfx95_supported():
-                return cls(
-                    is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized
-                )
-            else:
+            if not is_gfx95_supported():
                 platform = torch.cuda.get_device_properties(0).gcnArchName
                 raise ValueError(
                     f"Current platform {platform} not support mxfp4 computation"
                 )
 
-        return cls(is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized)
+        return cls(
+            ignored_layers=ignored_layers,
+            is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized,
+        )
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -343,7 +344,6 @@ class Mxfp4Config(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
-
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
@@ -381,6 +381,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.prefix = prefix
         self.topk_indices_dtype = None
         self.with_bias = False
+        self.sail_silu_clamp = None
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
         self.use_marlin = get_moe_runner_backend().is_marlin()
         # Weight layout, post-load processing and apply() must agree with the
@@ -659,6 +660,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 deinterleave_moe_mxfp4_w13_for_marlin(layer)
             prepare_moe_mxfp4_layer_for_marlin(layer)
             layer._mxfp4_backend = "marlin"
+            return
+
+        if self.sail_silu_clamp is not None:
+            from deep_gemm import preprocess_mxfp4_scales
+
+            for name in ("w13_weight_scale", "w2_weight_scale"):
+                scale = getattr(layer, name)
+                scale.data = preprocess_mxfp4_scales(scale.data)
             return
 
         if self.use_deep_gemm or self.use_mega_moe:
@@ -1412,6 +1421,37 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     ):
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
+        if (
+            self.use_deep_gemm
+            and get_platform().is_sail
+            and moe_runner_config.silu_clamp_mode == "post"
+        ):
+            from sglang.kernels.ops.activation.silu_clamp_and_mul import (
+                SiluClampAndMulOp,
+            )
+
+            if not get_moe_a2a_backend().is_none():
+                raise ValueError("SAIL MXFP4 post-SiLU MoE requires standard dispatch")
+            if (
+                moe_runner_config.activation != "silu"
+                or not moe_runner_config.is_gated
+                or moe_runner_config.gate_up_interleaved
+                or moe_runner_config.gemm1_alpha is not None
+                or moe_runner_config.gemm1_clamp_limit is None
+                or moe_runner_config.swiglu_limit is not None
+                or moe_runner_config.apply_router_weight_on_input
+                or moe_runner_config.no_combine
+                or self.with_bias
+            ):
+                raise ValueError(
+                    "SAIL MXFP4 requires split, unbiased gate/up weights, "
+                    "a post-SiLU limit, and router weights on the expert outputs"
+                )
+            self.sail_silu_clamp = SiluClampAndMulOp(
+                limit=moe_runner_config.gemm1_clamp_limit
+            )
+            return
+
         if self.use_mega_moe and moe_runner_backend.is_flashinfer_mxfp4():
             # MegaMoE uses this method for weight preparation only and calls
             # DeepGEMM directly instead of dispatching through a MoeRunner.
@@ -1578,12 +1618,38 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-
         from sglang.srt.layers.moe.token_dispatcher import (
             DispatchOutputChecker,
             StandardCombineInput,
         )
         from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+        if self.sail_silu_clamp is not None:
+            from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+                use_symmetric_memory,
+            )
+            from sglang.srt.hardware_backend.sail.mxfp4_moe import sail_mxfp4_moe
+            from sglang.srt.layers.dp_attention import is_allocation_symmetric
+            from sglang.srt.runtime_context import get_parallel
+
+            hidden_states = dispatch_output.hidden_states
+            topk_weights, topk_ids, _ = dispatch_output.topk_output
+            with use_symmetric_memory(
+                get_parallel().tp_group, disabled=not is_allocation_symmetric()
+            ):
+                output = hidden_states.new_empty(hidden_states.shape)
+            routed_scaling_factor = self.moe_runner_config.routed_scaling_factor
+            sail_mxfp4_moe(
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                (layer.w13_weight, layer.w13_weight_scale),
+                (layer.w2_weight, layer.w2_weight_scale),
+                self.sail_silu_clamp,
+                output,
+                routed_scaling_factor if routed_scaling_factor is not None else 1.0,
+            )
+            return StandardCombineInput(hidden_states=output)
 
         if self.use_deep_gemm:
             # Handles standard AND deepep_ll/deepep_normal dispatch formats via
@@ -1788,7 +1854,6 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         w13_weight = torch.nn.Parameter(
