@@ -388,7 +388,7 @@ jobs:
     if: >-
       always() && !cancelled() && github.repository == 't-head/sglang-for-sail' &&
       (inputs.tier || 'model_sanity') == 'model_sanity' &&
-      ((github.event_name == 'schedule' &&
+      (((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
         startsWith(github.workflow_ref, 't-head/sglang-for-sail/.github/workflows/nightly-dispatch-ppu.yml@refs/heads/')) ||
        (github.event_name == 'workflow_dispatch' &&
         startsWith(github.workflow_ref, 't-head/sglang-for-sail/.github/workflows/nightly-test-ppu.yml@refs/heads/') &&

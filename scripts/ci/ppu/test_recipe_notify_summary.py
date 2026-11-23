@@ -167,33 +167,68 @@ class NotifySummaryTest(unittest.TestCase):
             self.assertEqual(8, opener.open.call_args.kwargs["timeout"])
 
     def test_retry_uses_the_attempt_that_executed_each_job(self):
+        prior = {
+            "name": "prior",
+            "id": 101,
+            "run_attempt": 1,
+            "conclusion": "success",
+            "started_at": "2023-01-02T01:00:00Z",
+            "completed_at": "2023-01-02T01:30:00Z",
+        }
+        retry = dict(prior, name="retry", id=102)
+        retried = dict(
+            retry,
+            id=202,
+            run_attempt=2,
+            conclusion="failure",
+            started_at="2023-01-02T03:00:00Z",
+            completed_at="2023-01-02T03:00:30Z",
+        )
         current = [
-            {"jobs": [{"name": "retry", "conclusion": "failure"}]},
-            {"jobs": [{"name": "other", "conclusion": "success"}]},
+            {"jobs": [retried]},
+            {"jobs": [dict(prior, id=201, run_attempt=2)]},
         ]
-        old = [
-            {
-                "jobs": [
-                    {"name": "retry", "conclusion": "success"},
-                    {"name": "prior", "conclusion": "success"},
-                ]
-            }
-        ]
-        replies = [{"run_started_at": "2023-01-02T03:00:00Z"}, current, old]
+        old = [{"jobs": [retry, prior]}]
+
+        def github_api(command, **_):
+            endpoint = command[4]
+            if endpoint.endswith("/attempts/2"):
+                return b'{"run_started_at":"2023-01-02T03:00:00Z"}'
+            if "/attempts/1/jobs?" in endpoint:
+                return json.dumps(old)
+            if "/attempts/2/jobs?" in endpoint:
+                return json.dumps(current)
+            raise AssertionError(endpoint)
+
         with (
-            patch.object(
-                notify.subprocess,
-                "check_output",
-                side_effect=[json.dumps(reply) for reply in replies],
-            ),
+            patch.object(notify.subprocess, "check_output", side_effect=github_api),
             patch.object(notify.time, "time", return_value=1672628460),
         ):
-            jobs, elapsed = notify.run_jobs({"retry", "other", "prior"})
-        self.assertEqual(
-            {"retry": ("failure", 2), "other": ("success", 2), "prior": ("success", 1)},
-            jobs,
-        )
+            jobs, elapsed = notify.run_jobs({"retry", "prior"})
+        self.assertEqual({"retry": ("failure", 2), "prior": ("success", 1)}, jobs)
         self.assertEqual(60, elapsed)
+
+        def original_evidence(attempt):
+            if attempt != 1:
+                raise FileNotFoundError
+            return "pass", "unknown", None, None
+
+        self.assertEqual(
+            "pass",
+            notify.model_result("prior", jobs["prior"], original_evidence)["status"],
+        )
+        self.assertEqual(
+            "missing evidence",
+            notify.model_result("retry", jobs["retry"], original_evidence)["phase"],
+        )
+        results = [
+            notify.model_result(model, jobs[model], original_evidence)
+            for model in ("prior", "retry")
+        ]
+        roster = '{"models":{"prior":[{"user_id":"prior-owner"}],"retry":[{"user_id":"retry-owner"}]}}'
+        payload = notify.make_payload({"results": results}, roster, "mon")
+        self.assertEqual(["retry-owner"], payload["at"]["atUserIds"])
+        self.assertIn("[❌ 1 项失败 · 待认领]", payload["markdown"]["title"])
 
     def test_missing_evidence_and_conflicting_job_result_fail_closed(self):
         def missing(_attempt):
