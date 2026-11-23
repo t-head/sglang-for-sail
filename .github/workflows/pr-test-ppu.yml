@@ -347,6 +347,10 @@ jobs:
       model_filter: ${{ github.event_name == 'workflow_dispatch' && inputs.model_filter || '' }}
       skip_wheel_build: true
       wheel_artifact_id: ${{ needs.ppu-build.outputs.wheel-artifact-id }}
+    secrets:
+      PPU_CI_K8S_RUNTIME_DIGEST: ${{ secrets.PPU_CI_K8S_RUNTIME_DIGEST }}
+      PPU_CI_RECIPE_IMAGE_REPO: ${{ secrets.PPU_CI_RECIPE_IMAGE_REPO }}
+      PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS: ${{ secrets.PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS }}
 
   pr-test-ppu-finish:
     name: >-
