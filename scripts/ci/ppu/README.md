@@ -43,10 +43,11 @@ The worker keeps `HF_HOME` job-local and points `HF_HUB_CACHE` and `HUGGINGFACE_
 
 Use a runner configured for reviewed public PR revisions with public-safe runner labels, name and workspace metadata. Kubernetes device requests arbitrate card ownership. The CPU runner and worker must share access to the private per-job directory with mode 0700. The launcher captures Cluster Run diagnostics before exposing scheduler and worker results to GitHub. The evidence gate checks the runtime digest reported by Kubernetes and publishes a typed result. JIT caches for a pinned image can be reused across runs.
 
-For local structure checks, install PyYAML and use these commands. On Linux with `flock`, `git`, `jq` and `huggingface-hub`, also run `bash scripts/ci/ppu/run_selftests.sh`.
+For local structure checks, install PyYAML and use these commands. `test/ppu/README.md` is generated from the recipes and policies by `render-matrix` and checked in `test_recipe_ci.py`. On Linux with `flock`, `git`, `jq` and `huggingface-hub`, also run `bash scripts/ci/ppu/run_selftests.sh`.
 
 ```bash
 python3 -B scripts/ci/ppu/ppu_recipe.py validate --all --sglang-parser skip
+python3 -B scripts/ci/ppu/ppu_recipe.py render-matrix --check
 python3 -B -m unittest discover -s scripts/ci/ppu -p 'test_recipe*.py'
 ```
 
