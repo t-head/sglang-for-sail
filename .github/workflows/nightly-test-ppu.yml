@@ -70,6 +70,12 @@ on:
         required: false
       PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS:
         required: false
+      PPU_CI_NOTIFY_WEBHOOK_URL:
+        required: false
+      PPU_CI_NOTIFY_SIGNING_SECRET:
+        required: false
+      PPU_CI_NOTIFY_ROSTER_JSON:
+        required: false
 
 permissions:
   actions: read
@@ -375,3 +381,62 @@ jobs:
           name: ${{ env.TIER }}-${{ matrix.model }}-${{ github.run_attempt }}
           path: ppu-public/recipe.json
           if-no-files-found: error
+
+  notify-summary:
+    name: Notify Nightly summary
+    needs: [pr-gate, plan, ppu-build, evalscope-wheels, recipe-sanity]
+    if: >-
+      always() && !cancelled() && github.repository == 't-head/sglang-for-sail' &&
+      (inputs.tier || 'model_sanity') == 'model_sanity' &&
+      (((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
+        startsWith(github.workflow_ref, 't-head/sglang-for-sail/.github/workflows/nightly-dispatch-ppu.yml@refs/heads/')) ||
+       (github.event_name == 'workflow_dispatch' &&
+        startsWith(github.workflow_ref, 't-head/sglang-for-sail/.github/workflows/nightly-test-ppu.yml@refs/heads/') &&
+        contains(fromJSON('["yuhe/v1.0.0","release/v1.0.0"]'), github.ref_name)))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    continue-on-error: true
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - id: configured
+        name: Check notification configuration
+        env:
+          PPU_CI_NOTIFY_WEBHOOK_URL: ${{ secrets.PPU_CI_NOTIFY_WEBHOOK_URL }}
+        run: |
+          if [[ -n "$PPU_CI_NOTIFY_WEBHOOK_URL" ]]; then
+            echo 'enabled=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.configured.outputs.enabled == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          persist-credentials: false
+
+      - name: Fetch checked public model summaries
+        if: steps.configured.outputs.enabled == 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: model_sanity-*
+          path: ${{ runner.temp }}/ppu-notify-artifacts
+
+      - name: Send one Markdown notification
+        if: steps.configured.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTIFY_REF: ${{ inputs.target_ref || inputs.ref || github.ref_name }}
+          NOTIFY_GATE_RESULT: ${{ needs.pr-gate.result }}
+          NOTIFY_PLAN_RESULT: ${{ needs.plan.result }}
+          NOTIFY_BUILD_RESULT: ${{ needs.ppu-build.result }}
+          NOTIFY_EVAL_RESULT: ${{ needs.evalscope-wheels.result }}
+          NOTIFY_MATRIX_RESULT: ${{ needs.recipe-sanity.result }}
+          NOTIFY_MATRIX: ${{ needs.plan.outputs.models }}
+          NOTIFY_SOURCE_SHA: ${{ needs.plan.outputs.source-sha }}
+          PPU_CI_NOTIFY_WEBHOOK_URL: ${{ secrets.PPU_CI_NOTIFY_WEBHOOK_URL }}
+          PPU_CI_NOTIFY_SIGNING_SECRET: ${{ secrets.PPU_CI_NOTIFY_SIGNING_SECRET }}
+          PPU_CI_NOTIFY_ROSTER_JSON: ${{ secrets.PPU_CI_NOTIFY_ROSTER_JSON }}
+        run: python3 -B scripts/ci/ppu/ppu_notify_summary.py --nightly "$RUNNER_TEMP/ppu-notify-artifacts"
