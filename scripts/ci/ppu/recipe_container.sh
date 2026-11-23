@@ -103,7 +103,8 @@ sglang_ver = safe_version("sglang", getattr(sglang, "__version__", None))
 if not sglang_ver:
     raise SystemExit("Unable to determine installed sglang version")
 versions["sglang"] = sglang_ver
-kernel_ver = safe_version("sgl-kernel")
+# This release builds sglang-kernel. Older prebuilt images may only ship sgl-kernel.
+kernel_ver = safe_version("sglang-kernel", safe_version("sgl-kernel"))
 if kernel_ver:
     versions["sgl_kernel"] = kernel_ver
 torch_ver = safe_version("torch", getattr(torch, "__version__", None))

@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from importlib import metadata
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -1572,6 +1573,45 @@ exit 1
                 + process.stdout
                 + process.stderr,
             )
+
+    def test_container_records_built_kernel_version_before_legacy_image_metadata(self):
+        wrapper = (REPO_ROOT / "scripts/ci/ppu/recipe_container.sh").read_text()
+        platform_check = wrapper.split("phase platform_check\n", 1)[1]
+        python_source = platform_check.split("\n", 1)[1].split("\nPY\n", 1)[0]
+        modules = {
+            "sglang": SimpleNamespace(__version__="0.5.23"),
+            "torch": SimpleNamespace(
+                __version__="2.13.0", cuda=SimpleNamespace(device_count=lambda: 8)
+            ),
+            "sglang.srt.platforms": SimpleNamespace(
+                current_platform=SimpleNamespace(is_sail=lambda: True)
+            ),
+        }
+        for legacy, built, expected in (
+            ("0.3.31", "0.4.10", "0.4.10"),
+            (None, "0.4.10", "0.4.10"),
+            ("0.3.31", None, "0.3.31"),
+        ):
+            with (
+                self.subTest(legacy=legacy, built=built),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                distributions = {"sgl-kernel": legacy, "sglang-kernel": built}
+
+                def version(name):
+                    if (value := distributions.get(name)) is not None:
+                        return value
+                    raise metadata.PackageNotFoundError(name)
+
+                output = Path(tmp) / "runtime-versions.json"
+                with (
+                    patch.dict(sys.modules, modules),
+                    patch.dict(os.environ, {"RECIPE_PPU_COUNT": "8"}),
+                    patch.object(sys, "argv", ["-", str(output)]),
+                    patch.object(metadata, "version", side_effect=version),
+                ):
+                    exec(compile(python_source, "recipe_container.sh", "exec"), {})
+                self.assertEqual(json.loads(output.read_text())["sgl_kernel"], expected)
 
     def test_nightly_workflow_has_no_plaintext_runtime_image_and_exposes_safe_inputs(
         self,
