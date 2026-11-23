@@ -46,3 +46,7 @@ jobs:
       image_tag: ${{ inputs.image_tag || '' }}
       image_digest: ${{ inputs.image_digest || '' }}
       skip_wheel_build: ${{ inputs.skip_wheel_build == true }}
+    secrets:
+      PPU_CI_K8S_RUNTIME_DIGEST: ${{ secrets.PPU_CI_K8S_RUNTIME_DIGEST }}
+      PPU_CI_RECIPE_IMAGE_REPO: ${{ secrets.PPU_CI_RECIPE_IMAGE_REPO }}
+      PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS: ${{ secrets.PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS }}
