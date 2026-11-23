@@ -208,21 +208,33 @@ def run_jobs(expected):
         info = api(f"{route}/{attempt}")
         started = datetime.fromisoformat(info["run_started_at"].replace("Z", "+00:00"))
         elapsed = max(0, int(time.time() - started.timestamp()))
-        for number in range(attempt, 0, -1):
-            if expected <= jobs.keys():
-                break
+        if not expected:
+            return jobs, elapsed
+
+        executions = {}
+        for number in range(1, attempt + 1):
             pages = api(f"{route}/{number}/jobs?per_page=100", "--paginate", "--slurp")
-            matches = {}
+            seen = set()
             for page in pages:
                 for job in page["jobs"]:
                     name = job["name"]
-                    if name in expected:
-                        if name in matches:
-                            raise ValueError("Ambiguous job name")
-                        matches[name] = (job["conclusion"], number)
-            # A failed newer job takes precedence even if it produced no artifact.
-            jobs = matches | jobs
+                    if name not in expected:
+                        continue
+                    if name in seen:
+                        raise ValueError("Ambiguous job name")
+                    seen.add(name)
+                    # Partial reruns can copy prior jobs with new IDs and attempt
+                    # numbers. Their original execution timestamps are retained.
+                    timestamps = job["started_at"], job["completed_at"]
+                    if executions.get(name) != timestamps:
+                        executions[name] = timestamps
+                        executed_in = number
+                    else:
+                        executed_in = jobs[name][1]
+                    jobs[name] = job["conclusion"], executed_in
     except (OSError, KeyError, TypeError, ValueError, subprocess.SubprocessError):
+        # A later snapshot could contain a failure that supersedes an old pass.
+        jobs.clear()
         warn("GitHub job metadata is incomplete.")
     return jobs, elapsed
 
