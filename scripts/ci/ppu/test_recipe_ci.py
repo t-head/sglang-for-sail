@@ -1198,6 +1198,10 @@ class ClusterTransportTest(unittest.TestCase):
             (nightly_dir / "bench-warmup-1.log").write_text(
                 "/usr/bin/python3: No module named sglang.bench_serving\n"
             )
+            (nightly_dir / "sglang_serve_model_sanity.log").write_text(
+                "server_args={'moe_a2a_backend': 'deepep', 'watchdog_timeout': 3600.0}\n"
+                "ModuleNotFoundError: No module named 'triton_kernels'\n"
+            )
             records = recipe_cluster_diagnostics.recent_failures(root, 45055310117)
             self.assertEqual(
                 records,
@@ -1206,7 +1210,7 @@ class ClusterTransportTest(unittest.TestCase):
                         "run_id": 45055310116,
                         "tier": "model_sanity",
                         "model": "glm-5.3",
-                        "codes": ["python_import"],
+                        "codes": ["missing_triton_kernels", "python_import"],
                     }
                 ],
             )

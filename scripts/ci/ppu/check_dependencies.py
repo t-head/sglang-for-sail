@@ -1,7 +1,10 @@
 import argparse
 import hashlib
+import importlib
+import importlib.util
 import json
 import re
+import shutil
 import sys
 from importlib import metadata
 from pathlib import Path
@@ -74,6 +77,63 @@ def missing_wheels(wheel_dir, packages):
     return selected
 
 
+def find_triton_kernels_dir():
+    spec = importlib.util.find_spec("triton_kernels")
+    if spec is None or not spec.submodule_search_locations:
+        return None
+    for raw in spec.submodule_search_locations:
+        candidate = Path(raw)
+        if (
+            candidate.is_dir()
+            and not candidate.is_symlink()
+            and any(candidate.rglob("*.py"))
+        ):
+            return candidate.resolve(strict=True)
+    return None
+
+
+def backup_triton_kernels(backup_dir):
+    source = find_triton_kernels_dir()
+    if source is None:
+        return
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    dest = backup_dir / "triton_kernels"
+    if dest.exists():
+        shutil.rmtree(dest)
+    shutil.copytree(
+        source,
+        dest,
+        symlinks=False,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+    )
+    (backup_dir / "meta.json").write_text(
+        json.dumps({"target": str(source)}) + "\n", encoding="utf-8"
+    )
+
+
+def restore_triton_kernels(backup_dir):
+    meta_path = backup_dir / "meta.json"
+    payload_dir = backup_dir / "triton_kernels"
+    if not meta_path.is_file() or not payload_dir.is_dir():
+        return
+    importlib.invalidate_caches()
+    if find_triton_kernels_dir() is not None:
+        return
+    target = Path(json.loads(meta_path.read_text(encoding="utf-8"))["target"])
+    if (
+        target.name != "triton_kernels"
+        or not target.parent.is_dir()
+        or target.is_symlink()
+    ):
+        raise ValueError(
+            f"Refusing to restore triton_kernels into invalid path: {target}"
+        )
+    shutil.copytree(payload_dir, target, symlinks=False, dirs_exist_ok=True)
+    importlib.invalidate_caches()
+    if find_triton_kernels_dir() is None:
+        raise RuntimeError(f"Failed to restore triton_kernels into {target}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
@@ -85,7 +145,17 @@ def main():
     commands.add_parser("requirements")
     wheels = commands.add_parser("missing-wheels")
     wheels.add_argument("wheel_dir", type=Path)
+    backup_tk = commands.add_parser("backup-triton-kernels")
+    backup_tk.add_argument("backup_dir", type=Path)
+    restore_tk = commands.add_parser("restore-triton-kernels")
+    restore_tk.add_argument("backup_dir", type=Path)
     args = parser.parse_args()
+    if args.command == "backup-triton-kernels":
+        backup_triton_kernels(args.backup_dir)
+        return 0
+    if args.command == "restore-triton-kernels":
+        restore_triton_kernels(args.backup_dir)
+        return 0
     if args.command == "snapshot":
         args.output.write_text(json.dumps(snapshot(), indent=2, sort_keys=True) + "\n")
         return 0
