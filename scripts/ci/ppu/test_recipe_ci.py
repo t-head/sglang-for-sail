@@ -1696,6 +1696,27 @@ exit 1
             default = str(call_inputs[key].get("default", ""))
             self.assertNotIn(":", default)
             self.assertNotIn("docker_", default)
+        expected_secrets = (
+            "PPU_CI_K8S_RUNTIME_DIGEST",
+            "PPU_CI_RECIPE_IMAGE_REPO",
+            "PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS",
+        )
+        call_secrets = workflow["on"]["workflow_call"]["secrets"]
+        recipe_env = workflow["jobs"]["recipe-sanity"]["env"]
+        pr_workflow = yaml.load(
+            (REPO_ROOT / ".github/workflows/pr-test-ppu.yml").read_text(
+                encoding="utf-8"
+            ),
+            Loader=yaml.BaseLoader,
+        )
+        pr_fast_secrets = pr_workflow["jobs"]["ppu-fast-sanity"]["secrets"]
+        for secret_key in expected_secrets:
+            self.assertEqual(
+                str(call_secrets[secret_key].get("required", "")).lower(), "false"
+            )
+            expected_expr = f"${{{{ secrets.{secret_key} }}}}"
+            self.assertEqual(recipe_env[secret_key], expected_expr)
+            self.assertEqual(pr_fast_secrets[secret_key], expected_expr)
 
 
 if __name__ == "__main__":

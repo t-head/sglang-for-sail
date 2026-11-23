@@ -63,6 +63,13 @@ on:
       wheel_artifact_id:
         type: string
         default: ''
+    secrets:
+      PPU_CI_K8S_RUNTIME_DIGEST:
+        required: false
+      PPU_CI_RECIPE_IMAGE_REPO:
+        required: false
+      PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS:
+        required: false
 
 permissions:
   actions: read
@@ -314,6 +321,9 @@ jobs:
       PPU_CI_RUNTIME_IMAGE_TAG: ${{ inputs.image_tag || '' }}
       PPU_CI_RUNTIME_IMAGE_DIGEST: ${{ inputs.image_digest || '' }}
       PPU_CI_SKIP_WHEEL_INSTALL: ${{ needs.plan.outputs.skip-wheel-install }}
+      PPU_CI_K8S_RUNTIME_DIGEST: ${{ secrets.PPU_CI_K8S_RUNTIME_DIGEST }}
+      PPU_CI_RECIPE_IMAGE_REPO: ${{ secrets.PPU_CI_RECIPE_IMAGE_REPO }}
+      PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS: ${{ secrets.PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS }}
     steps:
       - uses: actions/checkout@v4
         with:
