@@ -23,6 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_RECIPES_ROOT = REPO_ROOT / "test" / "ppu" / "recipes"
 DEFAULT_POLICY_ROOT = REPO_ROOT / "test" / "ppu" / "policy"
 DEFAULT_MATRIX_DOC = REPO_ROOT / "test" / "ppu" / "README.md"
+GSM8K_GOLDEN_BAND_ABS = 0.02
 
 SERVING_SCHEMA = "ppu-serving/v1"
 DATASET_SCHEMA = "ppu-dataset/v1"
@@ -1368,8 +1369,6 @@ def _format_fast_sanity_weights(
 
 def _format_model_sanity_stages(policy_doc: dict[str, Any]) -> str:
     stages = policy_doc.get("tiers", {}).get("model_sanity", {}).get("stages", [])
-    gate = policy_doc.get("accuracy_gate") or {}
-    band = gate.get("golden_band_abs")
     items: list[str] = []
     for stage in stages:
         stage_id = str(stage["id"])
@@ -1377,10 +1376,7 @@ def _format_model_sanity_stages(policy_doc: dict[str, Any]) -> str:
         if kind == "evalscope":
             limit = stage.get("limit")
             scope = "full" if limit is None else f"limit={limit}"
-            if band is not None:
-                items.append(f"{_md_code(stage_id)} ({scope}, ±{band})")
-            else:
-                items.append(f"{_md_code(stage_id)} ({scope})")
+            items.append(f"{_md_code(stage_id)} ({scope}, ±{GSM8K_GOLDEN_BAND_ABS})")
         elif kind == "bench":
             concs = stage.get("concurrencies") or []
             if concs:

@@ -17,7 +17,7 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
-from ppu_recipe import REPO_ROOT, _load_yaml, resolve_recipe
+from ppu_recipe import GSM8K_GOLDEN_BAND_ABS, REPO_ROOT, _load_yaml, resolve_recipe
 
 HOST = "http://127.0.0.1:9985"
 MODEL = "recipe-model"
@@ -253,7 +253,7 @@ def evaluate(stage, config):
         or golden["generation"] != stage["generation"]
         or golden["dataset"]
         != {**dataset_options, "num_expected": expected, "dataset_id": dataset_id}
-        or golden["tolerance"] != {"mode": "band", "abs": 0.02}
+        or golden["tolerance"] != {"mode": "band", "abs": GSM8K_GOLDEN_BAND_ABS}
     ):
         raise ValueError("golden evaluation contract mismatch")
     directory = RESULTS / "evalscope"
@@ -299,7 +299,7 @@ def evaluate(stage, config):
         "gsm8k_correct": correct,
         "gsm8k_count": count,
         "golden_score": golden["score"],
-        "accuracy_within_band": abs(score - golden["score"]) <= 0.02,
+        "accuracy_within_band": abs(score - golden["score"]) <= GSM8K_GOLDEN_BAND_ABS,
         "baseline_established": True,
     }
 

@@ -20,7 +20,9 @@ from ppu_recipe import (
     ValidationError,
     _load_yaml,
     _scan_text,
-    main as ppu_recipe_main,
+)
+from ppu_recipe import main as ppu_recipe_main
+from ppu_recipe import (
     render_ci_matrix_markdown,
     resolve_recipe,
     validate_paths,
@@ -784,6 +786,22 @@ class RecipeContractTest(unittest.TestCase):
             self.assertIn(f"[`{entry['model']}`]", fast_section)
         for entry in select("model_sanity", "")["include"]:
             self.assertIn(f"[`{entry['model']}`]", nightly_section)
+
+    def test_render_matrix_uses_enforced_accuracy_band(self):
+        glm_policy = DEFAULT_POLICY_ROOT / "models/glm-5.3.yaml"
+
+        def load_policy_with_different_band(path):
+            doc = _load_yaml(path)
+            if path == glm_policy:
+                doc["accuracy_gate"]["golden_band_abs"] = 0.03
+            return doc
+
+        with patch(
+            "ppu_recipe._load_yaml", side_effect=load_policy_with_different_band
+        ):
+            actual = render_ci_matrix_markdown()
+
+        self.assertEqual(actual, DEFAULT_MATRIX_DOC.read_text(encoding="utf-8"))
 
     def test_render_matrix_cli_check_passes_and_detects_drift(self):
         self.assertEqual(ppu_recipe_main(["render-matrix", "--check"]), 0)
