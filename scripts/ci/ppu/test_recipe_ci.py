@@ -14,10 +14,14 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from ppu_recipe import (
+    DEFAULT_MATRIX_DOC,
     DEFAULT_POLICY_ROOT,
     REPO_ROOT,
     ValidationError,
     _load_yaml,
+    _scan_text,
+    main as ppu_recipe_main,
+    render_ci_matrix_markdown,
     resolve_recipe,
     validate_paths,
     validate_policy_structure,
@@ -730,6 +734,95 @@ class RecipeContractTest(unittest.TestCase):
                     [REPO_ROOT / "test/ppu/recipes/zai-org/GLM-5.3.yaml"],
                     sglang_parser_mode="required",
                 )
+
+    def test_resolve_recipe_reports_enabled_features(self):
+        dsv4_recipe = REPO_ROOT / "test/ppu/recipes/deepseek-ai/DeepSeek-V4-Flash.yaml"
+        dsv4_policy = DEFAULT_POLICY_ROOT / "models/deepseek-v4-flash.yaml"
+        dsv4_tp8_policy = DEFAULT_POLICY_ROOT / "models/deepseek-v4-flash-tp8.yaml"
+        glm_recipe = REPO_ROOT / "test/ppu/recipes/zai-org/GLM-5.3.yaml"
+        glm_policy = DEFAULT_POLICY_ROOT / "models/glm-5.3.yaml"
+
+        self.assertEqual(
+            resolve_recipe(dsv4_recipe, policy_path=dsv4_policy, tier="fast_sanity")[
+                "enabled_features"
+            ],
+            ["deepep"],
+        )
+        self.assertEqual(
+            resolve_recipe(
+                dsv4_recipe, policy_path=dsv4_tp8_policy, tier="model_sanity"
+            )["enabled_features"],
+            [],
+        )
+        self.assertEqual(
+            resolve_recipe(glm_recipe, policy_path=glm_policy, tier="fast_sanity")[
+                "enabled_features"
+            ],
+            [],
+        )
+
+    def test_checked_in_recipe_matrix_doc_is_up_to_date(self):
+        expected = render_ci_matrix_markdown()
+        self.assertTrue(DEFAULT_MATRIX_DOC.is_file())
+        actual = DEFAULT_MATRIX_DOC.read_text(encoding="utf-8")
+        self.assertEqual(
+            actual,
+            expected,
+            "test/ppu/README.md is out of date; regenerate with: "
+            "python3 -B scripts/ci/ppu/ppu_recipe.py render-matrix --output test/ppu/README.md",
+        )
+        self.assertEqual(_scan_text(actual, context="test/ppu/README.md"), [])
+        self.assertIn("## PR CI (`fast_sanity`)", actual)
+        self.assertIn("## Nightly CI (`model_sanity`)", actual)
+        self.assertIn("`default` (none)", actual)
+        self.assertIn("`deepep`", actual)
+
+        fast_section, nightly_section = actual.split(
+            "## Nightly CI (`model_sanity`)", 1
+        )
+        for entry in select("fast_sanity", "")["include"]:
+            self.assertIn(f"[`{entry['model']}`]", fast_section)
+        for entry in select("model_sanity", "")["include"]:
+            self.assertIn(f"[`{entry['model']}`]", nightly_section)
+
+    def test_render_matrix_cli_check_passes_and_detects_drift(self):
+        self.assertEqual(ppu_recipe_main(["render-matrix", "--check"]), 0)
+
+        with tempfile.TemporaryDirectory() as root:
+            tmp_dir = Path(root)
+            missing = tmp_dir / "missing.md"
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                self.assertEqual(
+                    ppu_recipe_main(
+                        ["render-matrix", "--output", str(missing), "--check"]
+                    ),
+                    1,
+                )
+            self.assertIn("matrix doc missing", stderr.getvalue())
+
+            target = tmp_dir / "README.md"
+            target.write_text("# stale\n", encoding="utf-8")
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                self.assertEqual(
+                    ppu_recipe_main(
+                        ["render-matrix", "--output", str(target), "--check"]
+                    ),
+                    1,
+                )
+            self.assertIn("matrix doc out of date", stderr.getvalue())
+
+            self.assertEqual(
+                ppu_recipe_main(["render-matrix", "--output", str(target)]), 0
+            )
+            self.assertEqual(
+                ppu_recipe_main(["render-matrix", "--output", str(target), "--check"]),
+                0,
+            )
+            self.assertEqual(
+                target.read_text(encoding="utf-8"), render_ci_matrix_markdown()
+            )
 
     def test_bundle_rejects_modified_wheel_and_source(self):
         with tempfile.TemporaryDirectory() as root:

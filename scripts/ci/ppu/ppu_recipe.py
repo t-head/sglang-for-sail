@@ -10,7 +10,9 @@ import copy
 import hashlib
 import importlib
 import json
+import os
 import re
+import shlex
 import sys
 from pathlib import Path
 from typing import Any
@@ -20,6 +22,7 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_RECIPES_ROOT = REPO_ROOT / "test" / "ppu" / "recipes"
 DEFAULT_POLICY_ROOT = REPO_ROOT / "test" / "ppu" / "policy"
+DEFAULT_MATRIX_DOC = REPO_ROOT / "test" / "ppu" / "README.md"
 
 SERVING_SCHEMA = "ppu-serving/v1"
 DATASET_SCHEMA = "ppu-dataset/v1"
@@ -389,11 +392,13 @@ def resolve_recipe(
         enabled_features[feat_name] = bool(flag_on)
 
     features_blk = recipe.get("features", {})
+    active_features: list[str] = []
     for feat_name, is_enabled in enabled_features.items():
         if not is_enabled:
             continue
         if feat_name not in features_blk:
             raise ValidationError(f"{recipe_path}: unknown feature {feat_name!r}")
+        active_features.append(feat_name)
         feat = features_blk[feat_name]
         if "modes" in feat:
             mode_name = feat.get("default_mode") or next(iter(feat["modes"]))
@@ -521,6 +526,7 @@ def resolve_recipe(
         "preset": eff_preset,
         "variant": variant,
         "hardware": hardware,
+        "enabled_features": active_features,
         "layer_override": eff_layers,
         "dummy_weights": eff_dummy,
     }
@@ -1298,6 +1304,300 @@ def _discover_default_paths() -> list[Path]:
     return paths
 
 
+def _md_cell(value: str) -> str:
+    return (
+        value.strip().replace("|", "&#124;").replace("\r\n", "\n").replace("\n", "<br>")
+    )
+
+
+def _md_code(value: str) -> str:
+    if "`" in value:
+        return f"`` {value} ``"
+    return f"`{value}`"
+
+
+def _md_link(label: str, repo_relative_path: str, *, base_dir: Path) -> str:
+    rel = os.path.relpath(
+        (REPO_ROOT / repo_relative_path).resolve(), base_dir.resolve()
+    )
+    posix_rel = Path(rel).as_posix()
+    return f"[{_md_code(label)}]({posix_rel})"
+
+
+def _format_preset(resolved: dict[str, Any]) -> str:
+    preset = resolved.get("preset")
+    variant = resolved.get("variant", "default")
+    preset_text = _md_code(preset) if preset else f"{_md_code('default')} (none)"
+    if variant != "default":
+        return f"variant {_md_code(variant)}, {preset_text}"
+    return preset_text
+
+
+def _format_features(resolved: dict[str, Any]) -> str:
+    features = resolved.get("enabled_features") or []
+    if not features:
+        return _md_code("none")
+    return ", ".join(_md_code(name) for name in features)
+
+
+def _format_flags_and_env(flags: list[str], server_env: dict[str, str]) -> str:
+    parts: list[str] = []
+    if flags:
+        parts.append(_md_code(shlex.join(flags)))
+    else:
+        parts.append(_md_code("none"))
+    if server_env:
+        env_items = ", ".join(
+            _md_code(f"{k}={v}") for k, v in sorted(server_env.items())
+        )
+        parts.append(f"env: {env_items}")
+    return "<br>".join(parts)
+
+
+def _format_fast_sanity_weights(
+    policy_doc: dict[str, Any], resolved: dict[str, Any]
+) -> str:
+    weight = _md_code("dummy") if resolved.get("dummy_weights") else "real"
+    layer_override = resolved.get("layer_override")
+    if layer_override is None:
+        return f"{weight}, full layers"
+    fs_cfg = policy_doc.get("tiers", {}).get("fast_sanity", {})
+    suffix = " (fallback: full)" if fs_cfg.get("fallback_full_layers") else ""
+    return f"{weight}, {layer_override} layers{suffix}"
+
+
+def _format_model_sanity_stages(policy_doc: dict[str, Any]) -> str:
+    stages = policy_doc.get("tiers", {}).get("model_sanity", {}).get("stages", [])
+    gate = policy_doc.get("accuracy_gate") or {}
+    band = gate.get("golden_band_abs")
+    items: list[str] = []
+    for stage in stages:
+        stage_id = str(stage["id"])
+        kind = stage["kind"]
+        if kind == "evalscope":
+            limit = stage.get("limit")
+            scope = "full" if limit is None else f"limit={limit}"
+            if band is not None:
+                items.append(f"{_md_code(stage_id)} ({scope}, ±{band})")
+            else:
+                items.append(f"{_md_code(stage_id)} ({scope})")
+        elif kind == "bench":
+            concs = stage.get("concurrencies") or []
+            if concs:
+                conc_str = ",".join(str(c) for c in concs)
+                items.append(f"{_md_code(stage_id)} ({_md_code(f'C={conc_str}')})")
+            else:
+                items.append(_md_code(stage_id))
+        else:
+            items.append(_md_code(stage_id))
+    return ", ".join(items) if items else _md_code("none")
+
+
+def _format_golden(resolved: dict[str, Any], *, base_dir: Path) -> str:
+    golden_key = resolved.get("golden_model_key")
+    if not golden_key:
+        return _md_code("none")
+    rel_path = f"test/ppu/golden/accuracy_{golden_key}_890p.json"
+    if (REPO_ROOT / rel_path).is_file():
+        return _md_link(golden_key, rel_path, base_dir=base_dir)
+    return _md_code(golden_key)
+
+
+def _render_md_table(headers: list[str], rows: list[list[str]]) -> list[str]:
+    lines = [
+        "| " + " | ".join(_md_cell(h) for h in headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(_md_cell(cell) for cell in row) + " |")
+    return lines
+
+
+def render_ci_matrix_markdown(*, base_dir: Path | None = None) -> str:
+    """Render the PR and Nightly PPU CI recipe matrix Markdown document."""
+    ci_dir = str(Path(__file__).resolve().parent)
+    if ci_dir not in sys.path:
+        sys.path.insert(0, ci_dir)
+    selector = importlib.import_module("recipe_select")
+    doc_dir = base_dir if base_dir is not None else DEFAULT_MATRIX_DOC.parent
+
+    fast_keys: list[str] = []
+    fast_rows: list[list[str]] = []
+    for entry in selector.select("fast_sanity", "")["include"]:
+        model_key = entry["model"]
+        fast_keys.append(model_key)
+        policy_rel = f"test/ppu/policy/models/{model_key}.yaml"
+        policy_path = REPO_ROOT / policy_rel
+        pol_doc = _load_yaml(policy_path)
+        recipe_rel = pol_doc["recipe"]
+        resolved = resolve_recipe(
+            REPO_ROOT / recipe_rel, policy_path=policy_path, tier="fast_sanity"
+        )
+        fast_rows.append(
+            [
+                _md_link(model_key, policy_rel, base_dir=doc_dir),
+                _md_link(Path(recipe_rel).name, recipe_rel, base_dir=doc_dir),
+                f"{_md_code(resolved['hardware'])} / {resolved['ppu_count']}",
+                _format_preset(resolved),
+                _format_features(resolved),
+                _format_fast_sanity_weights(pol_doc, resolved),
+                _format_flags_and_env(resolved["flags"], resolved["server_env"]),
+            ]
+        )
+
+    nightly_keys: list[str] = []
+    nightly_rows: list[list[str]] = []
+    for entry in selector.select("model_sanity", "")["include"]:
+        model_key = entry["model"]
+        nightly_keys.append(model_key)
+        policy_rel = f"test/ppu/policy/models/{model_key}.yaml"
+        policy_path = REPO_ROOT / policy_rel
+        pol_doc = _load_yaml(policy_path)
+        recipe_rel = pol_doc["recipe"]
+        resolved = resolve_recipe(
+            REPO_ROOT / recipe_rel, policy_path=policy_path, tier="model_sanity"
+        )
+        nightly_rows.append(
+            [
+                _md_link(model_key, policy_rel, base_dir=doc_dir),
+                _md_link(Path(recipe_rel).name, recipe_rel, base_dir=doc_dir),
+                f"{_md_code(resolved['hardware'])} / {resolved['ppu_count']}",
+                _format_preset(resolved),
+                _format_features(resolved),
+                _format_model_sanity_stages(pol_doc),
+                _format_golden(resolved, base_dir=doc_dir),
+                _format_flags_and_env(resolved["flags"], resolved["server_env"]),
+            ]
+        )
+
+    fast_only = [key for key in fast_keys if key not in set(nightly_keys)]
+
+    lines = [
+        "<!-- Generated by `python3 -B scripts/ci/ppu/ppu_recipe.py render-matrix --output test/ppu/README.md`. Do not edit manually. -->",
+        "",
+        "# SGLang PPU Recipe CI Matrix",
+        "",
+        "This document is generated from `test/ppu/recipes/` and `test/ppu/policy/models/`",
+        "using the same selector logic (`scripts/ci/ppu/recipe_select.py`) as GitHub Actions",
+        f"({_md_link('.github/workflows/pr-test-ppu.yml', '.github/workflows/pr-test-ppu.yml', base_dir=doc_dir)}).",
+        f"For runner orchestration, cluster provisioning, and CI labels, see {_md_link('scripts/ci/ppu/README.md', 'scripts/ci/ppu/README.md', base_dir=doc_dir)}.",
+        "",
+        "## Directory Layout",
+        "",
+        *_render_md_table(
+            ["Path", "Schema / Kind", "Purpose"],
+            [
+                [
+                    _md_link("recipes/", "test/ppu/recipes", base_dir=doc_dir),
+                    "`ppu-serving/v1` YAML",
+                    "Declarative serve config per model (`base_args`, `base_env`, `features`, `variants`, `hardware_overrides`, `presets`, topology, and HF checkpoint id).",
+                ],
+                [
+                    _md_link(
+                        "policy/models/", "test/ppu/policy/models", base_dir=doc_dir
+                    ),
+                    "`ppu-test-policy/v1` YAML",
+                    "Per-model CI policy (`hardware`, `accuracy_gate`, and `fast_sanity` / `model_sanity` tiers).",
+                ],
+                [
+                    _md_link(
+                        "policy/datasets/", "test/ppu/policy/datasets", base_dir=doc_dir
+                    ),
+                    "`ppu-dataset/v1` YAML",
+                    "Eval dataset definitions referenced as `<id>@<version>`.",
+                ],
+                [
+                    _md_link("golden/", "test/ppu/golden", base_dir=doc_dir),
+                    "`schema_version: 2` JSON",
+                    "Reference GSM8K score and tolerance band per `golden_model_key` (`accuracy_<key>_890p.json`).",
+                ],
+                [
+                    f"{_md_link('e2e/', 'test/ppu/e2e', base_dir=doc_dir)}, {_md_link('unit/', 'test/ppu/unit', base_dir=doc_dir)}, {_md_link('module/', 'test/ppu/module', base_dir=doc_dir)}",
+                    "pytest / `unittest`",
+                    "Device-facing regression suites (independent of the recipe/policy resolver; skip when no PPU device is present).",
+                ],
+            ],
+        ),
+        "",
+        "## Configuration Resolution Rules",
+        "",
+        "- **Resolution order**: `model.base_args` / `model.base_env` -> `variants.<variant>` (default: `default`) -> `hardware_overrides.<hardware>` -> enabled `features` (`ppu.default_features` overridden by `presets.<preset>.select.features`) -> optional `presets.<preset>` (`remove_args`, `tp`, `json_args`, `args`, `env`) -> policy switches (`--disable-radix-cache`, `--load-format dummy`, `--json-model-override-args`) -> runner-owned flags (`--enable-metrics`, `--model-path`, `--tokenizer-path`, `--served-model-name`, `--host`, `--port`).",
+        "- **Default preset behavior**: When a policy does not specify `preset`, CI runs the recipe's default baseline configuration. Named presets (such as `tp8` or `model_sanity`) are only applied when explicitly selected by a policy tier/stage or `--preset`.",
+        "- **Weights & layers in `fast_sanity`**: Policies declare `dummy_weights` and optional `layer_override`; current models start directly with full-layer dummy weights (`--load-format dummy`) unless `layer_override` is set.",
+        "- **Shared server in `model_sanity`**: All stages in `model_sanity` (`sanity`, `evalscope`, `bench`) run against one shared server process with real weights and `cache: enabled`.",
+        "- **Regenerate / verify**:",
+        "  ```bash",
+        "  python3 -B scripts/ci/ppu/ppu_recipe.py render-matrix --output test/ppu/README.md",
+        "  python3 -B scripts/ci/ppu/ppu_recipe.py render-matrix --check",
+        "  python3 -B scripts/ci/ppu/ppu_recipe.py validate --all --sglang-parser skip",
+        "  python3 -B -m unittest discover -s scripts/ci/ppu -p 'test_recipe*.py'",
+        "  ```",
+        "",
+        "## PR CI (`fast_sanity`)",
+        "",
+    ]
+    if fast_rows:
+        lines.extend(
+            _render_md_table(
+                [
+                    "Policy",
+                    "Recipe",
+                    "Hardware / Cards",
+                    "Preset",
+                    "Features",
+                    "Weights / Layers",
+                    "Effective serve flags",
+                ],
+                fast_rows,
+            )
+        )
+    else:
+        lines.append("_None._")
+
+    lines.extend(["", "## Nightly CI (`model_sanity`)", ""])
+    if nightly_rows:
+        lines.extend(
+            _render_md_table(
+                [
+                    "Policy",
+                    "Recipe",
+                    "Hardware / Cards",
+                    "Preset",
+                    "Features",
+                    "Stages",
+                    "Golden",
+                    "Effective serve flags",
+                ],
+                nightly_rows,
+            )
+        )
+    else:
+        lines.append("_None._")
+
+    if fast_only:
+        fast_only_list = ", ".join(_md_code(key) for key in fast_only)
+        lines.extend(
+            [
+                "",
+                f"> Policies declaring only `fast_sanity` (no `model_sanity` tier): {fast_only_list}.",
+            ]
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Adding or Changing a Model",
+            "",
+            "1. Add or edit the serving recipe under `test/ppu/recipes/` (`ppu-serving/v1`).",
+            "2. Add or edit the policy under `test/ppu/policy/models/` (`ppu-test-policy/v1`) and, for `model_sanity`, add `test/ppu/golden/accuracy_<golden_model_key>_890p.json`.",
+            "3. Regenerate this document with `python3 -B scripts/ci/ppu/ppu_recipe.py render-matrix --output test/ppu/README.md`.",
+            "4. Verify with `python3 -B scripts/ci/ppu/ppu_recipe.py validate --all --sglang-parser skip`, `python3 -B scripts/ci/ppu/ppu_recipe.py render-matrix --check`, and `python3 -B -m unittest discover -s scripts/ci/ppu -p 'test_recipe*.py'`.",
+        ]
+    )
+
+    return "\n".join(lines) + "\n"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Resolve and validate ppu-serving/v1")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1327,6 +1627,22 @@ def main(argv: list[str] | None = None) -> int:
     )
     val.add_argument("--require-sglang-parser", action="store_true")
 
+    mat = sub.add_parser(
+        "render-matrix",
+        help="Render or check the PR/Nightly CI recipe matrix Markdown doc",
+    )
+    mat.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Write rendered Markdown to this path (default: stdout, or test/ppu/README.md with --check)",
+    )
+    mat.add_argument(
+        "--check",
+        action="store_true",
+        help="Exit non-zero if the target Markdown doc is missing or out of date",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "resolve":
         result = resolve_recipe(
@@ -1345,6 +1661,35 @@ def main(argv: list[str] | None = None) -> int:
             served_model_name=args.served_model_name,
         )
         print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+
+    if args.command == "render-matrix":
+        target = args.output
+        expected = render_ci_matrix_markdown()
+        if args.check:
+            check_path = target if target is not None else DEFAULT_MATRIX_DOC
+            if not check_path.is_file():
+                print(
+                    f"matrix doc missing: {check_path}. Regenerate with:\n"
+                    "  python3 -B scripts/ci/ppu/ppu_recipe.py render-matrix "
+                    "--output test/ppu/README.md",
+                    file=sys.stderr,
+                )
+                return 1
+            actual = check_path.read_text(encoding="utf-8")
+            if actual != expected:
+                print(
+                    f"matrix doc out of date: {check_path}. Regenerate with:\n"
+                    "  python3 -B scripts/ci/ppu/ppu_recipe.py render-matrix "
+                    "--output test/ppu/README.md",
+                    file=sys.stderr,
+                )
+                return 1
+            return 0
+        if target is None:
+            print(expected, end="")
+        else:
+            target.write_text(expected, encoding="utf-8")
         return 0
 
     target_paths = list(args.paths)
