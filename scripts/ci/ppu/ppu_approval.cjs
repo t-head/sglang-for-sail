@@ -109,10 +109,14 @@ async function approvedTargetBranch(github, repo, branch) {
     : DENIED;
 }
 
+function isTrustedReleaseBranchName(branch) {
+  return branch === "yuhe/v1.0.0" || branch.startsWith("release/");
+}
+
 async function approvedCrossBranchTarget(github, repo, ref, workflowSha) {
   // The default-branch dispatcher calls the release workflow with a release branch
   // or forwards a previously pinned 40-char SHA into a nested reusable workflow.
-  if (ref === "yuhe/v1.0.0" || ref.startsWith("release/")) {
+  if (isTrustedReleaseBranchName(ref)) {
     return approvedTargetBranch(github, repo, ref);
   }
   if (!isSha(ref)) return DENIED;
@@ -158,6 +162,7 @@ async function resolve({github, context, label, ref = "", workflowSha = "", allo
       if (!actorAuth.isBot && !rerunnerIsBot) {
         return {approved: true, sha: context.sha};
       }
+      if (!isTrustedReleaseBranchName(branch)) return DENIED;
       const target = await approvedTargetBranch(github, context.repo, branch);
       return target.approved && target.sha === context.sha
         ? {approved: true, sha: context.sha}

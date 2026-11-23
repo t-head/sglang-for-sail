@@ -341,8 +341,8 @@ test("allowlisted GitHub App bots can dispatch trusted release targets without w
     {approved: false, sha: ""},
   );
 
-  // Allowlisted bot dispatching directly (ownRef) is permitted on trusted yuhe/v1.0.0,
-  // but denied on untrusted feature branches.
+  // Allowlisted bot dispatching directly (ownRef) is permitted on trusted yuhe/v1.0.0
+  // and protected release/* branches, but denied on non-release branches even if protected.
   f.context.actor = bot;
   process.env.GITHUB_TRIGGERING_ACTOR = bot;
   f.context.ref = "refs/heads/yuhe/v1.0.0";
@@ -351,12 +351,35 @@ test("allowlisted GitHub App bots can dispatch trusted release targets without w
     await approved.resolve({...f, ref: "", allowedDispatchBots: allowlist}),
     {approved: true, sha: yuheSha},
   );
+  f.context.ref = "refs/heads/release/v1.0.0";
+  f.context.sha = head;
+  assert.deepEqual(
+    await approved.resolve({...f, ref: "", allowedDispatchBots: allowlist}),
+    {approved: true, sha: head},
+  );
   f.context.ref = "refs/heads/feature/untrusted";
   f.context.sha = head;
   assert.deepEqual(
     await approved.resolve({...f, ref: "", allowedDispatchBots: allowlist}),
     {approved: false, sha: ""},
   );
+  const origGetBranch = f.github.rest.repos.getBranch;
+  f.github.rest.repos.getBranch = async ({branch}) => ({
+    data: {name: branch, protected: true, commit: {sha: head}},
+  });
+  f.context.ref = "refs/heads/feature/protected-topic";
+  f.context.sha = head;
+  assert.deepEqual(
+    await approved.resolve({...f, ref: "", allowedDispatchBots: allowlist}),
+    {approved: false, sha: ""},
+  );
+  f.context.actor = "maintainer";
+  process.env.GITHUB_TRIGGERING_ACTOR = bot;
+  assert.deepEqual(
+    await approved.resolve({...f, ref: "", allowedDispatchBots: allowlist}),
+    {approved: false, sha: ""},
+  );
+  f.github.rest.repos.getBranch = origGetBranch;
 
   // pull_request_target must never accept bot labels even when bot is in dispatch allowlist.
   const prFixture = fixture("run-ci-ppu");
