@@ -34,6 +34,13 @@ class NotifySummaryTest(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
 
+    def test_version_label_in_title_and_markdown(self):
+        report = {"results": [{"model": "example", "status": "pass"}]}
+        with patch.dict("os.environ", {"NOTIFY_VERSION": "v0.5.23"}):
+            payload = notify.make_payload(report, "", "mon")["markdown"]
+        self.assertTrue(payload["title"].startswith("[sglang | v0.5.23] "))
+        self.assertTrue(payload["text"].startswith("### [sglang | v0.5.23] "))
+
     def test_all_green_has_no_mentions(self):
         report = {"elapsed_s": 3701, "results": [{"model": "atlas", "status": "pass"}]}
         payload = notify.make_payload(report, "{invalid", "mon")
@@ -274,10 +281,10 @@ class SGLangNotificationTest(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            evidence = root / f"model_sanity-{model}-2" / "recipe.json"
+            evidence = root / f"v0523-model_sanity-{model}-2" / "recipe.json"
             evidence.parent.mkdir()
             evidence.write_text(json.dumps(payload))
-            jobs = {f"release-v100 / Model Sanity ({model})": ("failure", 2)}
+            jobs = {f"release-v0523 / Model Sanity ({model})": ("failure", 2)}
             with (
                 patch.dict("os.environ", environment, clear=True),
                 patch.object(nightly, "run_jobs", return_value=(jobs, 60)) as fetch,

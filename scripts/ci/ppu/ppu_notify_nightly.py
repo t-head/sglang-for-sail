@@ -23,7 +23,7 @@ SETUP = (
 
 
 def evidence(root, model, attempt):
-    report = json_file(root / f"model_sanity-{model}-{attempt}" / "recipe.json")
+    report = json_file(root / f"v0523-model_sanity-{model}-{attempt}" / "recipe.json")
     validate(report)
     if (
         report.get("model") != model
@@ -58,10 +58,10 @@ def collect(root):
     ):
         raise ValueError("Invalid model selection")
 
-    # The scheduled caller names its reusable workflow job "release-v100";
+    # The scheduled caller names its reusable workflow job "release-v0523";
     # direct dispatch exposes the inner job name without that prefix.
     workflow = os.environ.get("GITHUB_WORKFLOW_REF", "")
-    prefix = "release-v100 / " if "/nightly-dispatch-ppu.yml@" in workflow else ""
+    prefix = "release-v0523 / " if "/nightly-dispatch-ppu.yml@" in workflow else ""
     names = {f"{prefix}Model Sanity ({model})": model for model in models}
     jobs, elapsed = run_jobs(set(names))
     if os.environ["NOTIFY_GATE_RESULT"] != "success":
