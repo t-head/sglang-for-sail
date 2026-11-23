@@ -118,6 +118,7 @@ class RecipeContractTest(unittest.TestCase):
                     {"model": "glm-5.3", "ppu_count": 8},
                     {"model": "kimi-k2.6", "ppu_count": 8},
                     {"model": "minimax-m3-fp8", "ppu_count": 8},
+                    {"model": "minimax-m3.1-flash", "ppu_count": 8},
                     {"model": "minimax-m3", "ppu_count": 8},
                     {"model": "qwen3.8-27b", "ppu_count": 2},
                     {"model": "qwen3.8-flash-next-tp4", "ppu_count": 4},
@@ -199,6 +200,26 @@ class RecipeContractTest(unittest.TestCase):
         self.assertEqual(config["ppu_count"], 8)
         self.assertTrue(config["dummy_weights"])
         self.assertIsNone(config["layer_override"])
+
+    def test_minimax_m31_flash_selects_its_own_channelwise_fp8_snapshot(self):
+        model = "minimax-m3.1-flash"
+        policy = DEFAULT_POLICY_ROOT / f"models/{model}.yaml"
+        recipe = REPO_ROOT / _load_yaml(policy)["recipe"]
+        config = resolve_recipe(recipe, policy_path=policy, tier="fast_sanity")
+        self.assertEqual(
+            config["hf_model_id"],
+            "T-HEAD/MiniMax-M3.1-Flash-Quant-W-FP8-PerChannel-A-FP8-PerToken",
+        )
+        self.assertEqual(config["ppu_count"], 8)
+        self.assertTrue(config["dummy_weights"])
+        self.assertIsNone(config["layer_override"])
+        flags = config["flags"]
+        self.assertEqual(flags[flags.index("--tp-size") + 1], "8")
+        self.assertIn("--disable-radix-cache", flags)
+        self.assertNotIn("--attn-dp-size", flags)
+        self.assertNotIn("--speculative-algorithm", flags)
+        with self.assertRaises(ValueError):
+            select("model_sanity", model)
 
     def test_minimax_nightly_uses_published_quantized_reference(self):
         self.assert_nightly_reference("minimax-m3", width=8, correct=1284)
