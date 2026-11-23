@@ -22,11 +22,22 @@ cd "$source_dir"
 skip_wheel_install="${PPU_CI_SKIP_WHEEL_INSTALL:-false}"
 [[ "$skip_wheel_install" == true || "$skip_wheel_install" == false ]] || exit 2
 checker=scripts/ci/ppu/check_dependencies.py
+cleanup_dirs=()
+cleanup() {
+    if (( ${#cleanup_dirs[@]} > 0 )); then
+        rm -rf -- "${cleanup_dirs[@]}"
+    fi
+}
+trap cleanup EXIT
 python3 -I -B "$checker" snapshot "$artifact_dir/dependencies-before.json"
 if [[ "$skip_wheel_install" == false ]]; then
+    triton_kernels_backup=$(mktemp -d)
+    cleanup_dirs+=("$triton_kernels_backup")
+    python3 -I -B "$checker" backup-triton-kernels "$triton_kernels_backup"
     # The release image owns the SDK, PyTorch, DeepGEMM, FlashMLA and EvalScope.
     python3 -I -B -m pip uninstall -y sgl-kernel >/dev/null 2>&1 || true
     python3 -I -B -m pip install --no-deps --no-index --force-reinstall "$wheel_dir/"*.whl
+    python3 -I -B "$checker" restore-triton-kernels "$triton_kernels_backup"
     missing=$(python3 -I -B "$checker" missing-wheels "$wheel_dir/runtime-deps")
     if [[ -n "$missing" ]]; then
         mapfile -t extra <<< "$missing"
@@ -39,7 +50,7 @@ if [[ "${2:-}" == model_sanity && -n "${PPU_CI_EVAL_WHEEL_DIR:-}" ]]; then
     phase eval_environment
     (cd "$PPU_CI_EVAL_WHEEL_DIR" && sha256sum -- *.whl | cmp -s SHA256SUMS -)
     eval_dir=$(mktemp -d)
-    trap 'rm -rf -- "$eval_dir"' EXIT
+    cleanup_dirs+=("$eval_dir")
     python3 -I -B -m pip install --no-index --ignore-installed --target "$eval_dir" \
         --find-links "$PPU_CI_EVAL_WHEEL_DIR" 'evalscope==1.15.0'
     export PPU_CI_EVAL_SITE="$eval_dir"

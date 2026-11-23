@@ -3,6 +3,8 @@
 
 import argparse
 import contextlib
+import http.client
+import importlib.util
 import json
 import math
 import os
@@ -72,7 +74,7 @@ def server(config, label, timings, ready_timeout):
                     with request("/health_generate", timeout=10) as generated:
                         if generated.status == 200:
                             break
-                except (URLError, TimeoutError):
+                except (URLError, TimeoutError, http.client.HTTPException, OSError):
                     time.sleep(1)
             else:
                 phase("readiness_timeout")
@@ -302,6 +304,17 @@ def evaluate(stage, config):
     }
 
 
+def bench_module_name():
+    if (REPO_ROOT / "python/sglang/benchmark/serving.py").is_file():
+        return "sglang.benchmark.serving"
+    return (
+        "sglang.benchmark.serving"
+        if importlib.util.find_spec("sglang") is not None
+        and importlib.util.find_spec("sglang.benchmark.serving") is not None
+        else "sglang.bench_serving"
+    )
+
+
 def bench(stage, config, concurrency, requests, label):
     phase("micro_e2e")
     output = RESULTS / f"bench-{label}-{concurrency}.jsonl"
@@ -311,7 +324,7 @@ def bench(stage, config, concurrency, requests, label):
         "-I",
         "-B",
         "-m",
-        "sglang.bench_serving",
+        bench_module_name(),
         "--backend",
         "sglang",
         "--host",

@@ -17,6 +17,10 @@ on:
         description: "Comma-separated Fast Sanity policy keys. Empty runs all models."
         type: string
         default: ''
+      run_model_sanity:
+        description: "Run Nightly Model Sanity instead of Fast Sanity for selected models"
+        type: boolean
+        default: false
       run_all_tests:
         description: "Run Recipe CI even without PPU path changes"
         required: false
@@ -51,7 +55,7 @@ permissions:
 concurrency:
   # Keep legacy-only runs and unrelated label events separate from Recipe CI.
   group: >-
-    pr-test-ppu-${{ inputs.run_legacy_sanity && 'legacy' || 'recipe' }}-${{
+    pr-test-ppu-${{ inputs.run_legacy_sanity && 'legacy' || (inputs.run_model_sanity && 'model-sanity' || 'recipe') }}-${{
       (github.event_name == 'pull_request_target' &&
        github.event.action == 'labeled' &&
        !contains(fromJSON('["run-ci","run-ci-ppu"]'), github.event.label.name)) &&
@@ -339,7 +343,7 @@ jobs:
     uses: ./.github/workflows/nightly-test-ppu.yml
     with:
       ref: ${{ needs.check-changes.outputs.source-sha }}
-      tier: ${{ inputs.preflight_only && 'cluster_preflight' || 'fast_sanity' }}
+      tier: ${{ inputs.preflight_only && 'cluster_preflight' || (github.event_name == 'workflow_dispatch' && inputs.run_model_sanity && 'model_sanity' || 'fast_sanity') }}
       model_filter: ${{ github.event_name == 'workflow_dispatch' && inputs.model_filter || '' }}
       skip_wheel_build: true
       wheel_artifact_id: ${{ needs.ppu-build.outputs.wheel-artifact-id }}
