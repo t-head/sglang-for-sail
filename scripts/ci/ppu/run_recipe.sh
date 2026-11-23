@@ -4,7 +4,13 @@ set -euo pipefail
 umask 077
 
 private=${PPU_CI_ARTIFACT_DIR:?}
-wheel_dir=${PPU_CI_WHEEL_DIR:?}
+skip_wheel_install=${PPU_CI_SKIP_WHEEL_INSTALL:-false}
+[[ "$skip_wheel_install" == true || "$skip_wheel_install" == false ]]
+if [[ "$skip_wheel_install" == false ]]; then
+    wheel_dir=${PPU_CI_WHEEL_DIR:?}
+else
+    wheel_dir=""
+fi
 tier=${TIER:?}
 model=${MODEL_KEY:?}
 source_sha=${PPU_CI_SOURCE_SHA:?}
@@ -34,38 +40,48 @@ for path in "$repo" "$wheel_dir" "$private" "$model_path" "$dataset" "$jit_root"
 done
 
 phase wheel_verification
-"$host_python" -B scripts/ci/ppu/recipe_bundle.py check "$wheel_dir" "$source_sha"
-manifest="$wheel_dir/recipe-manifest.json"
+skip_wheel_install=${PPU_CI_SKIP_WHEEL_INSTALL:-false}
+[[ "$skip_wheel_install" == true || "$skip_wheel_install" == false ]]
+if [[ "$skip_wheel_install" == true ]]; then
+    recipe_tree_sha256=$("$host_python" -B scripts/ci/ppu/recipe_bundle.py checkout-digest "$source_sha")
+    [[ "$recipe_tree_sha256" =~ ^[0-9a-f]{64}$ ]]
+    cache_key="$recipe_tree_sha256"
+else
+    "$host_python" -B scripts/ci/ppu/recipe_bundle.py check "$wheel_dir" "$source_sha"
+    manifest="$wheel_dir/recipe-manifest.json"
+    cache_key=$("$host_python" -B scripts/ci/ppu/recipe_bundle.py cache-key "$wheel_dir" "$source_sha")
+fi
 
 phase image_resolution
-image=${PPU_CI_RECIPE_RUNTIME_IMAGE:-download.t-head.cn/docker_test/sglang:release-v0.5.23-20261116-cf244d4}
-registry=download.t-head.cn/docker_test/sglang
-if [[ "$image" != "$registry:release-v0.5.23-20261116-cf244d4" &&
-    ! "$image" =~ ^download\.t-head\.cn/docker_test/sglang@sha256:[0-9a-f]{64}$ ]]; then
-    exit 2
-fi
-if [[ "$image" == *@sha256:* ]]; then
-    digest=$image
-    if ! docker image inspect "$digest" >/dev/null 2>&1; then
-        docker pull "$digest"
-    fi
-else
-    docker pull "$image" > "$private/image-pull.log" 2>&1
-    pulled=$(awk '$1 == "Digest:" {print $2}' "$private/image-pull.log")
-    [[ "$pulled" =~ ^sha256:[0-9a-f]{64}$ ]]
-    digest="$registry@$pulled"
-fi
-# Use the immutable local image identity from this inspected digest.
-image_id=$(docker image inspect "$digest" --format '{{.Id}}')
+pulled_json=$("$host_python" -B scripts/ci/ppu/recipe_image.py docker-pull "$private/image-pull.log" \
+    --image-tag "${PPU_CI_RUNTIME_IMAGE_TAG:-}" \
+    --image-digest "${PPU_CI_RUNTIME_IMAGE_DIGEST:-}")
+image_id=$("$host_python" -B -c 'import json, sys; print(json.loads(sys.argv[1])["image_id"])' "$pulled_json")
+public_digest=$("$host_python" -B -c 'import json, sys; print(json.loads(sys.argv[1])["public_digest"])' "$pulled_json")
+image_key=$("$host_python" -B -c 'import json, sys; print(json.loads(sys.argv[1])["image_key"])' "$pulled_json")
 [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]
-"$host_python" -B - "$manifest" "$digest" "$private/provenance.json" <<'PY'
+[[ "$public_digest" =~ ^@sha256:[0-9a-f]{64}$ ]]
+[[ "$image_key" =~ ^[0-9a-f]{64}$ ]]
+if [[ "$skip_wheel_install" == true ]]; then
+    "$host_python" -B - "$public_digest" "$recipe_tree_sha256" "$private/provenance.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+digest, tree_sha, output = sys.argv[1:]
+Path(output).write_text(
+    json.dumps({"runtime_image": digest, "recipe_tree_sha256": tree_sha, "install_mode": "prebuilt_image"}) + "\n"
+)
+PY
+else
+    "$host_python" -B - "$manifest" "$public_digest" "$private/provenance.json" <<'PY'
 import json
 import sys
 from pathlib import Path
 manifest, digest, output = sys.argv[1:]
 data = json.loads(Path(manifest).read_text())
-Path(output).write_text(json.dumps({**data, "runtime_image": digest}) + "\n")
+Path(output).write_text(json.dumps({**data, "runtime_image": digest, "install_mode": "wheel_overlay"}) + "\n")
 PY
+fi
 
 phase runner_preflight
 queue_start=$(date +%s)
@@ -106,8 +122,7 @@ if [[ -n "$dataset" ]]; then
 fi
 
 # Use an image-, candidate-recipe- and model-specific cache on the runner's local disk.
-cache_key=$("$host_python" -B scripts/ci/ppu/recipe_bundle.py cache-key "$wheel_dir" "$source_sha")
-jit="$jit_root/sglang-ci/${digest##*:}/$cache_key/$model"
+jit="$jit_root/sglang-ci/$image_key/$cache_key/$model"
 mkdir -p -- "$jit"
 job_tag=$(basename -- "$private")
 [[ "$job_tag" =~ ^recipe\.[A-Za-z0-9]+$ ]]
@@ -150,14 +165,18 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+wheel_mount=()
+if [[ "$skip_wheel_install" == false ]]; then
+    wheel_mount=(--mount "type=bind,source=$wheel_dir,target=/wheels,readonly")
+fi
 docker create --name "$container" --runtime=runc --network=none --shm-size=128g \
-    "${device_args[@]}" "${model_mount[@]}" "${dataset_mount[@]}" \
+    "${device_args[@]}" "${model_mount[@]}" "${dataset_mount[@]}" "${wheel_mount[@]}" \
     --mount "type=bind,source=$repo,target=/source,readonly" \
-    --mount "type=bind,source=$wheel_dir,target=/wheels,readonly" \
     --mount "type=bind,source=$private,target=/artifacts" \
     --mount "type=bind,source=$jit,target=/jit" \
     --env NVIDIA_VISIBLE_DEVICES=void --env CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
     --env NCCL_SOCKET_IFNAME=lo --env GLOO_SOCKET_IFNAME=lo \
+    --env "PPU_CI_SKIP_WHEEL_INSTALL=$skip_wheel_install" \
     --env "PPU_RECIPE_CONTAINER_MODEL=$container_model" \
     --entrypoint bash "$image_id" /source/scripts/ci/ppu/recipe_container.sh \
     "test/ppu/policy/models/$model.yaml" "$tier" --queue-s "$queue_s"
