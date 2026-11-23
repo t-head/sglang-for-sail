@@ -268,3 +268,105 @@ test("default branch sail_ci_cd workflow_dispatch can target yuhe/v1.0.0 and pro
     sha: "",
   });
 });
+
+test("allowlisted GitHub App bots can dispatch trusted release targets without weakening PR or feature-branch gates", async t => {
+  const f = fixture("run-ci-ppu-nightly");
+  const originalActor = process.env.GITHUB_TRIGGERING_ACTOR;
+  const originalBots = process.env.PPU_CI_ALLOWED_DISPATCH_BOTS;
+  t.after(() => {
+    if (originalActor === undefined) delete process.env.GITHUB_TRIGGERING_ACTOR;
+    else process.env.GITHUB_TRIGGERING_ACTOR = originalActor;
+    if (originalBots === undefined) delete process.env.PPU_CI_ALLOWED_DISPATCH_BOTS;
+    else process.env.PPU_CI_ALLOWED_DISPATCH_BOTS = originalBots;
+  });
+
+  const bot = "trusted-devops-app[bot]";
+  // GitHub collaborator permission API returns none/404 for GitHub App bots.
+  f.github.rest.repos.getCollaboratorPermissionLevel = async ({username}) => ({
+    data: {permission: username === "maintainer" ? "maintain" : "none"},
+  });
+  f.repo.defaultBranch = "sail_ci_cd";
+  f.context.eventName = "workflow_dispatch";
+  f.context.ref = "refs/heads/sail_ci_cd";
+  f.context.sha = other;
+  f.context.actor = bot;
+  process.env.GITHUB_TRIGGERING_ACTOR = bot;
+  delete process.env.PPU_CI_ALLOWED_DISPATCH_BOTS;
+
+  // Denied by default when not allowlisted.
+  assert.deepEqual(await approved.resolve({...f, ref: "yuhe/v1.0.0"}), {
+    approved: false,
+    sha: "",
+  });
+
+  // Allowed for cross-branch trusted target when explicitly allowlisted (case-insensitive).
+  const allowlist = ` ${bot.toUpperCase()} , contributor , * `;
+  assert.deepEqual(
+    await approved.resolve({...f, ref: "yuhe/v1.0.0", allowedDispatchBots: allowlist}),
+    {approved: true, sha: yuheSha},
+  );
+  assert.deepEqual(
+    await approved.resolve({...f, ref: "release/v1.0.0", allowedDispatchBots: allowlist}),
+    {approved: true, sha: head},
+  );
+  // Still denied for untrusted cross-branch target.
+  assert.deepEqual(
+    await approved.resolve({...f, ref: "feature/untrusted", allowedDispatchBots: allowlist}),
+    {approved: false, sha: ""},
+  );
+
+  // Maintainer rerun of bot-triggered dispatch succeeds; non-write user rerun fails.
+  process.env.GITHUB_TRIGGERING_ACTOR = "maintainer";
+  assert.deepEqual(
+    await approved.resolve({...f, ref: "yuhe/v1.0.0", allowedDispatchBots: allowlist}),
+    {approved: true, sha: yuheSha},
+  );
+  process.env.GITHUB_TRIGGERING_ACTOR = "contributor";
+  assert.deepEqual(
+    await approved.resolve({...f, ref: "yuhe/v1.0.0", allowedDispatchBots: allowlist}),
+    {approved: false, sha: ""},
+  );
+
+  // Non-[bot] entries or wildcards in allowlist must never grant access to humans or unknown bots.
+  f.context.actor = "contributor";
+  process.env.GITHUB_TRIGGERING_ACTOR = "contributor";
+  assert.deepEqual(
+    await approved.resolve({...f, ref: "yuhe/v1.0.0", allowedDispatchBots: allowlist}),
+    {approved: false, sha: ""},
+  );
+  f.context.actor = "unknown-app[bot]";
+  process.env.GITHUB_TRIGGERING_ACTOR = "unknown-app[bot]";
+  assert.deepEqual(
+    await approved.resolve({...f, ref: "yuhe/v1.0.0", allowedDispatchBots: allowlist}),
+    {approved: false, sha: ""},
+  );
+
+  // Allowlisted bot dispatching directly (ownRef) is permitted on trusted yuhe/v1.0.0,
+  // but denied on untrusted feature branches.
+  f.context.actor = bot;
+  process.env.GITHUB_TRIGGERING_ACTOR = bot;
+  f.context.ref = "refs/heads/yuhe/v1.0.0";
+  f.context.sha = yuheSha;
+  assert.deepEqual(
+    await approved.resolve({...f, ref: "", allowedDispatchBots: allowlist}),
+    {approved: true, sha: yuheSha},
+  );
+  f.context.ref = "refs/heads/feature/untrusted";
+  f.context.sha = head;
+  assert.deepEqual(
+    await approved.resolve({...f, ref: "", allowedDispatchBots: allowlist}),
+    {approved: false, sha: ""},
+  );
+
+  // pull_request_target must never accept bot labels even when bot is in dispatch allowlist.
+  const prFixture = fixture("run-ci-ppu");
+  prFixture.timeline[0].actor.login = bot;
+  prFixture.github.rest.repos.getCollaboratorPermissionLevel = async () => ({
+    data: {permission: "none"},
+  });
+  process.env.PPU_CI_ALLOWED_DISPATCH_BOTS = bot;
+  assert.deepEqual(await approved.resolve({...prFixture, allowedDispatchBots: bot}), {
+    approved: false,
+    sha: "",
+  });
+});

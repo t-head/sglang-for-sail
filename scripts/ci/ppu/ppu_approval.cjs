@@ -2,9 +2,33 @@
 // This module runs on a GitHub-hosted runner from the trusted workflow revision.
 
 const DENIED = Object.freeze({approved: false, sha: ""});
+const BOT_LOGIN_RE = /^[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?\[bot\]$/;
 
 function isSha(value) {
   return typeof value === "string" && /^[0-9a-f]{40}$/.test(value);
+}
+
+function parseAllowedDispatchBots(raw) {
+  const bots = new Set();
+  if (typeof raw !== "string" || !raw.trim()) return bots;
+  for (const entry of raw.split(",")) {
+    const normalized = entry.trim().toLowerCase();
+    if (BOT_LOGIN_RE.test(normalized)) {
+      bots.add(normalized);
+    }
+  }
+  return bots;
+}
+
+async function canDispatch(github, repo, username, allowedBots) {
+  if (!username) return {allowed: false, isBot: false};
+  if (allowedBots.has(String(username).toLowerCase())) {
+    return {allowed: true, isBot: true};
+  }
+  if (await canWrite(github, repo, username)) {
+    return {allowed: true, isBot: false};
+  }
+  return {allowed: false, isBot: false};
 }
 
 async function canWrite(github, repo, username) {
@@ -105,7 +129,7 @@ async function approvedCrossBranchTarget(github, repo, ref, workflowSha) {
     : DENIED;
 }
 
-async function resolve({github, context, label, ref = "", workflowSha = ""}) {
+async function resolve({github, context, label, ref = "", workflowSha = "", allowedDispatchBots = ""}) {
   const {owner, repo} = context.repo;
   if (owner.toLowerCase() !== "t-head" || repo.toLowerCase() !== "sglang-for-sail" ||
       !["run-ci-ppu", "run-ci-ppu-nightly"].includes(label)) return DENIED;
@@ -117,13 +141,28 @@ async function resolve({github, context, label, ref = "", workflowSha = ""}) {
   const branch = context.ref.slice("refs/heads/".length);
   const ownRef = !ref || ref === context.sha || ref === context.ref || ref === branch;
   if (context.eventName === "workflow_dispatch") {
-    if (!await canWrite(github, context.repo, context.actor)) return DENIED;
+    const allowedBots = parseAllowedDispatchBots(
+      allowedDispatchBots || process.env.PPU_CI_ALLOWED_DISPATCH_BOTS || "",
+    );
+    const actorAuth = await canDispatch(github, context.repo, context.actor, allowedBots);
+    if (!actorAuth.allowed) return DENIED;
     const rerunner = process.env.GITHUB_TRIGGERING_ACTOR;
     if (!rerunner) return DENIED;
-    if (rerunner !== context.actor && !await canWrite(github, context.repo, rerunner)) {
-      return DENIED;
+    let rerunnerIsBot = actorAuth.isBot;
+    if (rerunner !== context.actor) {
+      const rerunnerAuth = await canDispatch(github, context.repo, rerunner, allowedBots);
+      if (!rerunnerAuth.allowed) return DENIED;
+      rerunnerIsBot = rerunnerAuth.isBot;
     }
-    if (ownRef) return {approved: true, sha: context.sha};
+    if (ownRef) {
+      if (!actorAuth.isBot && !rerunnerIsBot) {
+        return {approved: true, sha: context.sha};
+      }
+      const target = await approvedTargetBranch(github, context.repo, branch);
+      return target.approved && target.sha === context.sha
+        ? {approved: true, sha: context.sha}
+        : DENIED;
+    }
     if (!["main", "sail_ci_cd"].includes(branch)) return DENIED;
     const {data: repository} = await github.rest.repos.get(context.repo);
     if (repository.default_branch !== branch) return DENIED;

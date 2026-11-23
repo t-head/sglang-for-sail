@@ -35,6 +35,7 @@ jobs:
           WORKLOAD_LABEL: ${{ inputs.label }}
           CANDIDATE_REF: ${{ inputs.ref }}
           WORKFLOW_SHA: ${{ job.workflow_sha }}
+          PPU_CI_ALLOWED_DISPATCH_BOTS: ${{ vars.PPU_CI_ALLOWED_DISPATCH_BOTS }}
         with:
           script: |
             const approved = require('./scripts/ci/ppu/ppu_approval.cjs');
@@ -44,6 +45,7 @@ jobs:
               label: process.env.WORKLOAD_LABEL,
               ref: process.env.CANDIDATE_REF,
               workflowSha: process.env.WORKFLOW_SHA,
+              allowedDispatchBots: process.env.PPU_CI_ALLOWED_DISPATCH_BOTS || '',
             });
             core.setOutput('sha', res.sha);
             return res.approved;
