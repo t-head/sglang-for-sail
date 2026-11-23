@@ -215,3 +215,56 @@ test("resolve returns pinned target SHA and admits nested schedule SHA but rejec
   const unapprovedSha = "d".repeat(40);
   assert.deepEqual(await approved.resolve({...f, ref: unapprovedSha}), {approved: false, sha: ""});
 });
+
+test("default branch sail_ci_cd workflow_dispatch can target yuhe/v1.0.0 and protected release branches for write actors only", async t => {
+  const f = fixture("run-ci-ppu-nightly");
+  const original = process.env.GITHUB_TRIGGERING_ACTOR;
+  t.after(() => {
+    if (original === undefined) delete process.env.GITHUB_TRIGGERING_ACTOR;
+    else process.env.GITHUB_TRIGGERING_ACTOR = original;
+  });
+  f.repo.defaultBranch = "sail_ci_cd";
+  f.context.eventName = "workflow_dispatch";
+  f.context.ref = "refs/heads/sail_ci_cd";
+  f.context.sha = other;
+  f.context.actor = "maintainer";
+  process.env.GITHUB_TRIGGERING_ACTOR = "maintainer";
+
+  assert.deepEqual(await approved.resolve({...f, ref: "yuhe/v1.0.0"}), {
+    approved: true,
+    sha: yuheSha,
+  });
+  assert.deepEqual(await approved.resolve({...f, ref: "release/v1.0.0"}), {
+    approved: true,
+    sha: head,
+  });
+  assert.deepEqual(await approved.resolve({...f, ref: "feature/untrusted"}), {
+    approved: false,
+    sha: "",
+  });
+  assert.deepEqual(await approved.resolve({...f, ref: "d".repeat(40)}), {
+    approved: false,
+    sha: "",
+  });
+
+  // Non-default branch dispatch cannot cross-target yuhe/v1.0.0.
+  f.repo.defaultBranch = "main";
+  assert.deepEqual(await approved.resolve({...f, ref: "yuhe/v1.0.0"}), {
+    approved: false,
+    sha: "",
+  });
+  f.repo.defaultBranch = "sail_ci_cd";
+
+  // Unauthorized actor or triggering actor must be denied.
+  f.context.actor = "contributor";
+  assert.deepEqual(await approved.resolve({...f, ref: "yuhe/v1.0.0"}), {
+    approved: false,
+    sha: "",
+  });
+  f.context.actor = "maintainer";
+  process.env.GITHUB_TRIGGERING_ACTOR = "contributor";
+  assert.deepEqual(await approved.resolve({...f, ref: "yuhe/v1.0.0"}), {
+    approved: false,
+    sha: "",
+  });
+});
