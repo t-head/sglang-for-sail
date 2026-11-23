@@ -655,6 +655,7 @@ class Scheduler(
         # Init chunked prefill
         self.init_chunked_prefill()
         self.maybe_init_dynamic_chunk_sizer()
+        self.maybe_init_model_prefill_warmup()
 
         # Init diffusion LLM
         self.init_diffusion_llm()
@@ -1302,6 +1303,87 @@ class Scheduler(
             context_len=self.model_config.context_len,
             startup_available_gpu_memory_gb=self.startup_available_gpu_memory_gb,
         )
+
+    def maybe_init_model_prefill_warmup(self) -> None:
+        """Prepare after weight finalization and final local chunk setup."""
+        model_runner = self.tp_worker.model_runner
+        prewarm = getattr(model_runner.model, "prewarm_prefill_kernels", None)
+        if prewarm is None or model_runner.is_draft_worker:
+            return
+        parallel = get_parallel()
+        runtime = None
+        if (
+            getattr(getattr(model_runner.model, "config", None), "model_type", None)
+            == "deepseek_v41"
+        ):
+            from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+            from sglang.srt.models.deepseek_v4_prefill_context import (
+                PrefillWarmupRuntime,
+            )
+
+            runtime = PrefillWarmupRuntime(
+                chunked_prefill_size=self.chunked_prefill_size,
+                max_prefill_tokens=self.max_prefill_tokens,
+                page_size=self.page_size,
+                attn_dp_size=parallel.attn_dp_size,
+                attn_tp_size=parallel.attn_tp_size,
+                attn_cp_size=parallel.attn_cp_size,
+                tp_size=parallel.tp_size,
+                moe_ep_size=parallel.moe_ep_size,
+                moe_a2a_backend=get_moe_a2a_backend().value,
+                mixed_chunk=self.is_mixed_chunk,
+                dynamic_chunk=get_schedule().enable_dynamic_chunking,
+                encoder_replay=get_exec().features.enable_encoder_swa_bounded_replay,
+                prefill_graph_disabled=get_exec().graph.cuda_graph_config.prefill.backend
+                == "disabled",
+            )
+        # init_model_worker has returned after finalize_startup_weight_load;
+        # this helper follows init_chunked_prefill/dynamic setup in __init__.
+        device_module = torch.get_device_module(model_runner.device)
+        forward_stream = (
+            model_runner.forward_stream
+            if self.enable_overlap or parallel.pp_size > 1 or use_mlx()
+            else self.schedule_stream
+        )
+        with device_module.stream(forward_stream):
+            self._prewarm_model_prefill_kernels(model_runner, runtime=runtime)
+        # Allocator work runs on schedule_stream, including overlap/PP servers.
+        from sglang.srt.utils import is_sail
+
+        if (
+            is_sail()
+            and runtime is not None
+            and "prefill_shapes" in (model_runner.server_args.warmups or ())
+            and get_disagg().disaggregation_mode != "decode"
+        ):
+            from sglang.srt.model_executor.swa_page_clear_warmup import (
+                prepare_swa_allocator_startup,
+            )
+
+            with device_module.stream(self.schedule_stream):
+                prepare_swa_allocator_startup(
+                    self.token_to_kv_pool_allocator,
+                    device=self.schedule_stream.device,
+                    schedule_stream=self.schedule_stream,
+                    # Request rows are int32; cached Radix values are int64.
+                    representative_dtypes=(
+                        str(self.req_to_token_pool.req_to_token.dtype),
+                        "torch.int64",
+                    ),
+                )
+
+    def _prewarm_model_prefill_kernels(self, model_runner, *, runtime=None) -> None:
+        # Non-overlap PP1 serves on schedule_stream, not runner.forward_stream.
+        # The caller has already selected and entered the actual serving stream.
+        prewarm = getattr(model_runner.model, "prewarm_prefill_kernels", None)
+        if prewarm is not None and not model_runner.is_draft_worker:
+            if (
+                getattr(getattr(model_runner.model, "config", None), "model_type", None)
+                == "deepseek_v41"
+            ):
+                prewarm(model_runner.server_args, runtime=runtime)
+            else:
+                prewarm(model_runner.server_args)
 
     def init_hisparse_coordinator(self) -> None:
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None

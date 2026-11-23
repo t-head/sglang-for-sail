@@ -5560,6 +5560,137 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         return name
 
+    @torch.inference_mode()
+    def prewarm_prefill_kernels(self, server_args, *, runtime=None) -> None:
+        """Prepare eligible CP/DP prefill kernels on the actual serving stream."""
+        # The model keeps cp_size=None when CP is disabled. Runtime topology
+        # still has attention CP width1; keep those meanings distinct.
+        cp_size = self.cp_size if runtime is None else runtime.attn_cp_size
+        from sglang.srt.models.deepseek_v4_router_warmup import (
+            ROUTER_ROW_SELECTOR,
+            plan_router_prefill_warmup,
+            prepare_nonhash_router_startup,
+        )
+
+        router_rows = plan_router_prefill_warmup(
+            server_args,
+            model_type=getattr(self.config, "model_type", None),
+            is_sail=_is_sail,
+            cp_size=cp_size,
+            row_selector=ROUTER_ROW_SELECTOR,
+            runtime=runtime,
+        )
+        if router_rows:
+            prepare_nonhash_router_startup(
+                self.model.layers,
+                local_rows=router_rows,
+                stream=torch.cuda.current_stream(),
+            )
+
+        from sglang.srt.models.deepseek_v4_tf32_warmup import (
+            plan_tf32_prenorm_warmup,
+            prepare_tf32_prenorm_startup,
+        )
+
+        tf32_rows = plan_tf32_prenorm_warmup(
+            server_args,
+            model_type=getattr(self.config, "model_type", None),
+            is_sail=_is_sail,
+            cp_size=cp_size,
+            deep_gemm_enabled=envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get(),
+            runtime=runtime,
+        )
+        if tf32_rows:
+            fn = next(
+                (
+                    getattr(layer, "hc_attn_fn", None)
+                    for layer in self.model.layers
+                    if getattr(layer, "hc_attn_fn", None) is not None
+                ),
+                None,
+            )
+            if fn is not None:
+                tic = time.perf_counter()
+                prepare_tf32_prenorm_startup(
+                    fn.float().contiguous(),
+                    max_rows=max(tf32_rows),
+                    stream=torch.cuda.current_stream(),
+                    num_splits=1 if _is_sail else None,
+                )
+                torch.cuda.empty_cache()
+                logger.info(
+                    "DSv4.1 TF32 prenorm warmup: %d row counts in %.2fs",
+                    len(tf32_rows),
+                    time.perf_counter() - tic,
+                )
+
+        from sglang.srt.models.deepseek_v4_warmup import (
+            plan_prefill_warmup,
+            prepare_mega_mhc_bf16_startup,
+        )
+
+        mhc_rows = plan_prefill_warmup(
+            server_args,
+            model_type=getattr(self.config, "model_type", None),
+            is_sail=_is_sail,
+            cp_size=cp_size,
+            mega_mhc_enabled=envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.get(),
+            runtime=runtime,
+        )
+        if not mhc_rows:
+            return
+        if (
+            runtime is not None
+            and runtime.attn_cp_size == 1
+            and any(
+                getattr(
+                    getattr(layer, "self_attn", None),
+                    "accepts_deepgemm_mxfp8_input",
+                    lambda: False,
+                )()
+                for layer in self.model.layers
+            )
+        ):
+            # This DP preparation has only validated the BF16-output boundary.
+            # Do not describe optional FP8-output branches as covered.
+            return
+        from sglang.kernels.ops.layernorm.mhc_mega import _mega_mhc_supported
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.models.deepseek_v4_mhc import _can_use_mega_mhc
+
+        if not _mega_mhc_supported():
+            return
+        hc = next(
+            (
+                getattr(layer, "ffn_hc", None)
+                for layer in self.model.layers
+                if getattr(layer, "ffn_hc", None) is not None
+            ),
+            None,
+        )
+        if not (
+            hc is not None
+            and hc.cfg.mult == 4
+            and hc.cfg.hidden == 5120
+            and hc.cfg.pre_from_prev
+            and hc.norm.weight.dtype == torch.bfloat16
+            and (
+                runtime is None or runtime.attn_cp_size != 1 or hc.cfg.sinkhorn_iters == 20
+            )
+            and _can_use_mega_mhc(hc.cfg, SimpleNamespace(forward_mode=ForwardMode.EXTEND))
+        ):
+            return
+        tic = time.perf_counter()
+        prepare_mega_mhc_bf16_startup(
+            hc, local_rows=mhc_rows, stream=torch.cuda.current_stream()
+        )
+        torch.cuda.empty_cache()
+        logger.info(
+            "DSv4.1 MegaMHC prefill kernel warmup: %d row counts in %.2fs",
+            len(mhc_rows),
+            time.perf_counter() - tic,
+        )
+
     def _prewarm_mhc_kernels(self) -> None:
         """One-shot MHC JIT prewarm at load time, synced across ranks.
 

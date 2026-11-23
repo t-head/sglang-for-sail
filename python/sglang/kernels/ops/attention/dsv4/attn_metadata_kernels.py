@@ -161,7 +161,10 @@ def expand_prefill_causally(
     )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["bs", "num_tokens", "total_tokens"],
+    do_not_specialize_on_alignment=["bs", "num_tokens", "total_tokens"],
+)
 def _expand_prefill_causally_kernel(
     req_pool_ptr,
     seq_lens_ptr,

@@ -94,7 +94,7 @@ def engram_commit_history(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["num_tokens", "num_real"])
 def _engram_hash_kernel(
     ids_ptr,
     pos_ptr,

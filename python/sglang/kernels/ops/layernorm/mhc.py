@@ -2484,7 +2484,7 @@ def hc_mix_stats(x_flat: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch
     return mixes
 
 
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["m"])
 def _hc_mix_reduce_sinkhorn_kernel(
     part_mix_ptr,
     part_sq_ptr,
