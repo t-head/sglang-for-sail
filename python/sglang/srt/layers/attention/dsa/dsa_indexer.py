@@ -3516,7 +3516,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and not in_piecewise_or_breakable_cuda_graph
             and forward_batch.attn_cp_metadata is None
         ) or (
+            # The merged NoPE shortcut uses an FP8-only Q/head-gate kernel.
             self._wk_gate_weight is not None
+            and self.use_fp8
             and not self.bf16_indexer
             and (
                 forward_batch.forward_mode.is_decode_or_idle()
