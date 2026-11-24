@@ -1669,6 +1669,48 @@ class ClusterTransportTest(unittest.TestCase):
                 ],
             )
 
+        for layout in ("sglang/logs/sglang-for-sail", "sglang-for-sail"):
+            for link_level in ("tier", "model", "index", "log"):
+                with (
+                    self.subTest(layout=layout, link_level=link_level),
+                    tempfile.TemporaryDirectory() as outer_tmp,
+                ):
+                    outer = Path(outer_tmp)
+                    root = outer / "archive"
+                    outside = outer / "outside"
+                    outside_model = outside / "qwen3.8-27b"
+                    outside_model.mkdir(parents=True)
+                    (outside_model / "index.json").write_text("{}")
+                    (outside_model / "launcher.log").write_text(
+                        "ImagePullBackOff failed to pull image\n"
+                    )
+                    run_dir = root / layout / "775-1"
+                    if link_level == "tier":
+                        run_dir.mkdir(parents=True)
+                        (run_dir / "fast_sanity").symlink_to(outside)
+                    elif link_level == "model":
+                        (run_dir / "fast_sanity").mkdir(parents=True)
+                        (run_dir / "fast_sanity/qwen3.8-27b").symlink_to(outside_model)
+                    elif link_level == "index":
+                        model_dir = run_dir / "fast_sanity/qwen3.8-27b"
+                        model_dir.mkdir(parents=True)
+                        (model_dir / "index.json").symlink_to(
+                            outside_model / "index.json"
+                        )
+                        (model_dir / "launcher.log").write_text(
+                            "ImagePullBackOff failed to pull image\n"
+                        )
+                    else:
+                        model_dir = run_dir / "fast_sanity/qwen3.8-27b"
+                        model_dir.mkdir(parents=True)
+                        (model_dir / "index.json").write_text("{}")
+                        (model_dir / "launcher.log").symlink_to(
+                            outside_model / "launcher.log"
+                        )
+                    self.assertEqual(
+                        recipe_cluster_diagnostics.recent_failures(root, 776), []
+                    )
+
 
 class RuntimeImageAndPrebuiltModeTest(unittest.TestCase):
     def test_rejects_illegal_tags_digests_and_cross_repo_injection(self):
