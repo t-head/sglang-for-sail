@@ -2,7 +2,9 @@
 """Report fixed diagnostic codes from the task's retained private evidence."""
 
 import json
+import os
 import re
+import stat
 
 from recipe_publish import MODEL_POLICY_ROOT
 from recipe_retention import RETENTION_SUBPATH
@@ -55,6 +57,8 @@ def _safe_subdir(root, parts):
 
 
 def recent_failures(root, current_run):
+    if root.is_symlink() or not root.is_dir():
+        return []
     previous = []
     for parts in (RETENTION_SUBPATH, ("sglang-for-sail",)):
         parent = _safe_subdir(root, parts)
@@ -81,8 +85,15 @@ def recent_failures(root, current_run):
         records = []
         for tier in ("fast_sanity", "model_sanity"):
             for model in models:
-                directory = run / tier / model
-                if not (directory / "index.json").is_file():
+                directory = _safe_subdir(run, (tier, model))
+                if directory is None:
+                    continue
+                index_path = directory / "index.json"
+                try:
+                    index_info = index_path.lstat()
+                except OSError:
+                    continue
+                if not stat.S_ISREG(index_info.st_mode):
                     continue
                 code = []
                 for filename in (
@@ -99,14 +110,20 @@ def recent_failures(root, current_run):
                     "evalscope.log",
                 ):
                     path = directory / filename
-                    if path.is_file() and not path.is_symlink():
-                        with path.open("rb") as stream:
-                            stream.seek(max(0, path.stat().st_size - 262144))
-                            code.extend(
-                                diagnostic_codes(
-                                    stream.read(262144).decode(errors="replace")
-                                )
+                    try:
+                        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+                    except OSError:
+                        continue
+                    with os.fdopen(fd, "rb") as stream:
+                        info = os.fstat(stream.fileno())
+                        if not stat.S_ISREG(info.st_mode):
+                            continue
+                        stream.seek(max(0, info.st_size - 262144))
+                        code.extend(
+                            diagnostic_codes(
+                                stream.read(262144).decode(errors="replace")
                             )
+                        )
                 if code:
                     records.append(
                         {
