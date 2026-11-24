@@ -374,9 +374,12 @@ def handle_environment_variables(server_args: Any):
             "--enable-deepseek-v4-fp4-indexer requires SM100, SM120, or gfx95 GPUs "
             "with FP4 indexer support."
         )
-    if cfg.enable_fp4_indexer and not get_platform().is_sm100:
+    if cfg.enable_fp4_indexer and not (
+        (is_sail() and get_platform().device_sm >= 89) or get_platform().is_sm100
+    ):
         raise ValueError(
-            "--enable-fp4-indexer requires SM100 GPUs with FP4 indexer support."
+            "--enable-fp4-indexer requires SM100 GPUs or T-HEAD SAIL SM89+ "
+            "devices with FP4 indexer support."
         )
     if cfg.enable_dsa_fp4_indexer and not is_gfx95_supported():
         raise ValueError("--enable-dsa-fp4-indexer requires gfx950 GPUs.")

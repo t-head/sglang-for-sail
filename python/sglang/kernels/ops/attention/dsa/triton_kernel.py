@@ -88,23 +88,28 @@ import functools as _functools
 
 @_functools.lru_cache(maxsize=1)
 def is_fp4_indexer_cache_enabled() -> bool:
-    """Resolve the SAIL FP4 cache flag against its SM89+ vendor capability.
+    """Resolve the SAIL FP4 cache opt-ins against its SM89+ vendor capability.
 
+    Preserve the legacy environment default and accept the resolved CLI opt-in.
     Native CUDA FP4 keeps the target release's separate Indexer subclass
     and resolved configuration; this flag must not replace that policy.
     """
     from sglang.srt.environ import envs
+    from sglang.srt.runtime_context import get_exec
     from sglang.srt.utils.device import get_device_sm, is_sail
 
     if not is_sail():
         return False
-    if not envs.SGLANG_OPT_USE_FP4_INDEXER_CACHE.get():
+    if not (
+        envs.SGLANG_OPT_USE_FP4_INDEXER_CACHE.get()
+        or get_exec().kernel.enable_fp4_indexer
+    ):
         return False
     if get_device_sm() < 89:
         import logging
 
         logging.getLogger(__name__).warning(
-            "SGLANG_OPT_USE_FP4_INDEXER_CACHE=1 was requested but the current "
+            "FP4 indexer cache was requested but the current "
             "SAIL device is below SM89; retaining the non-FP4 indexer cache."
         )
         return False

@@ -16,6 +16,7 @@ from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
 from sglang.srt.runtime_context import get_exec
+from sglang.srt.utils.device import is_sail
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -132,4 +133,7 @@ class Fp4Indexer(Indexer):
 
 
 def dsa_indexer_cls() -> Type[Indexer]:
+    if is_sail():
+        # The base Indexer owns PPU MXFP4 dispatch; Fp4Indexer is SM100-specific.
+        return Indexer
     return Fp4Indexer if get_exec().kernel.enable_fp4_indexer else Indexer

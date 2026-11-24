@@ -1092,7 +1092,7 @@ class KVCacheConfigurator:
             ),
             geometry=IndexKeyGeometry(
                 index_head_dim=get_dsa_index_head_dim(hf_config),
-                use_fp4=get_exec().kernel.enable_fp4_indexer,
+                use_fp4=DSATokenToKVPool.use_fp4_indexer_for_current_platform(),
             ),
         )
         return row_format, index_keys
@@ -2590,7 +2590,9 @@ class KVCacheConfigurator:
                     model_config=self.model_config,
                     kv_cache_dtype=self.kv_cache_dtype,
                 ),
-                use_fp4_indexer=get_exec().kernel.enable_fp4_indexer,
+                use_fp4_indexer=DSATokenToKVPool.use_fp4_indexer_for_current_platform(
+                    get_dsa_index_kpool(self.model_config.hf_config)
+                ),
             )
 
         return SWAKVPool(
@@ -2825,7 +2827,9 @@ class KVCacheConfigurator:
                 dsa_index_kpool = get_dsa_index_kpool(self.model_config.hf_config)
                 extra_args.update(
                     use_dsa=True,
-                    use_fp4_indexer=get_exec().kernel.enable_fp4_indexer,
+                    use_fp4_indexer=DSATokenToKVPool.use_fp4_indexer_for_current_platform(
+                        dsa_index_kpool
+                    ),
                     index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
                     kv_cache_dim=calculate_mla_kv_cache_dim(
                         model_config=self.model_config,
