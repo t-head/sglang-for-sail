@@ -23,10 +23,23 @@ Covers:
 - ``rollback_matched_mamba_state`` directly (fresh vs. pre-held vs. session slot);
 - the PD bypass predicates (only interleave prefill-CP can un-bypass);
 - reuse-length accounting for HiCache host extensions;
-- ``drop_misaligned_dsa_cp_prefix_reuse`` / ``enforce_dsa_cp_prefix_cache_alignment``;
+- ``drop_misaligned_dsa_cp_prefix_reuse`` / ``enforce_dsa_cp_prefix_cache_alignment``,
+  including the retained-slot mark that makes the recompute clear the old
+  recurrent state;
 - the gate inside ``match_kv_cache`` (drop rolls the slot back, aligned hits
   are kept untouched);
-- the deferred mamba COW/clear collection shape invariant.
+- the deferred mamba COW/clear collection shape invariant;
+- the resolved page geometry behind ``dsa_cp_prefix_cache_alignment`` (lcm, not
+  a product; an inactive call must not poison a later active one);
+- the once-per-process misaligned-hit warning;
+- the switch surface: only ``SGLANG_DSA_CP_PREFIX_CACHE`` is honored on this
+  line, the 0.5.21 variable name is inert (no alias by decision);
+- the LayerSplit broadcast scratch invalidation and the prefetch transfer-coord
+  fallbacks added by the 0.5.23 migration batch;
+- the host-pool write-through invalidating a non-owner rank's scratch copy, and
+  packed MTP draft transfer ids following the live target layer count;
+- ``require_dsa_cp_hicache_layout`` (layer_first + kernel required with
+  ``--enable-dsa-cache-layer-split``, inert otherwise).
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -34,6 +47,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
+import os
 import unittest
 import unittest.mock
 from array import array
@@ -55,7 +69,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     rollback_matched_mamba_state,
 )
 from sglang.srt.mem_cache.common import match_kv_cache
+from sglang.srt.mem_cache.dsa_cache_layer_split import LayerSplitDSATokenToKVPool
 from sglang.srt.mem_cache.kv_cache_builder import require_dsa_cp_page_size
+from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
 _ALIGNMENT_SYMBOL = (
     "sglang.srt.mem_cache.base_prefix_cache.dsa_cp_prefix_cache_alignment"
@@ -339,6 +356,54 @@ class TestDropMisalignedReuse(CustomTestCase):
         self.assertEqual(allocator.free_calls, 0)
         self.assertIsNotNone(req.kv.mamba_pool_idx)
 
+    def test_retained_session_state_is_cleared_before_recomputation(self):
+        # Carried over from the 0.5.21 change set: when the slot survives the
+        # rollback (the request already held it before this match), the pool
+        # never marks it for clearing, so the drop path must do it -- otherwise
+        # the recompute reads the previous round's recurrent state as if it were
+        # the initial state.
+        allocator = _TrackingMambaAllocator()
+        tree = _ZeroingTreeCache(allocator)
+        kv = ReqKvInfo(mamba_pool_idx=torch.tensor(4, dtype=torch.int64))
+        req = SimpleNamespace(kv=kv, session=None)
+        match = _match(device_len=6)
+
+        with unittest.mock.patch(_ALIGNMENT_SYMBOL, return_value=4):
+            dropped = drop_misaligned_dsa_cp_prefix_reuse(
+                tree,
+                req,
+                match,
+                mamba_held_before_match=True,
+            )
+
+        self.assertEqual(dsa_cp_prefix_reuse_length(dropped), 0)
+        # A pre-held slot is kept (no double free) ...
+        self.assertEqual(req.kv.mamba_pool_idx.item(), 4)
+        self.assertEqual(allocator.free_calls, 0)
+        # ... but it is now marked for clearing, and the stale COW hint is gone.
+        self.assertTrue(req.kv.mamba_needs_clear)
+        self.assertIsNone(req.kv.mamba_cow_src_index)
+
+    def test_cleared_slot_is_collected_as_a_clear_index(self):
+        # The other half of the same contract: the batch collector must turn the
+        # mark written above into a clear index, so the slot really gets zeroed
+        # before the recomputed prefix is written.
+        allocator = _TrackingMambaAllocator()
+        req = SimpleNamespace(
+            kv=ReqKvInfo(
+                mamba_pool_idx=torch.tensor(4, dtype=torch.int64),
+                mamba_needs_clear=True,
+            )
+        )
+        batch = SimpleNamespace()
+
+        ScheduleBatch._collect_deferred_mamba_cow_and_clear(batch, [req])
+
+        self.assertEqual(batch.mamba_clear_indices.tolist(), [4])
+        self.assertIsNone(batch.mamba_cow_src_indices)
+        self.assertFalse(req.kv.mamba_needs_clear)
+        self.assertEqual(allocator.free_calls, 0)
+
 
 class _GateTreeCache(_ZeroingTreeCache):
     """Cache stub whose match stages mamba COW state like the real one."""
@@ -568,6 +633,481 @@ class TestPageSizePrecondition(CustomTestCase):
             alignment = dsa_cp_prefix_cache_alignment()
         self.assertEqual(alignment, 256)
         self.assertEqual(alignment, require_dsa_cp_page_size(256, 4))
+
+
+class TestResolvedDsaCpAlignment(CustomTestCase):
+    """The gate must follow the *resolved* page geometry, and must not be
+    process-cached: an inactive call may not poison a later active one.
+
+    Ported from the 0.5.21 ``TestResolvedDsaCpAlignment``; on this line the
+    alignment is recomputed from the active context on every call
+    (``dsa_cp_prefix_cache_alignment`` reads ``get_schedule()`` and
+    ``process_model_config()`` lazily), so the 0.5.21 ``cache_clear`` cleanup
+    has no counterpart to assert -- the "does not poison" case below is the
+    behaviour that cleanup used to protect.
+    """
+
+    def _active_context(self, stack: ExitStack, page_size, index_kpool: int):
+        stack.enter_context(envs.SGLANG_DSA_CP_PREFIX_CACHE.override(True))
+        stack.enter_context(
+            unittest.mock.patch.object(
+                dutils,
+                "get_disagg",
+                unittest.mock.Mock(return_value=SimpleNamespace(disaggregation_mode="prefill")),
+            )
+        )
+        stack.enter_context(
+            unittest.mock.patch.object(
+                dutils,
+                "get_parallel",
+                unittest.mock.Mock(
+                    return_value=SimpleNamespace(
+                        enable_prefill_cp=True,
+                        cp_strategy="interleave",
+                        attn_cp_size=8,
+                    )
+                ),
+            )
+        )
+        stack.enter_context(
+            unittest.mock.patch(
+                "sglang.srt.runtime_context.get_schedule",
+                return_value=SimpleNamespace(page_size=page_size),
+            )
+        )
+        stack.enter_context(
+            unittest.mock.patch(
+                "sglang.srt.runtime_context.process_model_config",
+                return_value=SimpleNamespace(
+                    hf_config=SimpleNamespace(index_kpool=index_kpool)
+                ),
+            )
+        )
+
+    def test_absent_page_size_falls_back_to_one_and_follows_kpool(self):
+        # A schedule without a page_size (operator input may leave it unset)
+        # must not crash the gate and must still honour the indexer granularity.
+        with ExitStack() as stack:
+            self._active_context(stack, None, 4)
+            self.assertEqual(dsa_cp_prefix_cache_alignment(), 4)
+
+    def test_alignment_is_the_lcm_not_the_product(self):
+        # page_size=128 with index_kpool=4: 128 already divides by 4, so the
+        # required alignment is 128 -- the 0.5.21 product form would have asked
+        # for 512 and dropped reuse that the kpool path could serve.
+        with ExitStack() as stack:
+            self._active_context(stack, 128, 4)
+            self.assertEqual(dsa_cp_prefix_cache_alignment(), 128)
+
+    def test_disabled_call_does_not_poison_later_enabled_call(self):
+        with envs.SGLANG_DSA_CP_PREFIX_CACHE.override(False):
+            self.assertEqual(dsa_cp_prefix_cache_alignment(), 1)
+        with ExitStack() as stack:
+            self._active_context(stack, 256, 4)
+            self.assertEqual(dsa_cp_prefix_cache_alignment(), 256)
+
+    def test_unsupported_deployment_keeps_alignment_inert(self):
+        # Same switch, but a decode worker: the guard must stay out of the way.
+        with ExitStack() as stack:
+            self._active_context(stack, 256, 4)
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    dutils,
+                    "get_disagg",
+                    unittest.mock.Mock(
+                        return_value=SimpleNamespace(disaggregation_mode="decode")
+                    ),
+                )
+            )
+            self.assertEqual(dsa_cp_prefix_cache_alignment(), 1)
+
+
+class TestMisalignedWarningIsOnce(CustomTestCase):
+    """A misaligned hit is expected during bring-up; log it once per process.
+
+    This is the 0.5.23 form of the 0.5.21 module-level "warned once" global: the
+    flag now lives in the runtime context resources, so it follows the context
+    instead of the import.
+    """
+
+    def _hit(self):
+        with ExitStack() as stack:
+            stack.enter_context(unittest.mock.patch(_ALIGNMENT_SYMBOL, return_value=4))
+            stack.enter_context(
+                unittest.mock.patch(
+                    "sglang.srt.runtime_context.get_context",
+                    return_value=SimpleNamespace(
+                        resources=SimpleNamespace(dsa_cp_misaligned_warned=False)
+                    ),
+                )
+            )
+            with unittest.mock.patch(
+                "sglang.srt.mem_cache.base_prefix_cache.logger"
+            ) as box:
+                self.assertTrue(is_dsa_cp_prefix_hit_misaligned(_match(6)))
+                self.assertTrue(is_dsa_cp_prefix_hit_misaligned(_match(10)))
+        return box.warning.call_count
+
+    def test_repeated_misaligned_hits_warn_once(self):
+        # Both hits above must be reported as misaligned, but only the first one
+        # may emit the warning; a per-request warning would bury the log.
+        self.assertEqual(self._hit(), 1)
+
+    def test_aligned_hit_does_not_warn(self):
+        with ExitStack() as stack:
+            stack.enter_context(unittest.mock.patch(_ALIGNMENT_SYMBOL, return_value=4))
+            stack.enter_context(
+                unittest.mock.patch(
+                    "sglang.srt.runtime_context.get_context",
+                    return_value=SimpleNamespace(
+                        resources=SimpleNamespace(dsa_cp_misaligned_warned=False)
+                    ),
+                )
+            )
+            with unittest.mock.patch(
+                "sglang.srt.mem_cache.base_prefix_cache.logger"
+            ) as box:
+                self.assertFalse(is_dsa_cp_prefix_hit_misaligned(_match(8)))
+        self.assertEqual(box.warning.call_count, 0)
+
+
+class TestSwitchNameIsThe0523NameOnly(CustomTestCase):
+    """The opt-in is ``SGLANG_DSA_CP_PREFIX_CACHE`` and nothing else.
+
+    Registered decision for the migration: the 0.5.21 variable name is *not*
+    carried over as an alias on this line, so an old customer script setting the
+    0.5.21 name must keep the default behaviour rather than silently enabling
+    the experimental path. If a real dependency on the old name is reported,
+    widening it is a separate, evidence-backed change.
+    """
+
+    def test_old_0521_variable_name_is_inert(self):
+        with unittest.mock.patch.dict(
+            os.environ, {"SGLANG_ENABLE_DSA_CP_PREFIX_CACHE": "1"}
+        ):
+            self.assertFalse(dutils.dsa_cp_prefix_cache_enabled())
+
+    def test_no_alias_attribute_is_exposed(self):
+        self.assertFalse(hasattr(envs, "SGLANG_ENABLE_DSA_CP_PREFIX_CACHE"))
+        self.assertTrue(hasattr(envs, "SGLANG_DSA_CP_PREFIX_CACHE"))
+
+    def test_0523_name_is_the_one_that_unbypasses(self):
+        with envs.SGLANG_DSA_CP_PREFIX_CACHE.override(True):
+            self.assertTrue(dutils.dsa_cp_prefix_cache_enabled())
+
+
+class TestLayerSplitScratchInvalidation(CustomTestCase):
+    """Every rank must drop its broadcast scratch copy on a host write-through.
+
+    Covers ``invalidate_kv_buffer_for_layer`` (added together with the KV-side
+    write-through invalidation) and keeps it distinct from the index-side twin.
+    The stubs are plain attribute bags: the method under test only reads the
+    broadcast bookkeeping, so no pool, device or process group is needed.
+    """
+
+    def _pool(self, *, pending_layer=None, remote_layer=None):
+        calls = []
+        pool = SimpleNamespace(
+            pending_remote_kv_layer_id=pending_layer,
+            remote_kv_layer_id=remote_layer,
+            pending_remote_kv_broadcast=pending_layer is not None,
+            index_key_cache=SimpleNamespace(invalidate=lambda layer: calls.append(("index", layer))),
+            _finalize_pending_kv_broadcast=lambda *, set_remote_layer_id: calls.append(
+                ("finalize", set_remote_layer_id)
+            ),
+        )
+        pool.calls = calls
+        return pool
+
+    def test_invalidate_kv_drops_pending_broadcast_without_publishing_it(self):
+        pool = self._pool(pending_layer=7, remote_layer=7)
+
+        LayerSplitDSATokenToKVPool.invalidate_kv_buffer_for_layer(pool, 7)
+
+        self.assertIn(("finalize", False), pool.calls)
+        self.assertIsNone(pool.remote_kv_layer_id)
+
+    def test_invalidate_kv_leaves_other_layers_scratch_copy_alone(self):
+        pool = self._pool(remote_layer=3)
+
+        LayerSplitDSATokenToKVPool.invalidate_kv_buffer_for_layer(pool, 7)
+
+        self.assertEqual(pool.calls, [])
+        self.assertEqual(pool.remote_kv_layer_id, 3)
+
+    def test_invalidate_kv_publishes_nothing_when_only_a_pending_broadcast_exists(
+        self,
+    ):
+        pool = self._pool(pending_layer=7)
+
+        LayerSplitDSATokenToKVPool.invalidate_kv_buffer_for_layer(pool, 7)
+
+        self.assertEqual(pool.calls, [("finalize", False)])
+        self.assertIsNone(pool.remote_kv_layer_id)
+
+    def test_index_invalidation_is_a_separate_call(self):
+        pool = self._pool(remote_layer=7)
+
+        LayerSplitDSATokenToKVPool.invalidate_index_buffer_for_layer(pool, 7)
+
+        self.assertEqual(pool.calls, [("index", 7)])
+        self.assertEqual(pool.remote_kv_layer_id, 7)
+
+
+class TestLayerSplitPrefetchWaits(CustomTestCase):
+    """A prefetch may not skip the wait just because a caller left the transfer
+    coordinates unset (the non-comm path reads a layer another rank owns)."""
+
+    def _pool(self, *, counter, comm=None):
+        broadcasts = []
+        pool = SimpleNamespace(
+            remote_kv_layer_id=None,
+            pending_remote_kv_broadcast=False,
+            pending_remote_kv_layer_id=None,
+            _finalize_pending_kv_broadcast=lambda **_: None,
+            _local_layer_idx=lambda layer_id: layer_id - 100,
+            kv_buffer=["slot-0", "slot-1", "slot-2"],
+            _is_layer_owned=lambda layer_id: False,
+            layer_transfer_counter=counter,
+            layer_broadcast_comm=comm,
+            remote_kv_buffer="remote-scratch",
+            _broadcast_tensor_from_owner=lambda *a, **k: broadcasts.append((a, k)),
+        )
+        pool.broadcasts = broadcasts
+        return pool
+
+    def test_unset_counter_falls_back_to_the_pools_own_counter(self):
+        counter = unittest.mock.Mock()
+        pool = self._pool(counter=counter)
+
+        LayerSplitDSATokenToKVPool.prefetch_kv_buffer(pool, 102)
+
+        counter.wait_until.assert_called_once_with(2)
+        self.assertEqual(len(pool.broadcasts), 1)
+        self.assertEqual(pool.remote_kv_layer_id, 102)
+
+    def test_explicit_coordinates_win_over_the_fallback(self):
+        pool_counter = unittest.mock.Mock()
+        explicit = unittest.mock.Mock()
+        pool = self._pool(counter=pool_counter)
+
+        LayerSplitDSATokenToKVPool.prefetch_kv_buffer(pool, 102, explicit, 5)
+
+        explicit.wait_until.assert_called_once_with(5)
+        pool_counter.wait_until.assert_not_called()
+
+    def test_no_counter_anywhere_still_broadcasts(self):
+        # Nothing to wait for: the synchronous broadcast is still issued, so the
+        # fallback cannot swallow the prefetch.
+        pool = self._pool(counter=None)
+
+        LayerSplitDSATokenToKVPool.prefetch_kv_buffer(pool, 102)
+
+        self.assertEqual(len(pool.broadcasts), 1)
+        self.assertEqual(pool.remote_kv_layer_id, 102)
+
+    def test_already_remote_layer_is_a_no_op(self):
+        counter = unittest.mock.Mock()
+        pool = self._pool(counter=counter)
+        pool.remote_kv_layer_id = 102
+
+        LayerSplitDSATokenToKVPool.prefetch_kv_buffer(pool, 102)
+
+        counter.wait_until.assert_not_called()
+        self.assertEqual(pool.broadcasts, [])
+
+
+class TestHostWriteThroughInvalidatesScratch(CustomTestCase):
+    """The write-through entry must invalidate before the ownership early-return,
+    otherwise a non-owner rank keeps serving a pre-write scratch copy."""
+
+    def _device_pool(self, recorder, *, start_layer=8):
+        return SimpleNamespace(
+            start_layer=start_layer,
+            layer_num=9,
+            invalidate_index_buffer_for_layer=recorder,
+            invalidate_kv_buffer_for_layer=recorder,
+        )
+
+    def test_dsa_host_pool_invalidates_on_a_non_owner_rank(self):
+        seen = []
+        host = SimpleNamespace(
+            _is_device_layer_sharded=lambda device_pool: True,
+            _is_device_layer_owned=lambda device_pool, layer_id: False,
+        )
+
+        DSAIndexerPoolHost.load_to_device_per_layer(
+            host,
+            self._device_pool(lambda layer: seen.append(layer)),
+            None,
+            None,
+            3,
+            "kernel",
+        )
+
+        # start_layer + layer_id: the scratch buffer is indexed by absolute layer.
+        self.assertEqual(seen, [11])
+
+    def test_dsa_host_pool_skips_invalidation_when_layers_are_not_sharded(self):
+        seen = []
+        host = SimpleNamespace(
+            _is_device_layer_sharded=lambda device_pool: False,
+            _is_device_layer_owned=lambda device_pool, layer_id: False,
+        )
+
+        DSAIndexerPoolHost.load_to_device_per_layer(
+            host, self._device_pool(lambda layer: seen.append(layer)), None, None, 3, "kernel"
+        )
+
+        self.assertEqual(seen, [])
+
+    def test_mla_host_pool_invalidates_kv_scratch_before_returning_early(self):
+        seen = []
+        host = SimpleNamespace(
+            _is_dummy=False,
+            _is_device_layer_sharded=lambda device_pool: True,
+            _target_layer_indices=set(),
+        )
+
+        MLATokenToKVPoolHost.load_to_device_per_layer(
+            host,
+            self._device_pool(lambda layer: seen.append(layer)),
+            None,
+            None,
+            3,
+            "kernel",
+        )
+
+        self.assertEqual(seen, [11])
+
+    def test_mla_host_pool_skips_invalidation_when_layers_are_not_sharded(self):
+        seen = []
+        host = SimpleNamespace(
+            _is_dummy=False,
+            _is_device_layer_sharded=lambda device_pool: False,
+            _target_layer_indices=set(),
+        )
+
+        MLATokenToKVPoolHost.load_to_device_per_layer(
+            host, self._device_pool(lambda layer: seen.append(layer)), None, None, 3, "kernel"
+        )
+
+        self.assertEqual(seen, [])
+
+
+class TestDraftTransferIdsFollowTargetLayerNum(CustomTestCase):
+    """Packed MTP draft layers are addressed host-pool relative.
+
+    The 0.5.21 line used the *device* pool's layer count here; with layer sharding
+    that id is the rank's full layer count, not the number of live target layers,
+    so the draft ids collided with the target range. This asserts the ids the host
+    pool now produces, with a device pool whose ``layer_num`` deliberately
+    disagrees.
+    """
+
+    def _host(self, *, sharded: bool, target_layer_num: int, drafts):
+        calls = []
+        host = SimpleNamespace(
+            _is_device_layer_sharded=lambda device_pool: sharded,
+            _owned_device_layer_ids=lambda device_pool: [0, 1],
+            mtp_draft_device_pools=drafts,
+            target_layer_num=target_layer_num,
+            _backup_from_device_per_layer=lambda pool, h, d, layer_id, io_backend, **kw: (
+                calls.append((pool, layer_id, kw.get("is_draft", False)))
+            ),
+        )
+        return host, calls
+
+    def test_draft_ids_start_at_the_live_target_layer_count(self):
+        draft_a, draft_b = object(), object()
+        host, calls = self._host(sharded=True, target_layer_num=2, drafts=(draft_a, draft_b))
+        device_pool = SimpleNamespace(layer_num=9)
+
+        DSAIndexerPoolHost.backup_from_device_all_layer(
+            host, device_pool, None, None, "kernel"
+        )
+
+        self.assertEqual(
+            calls,
+            [
+                (device_pool, 0, False),
+                (device_pool, 1, False),
+                (draft_a, 2, True),
+                (draft_b, 3, True),
+            ],
+        )
+
+    def test_no_draft_pools_means_no_extra_ids_at_all(self):
+        # Control for the loop above: a deployment without packed MTP drafts
+        # cannot acquire the new ids, so the change stays inside that scenario.
+        host, calls = self._host(sharded=True, target_layer_num=2, drafts=())
+        device_pool = SimpleNamespace(layer_num=9)
+
+        DSAIndexerPoolHost.backup_from_device_all_layer(
+            host, device_pool, None, None, "kernel"
+        )
+
+        self.assertEqual([layer for _, layer, _ in calls], [0, 1])
+
+
+class TestHiCacheLayoutGate(CustomTestCase):
+    """``--enable-dsa-cache-layer-split`` needs a per-layer host layout."""
+
+    def test_layer_split_hicache_layout(self):
+        # The combination established on the 0.5.21 line (GLM-5.3 checkpoint):
+        # layer_first host layout with the kernel I/O backend.
+        require_dsa_cp_hicache_layout(
+            cache_layer_split=True,
+            hicache_layout="layer_first",
+            hicache_io_backend="kernel",
+        )
+        with self.assertRaisesRegex(ValueError, "layer_first"):
+            require_dsa_cp_hicache_layout(
+                cache_layer_split=True,
+                hicache_layout="page_first",
+                hicache_io_backend="kernel",
+            )
+
+    def test_page_first_layout_is_rejected(self):
+        with self.assertRaises(ValueError):
+            require_dsa_cp_hicache_layout(
+                cache_layer_split=True,
+                hicache_layout="page_first",
+                hicache_io_backend="kernel",
+            )
+
+    def test_direct_io_backend_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "kernel"):
+            require_dsa_cp_hicache_layout(
+                cache_layer_split=True,
+                hicache_layout="layer_first",
+                hicache_io_backend="direct",
+            )
+
+    def test_rejection_names_the_two_settings_that_are_wrong(self):
+        with self.assertRaises(ValueError) as ctx:
+            require_dsa_cp_hicache_layout(
+                cache_layer_split=True,
+                hicache_layout="page_first_kv_split",
+                hicache_io_backend="direct",
+            )
+        message = str(ctx.exception)
+        self.assertIn("page_first_kv_split", message)
+        self.assertIn("direct", message)
+
+    def test_gate_inert_without_layer_split(self):
+        require_dsa_cp_hicache_layout(
+            cache_layer_split=False,
+            hicache_layout="page_first",
+            hicache_io_backend="direct",
+        )
+
+    def test_gate_inert_when_hierarchical_cache_is_off(self):
+        # The builder passes None for both fields when HiCache is disabled; a
+        # layer-split deployment without HiCache keeps today's behaviour.
+        require_dsa_cp_hicache_layout(
+            cache_layer_split=True, hicache_layout=None, hicache_io_backend=None
+        )
 
 
 if __name__ == "__main__":
