@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
@@ -179,7 +181,38 @@ class DSATopKBackend(Enum):
         packed_extend_topk: bool = False,
     ) -> torch.Tensor:
         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
-            return self.topk_func(logits, lengths, topk, row_starts=row_starts)
+            # PD IndexShare requires request-local IDs, not fused physical
+            # indices. Keep that contract while permitting BF16 selection.
+            if (
+                self.is_sgl_kernel()
+                and topk_transform_method == TopkTransformMethod.RAGGED
+                and logits.dtype == torch.bfloat16
+                and 0 < topk <= 2048
+                and lengths.shape[0] == logits.shape[0]
+            ):
+                raw_offsets = torch.zeros_like(lengths, dtype=torch.int32)
+                deepselect = _deepselect_ragged_topk(
+                    logits, lengths, topk, raw_offsets, row_starts, attn_metadata
+                )
+                if deepselect is not None:
+                    return deepselect
+                if (
+                    envs.SGLANG_DSA_RAGGED_BF16_TOPK.get()
+                    and logits.stride(1) == 1
+                    and logits.stride(0) % 4 == 0
+                    and logits.data_ptr() % (logits.element_size() * 4) == 0
+                ):
+                    from sglang.kernels.ops.attention.dsv4.topk import (
+                        topk_transform_ragged_v2,
+                    )
+                    out = logits.new_empty((logits.shape[0], topk), dtype=torch.int32)
+                    topk_transform_ragged_v2(
+                        logits, lengths, out_offsets=raw_offsets,
+                        out_indices=out, row_starts=row_starts,
+                    )
+                    return out
+            score = logits if logits.dtype == torch.float32 else logits.float()
+            return self.topk_func(score, lengths, topk, row_starts=row_starts)
 
         # Decode-shaped PAGED top-k for the SGL backend (plain decode AND spec
         # verify / draft-extend, whose expanded rows match the same shape) routes
@@ -375,6 +408,81 @@ class DSATopKBackend(Enum):
             raise RuntimeError(f"Unsupported {topk_transform_method = }.")
 
         raise RuntimeError(f"Unsupported {self = } for SGLANG_DSA_FUSE_TOPK.")
+
+
+_DEEPSELECT_HIT = "__deepselect_hit__"
+_DEEPSELECT_LOGGED: set = set()
+logger = logging.getLogger(__name__)
+
+
+def _deepselect_ragged_skip_reason(
+    logits: torch.Tensor, topk: int, topk_indices_offset: Optional[torch.Tensor]
+) -> Optional[str]:
+    """Return why the PPU DeepSelect kernel cannot serve this ragged top-k, else None."""
+    if not is_sail():
+        return "not a PPU(sail) device"
+    if topk_indices_offset is None:
+        return "ragged call without topk_indices_offset"
+    if logits.dim() != 2:
+        return f"logits rank {logits.dim()} != 2"
+    if logits.dtype != torch.bfloat16:
+        return f"logits dtype {logits.dtype} != bfloat16"
+    if not 0 < topk <= 4096:
+        return f"topk {topk} outside the deep_select contract (1..4096)"
+    return None
+
+
+def _deepselect_ragged_topk(
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    topk: int,
+    topk_indices_offset: Optional[torch.Tensor],
+    row_starts: Optional[torch.Tensor],
+    attn_metadata=None,
+) -> Optional[torch.Tensor]:
+    """Serve one ragged DSA top-k from the PPU(sail) deep_select wheel.
+
+    Returns None when the switch is off or a precondition is unmet, leaving the
+    caller on its existing kernel. A precondition missed while the switch is on
+    is logged once, so a run that never reached DeepSelect can be failed by a
+    gate instead of being measured as if it had.
+    """
+    if not envs.SGLANG_DSA_DEEPSELECT.get():
+        return None
+    reason = _deepselect_ragged_skip_reason(logits, topk, topk_indices_offset)
+    if reason is not None:
+        if reason not in _DEEPSELECT_LOGGED:
+            _DEEPSELECT_LOGGED.add(reason)
+            logger.warning("SGLANG_DSA_DEEPSELECT is on but skipped: %s", reason)
+        return None
+
+    from sglang.kernels.ops.attention.dsa.deep_select import topk_transform_ragged
+
+    max_seq_len = None
+    seq_lens_cpu = getattr(attn_metadata, "indexer_seq_lens_cpu", None)
+    if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
+        # Ragged KV concatenates requests, so only a lone request starts at
+        # column zero. CPU lengths also bound the packed width without a sync.
+        max_seq_len = int(seq_lens_cpu.max())
+        if seq_lens_cpu.numel() == 1:
+            row_starts = None
+    out = topk_transform_ragged(
+        logits,
+        lengths,
+        topk,
+        topk_indices_offset,
+        row_starts,
+        max_seq_len=max_seq_len,
+    )
+    if _DEEPSELECT_HIT not in _DEEPSELECT_LOGGED:
+        _DEEPSELECT_LOGGED.add(_DEEPSELECT_HIT)
+        logger.info(
+            "DSA ragged top-k served by PPU deep_select (rows=%d cols=%d topk=%d)",
+            logits.shape[0],
+            logits.shape[1],
+            topk,
+        )
+    return out
 
 
 def _topk_unfused(
