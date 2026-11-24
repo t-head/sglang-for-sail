@@ -9,7 +9,7 @@ if [[ -n "${PPU_CI_K8S_CONFIG_SHA256:-}" &&
 fi
 
 mode=${TIER:?}
-root=${PPU_CI_PRIVATE_RESULTS_ROOT:-}
+root=${PPU_CI_K8S_HOST_SCRATCH_ROOT:-${PPU_CI_PRIVATE_RESULTS_ROOT:-}}
 pod_root=${PPU_CI_K8S_PRIVATE_WORKER_ROOT:-}
 if [[ "$root" != /* || "$pod_root" != /* || ! -d "$root" || -L "$root" ]]; then
     echo "::error::PPU cluster private storage is not configured"
