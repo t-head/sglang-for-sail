@@ -1154,6 +1154,7 @@ class ClusterConfigBootstrapTest(unittest.TestCase):
             env_archive.chmod(0o755)
             cfg_archive.chmod(0o755)
             shutil.copytree(REPO_ROOT / "scripts/ci/ppu", scripts)
+            shutil.copytree(DEFAULT_POLICY_ROOT, workspace / "test/ppu/policy")
             (backend / "action.yml").write_text(
                 f'STAGE_TARBALL="{staging_mount}/${{GITHUB_RUN_ID}}-bundle.tar.gz"\n',
                 encoding="utf-8",
@@ -1403,6 +1404,127 @@ class ClusterConfigBootstrapTest(unittest.TestCase):
                     self.assertFalse(bad_status["retention_root_valid"])
                     self.assertFalse(bad_status["retention_writable"])
 
+            # 5. Normal Recipe exec path fails fast on unwritable external archive,
+            #    while legacy tier bypasses archive probing.
+            ro_archive = root / "ro-archive"
+            ro_base = ro_archive / "sglang/logs/sglang-for-sail"
+            ro_base.mkdir(parents=True)
+            ro_archive.chmod(0o755)
+            (ro_archive / "sglang").chmod(0o755)
+            (ro_archive / "sglang/logs").chmod(0o755)
+            ro_base.chmod(0o500)
+            try:
+                for tier in ("fast_sanity", "model_sanity"):
+                    with self.subTest(fail_fast_tier=tier):
+                        if captured_path.exists():
+                            captured_path.unlink()
+                        blocked = subprocess.run(
+                            [
+                                sys.executable,
+                                "-B",
+                                str(scripts / "recipe_cluster_config.py"),
+                            ],
+                            cwd=workspace,
+                            env={
+                                **fallback_case,
+                                "TIER": tier,
+                                "PPU_CI_PRIVATE_RESULTS_ROOT": str(ro_archive),
+                            },
+                            capture_output=True,
+                            text=True,
+                            timeout=10,
+                        )
+                        self.assertEqual(blocked.returncode, 2)
+                        self.assertFalse(captured_path.exists())
+                        self.assertNotIn(
+                            str(ro_archive), blocked.stdout + blocked.stderr
+                        )
+                        blocked_status = [
+                            json.loads(line)["private_retention_check"]
+                            for line in blocked.stdout.splitlines()
+                            if line.startswith("{")
+                        ][0]
+                        self.assertTrue(blocked_status["external_retention_root"])
+                        self.assertFalse(blocked_status["retention_writable"])
+
+                if captured_path.exists():
+                    captured_path.unlink()
+                legacy_exec = subprocess.run(
+                    [sys.executable, "-B", str(scripts / "recipe_cluster_config.py")],
+                    cwd=workspace,
+                    env={
+                        **fallback_case,
+                        "TIER": "legacy",
+                        "PPU_CI_PRIVATE_RESULTS_ROOT": str(ro_archive),
+                    },
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(
+                    legacy_exec.returncode, 0, legacy_exec.stdout + legacy_exec.stderr
+                )
+                self.assertTrue(captured_path.exists())
+            finally:
+                ro_base.chmod(0o700)
+
+            # 6. Pre-migration diagnostics under retained/sglang-for-sail remain
+            #    visible via --check when switching to a fresh external archive root.
+            fresh_archive = root / "fresh-archive"
+            fresh_archive.mkdir(mode=0o755)
+            fresh_archive.chmod(0o755)
+            old_run = retained / "sglang-for-sail/770-1/fast_sanity/qwen3.8-27b"
+            old_run.mkdir(parents=True)
+            (old_run / "index.json").write_text("{}", encoding="utf-8")
+            (old_run / "launcher.log").write_text(
+                "ImagePullBackOff failed to pull image\n", encoding="utf-8"
+            )
+            migrated_check = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(scripts / "recipe_cluster_config.py"),
+                    "--check",
+                ],
+                cwd=workspace,
+                env={
+                    **fallback_case,
+                    "PPU_CI_PRIVATE_RESULTS_ROOT": str(fresh_archive),
+                },
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(
+                migrated_check.returncode,
+                0,
+                migrated_check.stdout + migrated_check.stderr,
+            )
+            diag_lines = [
+                json.loads(line)["prior_cluster_diagnostics"]
+                for line in migrated_check.stdout.splitlines()
+                if line.startswith('{"prior_cluster_diagnostics"')
+            ]
+            self.assertEqual(
+                diag_lines,
+                [
+                    [
+                        {
+                            "codes": ["image_pull"],
+                            "model": "qwen3.8-27b",
+                            "run_id": 770,
+                            "tier": "fast_sanity",
+                        }
+                    ]
+                ],
+            )
+            self.assertNotIn(
+                str(fresh_archive), migrated_check.stdout + migrated_check.stderr
+            )
+            self.assertNotIn(
+                str(retained), migrated_check.stdout + migrated_check.stderr
+            )
+
     def test_retain_accepts_0755_prefix_dirs_and_rejects_bad_run_dir_or_symlink(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp).resolve()
@@ -1476,6 +1598,15 @@ class ClusterConfigBootstrapTest(unittest.TestCase):
                 ValueError, "unexpected retention directory type or mode"
             ):
                 retain({**env, "PPU_CI_PRIVATE_RESULTS_ROOT": str(sym_archive)})
+
+            # Effective archive base overlapping workspace must be rejected, and
+            # missing RUNNER_TEMP must raise ValueError instead of KeyError.
+            overlap_ws = archive / "sglang"
+            with self.assertRaisesRegex(ValueError, "must not be job-local"):
+                retain({**env, "GITHUB_WORKSPACE": str(overlap_ws)})
+            missing_temp_env = {k: v for k, v in env.items() if k != "RUNNER_TEMP"}
+            with self.assertRaisesRegex(ValueError, "missing runner workspace path"):
+                retain(missing_temp_env)
 
 
 @unittest.skipUnless(
@@ -1910,6 +2041,42 @@ class ClusterTransportTest(unittest.TestCase):
                     self.assertEqual(
                         recipe_cluster_diagnostics.recent_failures(root, 776), []
                     )
+
+        # Transient OSError while listing a candidate parent falls back cleanly.
+        with tempfile.TemporaryDirectory() as outer_tmp:
+            outer = Path(outer_tmp)
+            primary = outer / "external"
+            fallback = outer / "retained"
+            blocked_parent = primary / "sglang/logs/sglang-for-sail"
+            blocked_parent.mkdir(parents=True)
+            legacy_dir = fallback / "sglang-for-sail/774-1/fast_sanity/qwen3.8-27b"
+            legacy_dir.mkdir(parents=True)
+            (legacy_dir / "index.json").write_text("{}")
+            (legacy_dir / "launcher.log").write_text("ImagePullBackOff failed\n")
+            real_iterdir = Path.iterdir
+
+            def flaky_iterdir(self_path):
+                if self_path == blocked_parent:
+                    raise PermissionError("transient nfs error")
+                return real_iterdir(self_path)
+
+            with patch.object(
+                Path, "iterdir", autospec=True, side_effect=flaky_iterdir
+            ):
+                records = recipe_cluster_diagnostics.recent_failures(
+                    primary, 776, fallback_root=fallback
+                )
+            self.assertEqual(
+                records,
+                [
+                    {
+                        "run_id": 774,
+                        "tier": "fast_sanity",
+                        "model": "qwen3.8-27b",
+                        "codes": ["image_pull"],
+                    }
+                ],
+            )
 
 
 class RuntimeImageAndPrebuiltModeTest(unittest.TestCase):
