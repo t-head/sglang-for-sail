@@ -42,20 +42,27 @@ static constexpr uint32_t NUM_BYTES_PER_SMEM_STORE = 16;
 
 template<uint32_t NUM_VALUES, typename ValueT>
 __device__ __forceinline__
-void ld_shared(ValueT res[NUM_VALUES], const ValueT* ptr) {
+void ld_shared(ValueT res[NUM_VALUES], const void* ptr) {
     constexpr uint32_t NUM_BYTES_TO_LOAD = NUM_VALUES * sizeof(ValueT);
     static_assert(NUM_BYTES_TO_LOAD == 16 || NUM_BYTES_TO_LOAD == 8 || NUM_BYTES_TO_LOAD == 4 || NUM_BYTES_TO_LOAD == 2);
     uint32_t addr = cute::cast_smem_ptr_to_uint(ptr);
+    // PTX produces wide register values. Copy their bytes into the scalar
+    // array without accessing it through an incompatible C++ lvalue type.
     if constexpr (NUM_BYTES_TO_LOAD == 16) {
-        *(__int128_t*)res = ku::ld_shared(ptr);
+        const __int128_t bits = ku::ld_shared(ptr);
+        __builtin_memcpy(res, &bits, sizeof(bits));
     } else if constexpr (NUM_BYTES_TO_LOAD == 8) {
-        asm volatile ("ld.weak.shared::cta.b64 %0, [%1];\n" : "=l"(*(int64_t*)res) : "r"(addr) : "memory");
+        uint64_t bits;
+        asm volatile ("ld.weak.shared::cta.b64 %0, [%1];\n" : "=l"(bits) : "r"(addr) : "memory");
+        __builtin_memcpy(res, &bits, sizeof(bits));
     } else if constexpr (NUM_BYTES_TO_LOAD == 4) {
-        asm volatile ("ld.weak.shared::cta.b32 %0, [%1];\n" : "=r"(*(int32_t*)res) : "r"(addr) : "memory");
+        uint32_t bits;
+        asm volatile ("ld.weak.shared::cta.b32 %0, [%1];\n" : "=r"(bits) : "r"(addr) : "memory");
+        __builtin_memcpy(res, &bits, sizeof(bits));
     } else if constexpr (NUM_BYTES_TO_LOAD == 2) {
-        asm volatile ("ld.weak.shared::cta.b16 %0, [%1];\n" : "=h"(*(int16_t*)res) : "r"(addr) : "memory");
-    } else {
-        __builtin_unreachable();
+        uint16_t bits;
+        asm volatile ("ld.weak.shared::cta.b16 %0, [%1];\n" : "=h"(bits) : "r"(addr) : "memory");
+        __builtin_memcpy(res, &bits, sizeof(bits));
     }
 }
 
@@ -75,21 +82,19 @@ void ld_shared_with_loop(ValueT res[NUM_VALUES], const ValueT* ptr) {
 
 template<uint32_t NUM_VALUES, typename ValueT>
 __device__ __forceinline__
-void st_global(ValueT* ptr, ValueT src[NUM_VALUES]) {
+void st_global(ValueT* ptr, const ValueT src[NUM_VALUES]) {
     constexpr uint32_t NUM_BYTES_TO_STORE = NUM_VALUES * sizeof(ValueT);
     static_assert((IS_LDG_STG_256_AVAILABLE && NUM_BYTES_TO_STORE == 32) || NUM_BYTES_TO_STORE == 16 || NUM_BYTES_TO_STORE == 8 || NUM_BYTES_TO_STORE == 4 || NUM_BYTES_TO_STORE == 2);
-    if constexpr (IS_LDG_STG_256_AVAILABLE && NUM_BYTES_TO_STORE == 32) {
-        KU_STG_256(ptr, src, "no_allocate", "evict_first");
+    if constexpr (NUM_BYTES_TO_STORE == 32) {
+        uint64_t words[4];
+        __builtin_memcpy(words, src, sizeof(words));
+        STORE_TO_GMEM(ptr, words);
     } else if constexpr (NUM_BYTES_TO_STORE == 16) {
-        KU_STG_128(ptr, src, "no_allocate", "");
-    } else if constexpr (NUM_BYTES_TO_STORE == 8) {
-        *(uint64_t*)ptr = *(uint64_t*)src;
-    } else if constexpr (NUM_BYTES_TO_STORE == 4) {
-        *(uint32_t*)ptr = *(uint32_t*)src;
-    } else if constexpr (NUM_BYTES_TO_STORE == 2) {
-        *(uint16_t*)ptr = *(uint16_t*)src;
+        uint64_t words[2];
+        __builtin_memcpy(words, src, sizeof(words));
+        KU_STG_128(ptr, words, "no_allocate", "");
     } else {
-        __builtin_unreachable();
+        __builtin_memcpy(ptr, src, NUM_BYTES_TO_STORE);
     }
 }
 
@@ -161,25 +166,27 @@ struct EpilogueRunner {
                 constexpr uint32_t NUM_OUTPUT_IDXS_PER_STORE = NUM_BYTES_PER_GMEM_STORE / sizeof(OutIdxT);
                 #pragma unroll 2
                 for (uint32_t i = threadIdx.x * NUM_OUTPUT_IDXS_PER_STORE; i < args.topk; i += NUM_THREADS * NUM_OUTPUT_IDXS_PER_STORE) {
-                    OutIdxT out[NUM_OUTPUT_IDXS_PER_STORE];
+                    alignas(16) OutIdxT out[NUM_OUTPUT_IDXS_PER_STORE];
                     CUTE_UNROLL
                     for (uint32_t j = 0; j < NUM_OUTPUT_IDXS_PER_STORE; ++j)
                         out[j] = i+j < end_vocab_idx ? (OutIdxT)(i+j) + output_idx_offset : args.idx_oob_fill_value;
-                    STORE_TO_GMEM(result_indices + i, out);
+                    st_global<NUM_OUTPUT_IDXS_PER_STORE>(result_indices + i, out);
                 }
 
                 // Save values into `result_values`, if `RETURN_VALUE` is `True`
                 if constexpr (Config::return_value) {
                     #pragma unroll 2
                     for (uint32_t i = threadIdx.x * NUM_VALUES_PER_LOAD_STORE; i < args.topk; i += NUM_THREADS * NUM_VALUES_PER_LOAD_STORE) {
-                        ValueT values[NUM_VALUES_PER_LOAD_STORE];
+                        alignas(16) ValueT values[NUM_VALUES_PER_LOAD_STORE];
                         if (i < end_vocab_idx) {
-                            LOAD_FROM_GMEM(input_values + i, values);
+                            uint64_t words[NUM_BYTES_PER_GMEM_LOAD / sizeof(uint64_t)];
+                            LOAD_FROM_GMEM(input_values + i, words);
+                            __builtin_memcpy(values, words, sizeof(words));
                         }
                         CUTE_UNROLL
                         for (uint32_t j = 0; j < NUM_VALUES_PER_LOAD_STORE; ++j)
                             values[j] = i+j < end_vocab_idx ? values[j] : oob_fill_value;
-                        STORE_TO_GMEM(result_values + i, values);
+                        st_global<NUM_VALUES_PER_LOAD_STORE>(result_values + i, values);
                     }
                 }
             } else {
@@ -187,8 +194,8 @@ struct EpilogueRunner {
                 constexpr uint32_t NUM_OUTPUT_IDX_PER_ROUND = cute::min(NUM_BYTES_PER_SMEM_STORE / sizeof(uint32_t), NUM_BYTES_PER_GMEM_STORE / sizeof(OutIdxT));
                 #pragma unroll 2
                 for (uint32_t i = threadIdx.x * NUM_OUTPUT_IDX_PER_ROUND; i < args.topk; i += NUM_THREADS * NUM_OUTPUT_IDX_PER_ROUND) {
-                    uint32_t indices_u32[NUM_OUTPUT_IDX_PER_ROUND];
-                    OutIdxT out[NUM_OUTPUT_IDX_PER_ROUND];
+                    alignas(16) uint32_t indices_u32[NUM_OUTPUT_IDX_PER_ROUND];
+                    alignas(16) OutIdxT out[NUM_OUTPUT_IDX_PER_ROUND];
                     ld_shared<NUM_OUTPUT_IDX_PER_ROUND>(indices_u32, smem_index_buf + i);
                     CUTE_UNROLL
                     for (uint32_t j = 0; j < NUM_OUTPUT_IDX_PER_ROUND; ++j)
@@ -201,8 +208,8 @@ struct EpilogueRunner {
                     constexpr uint32_t NUM_VALUES_PER_ROUND = cute::min(NUM_BYTES_PER_SMEM_STORE, NUM_BYTES_PER_GMEM_STORE) / sizeof(ValueT);
                     #pragma unroll 2
                     for (uint32_t i = threadIdx.x * NUM_VALUES_PER_ROUND; i < args.topk; i += NUM_THREADS * NUM_VALUES_PER_ROUND) {
-                        UIntValueT values[NUM_VALUES_PER_ROUND];
-                        ld_shared<NUM_VALUES_PER_ROUND>(values, (UIntValueT*)(smem_value_buf + i));
+                        alignas(16) UIntValueT values[NUM_VALUES_PER_ROUND];
+                        ld_shared<NUM_VALUES_PER_ROUND>(values, smem_value_buf + i);
                         st_global<NUM_VALUES_PER_ROUND>((UIntValueT*)(result_values + i), values);
                     }
                 }
@@ -219,17 +226,19 @@ struct EpilogueRunner {
                     constexpr uint32_t NUM_VALUES_PER_LDG128 = NUM_BYTES_PER_SMEM_LOAD / sizeof(ValueT);
                     #pragma unroll 2
                     for (uint32_t i = (threadIdx.x-NUM_THREADS/2) * NUM_VALUES_PER_LDG128; i < end_vocab_idx; i += (NUM_THREADS/2) * NUM_VALUES_PER_LDG128) {
-                        ValueT values[NUM_VALUES_PER_LDG128];
-                        KU_LDG_128(input_values + i, values, ".nc", "no_allocate", "256B");
-                        ku::st_shared(smem_value_buf + i, *(__int128_t*)values);
+                        uint64_t words[2];
+                        KU_LDG_128(input_values + i, words, ".nc", "no_allocate", "256B");
+                        __int128_t bits;
+                        __builtin_memcpy(&bits, words, sizeof(bits));
+                        ku::st_shared(smem_value_buf + i, bits);
                     }
                 }
                 __syncthreads();
             }
 
             // Sort
-            UIntValueT local_values[NUM_VALUES_PER_THREAD_FOR_SORT];
-            uint32_t local_indices[NUM_VALUES_PER_THREAD_FOR_SORT];
+            alignas(16) UIntValueT local_values[NUM_VALUES_PER_THREAD_FOR_SORT];
+            alignas(16) uint32_t local_indices[NUM_VALUES_PER_THREAD_FOR_SORT];
             uint32_t thread_offset = threadIdx.x * NUM_VALUES_PER_THREAD_FOR_SORT;
             ld_shared_with_loop<NUM_VALUES_PER_THREAD_FOR_SORT>(local_values, (UIntValueT*)smem_value_buf + threadIdx.x * NUM_VALUES_PER_THREAD_FOR_SORT);
             ld_shared_with_loop<NUM_VALUES_PER_THREAD_FOR_SORT>(local_indices, smem_index_buf + threadIdx.x * NUM_VALUES_PER_THREAD_FOR_SORT);
@@ -251,7 +260,7 @@ struct EpilogueRunner {
                 CUTE_UNROLL
                 for (uint32_t i = 0; i < NUM_VALUES_PER_THREAD_FOR_SORT; ++i)
                     local_values[i] = !IS_SHORTCUT || threadIdx.x * NUM_VALUES_PER_THREAD_FOR_SORT + i < end_vocab_idx ? un_distort(local_values[i]) : *(UIntValueT*)&oob_fill_value;
-                OutIdxT local_indices_new[NUM_VALUES_PER_THREAD_FOR_SORT];
+                alignas(16) OutIdxT local_indices_new[NUM_VALUES_PER_THREAD_FOR_SORT];
                 CUTE_UNROLL
                 for (uint32_t i = 0; i < NUM_VALUES_PER_THREAD_FOR_SORT; ++i)
                     local_indices_new[i] = (OutIdxT)((int32_t)local_indices[i] + output_idx_offset);
@@ -266,7 +275,7 @@ struct EpilogueRunner {
                         for (uint32_t i = 0; i < NUM_BYTES_TO_STORE; i += NUM_BYTES_PER_GMEM_STORE) {
                             uint32_t elem_offset = i / sizeof(T);
                             if (thread_offset + elem_offset < args.topk)
-                                STORE_TO_GMEM(dst+elem_offset, src+elem_offset);
+                                st_global<NUM_BYTES_PER_GMEM_STORE / sizeof(T)>(dst+elem_offset, src+elem_offset);
                         }
                     }
                 };
@@ -532,7 +541,7 @@ public:
         bool should_select_whole_bucket = false;
         // Each lane loads 8 counters
         static_assert(NUM_RECONSTRUCT_BUCKETS == 32 * 8);
-        uint32_t counts[8];
+        alignas(16) uint32_t counts[8];
         const uint32_t *bucket_ptr = bucket_counter + lane_idx * 8;
         ld_shared<4>(counts, bucket_ptr);
         ld_shared<4>(counts + 4, bucket_ptr + 4);
@@ -1239,25 +1248,25 @@ public:
                     }
                     __syncthreads();
                 }
-                nv_bfloat162 my_values[4 * NUM_128b_PER_THREAD_PER_ROUND];
+                alignas(16) nv_bfloat162 my_values[4 * NUM_128b_PER_THREAD_PER_ROUND];
                 uint32_t num_my_values = 0;
                 CUTE_UNROLL
                 for (uint32_t k = 0; k < NUM_128b_PER_THREAD_PER_ROUND; ++k) {
                     uint32_t pos = threadIdx.x + (i * NUM_128b_PER_THREAD_PER_ROUND + k) * NUM_THREADS;
                     if (pos < num_128b_in_init_window_padded) {
-                        ld_shared<4>(my_values + k * 4, reinterpret_cast<const nv_bfloat162*>(init_buf + Base::sw_b128(pos) * NUM_ELEMS_PER_128b));
+                        ld_shared<4>(my_values + k * 4, init_buf + Base::sw_b128(pos) * NUM_ELEMS_PER_128b);
                         num_my_values = 4 * (k + 1);
                     }
                 }
                 histogram_radix_msb<4 * NUM_128b_PER_THREAD_PER_ROUND, 4>(smem.reconstruct_bucket_counter[0], my_values, num_my_values);
             }
 
-            nv_bfloat162 init_values[NUM_UINT32_IN_INIT_WINDOW_PER_THREAD];
+            alignas(16) nv_bfloat162 init_values[NUM_UINT32_IN_INIT_WINDOW_PER_THREAD];
             CUTE_UNROLL
             for (uint32_t j = 0; j < NUM_128b_INIT_PER_THREAD; ++j) {
                 if (j * NUM_ELEMS_PER_128b == num_my_elems) break;
                 uint32_t u0 = my_elem_start_idx / NUM_ELEMS_PER_128b + j;
-                ld_shared<4>(init_values + j * NUM_UINT32_PER_128b, reinterpret_cast<const nv_bfloat162*>(init_buf + Base::sw_b128(u0) * NUM_ELEMS_PER_128b));
+                ld_shared<4>(init_values + j * NUM_UINT32_PER_128b, init_buf + Base::sw_b128(u0) * NUM_ELEMS_PER_128b);
             }
 
             __syncthreads();    // publish the round-1 histogram
@@ -1346,8 +1355,8 @@ public:
             CUTE_UNROLL
             for (uint32_t m = 0; m < NUM_UINT32_RECONSTRUCT_PER_THREAD; m++) {
                 if (m == num_my_units) break;
-                uint32_t pair2[4];
-                ld_shared<4>(pair2, (const uint32_t*)unit_to_pair_addr(unit_base + m));
+                alignas(16) uint32_t pair2[4];
+                ld_shared<4>(pair2, (const void*)unit_to_pair_addr(unit_base + m));
                 // One b128 unit = 2 pairs {index0, value0, index1, value1}; pick the low halves of the
                 // two value words (the bf16 payloads) and pack them into one bf16x2 word.
                 values[m] = u32_to_bf16x2(__byte_perm(pair2[1], pair2[3], 0x5410));
@@ -1407,10 +1416,13 @@ public:
             uint32_t hit_mask = 0;
             if (is_warp_active) {
                 smem.tma_load_full_bar[tma_buf_idx].wait(tma_buf_phase);
-                ValueT values[NUM_ELEMS_PER_THREAD_PER_ROUND];
+                alignas(16) ValueT values[NUM_ELEMS_PER_THREAD_PER_ROUND];
                 Base::template load_swizzled_slice<NUM_128b_PER_THREAD_PER_ROUND>(values, buf, smem_read_offset, chunk_swizzle_mask);
                 CUTE_UNROLL
                 for (int32_t j = NUM_ELEMS_PER_THREAD_PER_ROUND - 4; j >= 0; j -= 4) {
+                    uint32_t first_pair, second_pair;
+                    __builtin_memcpy(&first_pair, values + j, sizeof(first_pair));
+                    __builtin_memcpy(&second_pair, values + j + 2, sizeof(second_pair));
                     asm volatile (
                         "{\n"
                         ".reg .b32 r0, r1, ind, nib;\n"
@@ -1421,9 +1433,7 @@ public:
                         "mad.lo.u32 %0, %0, 16, nib;\n"
                         "}\n"
                         : "+r"(hit_mask)
-                        : "r"(*(const uint32_t*)(values + j)),
-                          "r"(*(const uint32_t*)(values + j + 2)),
-                          "r"(threshold_x2_bits)
+                        : "r"(first_pair), "r"(second_pair), "r"(threshold_x2_bits)
                     );
                 }
             }
