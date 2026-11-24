@@ -21,8 +21,8 @@ HOST = "http://127.0.0.1:9985"
 MODEL = "recipe-model"
 RESULTS = Path(os.environ.get("PPU_CI_ARTIFACT_DIR", "/artifacts")) / "results"
 MODEL_SANITY_READY_TIMEOUTS = {
-    # GLM's 141-shard cold load took 35 minutes before DeepGEMM warmup.
-    "zai-org/GLM-5.3": 4500,
+    # GLM's 141-shard cold load took 63 minutes on TP4 before CUDA graph capture and DeepGEMM warmup.
+    "zai-org/GLM-5.3": 6600,
     # GLM Flash loaded 27 of 62 shards in 39 minutes.
     "zai-org/GLM-5.3-Flash": 6600,
     # MiniMax MXFP4/FP8 loaded 26 of 59 shards in 39 minutes.

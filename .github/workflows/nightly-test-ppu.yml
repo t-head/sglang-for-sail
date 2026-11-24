@@ -324,6 +324,7 @@ jobs:
     timeout-minutes: ${{ inputs.tier == 'fast_sanity' && 40 || 360 }}
     strategy:
       fail-fast: false
+      max-parallel: ${{ inputs.tier == 'fast_sanity' && 32 || 4 }}
       matrix: ${{ fromJSON(needs.plan.outputs.models) }}
     env:
       MODEL_KEY: ${{ matrix.model }}
