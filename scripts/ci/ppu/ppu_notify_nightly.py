@@ -64,7 +64,10 @@ def collect(root):
     prefix = "release-v0523 / " if "/nightly-dispatch-ppu.yml@" in workflow else ""
     names = {f"{prefix}Model Sanity ({model})": model for model in models}
     jobs, elapsed = run_jobs(set(names))
-    if os.environ["NOTIFY_GATE_RESULT"] != "success":
+    if (
+        os.environ["NOTIFY_GATE_RESULT"] != "success"
+        or os.environ.get("NOTIFY_GATE_APPROVED") != "true"
+    ):
         results = [failure("approval", "approval")]
     elif os.environ["NOTIFY_PLAN_RESULT"] != "success":
         results = [failure("plan", "selection")]

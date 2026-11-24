@@ -394,11 +394,13 @@ jobs:
     if: >-
       always() && !cancelled() && github.repository == 't-head/sglang-for-sail' &&
       (inputs.tier || 'model_sanity') == 'model_sanity' &&
-      (((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
-        startsWith(github.workflow_ref, 't-head/sglang-for-sail/.github/workflows/nightly-dispatch-ppu.yml@refs/heads/')) ||
-       (github.event_name == 'workflow_dispatch' &&
-        startsWith(github.workflow_ref, 't-head/sglang-for-sail/.github/workflows/nightly-test-ppu.yml@refs/heads/') &&
-        contains(fromJSON('["release/v0.5.23"]'), github.ref_name)))
+      ((github.event_name == 'schedule' && startsWith(github.workflow_ref, 't-head/sglang-for-sail/.github/workflows/nightly-dispatch-ppu.yml@refs/heads/')) ||
+       (github.event_name == 'workflow_dispatch' && inputs.model_filter == '' &&
+        needs.pr-gate.result == 'success' && needs.pr-gate.outputs.approved == 'true' &&
+        needs.plan.result == 'success' &&
+        (startsWith(github.workflow_ref, 't-head/sglang-for-sail/.github/workflows/nightly-dispatch-ppu.yml@refs/heads/') ||
+         (startsWith(github.workflow_ref, 't-head/sglang-for-sail/.github/workflows/nightly-test-ppu.yml@refs/heads/') &&
+          contains(fromJSON('["release/v0.5.23"]'), github.ref_name)))))
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     continue-on-error: true
@@ -437,6 +439,7 @@ jobs:
           NOTIFY_VERSION: 'v0.5.23'
           NOTIFY_REF: ${{ inputs.target_ref || inputs.ref || github.ref_name }}
           NOTIFY_GATE_RESULT: ${{ needs.pr-gate.result }}
+          NOTIFY_GATE_APPROVED: ${{ needs.pr-gate.outputs.approved }}
           NOTIFY_PLAN_RESULT: ${{ needs.plan.result }}
           NOTIFY_BUILD_RESULT: ${{ needs.ppu-build.result }}
           NOTIFY_EVAL_RESULT: ${{ needs.evalscope-wheels.result }}
