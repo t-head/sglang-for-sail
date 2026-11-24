@@ -85,13 +85,28 @@ def recent_failures(root, current_run):
                 for filename in ("launcher.log", "runtime.log", "pod-status.json"):
                     path = directory / filename
                     try:
-                        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+                        pre_info = path.lstat()
                     except OSError:
                         continue
-                    with os.fdopen(fd, "rb") as stream:
-                        info = os.fstat(stream.fileno())
+                    if not stat.S_ISREG(pre_info.st_mode):
+                        continue
+                    try:
+                        fd = os.open(
+                            path,
+                            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+                        )
+                    except OSError:
+                        continue
+                    try:
+                        info = os.fstat(fd)
                         if not stat.S_ISREG(info.st_mode):
+                            os.close(fd)
                             continue
+                        stream = os.fdopen(fd, "rb")
+                    except OSError:
+                        os.close(fd)
+                        continue
+                    with stream:
                         stream.seek(max(0, info.st_size - 262144))
                         code.extend(
                             diagnostic_codes(
