@@ -70,6 +70,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.disaggregation.utils import (
     dsa_cp_prefix_cache_enabled,
+    require_dsa_cp_hicache_layout,
     should_bypass_dsa_cp_prefix_cache,
     supports_dsa_cp_prefix_cache,
 )
@@ -423,6 +424,15 @@ def build_kv_cache(
         # index_kpool) == 0 enforced in base_prefix_cache.
         require_dsa_cp_page_size(
             page_size, int(get_dsa_index_kpool(model_config.hf_config))
+        )
+        require_dsa_cp_hicache_layout(
+            cache_layer_split=get_parallel().enable_dsa_cache_layer_split,
+            hicache_layout=(
+                get_memory().hicache_mem_layout if enable_hierarchical_cache else None
+            ),
+            hicache_io_backend=(
+                get_memory().hicache_io_backend if enable_hierarchical_cache else None
+            ),
         )
         # Printed once per worker process (this builder runs once at startup), so
         # it is the low-frequency feature-hit marker for the switch.

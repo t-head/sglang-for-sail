@@ -194,6 +194,37 @@ def supports_dsa_cp_prefix_cache() -> bool:
     )
 
 
+def require_dsa_cp_hicache_layout(
+    *,
+    cache_layer_split: bool,
+    hicache_layout: Optional[str],
+    hicache_io_backend: Optional[str],
+) -> None:
+    """Reject a DSA prefill-CP prefix-cache deployment whose HiCache layout the
+    layer-split pools cannot serve.
+
+    With ``--enable-dsa-cache-layer-split`` a layer's KV lives on one owner rank
+    and is read by the others through the broadcast scratch buffer. The host
+    (L2/L3) side must therefore index rows per layer: a page-oriented layout or
+    the direct I/O backend would address host rows by page, which does not line
+    up with per-layer ownership. This mirrors the constraint established on the
+    0.5.21 line (GLM-5.3 checkpoint under test) instead of failing later inside
+    the indexer.
+
+    Only checked when the experimental opt-in is active, so a deployment that
+    keeps bypassing the radix cache is unaffected.
+    """
+    if not cache_layer_split or hicache_layout is None:
+        return
+    if hicache_layout != "layer_first" or hicache_io_backend != "kernel":
+        raise ValueError(
+            "SGLANG_DSA_CP_PREFIX_CACHE=1 with --enable-dsa-cache-layer-split "
+            "requires HiCache layer_first layout and kernel I/O; got "
+            f"hicache_mem_layout={hicache_layout!r}, "
+            f"hicache_io_backend={hicache_io_backend!r}."
+        )
+
+
 def should_bypass_dsa_cp_prefix_cache(*, is_dsa: bool = True) -> bool:
     """Whether PD DSA prefill CP must bypass the legacy radix cache."""
     if not is_dsa:
