@@ -46,10 +46,72 @@ OPTIONAL_FILES = (
 )
 
 
+RETENTION_SUBPATH = ("sglang", "logs", "sglang-for-sail")
+
+
 def _check_dir_mode(directory: Path, *allowed_modes: int) -> None:
     mode = directory.lstat().st_mode
     if not stat.S_ISDIR(mode) or stat.S_IMODE(mode) not in allowed_modes:
         raise ValueError("unexpected retention directory type or mode")
+
+
+def validate_retention_root(raw_root: str, environ) -> Path:
+    if not raw_root or any(ord(char) < 32 for char in raw_root):
+        raise ValueError("expected an absolute retention root")
+    root = Path(raw_root)
+    if not root.is_absolute() or ".." in root.parts:
+        raise ValueError("expected an absolute retention root")
+    _check_dir_mode(root, 0o700, 0o755)
+    root = root.resolve(strict=True)
+    archive_base = root.joinpath(*RETENTION_SUBPATH)
+    for key in ("RUNNER_TEMP", "GITHUB_WORKSPACE"):
+        raw_ephemeral = environ.get(key)
+        if not raw_ephemeral:
+            raise ValueError("missing runner workspace path")
+        ephemeral = Path(raw_ephemeral).resolve()
+        if (
+            ephemeral == root
+            or ephemeral in root.parents
+            or ephemeral == archive_base
+            or ephemeral in archive_base.parents
+            or archive_base in ephemeral.parents
+        ):
+            raise ValueError("retention root must not be job-local")
+    return root
+
+
+def ensure_retention_base(root: Path) -> Path:
+    parent = root
+    for component in RETENTION_SUBPATH:
+        parent /= component
+        try:
+            _check_dir_mode(parent, 0o700, 0o755)
+        except FileNotFoundError:
+            parent.mkdir(mode=0o700, exist_ok=True)
+            _check_dir_mode(parent, 0o700, 0o755)
+    return parent
+
+
+def probe_retention_writable(base_dir: Path) -> None:
+    fd, probe_name = tempfile.mkstemp(prefix=".probe-", dir=base_dir)
+    probe_path = Path(probe_name)
+    closed = False
+    try:
+        os.fchmod(fd, 0o600)
+        if os.write(fd, b"ok\n") != 3:
+            raise OSError("short retention probe write")
+        os.close(fd)
+        closed = True
+    finally:
+        if not closed:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            probe_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def retain(environ) -> None:
@@ -68,19 +130,9 @@ def retain(environ) -> None:
     ):
         raise ValueError("invalid retention metadata")
 
-    root = Path(environ["PPU_CI_PRIVATE_RESULTS_ROOT"])
-    if not root.is_absolute():
-        raise ValueError("expected an absolute retention root")
-    _check_dir_mode(root, 0o700, 0o755)
-    root = root.resolve(strict=True)
-    for key in ("RUNNER_TEMP", "GITHUB_WORKSPACE"):
-        ephemeral = Path(environ[key]).resolve()
-        if ephemeral == root or ephemeral in root.parents:
-            raise ValueError("retention root must not be job-local")
-
-    parent = root
+    root = validate_retention_root(environ["PPU_CI_PRIVATE_RESULTS_ROOT"], environ)
+    parent = ensure_retention_base(root)
     for component in (
-        "sglang-for-sail",
         f"{index['run_id']}-{index['attempt']}",
         index["tier"],
     ):

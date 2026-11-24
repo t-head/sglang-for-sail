@@ -66,8 +66,8 @@ The runner uses the pinned T-Head Cluster Run backend. Each Recipe job requests 
 | `PPU_CI_GSM8K_PATH` | Offline EvalScope GSM8K dataset directory |
 | `PPU_CI_JIT_ROOT` | Node-local persistent JIT cache root |
 | `PPU_CI_K8S_STAGE_ROOT` | Cluster Run's shared source staging directory in the CPU runner view |
-| `PPU_CI_PRIVATE_RESULTS_ROOT` | Private shared results directory in the CPU runner view |
-| `PPU_CI_K8S_PRIVATE_WORKER_ROOT` | The same results directory in the worker view |
+| `PPU_CI_PRIVATE_RESULTS_ROOT` | Private results archive root in the CPU runner view; Recipe runs are archived under `sglang/logs/sglang-for-sail/<run_id>-<attempt>/<tier>/<model_key>` |
+| `PPU_CI_K8S_PRIVATE_WORKER_ROOT` | Worker view of the task-scoped private scratch directory (`PPU_CI_K8S_HOST_SCRATCH_ROOT`) |
 | `PPU_CI_K8S_RUNTIME_DIGEST` | Optional manifest reference for the designated release runtime tag |
 | `PPU_CI_RUNTIME_IMAGE` | Existing single-device test image |
 | `PPU_CI_TARGET_MODEL_PATH`, `PPU_CI_EAGLE3_MODEL_PATH`, `PPU_CI_DFLASH_MODEL_PATH`, `PPU_CI_EVAL_CACHE` | Existing single-device assets in the worker view |

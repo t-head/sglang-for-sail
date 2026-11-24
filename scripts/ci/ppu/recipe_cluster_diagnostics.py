@@ -2,9 +2,12 @@
 """Report fixed diagnostic codes from the task's retained private evidence."""
 
 import json
+import os
 import re
+import stat
 
 from recipe_publish import MODEL_POLICY_ROOT
+from recipe_retention import RETENTION_SUBPATH
 
 RULES = {
     "image_pull": r"ErrImagePull|ImagePullBackOff|failed to pull image|manifest unknown",
@@ -44,17 +47,54 @@ def diagnostic_codes(text):
     return [name for name, pattern in RULES.items() if re.search(pattern, text, re.I)]
 
 
-def recent_failures(root, current_run):
-    parent = root / "sglang-for-sail"
-    if not parent.is_dir():
-        return []
+def _safe_subdir(root, parts):
+    current = root
+    for part in parts:
+        current = current / part
+        try:
+            if current.is_symlink() or not current.is_dir():
+                return None
+        except OSError:
+            return None
+    return current
+
+
+def recent_failures(root, current_run, fallback_root=None):
+    roots = [root]
+    if fallback_root is not None and fallback_root != root:
+        roots.append(fallback_root)
     previous = []
-    for run in parent.iterdir():
-        if not re.fullmatch(r"[0-9]+-[0-9]+", run.name):
+    for candidate_root in roots:
+        try:
+            if candidate_root.is_symlink() or not candidate_root.is_dir():
+                continue
+        except OSError:
             continue
-        run_id, attempt = map(int, run.name.split("-"))
-        if run_id != current_run:
-            previous.append((run_id, attempt, run))
+        for parts in (RETENTION_SUBPATH, ("sglang-for-sail",)):
+            parent = _safe_subdir(candidate_root, parts)
+            if parent is None:
+                continue
+            try:
+                runs = list(parent.iterdir())
+            except OSError:
+                continue
+            for run in runs:
+                try:
+                    if run.is_symlink() or not run.is_dir():
+                        continue
+                except OSError:
+                    continue
+                if not re.fullmatch(r"[0-9]+-[0-9]+", run.name):
+                    continue
+                run_id, attempt = map(int, run.name.split("-"))
+                if run_id != current_run:
+                    previous.append((run_id, attempt, run))
+            if previous:
+                break
+        if previous:
+            break
+    if not previous:
+        return []
     models = sorted(
         policy.stem
         for policy in MODEL_POLICY_ROOT.glob("*.yaml")
@@ -64,8 +104,15 @@ def recent_failures(root, current_run):
         records = []
         for tier in ("fast_sanity", "model_sanity"):
             for model in models:
-                directory = run / tier / model
-                if not (directory / "index.json").is_file():
+                directory = _safe_subdir(run, (tier, model))
+                if directory is None:
+                    continue
+                index_path = directory / "index.json"
+                try:
+                    index_info = index_path.lstat()
+                except OSError:
+                    continue
+                if not stat.S_ISREG(index_info.st_mode):
                     continue
                 code = []
                 for filename in (
@@ -82,14 +129,35 @@ def recent_failures(root, current_run):
                     "evalscope.log",
                 ):
                     path = directory / filename
-                    if path.is_file() and not path.is_symlink():
-                        with path.open("rb") as stream:
-                            stream.seek(max(0, path.stat().st_size - 262144))
-                            code.extend(
-                                diagnostic_codes(
-                                    stream.read(262144).decode(errors="replace")
-                                )
+                    try:
+                        pre_info = path.lstat()
+                    except OSError:
+                        continue
+                    if not stat.S_ISREG(pre_info.st_mode):
+                        continue
+                    try:
+                        fd = os.open(
+                            path,
+                            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+                        )
+                    except OSError:
+                        continue
+                    try:
+                        info = os.fstat(fd)
+                        if not stat.S_ISREG(info.st_mode):
+                            os.close(fd)
+                            continue
+                        stream = os.fdopen(fd, "rb")
+                    except OSError:
+                        os.close(fd)
+                        continue
+                    with stream:
+                        stream.seek(max(0, info.st_size - 262144))
+                        code.extend(
+                            diagnostic_codes(
+                                stream.read(262144).decode(errors="replace")
                             )
+                        )
                 if code:
                     records.append(
                         {
@@ -104,7 +172,7 @@ def recent_failures(root, current_run):
     return []
 
 
-def publish_recent_failures(root, current_run):
-    records = recent_failures(root, current_run)
+def publish_recent_failures(root, current_run, fallback_root=None):
+    records = recent_failures(root, current_run, fallback_root=fallback_root)
     if records:
         print(json.dumps({"prior_cluster_diagnostics": records}, sort_keys=True))
