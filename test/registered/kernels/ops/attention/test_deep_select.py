@@ -20,6 +20,7 @@ from sglang.kernels.ops.attention.deep_select import (
     topk,
     topk_page_transform,
 )
+from sglang.kernels.ops.elementwise.deep_select_topk import deep_select_topk
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=150, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -124,6 +125,24 @@ def test_variable_row_end():
         return_value=True,
     )
     _check_topk(input, k, indices, end=end, values=values, idx_fill=-1, value_fill=-5.0)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="Step 5 DeepSelect requires CUDA SM10x",
+)
+def test_step5_fp32_shortcut_and_streaming():
+    k, width = 512, 32768
+    scores = _make_input(5, width, torch.float32)
+    ends = torch.tensor([0, k - 1, k, k + 1, width], dtype=torch.int32, device="cuda")
+    indices = torch.empty((len(ends), k), dtype=torch.int32, device="cuda")
+    deep_select_topk(scores, ends, indices)
+    _check_topk(scores, k, indices, end=ends, idx_fill=-1)
+
+    # A sliced view can have aligned row strides and an unaligned base address.
+    backing = torch.empty((len(ends), k + 8), dtype=torch.int32, device="cuda")
+    with pytest.raises(RuntimeError, match="Tensor data pointer is not aligned"):
+        deep_select_topk(scores, ends, backing[:, 1 : k + 1])
 
 
 def test_caller_output_and_index_offset():

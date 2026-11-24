@@ -262,8 +262,8 @@ public:
                 CUTE_UNROLL
                 for (uint32_t i = 0; i < NUM_128b_PER_THREAD; i++) {
                     if (i == num_my_128b) break;
-                    uint32_t pair2[4];
-                    topk_select_common::ld_shared<4>(pair2, (const uint32_t*)b128_to_pair_addr(b128_base + i));
+                    alignas(16) uint32_t pair2[4];
+                    topk_select_common::ld_shared<4>(pair2, (const void*)b128_to_pair_addr(b128_base + i));
                     fn(pair2[1]);
                     fn(pair2[3]);
                 }
@@ -284,8 +284,8 @@ public:
                 CUTE_UNROLL
                 for (uint32_t i = 0; i < NUM_128b_PER_THREAD; i++) {
                     if (i == num_my_128b) break;
-                    uint32_t pair2[4];
-                    topk_select_common::ld_shared<4>(pair2, (const uint32_t*)b128_to_pair_addr(b128_base + i));
+                    alignas(16) uint32_t pair2[4];
+                    topk_select_common::ld_shared<4>(pair2, (const void*)b128_to_pair_addr(b128_base + i));
                     float v0 = __uint_as_float(pair2[1]);
                     float v1 = __uint_as_float(pair2[3]);
                     bool t0 = v0 == pivot_value && eq_quota != 0;
@@ -353,25 +353,25 @@ public:
                     }
                     __syncthreads();
                 }
-                uint32_t my_values[4 * NUM_128b_PER_THREAD_PER_ROUND];
+                alignas(16) uint32_t my_values[4 * NUM_128b_PER_THREAD_PER_ROUND];
                 uint32_t num_my_values = 0;
                 CUTE_UNROLL
                 for (uint32_t k = 0; k < NUM_128b_PER_THREAD_PER_ROUND; ++k) {
                     uint32_t u = threadIdx.x + (i * NUM_128b_PER_THREAD_PER_ROUND + k) * NUM_THREADS;
                     if (u < num_128b_in_init_window_padded) {
-                        topk_select_common::ld_shared<4>(my_values + k * 4, (const uint32_t*)(init_buf + Base::sw_b128(u) * NUM_ELEMS_PER_128b));
+                        topk_select_common::ld_shared<4>(my_values + k * 4, init_buf + Base::sw_b128(u) * NUM_ELEMS_PER_128b);
                         num_my_values = 4 * (k + 1);
                     }
                 }
                 histogram_radix_msb(my_values, num_my_values);
             }
 
-            uint32_t init_values[NUM_UINT32_IN_INIT_WINDOW_PER_THREAD];
+            alignas(16) uint32_t init_values[NUM_UINT32_IN_INIT_WINDOW_PER_THREAD];
             CUTE_UNROLL
             for (uint32_t j = 0; j < NUM_128b_INIT_PER_THREAD; ++j) {
                 if (j * NUM_UINT32_PER_128b == num_my_elems) break;
                 uint32_t u0 = my_elem_start_idx / NUM_ELEMS_PER_128b + j;
-                topk_select_common::ld_shared<4>(init_values + j * NUM_UINT32_PER_128b, (const uint32_t*)(init_buf + Base::sw_b128(u0) * NUM_ELEMS_PER_128b));
+                topk_select_common::ld_shared<4>(init_values + j * NUM_UINT32_PER_128b, init_buf + Base::sw_b128(u0) * NUM_ELEMS_PER_128b);
             }
 
             __syncthreads();    // publish the round-1 histogram; also the last read of init_buf
@@ -469,7 +469,7 @@ public:
             uint32_t hit_mask = 0;
             if (is_warp_active) {
                 smem.tma_load_full_bar[tma_buf_idx].wait(tma_buf_phase);
-                ValueT values[NUM_ELEMS_PER_THREAD_PER_ROUND];
+                alignas(16) ValueT values[NUM_ELEMS_PER_THREAD_PER_ROUND];
                 Base::template load_swizzled_slice<NUM_128b_PER_THREAD_PER_ROUND>(values, buf, smem_read_offset, chunk_swizzle_mask);
 
                 float threshold = __uint_as_float(threshold_bits);
