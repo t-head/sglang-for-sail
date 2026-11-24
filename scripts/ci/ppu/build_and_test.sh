@@ -172,6 +172,6 @@ if [[ "$phase" == legacy ]]; then
 else
     python3 "$repo/test/run_suite.py" --hw ppu --suite extra-test-1-gpu-ppu --timeout-per-file 1200 \
         2>&1 | tee "$artifacts/sanity.log"
-    # Require all five model sanity files and all six kernel regressions.
-    grep -Fxq 'Test Summary: 11/11 passed' "$artifacts/sanity.log"
+    # Require all registered model and kernel regression files.
+    grep -Fxq 'Test Summary: 13/13 passed' "$artifacts/sanity.log"
 fi
