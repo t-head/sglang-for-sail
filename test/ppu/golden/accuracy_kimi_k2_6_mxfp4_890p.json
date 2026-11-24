@@ -1,0 +1,35 @@
+{
+  "schema_version": 2,
+  "model": "kimi_k2_6_mxfp4",
+  "chip": "890p",
+  "checkpoint": "T-HEAD/Kimi-K2.6-MXFP4-FP8",
+  "checkpoint_tail": "T-HEAD/Kimi-K2.6-MXFP4-FP8",
+  "benchmark": "gsm8k",
+  "evalscope_version": "",
+  "dataset": {
+    "dataset_id": "gsm8k@2026-11",
+    "few_shot_num": 4,
+    "few_shot_random": false,
+    "subset_list": ["main"],
+    "num_expected": 1319
+  },
+  "serving": {
+    "ppu_count": 8,
+    "tensor_parallel_size": 8,
+    "data_parallel_size": 1,
+    "enable_expert_parallel": false,
+    "gpu_memory_utilization": null,
+    "max_model_len": null,
+    "seed": null
+  },
+  "generation": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "max_tokens": 10240
+  },
+  "score": 0.9788,
+  "score_num": 1291,
+  "tolerance": {"mode": "band", "abs": 0.02},
+  "measured_at": null,
+  "baseline_origin": "vLLM SAIL TP8 v0.23.0; committed reference at 933d833bc5918e340e0ed19206d0a78f908df593; migration tracked in vLLM SAIL #308"
+}

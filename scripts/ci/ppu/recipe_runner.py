@@ -20,6 +20,19 @@ from ppu_recipe import REPO_ROOT, _load_yaml, resolve_recipe
 HOST = "http://127.0.0.1:9985"
 MODEL = "recipe-model"
 RESULTS = Path(os.environ.get("PPU_CI_ARTIFACT_DIR", "/artifacts")) / "results"
+MODEL_SANITY_READY_TIMEOUTS = {
+    # GLM's 141-shard cold load took 35 minutes before DeepGEMM warmup.
+    "zai-org/GLM-5.3": 4500,
+    # GLM Flash loaded 27 of 62 shards in 39 minutes.
+    "zai-org/GLM-5.3-Flash": 6600,
+    # MiniMax MXFP4/FP8 loaded 26 of 59 shards in 39 minutes.
+    "MiniMaxAI/MiniMax-M3": 6600,
+    # Both real-weight TP8 jobs were still loading MoE weights at 2400 seconds.
+    "deepseek-ai/DeepSeek-V4-Pro": 6000,
+    "moonshotai/Kimi-K2.6": 6000,
+    # The first Qwen TP4 run loaded 93 of 131 shards in 39 minutes.
+    "Qwen/Qwen3.8-Flash-Next": 5100,
+}
 
 
 def phase(name):
@@ -85,18 +98,22 @@ def probes(cfg, *, fast):
         "seed": cfg.get("seed", 42),
         "max_tokens": cfg["max_tokens"],
     }
-    if not fast:
+    if fast:
+        payload.update(
+            (key, cfg[key]) for key in ("temperature", "top_p", "top_k") if key in cfg
+        )
+    else:
         payload["thinking"] = {"type": "disabled"}
     with request(
         "/v1/chat/completions", json.dumps(payload).encode(), timeout=90
     ) as response:
         answer = json.load(response)["choices"][0]
-    if not fast:
-        (RESULTS / "chat-probe-response.json").write_text(json.dumps(answer) + "\n")
-    content = answer["message"].get("content")
+    (RESULTS / "chat-probe-response.json").write_text(json.dumps(answer) + "\n")
+    message = answer["message"]
+    content = message.get("content")
+    text_fields = (content, message.get("reasoning_content")) if fast else (content,)
     if (
-        not isinstance(content, str)
-        or not content.strip()
+        not any(isinstance(field, str) and field.strip() for field in text_fields)
         or not answer["finish_reason"]
     ):
         raise ValueError("incomplete non-streaming response")
@@ -373,17 +390,42 @@ def run_evaluation(stage, config):
 def cached_model_path(repo_id, revision):
     from huggingface_hub import snapshot_download
 
+    cache = Path(os.environ["HF_HUB_CACHE"])
+    if revision is None:
+        from huggingface_hub.file_download import repo_folder_name
+        from huggingface_hub.utils import validate_repo_id
+
+        validate_repo_id(repo_id)
+        repo_dir = cache / repo_folder_name(repo_id=repo_id, repo_type="model")
+        revision = (repo_dir / "refs/main").read_text().strip()
     if not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise ValueError("expected a pinned model snapshot")
-    cache = Path(os.environ["HF_HUB_CACHE"])
     snapshot = Path(
         snapshot_download(
-            repo_id=repo_id, revision=revision, cache_dir=cache, local_files_only=True
+            repo_id=repo_id,
+            revision=revision,
+            cache_dir=cache,
+            local_files_only=True,
         )
     )
-    for name in ("config.json", "tokenizer.json"):
-        if not (snapshot / name).is_file():
-            raise ValueError("offline model snapshot lacks metadata")
+    if snapshot.name != revision:
+        raise ValueError("expected a pinned model snapshot")
+    config_path = snapshot / "config.json"
+    if not config_path.is_file():
+        raise ValueError("offline model snapshot lacks config metadata")
+    if not (snapshot / "tokenizer.json").is_file():
+        config = json.loads(config_path.read_text())
+        kimi_tokenizer_files = (
+            "tokenizer_config.json",
+            "tiktoken.model",
+            "tokenization_kimi.py",
+            "tool_declaration_ts.py",
+        )
+        if config.get("model_type") != "kimi_k25" or any(
+            not (snapshot / name).is_file() or (snapshot / name).stat().st_size == 0
+            for name in kimi_tokenizer_files
+        ):
+            raise ValueError("offline model snapshot lacks tokenizer metadata")
     index = json.loads((snapshot / "model.safetensors.index.json").read_text())
     shards = set(index["weight_map"].values())
     if not shards or any(
@@ -394,7 +436,7 @@ def cached_model_path(repo_id, revision):
         for name in shards
     ):
         raise ValueError("offline model snapshot has missing shards")
-    return str(snapshot.resolve(strict=True))
+    return str(snapshot.resolve(strict=True)), revision
 
 
 def run(policy_path, tier, queue_s):
@@ -403,11 +445,14 @@ def run(policy_path, tier, queue_s):
     assets = RESULTS.parent / "assets.json"
     recipe_ppu = _load_yaml(recipe)["ppu"]
     revision = os.environ.get("PPU_CI_HF_MODEL_REVISION")
-    if revision is None:
+    uses_cache_ref = revision is None and "PPU_CI_HF_CACHE_ROOT" in os.environ
+    if revision is None and not uses_cache_ref:
         model_path = os.environ["PPU_RECIPE_CONTAINER_MODEL"]
     else:
         phase("model_cache_check")
-        model_path = cached_model_path(recipe_ppu["hf_model_id"], revision)
+        model_path, snapshot_revision = cached_model_path(
+            recipe_ppu["hf_model_id"], revision
+        )
     assets.write_text(
         json.dumps({name: model_path for name in recipe_ppu["assets"].values()})
     )
@@ -418,8 +463,14 @@ def run(policy_path, tier, queue_s):
         assets_map_path=assets,
         served_model_name=MODEL,
     )
+    if uses_cache_ref:
+        resolve["cache_revision"] = snapshot_revision
     config = resolve_recipe(recipe, **resolve)
-    if config["ppu_count"] != 8 or policy["model_id"] != config["model_id"]:
+    expected_width = int(os.environ.get("RECIPE_PPU_COUNT", "8"))
+    if (
+        config["ppu_count"] != expected_width
+        or policy["model_id"] != config["model_id"]
+    ):
         raise ValueError("incorrect recipe identity or device width")
     result = {
         "queue_s": queue_s,
@@ -431,8 +482,10 @@ def run(policy_path, tier, queue_s):
         cold_total = 0
         start = time.monotonic()
         has_layer_override = config["layer_override"] is not None
-        # A cold GLM run was still capturing prefill graphs at 1,000 seconds.
-        full_ready_timeout = 1350 if policy["model_id"] == "zai-org/GLM-5.3" else 1000
+        full_ready_timeout = 1000
+        if policy["model_id"] in {"zai-org/GLM-5.3", "Qwen/Qwen3.8-Flash-Next"}:
+            # Cold graph capture and the first kernel compilation need extra time.
+            full_ready_timeout = 1350
         try:
             with server(
                 config,
@@ -457,8 +510,7 @@ def run(policy_path, tier, queue_s):
         )
     else:
         stages = {stage["kind"]: stage for stage in policy["tiers"][tier]["stages"]}
-        # GLM's 141-shard cold load took 35 minutes before DeepGEMM warmup.
-        ready_timeout = 4500 if policy["model_id"] == "zai-org/GLM-5.3" else 2400
+        ready_timeout = MODEL_SANITY_READY_TIMEOUTS.get(policy["model_id"], 2400)
         with server(config, "model_sanity", result, ready_timeout):
             probes(stages["sanity"]["probe"], fast=False)
             result["sse_verified"] = True

@@ -2,7 +2,7 @@
 
 The release branch owns the SGLang serving recipes, test policies and 890P accuracy references in `test/ppu`. Native SAIL wheels and their Recipe bundle carry the same source revision. The runner verifies the wheel inventory, archive and recipe tree before installation and records the release runtime's manifest digest.
 
-- **Fast Sanity** runs every model with a `fast_sanity` policy. The current models start directly with full-layer dummy weights. Both non-streaming and streaming probes must complete.
+- **Fast Sanity** runs every model with a `fast_sanity` policy. The current models start directly with full-layer dummy weights. The model policy controls prefix caching. Both non-streaming and streaming probes must complete.
 - **Model Sanity** runs real weights once per model. It runs GSM8K main (1,319 questions), reconciles each scored sample with the reference band, verifies the KV gauge after a cache flush, and runs the native microbench at concurrency 1 and 16. The same-server performance measurements are diagnostic.
 - **Legacy single-device sanity** runs EAGLE3 and DFlash on both board types when explicitly requested. Each test reports its original result and the runner retains the raw output privately.
 
@@ -23,7 +23,7 @@ Cluster jobs use the T-Head CPU orchestration runner label `k8s-runner-group-cpu
 
 For pre-merge validation, dispatch `pr-test-ppu.yml` on a same-repository maintainer branch with `preflight_only=true`. This runs the Linux selftests and the private configuration checks via the direct and reusable workflows. A cross-branch caller can request `tier: cluster_preflight` from the same reusable workflow.
 
-The runner uses the pinned T-Head Cluster Run backend. The scheduler assigns one eight-card 890P Pod for each Recipe job. Each existing single-device test job requests one card on its selected board. The CPU runner passes model and dataset paths privately to the worker from its service environment. A task-specific shared configuration can supply the same variables. The workflow pins the configuration digest and verifies access in a CPU-only job before scheduling PPU Pods. Provision the task configuration and output directory for the runner account before starting jobs. Keep the configuration files at mode 0600 and the private directories at mode 0700.
+The runner uses the pinned T-Head Cluster Run backend. Each Recipe job requests one 890P Pod with the width resolved from its selected policy and Recipe (2, 4, or 8 cards). The worker verifies that its visible card count and resolved Recipe match this allocation. Each existing single-device test job requests one card on its selected board. The CPU runner passes model and dataset paths privately to the worker from its service environment. A task-specific shared configuration can supply the same variables. The workflow pins the configuration digest and verifies access in a CPU-only job before scheduling PPU Pods. Provision the task configuration and output directory for the runner account before starting jobs. Keep the configuration files at mode 0600 and the private directories at mode 0700.
 
 | Setting | Purpose |
 | --- | --- |
@@ -39,7 +39,7 @@ The runner uses the pinned T-Head Cluster Run backend. The scheduler assigns one
 | `PPU_CI_RUNTIME_IMAGE` | Existing single-device test image |
 | `PPU_CI_TARGET_MODEL_PATH`, `PPU_CI_EAGLE3_MODEL_PATH`, `PPU_CI_DFLASH_MODEL_PATH`, `PPU_CI_EVAL_CACHE` | Existing single-device assets in the worker view |
 
-The worker keeps `HF_HOME` job-local and points `HF_HUB_CACHE` and `HUGGINGFACE_HUB_CACHE` at the shared cache. The Recipe's `hf_model_id` and pinned revision resolve the checkpoint offline before server launch. The Pod must see the cache and the targets of its snapshot links.
+The worker keeps `HF_HOME` job-local and points `HF_HUB_CACHE` and `HUGGINGFACE_HUB_CACHE` at the shared cache. The Recipe's `hf_model_id` resolves the checkpoint offline before server launch. Models without an explicit runner pin use the cache's local `refs/main`; the worker resolves it once to a concrete snapshot and includes that revision in the configuration digest. The Pod must see the cache and the targets of its snapshot links. Besides standard `tokenizer.json` snapshots, `kimi_k25` checkpoints can use their complete TikToken files.
 
 Use a runner configured for reviewed public PR revisions with public-safe runner labels, name and workspace metadata. Kubernetes device requests arbitrate card ownership. The CPU runner and worker must share access to the private per-job directory with mode 0700. The launcher captures Cluster Run diagnostics before exposing scheduler and worker results to GitHub. The evidence gate checks the runtime digest reported by Kubernetes and publishes a typed result. JIT caches for a pinned image can be reused across runs.
 

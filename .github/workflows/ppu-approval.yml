@@ -11,6 +11,8 @@ on:
     outputs:
       approved:
         value: ${{ jobs.approval.outputs.approved }}
+      sha:
+        value: ${{ jobs.approval.outputs.sha }}
 permissions:
   contents: read
   pull-requests: read
@@ -19,6 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       approved: ${{ steps.policy.outputs.result }}
+      sha: ${{ steps.policy.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -31,7 +34,16 @@ jobs:
         env:
           WORKLOAD_LABEL: ${{ inputs.label }}
           CANDIDATE_REF: ${{ inputs.ref }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
         with:
           script: |
             const approved = require('./scripts/ci/ppu/ppu_approval.cjs');
-            return approved({github, context, label: process.env.WORKLOAD_LABEL, ref: process.env.CANDIDATE_REF});
+            const res = await approved.resolve({
+              github,
+              context,
+              label: process.env.WORKLOAD_LABEL,
+              ref: process.env.CANDIDATE_REF,
+              workflowSha: process.env.WORKFLOW_SHA,
+            });
+            core.setOutput('sha', res.sha);
+            return res.approved;

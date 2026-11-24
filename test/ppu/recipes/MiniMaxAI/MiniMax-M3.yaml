@@ -1,0 +1,26 @@
+schema_version: ppu-serving/v1
+ppu:
+  framework: sglang
+  visibility: public
+  assets: {model: minimax-m3-mxfp4-fp8, tokenizer: minimax-m3-mxfp4-fp8}
+  hf_model_id: T-HEAD/MiniMax-M3-MXFP4-FP8
+  golden_model_key: minimax_m3_mxfp4_fp8
+  topology: {kind: single_node, nodes: 1, devices_per_node: 8}
+model:
+  model_id: MiniMaxAI/MiniMax-M3
+  base_args:
+    - --tp-size
+    - "8"
+    - --trust-remote-code
+    - --mem-fraction-static
+    - "0.9"
+    - --attention-backend
+    - fa3
+    - --page-size
+    - "128"
+    - --kv-cache-dtype
+    - fp8_e4m3
+    - --moe-runner-backend
+    - deep_gemm
+variants:
+  default: {precision: mxfp4}

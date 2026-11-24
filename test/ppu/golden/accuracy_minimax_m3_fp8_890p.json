@@ -1,0 +1,35 @@
+{
+  "schema_version": 2,
+  "model": "minimax_m3_fp8",
+  "chip": "890p",
+  "checkpoint": "T-HEAD/MiniMax-M3-Quant-W-FP8-PerChannel-A-FP8-PerToken",
+  "checkpoint_tail": "T-HEAD/MiniMax-M3-Quant-W-FP8-PerChannel-A-FP8-PerToken",
+  "benchmark": "gsm8k",
+  "evalscope_version": "",
+  "dataset": {
+    "dataset_id": "gsm8k@2026-11",
+    "few_shot_num": 4,
+    "few_shot_random": false,
+    "subset_list": ["main"],
+    "num_expected": 1319
+  },
+  "serving": {
+    "ppu_count": 8,
+    "tensor_parallel_size": 8,
+    "data_parallel_size": 1,
+    "enable_expert_parallel": false,
+    "gpu_memory_utilization": null,
+    "max_model_len": null,
+    "seed": null
+  },
+  "generation": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "max_tokens": 10240
+  },
+  "score": 0.9735,
+  "score_num": 1284,
+  "tolerance": {"mode": "band", "abs": 0.02},
+  "measured_at": null,
+  "baseline_origin": "vllm-project/vllm-sail legacy FP8 TP8 reference at 036442fcd1bdaf4e582018e70fe8d82fb5d2fb7f"
+}
