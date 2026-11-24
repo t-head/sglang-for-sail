@@ -63,12 +63,19 @@ def validate_retention_root(raw_root: str, environ) -> Path:
         raise ValueError("expected an absolute retention root")
     _check_dir_mode(root, 0o700, 0o755)
     root = root.resolve(strict=True)
+    archive_base = root.joinpath(*RETENTION_SUBPATH)
     for key in ("RUNNER_TEMP", "GITHUB_WORKSPACE"):
-        raw_ephemeral = environ[key]
+        raw_ephemeral = environ.get(key)
         if not raw_ephemeral:
             raise ValueError("missing runner workspace path")
         ephemeral = Path(raw_ephemeral).resolve()
-        if ephemeral == root or ephemeral in root.parents:
+        if (
+            ephemeral == root
+            or ephemeral in root.parents
+            or ephemeral == archive_base
+            or ephemeral in archive_base.parents
+            or archive_base in ephemeral.parents
+        ):
             raise ValueError("retention root must not be job-local")
     return root
 
