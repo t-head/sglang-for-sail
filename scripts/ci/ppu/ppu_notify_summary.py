@@ -280,7 +280,9 @@ def make_payload(report, roster, weekday):
         if failures
         else f"[✅ 全绿 {passed}/{len(rows)}]"
     )
-    title = f"{headline} {repo} / {ref} · {event}"
+    version = os.environ.get("NOTIFY_VERSION")
+    version_label = f"[sglang | {version}] " if version in ("v0.5.23", "v1.0.0") else ""
+    title = f"{version_label}{headline} {repo} / {ref} · {event}"
     elapsed = report.get("elapsed_s")
     duration = "未知"
     if type(elapsed) is int and elapsed >= 0:
@@ -289,7 +291,7 @@ def make_payload(report, roster, weekday):
         duration = f"{hours}h {minutes:02d}m {seconds:02d}s"
     link = f"https://github.com/{repo}/actions/runs/{run_id}"
     text = [
-        f"### {headline} `{repo} / {ref}` · {event}",
+        f"### {version_label}{headline} `{repo} / {ref}` · {event}",
         f"通过 **{passed}/{len(rows)}** · 总耗时 {duration} · [Run]({link})",
     ]
     for row in failures:
