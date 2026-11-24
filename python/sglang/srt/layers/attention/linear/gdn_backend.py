@@ -517,6 +517,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     needs_cpu_seq_lens: bool = False
     supports_mis: bool = True
+    reuse_prefill_initial_state_mask: bool = True
     requires_contiguous_prefill_state: bool = True
 
     def __init__(self, model_runner: ModelRunner):
@@ -932,7 +933,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             layer.bias,
             activation=layer.activation,
             conv_states=conv_states,
-            has_initial_state=forward_batch.extend_prefix_lens > 0,
+            has_initial_state=self._prefill_has_initial_state(forward_batch),
             cache_indices=cache_indices,
             query_start_loc=self.forward_metadata.query_start_loc,
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,

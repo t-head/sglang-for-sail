@@ -45,7 +45,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_exec, get_memory, get_spec
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import is_pin_memory_available
+from sglang.srt.utils import is_pin_memory_available, is_sail
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.verify_mask import VerifyMask
@@ -67,6 +67,7 @@ _validate_mamba_replay_state_indices = (
 
 class MambaAttnBackendBase(AttentionBackend):
     supports_mis: bool = False
+    reuse_prefill_initial_state_mask: bool = False
 
     @classmethod
     def validate_mis_support(cls, server_args) -> None:
@@ -191,6 +192,7 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_end_locs = None
         track_ssm_recompute_dst = None
         logical_num_tokens = None
+        prefill_has_initial_state = None
         track_mask_indices = None
 
         # Padded rows carry req-pool row 0, which maps to the reserved mamba
@@ -313,6 +315,12 @@ class MambaAttnBackendBase(AttentionBackend):
                     if retrieve_next_token is not None:
                         retrieve_parent_token = torch.empty_like(retrieve_next_token)
             else:
+                if (
+                    self.reuse_prefill_initial_state_mask
+                    and is_sail()
+                    and forward_batch.extend_prefix_lens is not None
+                ):
+                    prefill_has_initial_state = forward_batch.extend_prefix_lens > 0
                 query_start_loc = torch.empty(
                     (bs + 1,), dtype=torch.int32, device=self.device
                 )
@@ -351,6 +359,7 @@ class MambaAttnBackendBase(AttentionBackend):
         return ForwardMetadata(
             query_start_loc=query_start_loc,
             logical_num_tokens=logical_num_tokens,
+            prefill_has_initial_state=prefill_has_initial_state,
             mamba_track_mask_indices=track_mask_indices,
             mamba_cache_indices=mamba_cache_indices,
             # Physical track destinations (None when tracking off); cuda-graph
@@ -394,6 +403,10 @@ class MambaAttnBackendBase(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self.forward_metadata = self._forward_metadata(forward_batch)
+
+    def _prefill_has_initial_state(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        mask = getattr(self.forward_metadata, "prefill_has_initial_state", None)
+        return forward_batch.extend_prefix_lens > 0 if mask is None else mask
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]

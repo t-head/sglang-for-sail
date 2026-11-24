@@ -404,7 +404,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
             ssm_state_indices,
             out,
             True,
-            torch.arange(B + 1, device=a.device, dtype=torch.int32),
+            None,  # PLA uses one token per physical row without offsets.
             False,
         )
         logger.info_once(
