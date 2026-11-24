@@ -1890,6 +1890,27 @@ class ClusterTransportTest(unittest.TestCase):
                         recipe_cluster_diagnostics.recent_failures(root, 776), []
                     )
 
+        for layout in ("sglang/logs/sglang-for-sail", "sglang-for-sail"):
+            for non_regular in ("dir", "fifo"):
+                if non_regular == "fifo" and not hasattr(os, "mkfifo"):
+                    continue
+                with (
+                    self.subTest(layout=layout, non_regular=non_regular),
+                    tempfile.TemporaryDirectory() as outer_tmp,
+                ):
+                    root = Path(outer_tmp) / "archive"
+                    model_dir = root / layout / "775-1/fast_sanity/qwen3.8-27b"
+                    model_dir.mkdir(parents=True)
+                    (model_dir / "index.json").write_text("{}")
+                    log_path = model_dir / "launcher.log"
+                    if non_regular == "dir":
+                        log_path.mkdir()
+                    else:
+                        os.mkfifo(log_path)
+                    self.assertEqual(
+                        recipe_cluster_diagnostics.recent_failures(root, 776), []
+                    )
+
 
 class RuntimeImageAndPrebuiltModeTest(unittest.TestCase):
     def test_rejects_illegal_tags_digests_and_cross_repo_injection(self):
