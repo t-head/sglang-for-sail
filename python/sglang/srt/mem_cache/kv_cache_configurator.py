@@ -39,6 +39,7 @@ from sglang.srt.configs.model_config import (
     mla_attention_dcp_size,
     uses_compressed_kv_attention,
 )
+from sglang.srt.configs.step5 import get_step5_text_config
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -487,8 +488,12 @@ class KVCacheConfigurator:
         self.hybrid_kda_config = hybrid_kda_config(self.model_config)
         self._resolve_kv_shard()
         self.draft_owns_its_depth = self.layer_info.draft_owns_its_depth
-        self.draft_swa_full_capacity = self.draft_owns_its_depth and bool(
-            self.layer_info.swa_attention_layer_ids
+        # Step5 draft 共享目标的物理 FULL->SWA 映射；其预算按 SWA 容量计费，
+        # 不使用通用 MTP 的 FULL 容量 identity 映射。
+        self.draft_swa_full_capacity = (
+            self.draft_owns_its_depth
+            and bool(self.layer_info.swa_attention_layer_ids)
+            and self.layer_info.step5_layer_selection is None
         )
         quant_config = getattr(self.model, "quant_config", None)
         if (
@@ -602,7 +607,19 @@ class KVCacheConfigurator:
             if reason is not None:
                 raise ValueError(reason)
 
-        if not self.spec_algorithm.is_none() and self.is_draft_worker:
+        step5_budget = None
+        if get_step5_text_config(self.model_config.hf_config) is not None:
+            from sglang.srt.model_executor.step5_pool_configurator import (
+                Step5PoolConfigurator,
+            )
+
+            config = self.memory_pool_config
+            if config is None and not self.is_draft_worker:
+                config = self._resolve_memory_pool_config(pre_model_load_memory)
+            step5_budget = Step5PoolConfigurator._validate_step5_construction(
+                kvc=self, config=config
+            )
+        elif not self.spec_algorithm.is_none() and self.is_draft_worker:
             assert self.memory_pool_config is not None, (
                 "Draft worker requires memory_pool_config"
             )
@@ -637,6 +654,15 @@ class KVCacheConfigurator:
                 "SWA ring: swa_max_total_num_tokens "
                 f"{sizes.swa_max_total_num_tokens} -> {swa_max_total_num_tokens} "
                 "(fixed per-request SWA ring capacity)."
+            )
+
+        if step5_budget is not None:
+            Step5PoolConfigurator._finish_step5_construction(
+                kvc=self,
+                config=step5_budget,
+                req_pool=pools.req_to_token_pool,
+                kv_pool=pools.token_to_kv_pool,
+                allocator=pools.token_to_kv_pool_allocator,
             )
 
         logger.info(
@@ -1937,6 +1963,7 @@ class KVCacheConfigurator:
                 token_to_kv_pool = self._build_hybrid_swa_kv_pool(
                     full_max_total_num_tokens=sizes.full_max_total_num_tokens,
                     swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
+                    req_to_token_pool=req_to_token_pool,
                     mha_pool_class=mha_pool_class,
                 )
             elif is_minimax_sparse(self.model_config.hf_config):
@@ -2659,8 +2686,21 @@ class KVCacheConfigurator:
         *,
         full_max_total_num_tokens: Optional[int],
         swa_max_total_num_tokens: Optional[int],
+        req_to_token_pool: ReqToTokenPool,
         mha_pool_class: type,
     ) -> KVCache:
+        if get_step5_text_config(self.model_config.hf_config) is not None:
+            from sglang.srt.model_executor.step5_pool_configurator import (
+                Step5PoolConfigurator,
+            )
+
+            return Step5PoolConfigurator.build_kv_pool(
+                self,
+                full_max_total_num_tokens=full_max_total_num_tokens,
+                swa_max_total_num_tokens=swa_max_total_num_tokens,
+                req_to_token_pool=req_to_token_pool,
+                mha_pool_class=mha_pool_class,
+            )
         kwargs = {}
         if self.is_hybrid_swa_compress:
             kwargs = {
@@ -3464,9 +3504,10 @@ class KVCacheConfigurator:
         if get_memory().enable_unified_memory and not self.is_draft_worker:
             config.mem_fraction_static = get_schedule().mem_fraction_static
             return config
-        config.max_running_requests = self.resolve_max_num_reqs(
-            config.max_total_num_tokens
-        )
+        if config.max_running_requests is None:
+            config.max_running_requests = self.resolve_max_num_reqs(
+                config.max_total_num_tokens
+            )
         configurator = create_memory_pool_configurator(self)
         config = configurator.finalize_with_max_running_requests(config)
         config.mem_fraction_static = get_schedule().mem_fraction_static

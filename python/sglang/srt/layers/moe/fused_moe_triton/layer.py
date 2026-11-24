@@ -412,11 +412,16 @@ class FusedMoE(torch.nn.Module):
         quant_method: Optional[FusedMoEMethodBase] = None,
         uses_expert_location: bool = True,
         allow_fp8_blockwise_tail: bool = False,
+        fp8_use_rn_division: bool = False,
+        silu_clamp_mode: Optional[str] = None,
+        fc1_output_dtype: Optional[str] = None,
     ):
         super().__init__()
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
 
+        if fp8_use_rn_division and not get_moe_runner_backend().is_triton():
+            raise ValueError("FP8 RN division currently requires the Triton MoE runner")
         self.params_dtype = params_dtype
         # False for a model whose loader keeps compressed-tensors' `weight_packed`
         # expert names; Mxfp4MoEMethod's fused `w13_weight`/`w2_weight` cannot
@@ -525,6 +530,9 @@ class FusedMoE(torch.nn.Module):
             is_gated=is_gated,
             routing_method_type=routing_method_type,
             gate_up_interleaved=gate_up_interleaved,
+            fp8_use_rn_division=fp8_use_rn_division,
+            silu_clamp_mode=silu_clamp_mode,
+            fc1_output_dtype=fc1_output_dtype,
             layer=self,
         )
 

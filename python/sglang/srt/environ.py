@@ -817,6 +817,27 @@ class Envs:
     # - Source builds with a missing or unusable Rust toolchain.
     # This also applies when Rust is explicitly selected.
     SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("rust")
+    # Opt in to loading-time FP8 quantization of checkpoint BF16 MoE experts.
+    # Step5-Preview keeps its last three routed-expert layers in BF16.
+    SGLANG_STEP5_QUANTIZE_BF16_MOE = EnvBool(False)
+    # PPU region-scoring fast path: feed the E4M3 bytes straight to the fp8 MMA
+    # and group rows that share a request onto one key-tile gather. Set false to
+    # fall back to the portable per-row/per-group Triton schedule.
+    SGLANG_STEP5_SCORING_REGION_OPT = EnvBool(True)
+    # Pack contiguous K per layer for eligible 890P prefill; False restores legacy scoring.
+    SGLANG_SAIL_STEP5_SCORING_COMPACT = EnvBool(True)
+    # PPU region-scoring indexer operands: feed the E4M3 key/query bytes straight
+    # to the fp8 MMA. Set false to decode them to BF16 and dot in BF16 instead,
+    # which reproduces the portable path's math for accuracy A/B comparisons.
+    SGLANG_SAIL_STEP5_FP8_INDEXER = EnvBool(True)
+    # PPU region-selection fast path: rank the history with the SAIL JIT radix
+    # selector instead of FlashInfer ragged top-k. Set false to fall back.
+    SGLANG_SAIL_STEP5_SELECTION_RADIX = EnvBool(True)
+    # PPU attention fast path: run the Step5 sparse decode and prefill attention
+    # on the SAIL JIT kernels instead of the portable Triton fallback (the CuTe
+    # kernels never run on PPU parts). Set false to force Triton for A/B
+    # comparisons; shapes the JIT kernels do not cover fall back on their own.
+    SGLANG_SAIL_STEP5_ATTN_CUDA = EnvBool(True)
     # Once decode passes the sliding window, drop the SWA part of the prefill's
     # tree lock; its SWA KV becomes evictable rather than freed.
     SGLANG_OPT_RELEASE_PREFILL_SWA = EnvBool(False)
@@ -1665,7 +1686,7 @@ class Envs:
     # ===================================================================
     # DeepGEMM Mega MoE
     # ===================================================================
-    SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(8192)
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(16384)
     # Blackwell MegaMoE uses a whole-grid software barrier. Keep a small
     # residency margin so every cluster can launch beside other streams.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)

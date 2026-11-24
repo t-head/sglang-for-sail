@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.fused_op import BaseFusedOp, register_fused_op
+from sglang.kernels.ops.activation.silu_clamp_and_mul import SiluClampAndMulOp
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.spec import (
     CUDA_ONLY,
@@ -98,12 +99,23 @@ class SiluAndMulOp(BaseFusedOp):
 
 _SILU_AND_MUL = register_fused_op(SiluAndMulOp(), __name__, "_SILU_AND_MUL")
 
+_SILU_CLAMP_AND_MUL = register_fused_op(
+    SiluClampAndMulOp(), __name__, "_SILU_CLAMP_AND_MUL"
+)
+
 
 def silu_and_mul(
     input: torch.Tensor, out: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
     """``out = silu(input[..., :d]) * input[..., d:]`` with ``d = input.shape[-1] // 2``."""
     return _SILU_AND_MUL(input, out)
+
+
+def silu_clamp_and_mul(
+    input: torch.Tensor, out: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """Post-SiLU clamp with limit 7; use ``SiluClampAndMulOp`` for another limit."""
+    return _SILU_CLAMP_AND_MUL(input, out)
 
 
 def situ_and_mul(
@@ -122,6 +134,8 @@ __all__ = [
     "situ_and_mul",
     "SiluAndMulOp",
     "silu_and_mul",
+    "SiluClampAndMulOp",
+    "silu_clamp_and_mul",
 ]
 
 

@@ -1657,12 +1657,14 @@ class Scheduler(
 
         # A DFLASH draft KV ring is sent as its own state, not as draft KV pages.
         draft_kv_ring = None
+        draft_kv_pools = ()
         draft_token_to_kv_pool = None
         if self.draft_worker is not None:
             if get_spec().speculative_dflash_draft_kv_ring:
                 draft_kv_ring = self.draft_worker.draft_kv_ring
             else:
                 draft_token_to_kv_pool = self.draft_worker.primary_draft_kv_pool
+                draft_kv_pools = self.draft_worker.draft_kv_pools
 
         if self.spec_algorithm.carries_draft_hidden_states():
             # Derive the rank-uniform PD wire schema from config because only the
@@ -1722,6 +1724,7 @@ class Scheduler(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 draft_token_to_kv_pool=draft_token_to_kv_pool,
+                draft_kv_pools=draft_kv_pools,
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=self.disagg_metadata_buffers,
                 scheduler=self,
@@ -1755,6 +1758,7 @@ class Scheduler(
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
                 token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
                 draft_token_to_kv_pool=draft_token_to_kv_pool,
+                draft_kv_pools=draft_kv_pools,
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=self.disagg_metadata_buffers,
                 gpu_id=get_device().gpu_id,
@@ -3071,6 +3075,7 @@ class Scheduler(
             if req.sampling_params.max_new_tokens is not None
             else 1 << 30
         )
+        wants_generation = max_new_tokens > 0
         if self.max_new_tokens_limit is not None and self.max_new_tokens_limit > 0:
             if max_new_tokens > self.max_new_tokens_limit:
                 logger.warning(
@@ -3085,7 +3090,7 @@ class Scheduler(
             0,
             min(
                 max_new_tokens,
-                self.max_req_len - input_len - 1,
+                self.max_req_len - input_len,
             ),
         )
         # PrefillAdder reserves one page per shard; the allocator reserves one.
@@ -3120,7 +3125,7 @@ class Scheduler(
             # Admission cuts a chunk on this alignment, so no smaller chunk runs.
             chunk_align=self.truncation_align_size,
         )
-        if max_new_tokens is None:
+        if max_new_tokens is None or (wants_generation and max_new_tokens == 0):
             req.set_finish_with_abort(
                 f"Request prompt exceeds the KV memory budget: input_len={input_len}."
             )
@@ -3643,11 +3648,11 @@ class Scheduler(
             mm_cleanup.pop_all()
             self._maybe_compute_mrope_positions(req)
 
-            if len(req.origin_input_ids) >= self.max_req_input_len:
+            if len(req.origin_input_ids) > self.max_req_input_len:
                 req.set_finish_with_abort(
                     error_msg=(
                         "Multimodal prompt is too long after expanding multimodal tokens. "
-                        f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
+                        f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} > {self.max_req_input_len}."
                     )
                 )
                 self.init_req_max_new_tokens(req)
@@ -3661,7 +3666,7 @@ class Scheduler(
         error_msg = validate_input_length(
             req,
             self.max_req_input_len,
-            get_serving().allow_auto_truncate,
+            False,
         )
         if error_msg:
             req.set_finish_with_abort(error_msg)

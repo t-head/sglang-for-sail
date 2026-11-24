@@ -459,7 +459,7 @@ def fused_moe_kernel(
                 stride_cn,
                 pid_n,
                 N,
-                offs_token,
+                offs_token_id if c_sorted else offs_token,
                 token_mask,
                 BLOCK_SIZE_M,
                 BLOCK_SIZE_N,
@@ -834,12 +834,17 @@ def invoke_fused_moe_kernel(
     lora_preserve_base: bool = False,
     fuse_swiglu: bool = False,
     a_output_slices: int = 1,
+    fp8_use_rn_division: bool = False,
 ) -> None:
     """Skip inactive experts, including with filter_expert=False.
 
     a_output_slices=2 pairs consecutive A rank halves with B/C output halves
     on the unquantized add path, without splitting the shrink/expand launches.
     """
+    if fp8_use_rn_division and (
+        not _is_cuda or not use_fp8_w8a8 or block_shape is None
+    ):
+        raise ValueError("RN division requires CUDA block-wise FP8 MoE")
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
     assert a_output_slices in (1, 2)
@@ -909,7 +914,15 @@ def invoke_fused_moe_kernel(
                 pad_k = (-A.shape[-1]) % block_k
                 if pad_k:
                     A = F.pad(A, (0, pad_k))
-                if _is_cuda:
+                if fp8_use_rn_division:
+                    from sglang.kernels.ops.quantization.per_token_group_quant import (
+                        per_token_group_quant,
+                    )
+
+                    A, A_scale = per_token_group_quant(
+                        A, group_size=block_k, use_rn_division=True
+                    )
+                elif _is_cuda:
                     A, A_scale = sglang_per_token_group_quant_fp8(A, block_k)
                 else:
                     A, A_scale = per_token_group_quant_fp8(A, block_k)

@@ -37,6 +37,7 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
 from sglang.srt.utils import is_hip, is_sm100_supported
+from sglang.srt.utils.device import is_sail
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -913,3 +914,183 @@ def _transform_mega_moe_shared_sf(linear) -> torch.Tensor:
         num_groups=1,
         disable_ue8m0_cast=False,
     ).squeeze(0)
+
+
+def build_mega_moe_fp8_block_experts_weights(experts, chunk: int = 16) -> None:
+    from deep_gemm import transform_sf_into_required_layout
+    from deep_gemm.utils import per_token_cast_to_fp8
+
+    if getattr(experts, "_mega_moe_weights_built", False):
+        return
+    if chunk <= 0:
+        raise ValueError("MegaMoE FP8 weight conversion requires a positive chunk")
+    check_mega_moe_shapes(
+        hidden=experts.w13_weight.shape[-1],
+        intermediate=experts.w13_weight.shape[1] // 2,
+        mma_type="fp8xfp8",
+    )
+
+    def to_mxfp8(weight, scale_inv, block):
+        num_groups, n, k = weight.shape
+        out = torch.empty_like(weight)
+        sf = torch.empty(
+            (num_groups, n, k // 32), dtype=torch.float32, device=weight.device
+        )
+        for start in range(0, num_groups, chunk):
+            end = min(start + chunk, num_groups)
+            scale = scale_inv[start:end].repeat_interleave(block[0], dim=1)[:, :n]
+            scale = scale.repeat_interleave(block[1], dim=2)[:, :, :k]
+            dequant = weight[start:end].float() * scale
+            for g in range(end - start):
+                out[start + g], sf[start + g] = per_token_cast_to_fp8(
+                    dequant[g], use_ue8m0=True, gran_k=32
+                )
+            del dequant, scale
+        packed = transform_sf_into_required_layout(
+            sf,
+            mn=n,
+            k=k,
+            recipe=(1, 32),
+            num_groups=num_groups,
+            disable_ue8m0_cast=False,
+        )
+        return out, packed
+
+    block = experts.quant_method.quant_config.weight_block_size
+    w13, w13_sf = to_mxfp8(
+        experts.w13_weight.data, experts.w13_weight_scale_inv.data, block
+    )
+    w2, w2_sf = to_mxfp8(
+        experts.w2_weight.data, experts.w2_weight_scale_inv.data, block
+    )
+    w13_interleaved = _interleave_mega_moe_gate_up(w13, gran=8)
+    w13_sf_interleaved = _interleave_mega_moe_gate_up(w13_sf, gran=8)
+    w13_sf_utccp = _transpose_mega_moe_sf_for_utccp(w13_sf_interleaved)
+    w2_sf_utccp = _transpose_mega_moe_sf_for_utccp(w2_sf)
+    localize = _is_mega_moe_localization_enabled()
+    mega_l1, mega_l2 = w13_interleaved, w2
+    if localize:
+        import deep_gemm
+
+        mega_l1, mega_l2 = deep_gemm.localize(mega_l1), deep_gemm.localize(mega_l2)
+        w13_interleaved, w2 = mega_l1.transpose(0, 1), mega_l2.transpose(0, 1)
+        experts._mega_moe_weights_localized = True
+
+    experts.w13_weight.data = w13_interleaved
+    experts.w2_weight.data = w2
+    experts.w13_weight_scale_inv.data = w13_sf_interleaved
+    experts.w2_weight_scale_inv.data = w2_sf
+    experts.w13_weight_scale_inv.format_ue8m0 = True
+    experts.w2_weight_scale_inv.format_ue8m0 = True
+    experts.mega_l1_weights = (mega_l1, w13_sf_utccp)
+    experts.mega_l2_weights = (mega_l2, w2_sf_utccp)
+    # 独立注册 UTCCP 副本，让 EPLB 与非转置参数 scales 一起搬迁。
+    experts.register_parameter(
+        "mega_w13_weight_scale_utccp",
+        torch.nn.Parameter(w13_sf_utccp, requires_grad=False),
+    )
+    experts.register_parameter(
+        "mega_w2_weight_scale_utccp",
+        torch.nn.Parameter(w2_sf_utccp, requires_grad=False),
+    )
+    experts.mega_moe_mma_type = "fp8xfp8"
+    experts._mega_moe_weights_built = True
+    if localize:
+        del w13, w13_sf, w13_sf_interleaved
+        torch.cuda.empty_cache()
+
+
+def forward_mega_moe_local_experts(
+    experts,
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    group,
+    activation_clamp: Optional[float],
+) -> torch.Tensor:
+    import deep_gemm
+
+    if not is_mega_moe_experts_ready(experts):
+        raise ValueError("Step5 local MegaMoE weights are not supported on this device")
+    if group.size() != 1 or experts.num_fused_shared_experts != 0:
+        raise ValueError(
+            "Step5 local MegaMoE requires a singleton MoE TP group and separate shared experts"
+        )
+    num_tokens, hidden_size = hidden_states.shape
+    num_local = experts._num_local_routed
+    expert_offset = experts._expert_storage_rank * num_local
+    mma_type = _mega_moe_mma_type(experts)
+    cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+    if cap <= 0:
+        raise ValueError("MegaMoE local experts require a positive token capacity")
+    if num_tokens > cap:
+        return torch.cat(
+            [
+                forward_mega_moe_local_experts(
+                    experts,
+                    hidden_states[start : start + cap],
+                    topk_ids[start : start + cap],
+                    topk_weights[start : start + cap],
+                    group=group,
+                    activation_clamp=activation_clamp,
+                )
+                for start in range(0, num_tokens, cap)
+            ]
+        )
+    buf = _get_mega_moe_symm_buffer(
+        group,
+        num_experts=num_local,
+        num_max_tokens_per_rank=cap,
+        num_topk=topk_ids.shape[1],
+        hidden=hidden_size,
+        intermediate_hidden=experts.intermediate_size_per_partition,
+        mma_type=mma_type,
+    )
+    if is_sail() or _device_sm == 90:
+        # 目标的 PPU/SM90 预分发有独立 ABI；输入 ID 仍按真实 storage 分片过滤。
+        local_ids = topk_ids.to(torch.int64) - expert_offset
+        local_ids = torch.where(
+            (local_ids >= 0) & (local_ids < num_local), local_ids, -1
+        )
+        return run_mega_routed_experts(
+            experts,
+            hidden_states,
+            local_ids,
+            topk_weights,
+            hidden_size=hidden_size,
+            intermediate_size=experts.intermediate_size_per_partition,
+            top_k=topk_ids.shape[1],
+            num_tokens=num_tokens,
+            activation_clamp=activation_clamp,
+            buf=buf,
+        )
+    mega_moe_pre_dispatch(
+        hidden_states,
+        topk_ids.to(torch.int32),
+        topk_weights.to(torch.float32),
+        buf.x,
+        buf.x_sf,
+        buf.topk_idx,
+        buf.topk_weights,
+        quant_group_size=32,
+        expert_offset=expert_offset,
+        num_local_experts=num_local,
+    )
+    y = torch.empty(
+        (max(num_tokens, 1), hidden_size),
+        dtype=torch.bfloat16,
+        device=hidden_states.device,
+    )
+    with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+        deep_gemm.fp8_fp4_mega_moe(
+            y,
+            experts.mega_l1_weights,
+            experts.mega_l2_weights,
+            buf,
+            recipe=(1, 1, 32),
+            activation="swiglu",
+            activation_clamp=activation_clamp,
+            fast_math=True,
+        )
+    return y[:num_tokens]

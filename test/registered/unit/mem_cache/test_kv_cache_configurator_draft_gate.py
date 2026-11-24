@@ -620,11 +620,13 @@ class TestSWARetainWindow(CustomTestCase):
 
     def test_the_free_at_a_checkpoint_keeps_every_slot_the_draft_reads(self):
         pre_len = 20
+        # 此夹具没有 bigram，page_size=1；插入边界就是已提交长度。
+        # draft 仍读取 [pre_len - _DRAFT_REACH, pre_len)，不能只检查游标。
         for draft_swa_window, frontier in (
-            (_DRAFT_REACH, pre_len - 1 - _DRAFT_REACH),
-            (0, pre_len - 1 - _WINDOW),
+            (_DRAFT_REACH, pre_len - _DRAFT_REACH),
+            (0, pre_len - _WINDOW),
         ):
-            batch, req, _ = self._fixture(
+            batch, req, kv_indices = self._fixture(
                 UnifiedRadixCache, draft_swa_window=draft_swa_window, num_tokens=pre_len
             )
             cache = batch.tree_cache
@@ -638,6 +640,12 @@ class TestSWARetainWindow(CustomTestCase):
             with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
                 checkpoint_kv_cache(req, cache)
             self.assertEqual(req.kv.get_evicted_seqlen("swa"), frontier)
+            mapping = batch.token_to_kv_pool_allocator.full_to_swa_index_mapping
+            draft_read = kv_indices[pre_len - _DRAFT_REACH : pre_len]
+            self.assertEqual(
+                bool((mapping[draft_read] > 0).all()), draft_swa_window > 0
+            )
+            self.assertEqual(req.kv.cache_protected_len, pre_len)
             cache.unlock(req.lock)
             cache.sanity_check()
 

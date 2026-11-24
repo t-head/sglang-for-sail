@@ -103,6 +103,9 @@ def is_deferred_finalize_enabled() -> bool:
 def finalize_flashinfer_trtllm_deferred_output(
     deferred_output: FlashInferTrtllmDeferredFinalizeOutput,
     shared_output: Optional[torch.Tensor],
+    *,
+    output_dtype: torch.dtype = torch.bfloat16,
+    round_routed: bool = False,
 ) -> torch.Tensor:
     from sglang.kernels.ops.moe.moe_finalize_fuse_shared import moe_finalize_fuse_shared
 
@@ -113,6 +116,8 @@ def finalize_flashinfer_trtllm_deferred_output(
         shared_output,
         deferred_output.top_k,
         enable_pdl=trtllm_moe_enable_pdl(deferred_output.expert_weights.shape[0]),
+        output_dtype=output_dtype,
+        round_routed=round_routed,
     )
 
 
@@ -1294,6 +1299,10 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 use_shuffled_weight=use_shuffled_weight,
                 tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
             )
+            if runner_config.silu_clamp_mode is not None:
+                routed_kwargs["silu_clamp_mode"] = runner_config.silu_clamp_mode
+            if runner_config.fc1_output_dtype is not None:
+                routed_kwargs["fc1_output_dtype"] = runner_config.fc1_output_dtype
             if defer_finalize:
                 from flashinfer.fused_moe import trtllm_fp8_block_scale_routed_moe
 
@@ -1354,6 +1363,10 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 use_shuffled_weight=use_shuffled_weight,
                 tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
             )
+            if runner_config.silu_clamp_mode is not None:
+                common_kwargs["silu_clamp_mode"] = runner_config.silu_clamp_mode
+            if runner_config.fc1_output_dtype is not None:
+                common_kwargs["fc1_output_dtype"] = runner_config.fc1_output_dtype
             if defer_finalize:
                 from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
 
@@ -2254,6 +2267,7 @@ class FlashInferTrtllmBf16MoeQuantInfo(MoeQuantInfo):
     # Expert-parallel metadata
     global_num_experts: int
     local_expert_offset: int
+    gemm1_clamp_limit: torch.Tensor | None = None
 
 
 def fused_experts_none_to_flashinfer_trtllm_bf16(
@@ -2305,6 +2319,16 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
     activation_type = get_activation_type(
         runner_config.activation, is_gated=runner_config.is_gated
     )
+
+    step_post_clamp = runner_config.silu_clamp_mode == "post"
+    if step_post_clamp:
+        from flashinfer.tllm_enums import ActivationType
+
+        if not use_routed_topk or runner_config.activation != "silu":
+            raise ValueError("Step BF16 requires precomputed routing and SiLU")
+        if quant_info.gemm1_clamp_limit is None:
+            raise ValueError("Step BF16 requires an explicit clamp limit")
+        activation_type = ActivationType.SwigluStep
 
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
@@ -2358,6 +2382,7 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
                 enable_pdl=trtllm_moe_enable_pdl(hidden_states.shape[0]),
                 tune_max_num_tokens=next_power_of_2(hidden_states.shape[0]),
                 activation_type=activation_type,
+                gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
             )
             if defer_finalize:
                 final_hidden_states = _make_deferred_finalize_output(
@@ -2449,6 +2474,22 @@ def fused_experts_none_to_flashinfer_trtllm_routed(
         )
     raise TypeError(
         f"Unexpected quant_info type for flashinfer_trtllm_routed: {type(quant_info)}"
+    )
+
+
+@register_fused_func("megamoe", "flashinfer_trtllm_routed")
+def fused_experts_megamoe_to_flashinfer_trtllm_bf16(
+    dispatch_output: StandardDispatchOutput,
+    quant_info: MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> StandardCombineInput:
+    # MegaMoE 的 BF16 层使用 StandardDispatcher；Step5 负责归约本地贡献。
+    if not isinstance(quant_info, FlashInferTrtllmBf16MoeQuantInfo):
+        raise TypeError("MegaMoE's TRTLLM fallback only supports BF16 experts")
+    if runner_config.silu_clamp_mode != "post":
+        raise ValueError("MegaMoE's TRTLLM BF16 fallback requires Step post-SiLU clamp")
+    return fused_experts_none_to_flashinfer_trtllm_bf16(
+        dispatch_output, quant_info, runner_config, use_routed_topk=True
     )
 
 

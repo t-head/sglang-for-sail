@@ -60,10 +60,13 @@ from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 
 logger = logging.getLogger(__name__)
 
-# NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
-# to ensure consistent logging behavior across the codebase. This prevents issues with log
-# propagation that can cause some log messages (like 'server is fired up') to not appear
-# in the console when multimodal support is enabled.
+# Large tensors that live in ``MultimodalDataItem.model_specific_data`` but
+# have the same transport/lifetime requirements as ``item.feature``. Keep
+# this list explicit: other model-specific tensors can be small metadata or
+# carry device semantics that must not be changed generically.
+AUXILIARY_TRANSPORT_FEATURE_NAMES = frozenset(("patch_pixel_values",))
+_AUXILIARY_SHM_MIN_BYTES = 1024 * 1024
+
 
 _GPU_FEATURE_BUFFER: Optional[torch.Tensor] = None
 _BUFFER_OFFSET = 0
@@ -878,6 +881,20 @@ def prepare_mm_inputs(
                             feature.record_stream(stream)
                             mm_item.feature = feature.to("cpu", non_blocking=True)
                             offloaded = True
+                        model_specific_data = mm_item.model_specific_data
+                        updated = None
+                        if isinstance(model_specific_data, dict):
+                            for key in AUXILIARY_TRANSPORT_FEATURE_NAMES:
+                                value = model_specific_data.get(key)
+                                if isinstance(value, torch.Tensor) and value.is_cuda:
+                                    if updated is None:
+                                        # Sampling copies items shallowly.
+                                        updated = dict(model_specific_data)
+                                    value.record_stream(stream)
+                                    updated[key] = value.to("cpu", non_blocking=True)
+                                    offloaded = True
+                        if updated is not None:
+                            mm_item.model_specific_data = updated
                         if language_only:
                             precomputed = mm_item.precomputed_embeddings
                             if (
@@ -1487,6 +1504,9 @@ class ShmPointerMMData:
         the tensor and all derived views are released. Other platforms retain
         the clone path.
         """
+        cached = getattr(self, "_materialized_tensor", None)
+        if cached is not None:
+            return cached
         try:
             if self._materialization_error is not None:
                 raise RuntimeError(self._materialization_error)
@@ -1497,11 +1517,15 @@ class ShmPointerMMData:
                     access=mmap.ACCESS_COPY,
                 )
                 try:
-                    return torch.frombuffer(owned, dtype=self.dtype).reshape(self.shape)
+                    self._materialized_tensor = torch.frombuffer(
+                        owned, dtype=self.dtype
+                    ).reshape(self.shape)
+                    return self._materialized_tensor
                 except BaseException:
                     owned.close()
                     raise
-            return self.tensor.clone()
+            self._materialized_tensor = self.tensor.clone()
+            return self._materialized_tensor
         finally:
             self.close_and_unlink()
 
@@ -1561,7 +1585,7 @@ def _model_specific_shm_values(item):
     if not data:
         return
     for key, value in data.items():
-        if isinstance(value, ShmPointerMMData):
+        if _feature_has_shm(value):
             yield key, value
 
 
@@ -1599,6 +1623,9 @@ def _wrap_shm_or_inline(tensor: torch.Tensor, precomputed_hash: Optional[int] = 
     """Wrap a tensor in ShmPointerMMData, falling back to inline (pickled)
     transport when shared memory cannot be allocated, e.g. /dev/shm is full
     under a burst of multimodal requests."""
+    if tensor.numel() == 0:
+        # multiprocessing.shared_memory rejects size=0.
+        return tensor
     try:
         return ShmPointerMMData(tensor, precomputed_hash=precomputed_hash)
     except OSError as e:
@@ -1684,6 +1711,37 @@ def _wrap_model_specific_data(item) -> None:
         item.model_specific_data = wrapped
 
 
+def _wrap_auxiliary_transport_value(value, *, use_shm=True):
+    """Move a registered auxiliary feature to CPU and use SHM when large.
+
+    CUDA IPC proxies are already transport-ready and are intentionally left
+    untouched. Containers are rebuilt instead of modified in place because
+    parallel-sampling requests can share nested model-specific objects.
+    """
+    if isinstance(value, CudaIpcTensorTransportProxy):
+        return value
+    if isinstance(value, torch.Tensor):
+        cpu_value = value if value.is_cpu else value.cpu()
+        nbytes = cpu_value.numel() * cpu_value.element_size()
+        if use_shm and nbytes >= _AUXILIARY_SHM_MIN_BYTES:
+            return _wrap_shm_or_inline(cpu_value)
+        return _compact_inline_tensors(cpu_value)
+    if isinstance(value, dict):
+        return {
+            key: _wrap_auxiliary_transport_value(item, use_shm=use_shm)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _wrap_auxiliary_transport_value(item, use_shm=use_shm) for item in value
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            _wrap_auxiliary_transport_value(item, use_shm=use_shm) for item in value
+        )
+    return value
+
+
 def wrap_shm_features(obj):
     """
     Wrap multimodal features in SHM pointers, or compact inline CPU storage.
@@ -1715,6 +1773,22 @@ def wrap_shm_features(obj):
                         item.precomputed_embeddings, inline_memo
                     )
                 )
+            model_specific_data = item.model_specific_data
+            updated_model_specific_data = None
+            for key in AUXILIARY_TRANSPORT_FEATURE_NAMES:
+                if key not in model_specific_data:
+                    continue
+                original_value = model_specific_data[key]
+                wrapped_value = _wrap_auxiliary_transport_value(
+                    original_value, use_shm=use_shm
+                )
+                if wrapped_value is original_value:
+                    continue
+                if updated_model_specific_data is None:
+                    updated_model_specific_data = dict(model_specific_data)
+                updated_model_specific_data[key] = wrapped_value
+            if updated_model_specific_data is not None:
+                item.model_specific_data = updated_model_specific_data
             if wrap_model_data:
                 _wrap_model_specific_data(item)
             # Compact remaining inline tensors after the optional SHM wrapping.
@@ -1725,12 +1799,14 @@ def wrap_shm_features(obj):
     return obj
 
 
-def _feature_has_shm(feat) -> bool:
-    """Check whether a single feature (tensor, ShmPointer, or list) contains ShmPointerMMData."""
-    if isinstance(feat, ShmPointerMMData):
+def _feature_has_shm(value) -> bool:
+    """Recursively detect SHM pointers in a multimodal transport value."""
+    if isinstance(value, ShmPointerMMData):
         return True
-    if isinstance(feat, (list, tuple)):
-        return any(isinstance(t, ShmPointerMMData) for t in feat)
+    if isinstance(value, dict):
+        return any(_feature_has_shm(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_feature_has_shm(item) for item in value)
     return False
 
 
@@ -1758,10 +1834,12 @@ def has_shm_features(recv_reqs):
 def _discard_tensor_or_list(value) -> None:
     if isinstance(value, ShmPointerMMData):
         value.close_and_unlink()
+    elif isinstance(value, dict):
+        for tensor in value.values():
+            _discard_tensor_or_list(tensor)
     elif isinstance(value, (list, tuple)):
         for tensor in value:
-            if isinstance(tensor, ShmPointerMMData):
-                tensor.close_and_unlink()
+            _discard_tensor_or_list(tensor)
 
 
 def discard_shm_features(obj) -> None:
@@ -1780,7 +1858,7 @@ def discard_shm_features(obj) -> None:
         # Rejecting a request must release its crop segments too, or each one
         # leaks a multi-megabyte /dev/shm allocation.
         for _key, value in _model_specific_shm_values(item):
-            value.close_and_unlink()
+            _discard_tensor_or_list(value)
 
 
 def strip_mm_features_for_pp_relay(reqs: List) -> List:
@@ -1813,29 +1891,35 @@ def _strip_mm_features(req):
     return msgspec.structs.replace(req, mm_inputs=stripped_mm_inputs)
 
 
-def _unwrap_tensor_or_list(value):
-    """Restore ShmPointerMMData wrappers back into standard torch.Tensors."""
+def _unwrap_transport_value(value, memo):
+    """Restore nested SHM pointers while preserving repeated references."""
     if isinstance(value, ShmPointerMMData):
-        return value.materialize()
-    elif isinstance(value, (list, tuple)):
-        unwrapped = [
-            t.materialize() if isinstance(t, ShmPointerMMData) else t for t in value
-        ]
-        return type(value)(unwrapped) if isinstance(value, tuple) else unwrapped
+        proxy_id = id(value)
+        if proxy_id not in memo:
+            memo[proxy_id] = value.materialize()
+        return memo[proxy_id]
+    if isinstance(value, dict):
+        return {key: _unwrap_transport_value(item, memo) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_unwrap_transport_value(item, memo) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_unwrap_transport_value(item, memo) for item in value)
     return value
 
 
-def unwrap_shm_features(obj):
+def unwrap_shm_features(obj, _memo=None):
     """
     Restore ShmPointerMMData wrappers back into standard torch.Tensors.
     Handles both single requests and batch requests.
     """
     if _get_is_default_transport() or get_serving().skip_tokenizer_init:
         return obj
+    if _memo is None:
+        _memo = {}
     # Handle batch requests
     if isinstance(obj, BaseBatchReq):
         for sub_obj in obj.batch:
-            unwrap_shm_features(sub_obj)
+            unwrap_shm_features(sub_obj, _memo)
         return obj
     # Handle single requests
     if isinstance(
@@ -1843,17 +1927,17 @@ def unwrap_shm_features(obj):
     ) and isinstance(obj.mm_inputs, (MultimodalProcessorOutput, MultimodalInputs)):
         for item in obj.mm_inputs.mm_items:
             if item.feature is not None:
-                item.feature = _unwrap_tensor_or_list(item.feature)
+                item.feature = _unwrap_transport_value(item.feature, _memo)
             if item.precomputed_embeddings is not None:
-                item.precomputed_embeddings = _unwrap_tensor_or_list(
-                    item.precomputed_embeddings
+                item.precomputed_embeddings = _unwrap_transport_value(
+                    item.precomputed_embeddings, _memo
                 )
             # Fresh dict, for the same copy.copy aliasing reason as the wrap.
             unwrapped = None
             for key, value in _model_specific_shm_values(item):
                 if unwrapped is None:
                     unwrapped = dict(item.model_specific_data)
-                unwrapped[key] = value.materialize()
+                unwrapped[key] = _unwrap_transport_value(value, _memo)
             if unwrapped is not None:
                 item.model_specific_data = unwrapped
     return obj

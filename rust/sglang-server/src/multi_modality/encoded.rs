@@ -47,6 +47,7 @@ pub enum MmMetaValue {
 pub struct MmEncodedItem {
     pub modality: MmModality,
     pub feature: Tensor,
+    pub aux: Vec<(String, Tensor)>,
     /// Legacy source/routing hint. Cache equality uses the full output
     /// identity, never this scalar (which callers may override).
     pub hash: u64,
@@ -90,6 +91,17 @@ impl MmEncodedEntry {
                 return Err(format!(
                     "multimodal item {index}: feature shape does not match its data"
                 ));
+            }
+            for (name, tensor) in &item.aux {
+                let elements = tensor
+                    .shape
+                    .iter()
+                    .try_fold(1usize, |n, &d| n.checked_mul(d));
+                if elements != Some(tensor.data.len()) {
+                    return Err(format!(
+                        "multimodal item {index}: aux {name} shape does not match its data"
+                    ));
+                }
             }
             if item
                 .offsets
@@ -205,6 +217,24 @@ impl MmEncodedItem {
         hash.update(metadata);
         hash.update((data.len() as u64).to_be_bytes());
         hash.update(data);
+        // 辅助图像张量同样决定模型输出；无 aux 时保持目标原有 identity。
+        if !self.aux.is_empty() {
+            hash.update(b"sglang-rust-mm-aux-v1");
+            hash.update((self.aux.len() as u64).to_be_bytes());
+            for (name, tensor) in &self.aux {
+                let (dtype, data): (&str, &[u8]) = match &tensor.data {
+                    TensorData::F32(v) => ("f32", bytemuck::cast_slice(v)),
+                    TensorData::I64(v) => ("i64", bytemuck::cast_slice(v)),
+                    TensorData::Bf16(v) => ("bf16", bytemuck::cast_slice(v)),
+                };
+                let metadata = rmp_serde::to_vec_named(&(name, dtype, &tensor.shape))
+                    .map_err(|e| format!("mm aux identity encode: {e}"))?;
+                hash.update((metadata.len() as u64).to_be_bytes());
+                hash.update(metadata);
+                hash.update((data.len() as u64).to_be_bytes());
+                hash.update(data);
+            }
+        }
         Ok(hash.finalize().into())
     }
 }
@@ -215,6 +245,7 @@ mod tests {
 
     fn item() -> MmEncodedItem {
         MmEncodedItem {
+            aux: Vec::new(),
             modality: MmModality::Image,
             feature: Tensor {
                 shape: vec![2, 2],

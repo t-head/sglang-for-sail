@@ -36,6 +36,7 @@ def _jit_module(
     use_pdl: bool,
     sorted_layout: bool = False,
     silu_and_mul_mode: str = "legacy",
+    use_rn_division: bool = False,
 ) -> Module:
     assert in_dtype in _SUPPORTED_INPUT_DTYPES
     assert out_dtype in _SUPPORTED_OUTPUT_DTYPES
@@ -54,7 +55,12 @@ def _jit_module(
             "dense mode requires flat or masked BF16/FP16 SiLU+mul, FP8 output and "
             "group_size=128"
         )
-    # Only the dense variants add a flag; legacy launcher arguments stay intact.
+    if use_rn_division and (
+        out_dtype != torch.float8_e4m3fn or scale_ue8m0 or fuse_silu_and_mul
+    ):
+        raise ValueError(
+            "RN division requires E4M3, FP32 scales and no fused activation"
+        )
     trait_args = make_cpp_args(
         in_dtype,
         out_dtype,
@@ -65,7 +71,11 @@ def _jit_module(
         aligned,
         fuse_silu_and_mul,
         use_pdl,
-        *([True] if dense else []),
+        *(
+            [use_rn_division]
+            if sorted_layout
+            else [dense, use_rn_division]
+        ),
     )
     assert not (masked_layout and sorted_layout)
     layout = "masked" if masked_layout else ("sorted" if sorted_layout else "flat")
@@ -78,7 +88,7 @@ def _jit_module(
         cuda_wrappers=[("per_token_group_quant", f"{launcher}<{trait_args}>::run")],
         extra_cuda_cflags=get_activation_cuda_cflags()
         if dense
-        else ["--use_fast_math"],
+        else ([] if use_rn_division else ["--use_fast_math"]),
     )
 
 
@@ -118,9 +128,11 @@ def _per_token_group_quant_custom_op(
     num_tokens_post_padded: Optional[torch.Tensor] = None,
     num_valid_tokens: int = 0,
     silu_and_mul_mode: str = "legacy",
+    use_rn_division: bool = False,
 ) -> None:
     if (
         scale_ue8m0
+        and not use_rn_division
         and output_s.dtype == torch.float32
         and output_s.ndim == 2
         and output_s.is_contiguous()
@@ -166,6 +178,7 @@ def _per_token_group_quant_custom_op(
         is_arch_support_pdl(),
         sorted_token_ids is not None,
         silu_and_mul_mode,
+        use_rn_division=bool(use_rn_division),
     )
     if masked_m is not None:
         module.per_token_group_quant(
@@ -238,6 +251,7 @@ def per_token_group_quant(
     *,
     out_dtype: Optional[torch.dtype] = None,
     column_major_scales: bool = False,
+    use_rn_division: bool = False,
     sorted_token_ids: Optional[torch.Tensor] = None,
     num_tokens_post_padded: Optional[torch.Tensor] = None,
     num_valid_tokens: int = 0,
@@ -249,6 +263,11 @@ def per_token_group_quant(
     caller-owned buffers, or omit both to have them allocated per ``out_dtype``
     (default fp8_e4m3), ``scale_ue8m0`` and ``column_major_scales``. Either way
     the two tensors are returned.
+
+    ``use_rn_division`` selects FP32 round-to-nearest division for both
+    ``scale = max(amax, 1e-10) / 448`` and ``x / scale`` before E4M3 conversion.
+    It requires E4M3 output, FP32 scales, and no fused activation. The default
+    retains reciprocal multiplication. Finite inputs define the RN contract.
 
     Input / output shapes:
       vanilla:            input [T, hidden],      output_q [T, hidden]
@@ -310,6 +329,7 @@ def per_token_group_quant(
         fuse_silu_and_mul=fuse_silu_and_mul,
         masked_m=masked_m,
         expected_m=expected_m,
+        use_rn_division=use_rn_division,
         sorted_token_ids=sorted_token_ids,
         num_tokens_post_padded=num_tokens_post_padded,
         num_valid_tokens=num_valid_tokens,

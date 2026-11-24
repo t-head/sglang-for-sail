@@ -1685,6 +1685,9 @@ class ModelRunner:
                 ),
                 speculative_draft_attention_backend=self.draft_attention_backend,
                 speculative_draft_kv_cache_dtype=get_spec().speculative_draft_kv_cache_dtype,
+                full_attention_only=getattr(
+                    getattr(self, "model", None), "kv_cache_dtype_full_attention_only", False
+                ),
             )
         )
 

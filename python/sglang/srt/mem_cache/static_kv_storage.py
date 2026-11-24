@@ -72,6 +72,7 @@ def kv_storage_of(
     shape: Optional[StaticPoolShape] = None,
     draft_token_to_kv_pool=None,
     num_hidden_layers: Optional[int] = None,
+    draft_kv_pools: Optional[Tuple] = None,
 ) -> KVStorage | StaticKVStorage:
     """What a request's lifecycle, the pool observers and a PD peer go through:
     a unified pool's own storage, else the static pools' one `StaticKVStorage`,
@@ -90,8 +91,14 @@ def kv_storage_of(
         token_to_kv_pool_allocator._static_kv_storage = static
     if shape is not None:
         static.bind_shape(shape)
-    if draft_token_to_kv_pool is not None or num_hidden_layers is not None:
-        static.bind_transfer_draft(draft_token_to_kv_pool, num_hidden_layers)
+    if (
+        draft_token_to_kv_pool is not None
+        or num_hidden_layers is not None
+        or draft_kv_pools is not None
+    ):
+        static.bind_transfer_draft(
+            draft_token_to_kv_pool, num_hidden_layers, draft_kv_pools=draft_kv_pools
+        )
     return static
 
 
@@ -148,6 +155,7 @@ class StaticKVStorage:
         self._allocator = token_to_kv_pool_allocator
         self._shape = shape
         self._draft_token_to_kv_pool = draft_token_to_kv_pool
+        self._draft_kv_pools: Tuple = ()
         self._num_hidden_layers = num_hidden_layers
         self._owner_region: Optional[Region] = None
         self._state_entries: Optional[_StaticStateEntries] = None
@@ -171,15 +179,23 @@ class StaticKVStorage:
         self._shape = shape
 
     def bind_transfer_draft(
-        self, draft_token_to_kv_pool, num_hidden_layers: Optional[int]
+        self,
+        draft_token_to_kv_pool,
+        num_hidden_layers: Optional[int],
+        *,
+        draft_kv_pools: Optional[Tuple] = None,
     ) -> None:
-        """The draft pool a PD peer registers with the target's, and the
-        target's layer count; the state entries are rebuilt from them."""
-        if (draft_token_to_kv_pool, num_hidden_layers) != (
+        """绑定 PD 的主 draft 和有序多层 draft；变更后重建 state entries。"""
+        pools = (
+            self._draft_kv_pools if draft_kv_pools is None else tuple(draft_kv_pools)
+        )
+        if (draft_token_to_kv_pool, num_hidden_layers, pools) != (
             self._draft_token_to_kv_pool,
             self._num_hidden_layers,
+            self._draft_kv_pools,
         ):
             self._draft_token_to_kv_pool = draft_token_to_kv_pool
+            self._draft_kv_pools = pools
             self._num_hidden_layers = num_hidden_layers
             self._state_entries = None
 
@@ -189,7 +205,9 @@ class StaticKVStorage:
         self._shape = other._shape
         self._window_retention = other._window_retention
         self.bind_transfer_draft(
-            other._draft_token_to_kv_pool, other._num_hidden_layers
+            other._draft_token_to_kv_pool,
+            other._num_hidden_layers,
+            draft_kv_pools=other._draft_kv_pools,
         )
 
     def resume_units(
@@ -857,6 +875,7 @@ class StaticKVStorage:
                 draft_token_to_kv_pool=self._draft_token_to_kv_pool,
                 total_kv_layers=self._num_hidden_layers,
                 state_pool=None if state is None else state.pool,
+                draft_kv_pools=self._draft_kv_pools,
             )
         return self._state_entries
 
@@ -910,6 +929,7 @@ def _static_state_entries(
     draft_token_to_kv_pool,
     total_kv_layers: Optional[int],
     state_pool,
+    draft_kv_pools: Tuple = (),
 ) -> _StaticStateEntries:
     """A static pool's state entries in the order PD peers register them; a
     draft's state rides in the target's entries where the pool family shares
@@ -1293,6 +1313,12 @@ def _static_state_entries(
         if row_ptrs:
             add(StateType.REQUEST_ROW, row_ptrs, row_lens, row_item_lens)
 
+    # 附加的页状态和请求行状态沿用 pool 提供的顺序。
+    getter = getattr(token_to_kv_pool, "get_pd_state_components", None)
+    if getter is not None:
+        for name, buf_infos in getter():
+            add(StateType(name), *buf_infos)
+
     # The recurrent state pool, when the KV pool does not describe it (a
     # window KV pool beside a state sub-pool).
     if StateType.MAMBA not in types and state_pool is not None:
@@ -1317,6 +1343,27 @@ def _static_state_entries(
             *owner_view.get_kv_scale_buf_infos(),
             layer_ids=owner_view.model_layer_ids,
         )
+
+    # 多层 draft 沿用目标 FULL→SWA 映射，各自注册独立的窗口组件。
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+    swa_mapping = getattr(token_to_kv_pool, "full_to_swa_index_mapping", None)
+    seen_pools = {id(token_to_kv_pool)}
+    for draft_pool in draft_kv_pools:
+        if (
+            id(draft_pool) not in seen_pools
+            and swa_mapping is not None
+            and isinstance(draft_pool, SWAKVPool)
+            and draft_pool.swa_layer_nums > 0
+            and draft_pool.full_to_swa_index_mapping is swa_mapping
+        ):
+            seen_pools.add(id(draft_pool))
+            add(
+                StateType.SWA,
+                *draft_pool.get_state_buf_infos(),
+                kv_layout=draft_pool.swa_kv_pool.kv_cache_layout,
+                view=lambda pool=draft_pool: pool.swa_kv_pool,
+            )
 
     regions = {}
     views = {}
