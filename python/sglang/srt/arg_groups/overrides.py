@@ -1510,11 +1510,23 @@ def _ppu_flashmla_fp8_kv_cache_fallback(view: Any) -> dict:
             or view.dsa_decode_backend in dsa_flashmla_backends
         ):
             return {}
-        if (
-            get_platform().device_sm >= 89
-            and view.dsa_prefill_backend == view.dsa_decode_backend == "flashmla_kv"
-        ):
-            return {}
+        if get_platform().device_sm >= 89:
+            # Both phases served by the fp8-capable FlashMLA KV kernel, which reads
+            # the fp8 pool directly, so the store stays fp8.
+            if view.dsa_prefill_backend == view.dsa_decode_backend == "flashmla_kv":
+                return {}
+            # Sparse FlashMLA prefill + FlashMLA KV decode: the sparse kernel only
+            # consumes bf16, and the framework dequantizes the fp8 prefix KV
+            # (dequantize_k_cache_paged_dsa) in front of it while the pool itself is
+            # still written as fp8 (quantize on write). The capacity win survives
+            # and the decode phase uses the fp8-capable KV kernel, so this
+            # combination is supported and must not be forced back to
+            # compute-dtype KV.
+            if (
+                view.dsa_prefill_backend == "flashmla_sparse"
+                and view.dsa_decode_backend == "flashmla_kv"
+            ):
+                return {}
 
     incompatible = []
     if view.decode_attention_backend == "flashmla":
