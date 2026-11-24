@@ -1,15 +1,12 @@
 name: Nightly Dispatch (PPU)
 
-# Merge order: land the companion yuhe/v1.0.0 nightly-test-ppu.yml PR declaring
-# target_ref, image_tag, and image_digest before merging this dispatcher PR.
-
 on:
   schedule:
-    - cron: '23 18 * * *'
+    - cron: '0 16 * * *'
   workflow_dispatch:
     inputs:
       target_ref:
-        description: 'Target branch or 40-char commit SHA (default: yuhe/v1.0.0)'
+        description: 'Supported release branch or its current head SHA (default: yuhe/v1.0.0)'
         type: string
         default: 'yuhe/v1.0.0'
       model_filter:
@@ -34,16 +31,78 @@ permissions:
   contents: read
   pull-requests: read
 
+# One dispatcher run owns the queue until both versions have finished.
+concurrency:
+  group: sglang-ppu-nightly-dispatch
+  queue: max
+
 jobs:
-  release-v100:
+  plan:
     if: >-
-      github.repository == 't-head/sglang-for-sail' &&
+      github.repository == 't-head/sglang-for-sail' && github.ref_name == 'sail_ci_cd' &&
       (github.event_name != 'schedule' || vars.PPU_NIGHTLY_SCHEDULE_DISABLED != 'true')
+    runs-on: ubuntu-latest
+    outputs:
+      v0523: ${{ steps.refs.outputs.v0523 }}
+      v100: ${{ steps.refs.outputs.v100 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/ci/ppu
+          persist-credentials: false
+      - uses: actions/github-script@v8
+        id: refs
+        env:
+          TARGET: ${{ inputs.target_ref }}
+          ACTIVE_REFS: ${{ vars.PPU_NIGHTLY_ACTIVE_REFS }}
+        with:
+          script: |
+            const {selectRefs} = require('./scripts/ci/ppu/nightly_dispatch.cjs');
+            const getHead = async branch => {
+              try {
+                const {data} = await github.rest.repos.getBranch({...context.repo, branch});
+                return data.commit.sha;
+              } catch (error) {
+                if (error?.status === 404) return null;
+                throw error;
+              }
+            };
+            const refs = await selectRefs({
+              event: context.eventName, activeRefs: process.env.ACTIVE_REFS,
+              target: process.env.TARGET, getHead,
+            });
+            core.setOutput("v0523", refs.v0523);
+            core.setOutput("v100", refs.v100);
+
+  release-v0523:
+    needs: plan
+    if: needs.plan.outputs.v0523 != ''
+    uses: t-head/sglang-for-sail/.github/workflows/nightly-test-ppu.yml@release/v0.5.23
+    with:
+      target_ref: ${{ needs.plan.outputs.v0523 }}
+      model_filter: ${{ inputs.model_filter || '' }}
+      image_tag: ${{ inputs.image_tag || (github.event_name == 'schedule' && vars.PPU_NIGHTLY_IMAGE_TAG_V0523) || '' }}
+      image_digest: ${{ inputs.image_digest || '' }}
+      skip_wheel_build: ${{ inputs.skip_wheel_build == true }}
+    secrets:
+      PPU_CI_K8S_RUNTIME_DIGEST: ${{ secrets.PPU_CI_K8S_RUNTIME_DIGEST }}
+      PPU_CI_RECIPE_IMAGE_REPO: ${{ secrets.PPU_CI_RECIPE_IMAGE_REPO }}
+      PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS: ${{ secrets.PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS }}
+      PPU_CI_NOTIFY_WEBHOOK_URL: ${{ secrets.PPU_CI_NOTIFY_WEBHOOK_URL }}
+      PPU_CI_NOTIFY_SIGNING_SECRET: ${{ secrets.PPU_CI_NOTIFY_SIGNING_SECRET }}
+      PPU_CI_NOTIFY_ROSTER_JSON: ${{ secrets.PPU_CI_NOTIFY_ROSTER_JSON }}
+
+  release-v100:
+    needs: [plan, release-v0523]
+    if: >-
+      !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.v100 != ''
+    # GitHub requires a literal reusable-workflow ref. The v1 workflow
+    # approves and checks out the selected v1 source branch or SHA.
     uses: t-head/sglang-for-sail/.github/workflows/nightly-test-ppu.yml@yuhe/v1.0.0
     with:
-      target_ref: ${{ inputs.target_ref || 'yuhe/v1.0.0' }}
+      target_ref: ${{ needs.plan.outputs.v100 }}
       model_filter: ${{ inputs.model_filter || '' }}
-      image_tag: ${{ inputs.image_tag || '' }}
+      image_tag: ${{ inputs.image_tag || (github.event_name == 'schedule' && vars.PPU_NIGHTLY_IMAGE_TAG_V100) || '' }}
       image_digest: ${{ inputs.image_digest || '' }}
       skip_wheel_build: ${{ inputs.skip_wheel_build == true }}
     secrets:
