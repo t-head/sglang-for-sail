@@ -21,6 +21,7 @@ Everything else falls back to the unfused chain.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -32,13 +33,19 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 from sglang.kernels.jit.utils.common import is_sail_runtime as is_sail
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 SUPPORTED_HEADS = {3, 6, 8, 12, 16}
 SAIL_SUPPORTED_HEADS = {12, 24, 48, 96}
+_SAIL_PLA_HEADS = SAIL_SUPPORTED_HEADS | {4, 6, 8, 16, 64}
 _CONV_STATE_W = 3  # kernel width 4 -> 3 cached tokens
+
+
+def sail_supported_heads() -> set[int]:
+    return _SAIL_PLA_HEADS if envs.SGLANG_SAIL_PLA_CUDA.get() else SAIL_SUPPORTED_HEADS
 
 
 @cache_once
@@ -66,36 +73,14 @@ def covered(
     packed [T, 3*H*128] qkv rows, transposed [slots, 3, 3*H*128] conv pool, fp32
     [slots, H, 128, 128] ssm pool (inner-contiguous, any slot pitch — the
     kernel reads the real slot stride), one token per request."""
+    if is_sail():
+        return _sail_covered(
+            mixed_qkv, a, b, conv_states, ssm_states, cache_indices, onorm_g
+        )
+
     if ssm_states.ndim < 4:
         return False
     H, V, K = ssm_states.shape[-3:]
-    if is_sail():
-        seg = H * 128
-        return (
-            H in SAIL_SUPPORTED_HEADS
-            and V == 128
-            and K == 128
-            and mixed_qkv.ndim == 2
-            and mixed_qkv.shape[-1] == 3 * seg
-            and a.shape == (mixed_qkv.shape[0], seg)
-            and b.shape == (mixed_qkv.shape[0], H)
-            and onorm_g.shape == (mixed_qkv.shape[0], seg)
-            and conv_states.ndim == 3
-            and conv_states.shape[-2:] == (3, 3 * seg)
-            and mixed_qkv.dtype in (torch.bfloat16, torch.float16)
-            and all(x.dtype == mixed_qkv.dtype for x in (a, b, conv_states, onorm_g))
-            and ssm_states.dtype == torch.float32
-            and cache_indices.dtype == torch.int32
-            and cache_indices.shape == (mixed_qkv.shape[0],)
-            and cache_indices.is_contiguous()
-            and mixed_qkv.stride(-1) == 1
-            and onorm_g.stride(-1) == 1
-            and conv_states.stride(-1) == 1
-            and conv_states.stride(-2) == 3 * seg
-            and ssm_states.stride(-1) == 1
-            and ssm_states.stride(-2) == K
-            and ssm_states.stride(-3) == V * K
-        )
     if H not in SUPPORTED_HEADS:
         return False
 
@@ -136,6 +121,57 @@ def covered(
         and ssm_states.stride(-2) == K
         and ssm_states.stride(-3) == V * K
         and cache_indices.is_contiguous()
+    )
+
+
+def _sail_covered(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    conv_states: torch.Tensor,
+    ssm_states: torch.Tensor,
+    cache_indices: torch.Tensor,
+    onorm_g: torch.Tensor,
+) -> bool:
+    if ssm_states.ndim < 4:
+        return False
+    H, V, K = ssm_states.shape[-3:]
+    legacy_head = H in SAIL_SUPPORTED_HEADS
+    if not legacy_head:
+        if ssm_states.ndim != 4 or H not in sail_supported_heads():
+            return False
+        # PLA's reference implementation only accepts BF16 activations.
+        if mixed_qkv.dtype == torch.float16 and os.getenv("KDA_DECODE_IMPL") in (
+            "ref",
+            "1",
+        ):
+            return False
+
+    seg = H * 128
+    return (
+        V == 128
+        and K == 128
+        and mixed_qkv.ndim == 2
+        and mixed_qkv.shape[-1] == 3 * seg
+        and a.shape == (mixed_qkv.shape[0], seg)
+        and b.shape == (mixed_qkv.shape[0], H)
+        and onorm_g.shape == (mixed_qkv.shape[0], seg)
+        and conv_states.ndim == 3
+        and conv_states.shape[-2:] == (3, 3 * seg)
+        and mixed_qkv.dtype in (torch.bfloat16, torch.float16)
+        and all(x.dtype == mixed_qkv.dtype for x in (a, b, conv_states, onorm_g))
+        and ssm_states.dtype == torch.float32
+        and cache_indices.dtype == torch.int32
+        and cache_indices.shape == (mixed_qkv.shape[0],)
+        and cache_indices.is_contiguous()
+        and mixed_qkv.stride(-1) == 1
+        and onorm_g.stride(-1) == 1
+        and conv_states.stride(-1) == 1
+        and conv_states.stride(-2) == 3 * seg
+        and ssm_states.stride(-1) == 1
+        and ssm_states.stride(-2) == K
+        and ssm_states.stride(-3) == V * K
+        and (legacy_head or (a.is_contiguous() and b.stride(-1) == 1))
     )
 
 

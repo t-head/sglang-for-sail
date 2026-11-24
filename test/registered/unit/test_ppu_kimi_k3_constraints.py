@@ -14,6 +14,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear import kda_backend
 from sglang.srt.layers.attention.linear.kernels import kda_flashkda
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
+from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16_moe import (
     CompressedTensorsWNA16DeepGemmMoE,
 )
@@ -187,8 +188,8 @@ class TestFlashKDAStridedInputs(CustomTestCase):
         expected_states[cache_indices] += 1
         expected_output = q + k + v + g + beta.unsqueeze(-1)
 
-        for use_pla in (True, False):
-            with self.subTest(use_pla=use_pla):
+        for use_pla, indexed in ((True, True), (True, False), (False, False)):
+            with self.subTest(use_pla=use_pla, indexed=indexed):
                 states = initial_pool.clone()
 
                 def run_kernel(
@@ -203,8 +204,10 @@ class TestFlashKDAStridedInputs(CustomTestCase):
                     dt_bias,
                     lower_bound,
                     *,
-                    initial_state,
-                    final_state,
+                    initial_state=None,
+                    final_state=None,
+                    state_pool=None,
+                    state_indices=None,
                     **kwargs,
                 ):
                     for name, tensor in dict(q=q, k=k, v=v, g=g, beta=beta).items():
@@ -217,11 +220,19 @@ class TestFlashKDAStridedInputs(CustomTestCase):
                             self.assertTrue(tensor.is_contiguous())
 
                     self.assertTrue(out.is_contiguous())
-                    self.assertTrue(
-                        torch.equal(initial_state, initial_pool[cache_indices])
-                    )
                     out.copy_(q + k + v + g + beta.unsqueeze(-1))
-                    final_state.copy_(initial_state + 1)
+                    if indexed:
+                        self.assertIs(state_pool, states)
+                        self.assertIs(state_indices, cache_indices)
+                        self.assertIsNone(initial_state)
+                        self.assertIsNone(final_state)
+                        state_pool[state_indices] += 1
+                    else:
+                        self.assertIsNone(state_pool)
+                        self.assertTrue(
+                            torch.equal(initial_state, initial_pool[cache_indices])
+                        )
+                        final_state.copy_(initial_state + 1)
 
                 fwd = Mock(side_effect=run_kernel)
                 pla_module = ModuleType("pla")
@@ -231,6 +242,15 @@ class TestFlashKDAStridedInputs(CustomTestCase):
                 prefill_module.flashkdapro = flashkda_module
                 flashkda_module.flashkda_fwd = fwd
 
+                query_start_loc = torch.tensor([0, 19, 64], dtype=torch.int32)
+                metadata = (
+                    ForwardMetadata(
+                        query_start_loc=query_start_loc,
+                        mamba_cache_indices=cache_indices,
+                    )
+                    if indexed
+                    else None
+                )
                 with (
                     patch.object(kda_flashkda, "is_sail", return_value=use_pla),
                     patch.object(
@@ -251,12 +271,14 @@ class TestFlashKDAStridedInputs(CustomTestCase):
                         **inputs,
                         ssm_states=states,
                         cache_indices=cache_indices,
-                        query_start_loc=torch.tensor([0, 19, 64], dtype=torch.int32),
+                        query_start_loc=query_start_loc,
                         A_log=torch.zeros(1, 1, num_heads, 1),
                         dt_bias=torch.zeros(num_heads * head_dim),
                         lower_bound=-5.0,
                         beta_is_raw=True,
                         extend_seq_lens_cpu=[19, 45],
+                        req_pool_indices_cpu=cache_indices.to(torch.int64),
+                        pla_prefill_metadata=metadata,
                     )
 
                 fwd.assert_called_once()
@@ -273,8 +295,50 @@ class TestFlashKDAStridedInputs(CustomTestCase):
         ({"extend_seq_lens_cpu": [64]}, [0, 64], (0, 64)),
         ({"extend_seq_lens_cpu": [19]}, [0, 19], (0, 19)),
         ({"extend_seq_lens_cpu": [19, 45]}, [0, 19, 64], (0, 19, 64)),
+        (
+            {
+                "cache_offsets": True,
+                "extend_seq_lens_cpu": [19, 45],
+                "beta_is_raw": True,
+            },
+            [0, 19, 64],
+            (0, 19, 64),
+        ),
+        (
+            {
+                "cache_offsets": True,
+                "extend_seq_lens_cpu": [32, 32],
+                "state_slots": [0, 0],
+                "warmup": True,
+            },
+            [0, 32, 64],
+            (0, 32, 64),
+        ),
+        (
+            {
+                "cache_offsets": True,
+                "extend_seq_lens_cpu": [32, 32],
+                "state_slots": [1, 1],
+            },
+            [0, 32, 64],
+            (0, 32, 64),
+        ),
+        (
+            {
+                "cache_offsets": True,
+                "extend_seq_lens_cpu": [32, 32],
+                "beta_is_raw": True,
+                "head_major_beta": True,
+            },
+            [0, 32, 64],
+            (0, 32, 64),
+        ),
         ({"extend_seq_lens_cpu": (45, 19)}, [0, 45, 64], (0, 45, 64)),
-        ({"extend_seq_lens_cpu": [0, 64]}, [0, 0, 64], (0, 0, 64)),
+        (
+            {"cache_offsets": True, "extend_seq_lens_cpu": [0, 64]},
+            [0, 0, 64],
+            (0, 0, 64),
+        ),
         ({"extend_seq_lens_cpu": [64, 0]}, [0, 64], None),
         ({"extend_seq_lens_cpu": [4096]}, [0, 19], None),
         ({"extend_seq_lens_cpu": [19]}, [0, 64], None),
@@ -295,23 +359,55 @@ def test_ppu_flashkda_dispatches_to_platform_operator(
     k = torch.zeros_like(q)
     v = torch.zeros_like(q)
     g = torch.zeros_like(q)
-    beta = torch.full((1, packed_tokens, num_heads), 0.5, dtype=torch.float32)
+    extend_kwargs = extend_kwargs.copy()
+    cache_offsets = extend_kwargs.pop("cache_offsets", False)
+    warmup = extend_kwargs.pop("warmup", False)
+    state_slots = extend_kwargs.pop("state_slots", None)
+    head_major_beta = extend_kwargs.pop("head_major_beta", False)
+    indexed = (
+        cache_offsets
+        and not capturing
+        and state_slots is None
+        and all(length > 0 for length in extend_kwargs["extend_seq_lens_cpu"])
+    )
+    if head_major_beta:
+        beta = torch.full((1, num_heads, packed_tokens), 0.5, dtype=torch.bfloat16)
+        beta = beta.transpose(1, 2)
+    elif extend_kwargs.get("beta_is_raw"):
+        beta = torch.full((1, packed_tokens, 2 * num_heads), 0.5, dtype=torch.bfloat16)[
+            ..., :num_heads
+        ]
+    else:
+        beta = torch.full((1, packed_tokens, num_heads), 0.5, dtype=torch.float32)
     num_sequences = len(device_offsets) - 1
     ssm_states = torch.zeros(
         (num_sequences + 1, num_heads, head_dim, head_dim), dtype=torch.float32
     )
-    cache_indices = torch.arange(1, num_sequences + 1, dtype=torch.int32)
+    cache_indices = (
+        torch.arange(1, num_sequences + 1, dtype=torch.int32)
+        if state_slots is None
+        else torch.tensor(state_slots, dtype=torch.int32)
+    )
+    req_pool_indices_cpu = None if warmup else cache_indices.to(torch.int64)
     device_cu = torch.tensor(device_offsets, dtype=torch.int32)
     # CPU backing storage, with device metadata/capture flags mocked explicitly.
-    query_start_loc = SimpleNamespace(
-        is_cuda=True, numel=device_cu.numel, to=device_cu.to
-    )
-    flashkda_fwd = Mock(
-        side_effect=lambda **kwargs: (
-            kwargs["out"].fill_(0.25),
-            kwargs["final_state"].copy_(kwargs["initial_state"] + 1),
+    query_start_loc = SimpleNamespace(is_cuda=True, numel=device_cu.numel)
+    metadata = (
+        ForwardMetadata(
+            query_start_loc=query_start_loc, mamba_cache_indices=cache_indices
         )
+        if cache_offsets
+        else None
     )
+
+    def flashkda_mock(**kwargs):
+        kwargs["out"].fill_(0.25)
+        if "state_pool" in kwargs:
+            kwargs["state_pool"][kwargs["state_indices"]] += 1
+        else:
+            kwargs["final_state"].copy_(kwargs["initial_state"] + 1)
+
+    flashkda_fwd = Mock(side_effect=flashkda_mock)
     pla_module = ModuleType("pla")
     prefill_module = ModuleType("pla.prefill")
     flashkda_module = ModuleType("pla.prefill.flashkdapro")
@@ -322,7 +418,12 @@ def test_ppu_flashkda_dispatches_to_platform_operator(
     with (
         patch.object(kda_flashkda, "is_sail", return_value=True),
         patch.object(kda_flashkda, "_load_flash_kda") as load_flash_kda,
-        patch.object(torch.cuda, "is_current_stream_capturing", return_value=capturing),
+        patch.object(
+            torch.cuda, "is_current_stream_capturing", return_value=capturing
+        ) as capture_check,
+        patch.object(
+            kda_flashkda, "_pla_host_offsets", wraps=kda_flashkda._pla_host_offsets
+        ) as build_offsets,
         envs.SGLANG_SAIL_PLA_CUDA.override(True),
         patch.dict(
             sys.modules,
@@ -333,37 +434,55 @@ def test_ppu_flashkda_dispatches_to_platform_operator(
             },
         ),
     ):
-        output = kda_flashkda.FlashKDAKernel().extend(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            ssm_states=ssm_states,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            A_log=torch.zeros((1, 1, num_heads, 1), dtype=torch.float32),
-            dt_bias=torch.zeros(num_heads * head_dim, dtype=torch.float32),
-            lower_bound=-5.0,
-            **extend_kwargs,
-        )
+        kernel = kda_flashkda.FlashKDAKernel()
+        # A second layer must reuse the tuple built by the first eligible layer.
+        layers = 2 if indexed else 1
+        for _ in range(layers):
+            output = kernel.extend(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                A_log=torch.zeros((1, 1, num_heads, 1), dtype=torch.float32),
+                dt_bias=torch.zeros(num_heads * head_dim, dtype=torch.float32),
+                lower_bound=-5.0,
+                req_pool_indices_cpu=req_pool_indices_cpu,
+                pla_prefill_metadata=metadata,
+                **extend_kwargs,
+            )
 
     assert isinstance(output, torch.Tensor)
     assert output.shape == q.shape
     assert torch.all(output == 0.25)
-    assert torch.all(ssm_states[1:] == 1)
-    assert torch.count_nonzero(ssm_states[0]) == 0
+    expected_states = torch.zeros_like(ssm_states)
+    expected_states[cache_indices] = layers
+    torch.testing.assert_close(ssm_states, expected_states)
     load_flash_kda.assert_not_called()
-    flashkda_fwd.assert_called_once()
+    assert flashkda_fwd.call_count == capture_check.call_count == layers
+    assert build_offsets.call_count == (0 if capturing else 1)
+    if metadata is not None:
+        assert metadata.pla_prefill_host_offsets == (expected_raw if indexed else None)
     kwargs = flashkda_fwd.call_args.kwargs
     assert kwargs["q"].shape == (packed_tokens, num_heads, head_dim)
     assert kwargs["beta"].shape == (packed_tokens, num_heads)
     assert kwargs["beta"].dtype == torch.bfloat16
     assert kwargs["A_log"].shape == (num_heads,)
     assert kwargs["dt_bias"].shape == (num_heads, head_dim)
-    assert kwargs["cu_seqlens"].dtype == torch.int64
-    assert kwargs["cu_seqlens"].tolist() == device_offsets
+    assert kwargs["cu_seqlens"] is query_start_loc
+    if indexed:
+        assert kwargs["state_pool"] is ssm_states
+        assert kwargs["state_indices"] is cache_indices
+        assert "initial_state" not in kwargs
+    else:
+        assert "state_pool" not in kwargs
     assert kwargs["raw_cu_seqlens"] == (None if capturing else expected_raw)
+    if extend_kwargs.get("beta_is_raw"):
+        assert kwargs["beta"].data_ptr() == beta.data_ptr()
+        assert kwargs["beta"].stride() == beta.stride()[-2:]
 
 
 @pytest.mark.parametrize(
@@ -385,29 +504,26 @@ def test_pla_host_offsets_never_reads_device_values(lengths, num_tokens, expecte
         tolist=Mock(side_effect=AssertionError("unexpected D2H")),
         item=Mock(side_effect=AssertionError("unexpected D2H")),
     )
-    with patch.object(torch.cuda, "is_current_stream_capturing", return_value=False):
-        assert kda_flashkda._pla_host_offsets(lengths, query, num_tokens) == expected
+    assert kda_flashkda._pla_host_offsets(lengths, query, num_tokens) == expected
     query.cpu.assert_not_called()
     query.tolist.assert_not_called()
     query.item.assert_not_called()
 
 
-def test_pla_host_offsets_keeps_capture_device_driven_but_allows_eager_breaks():
+def test_pla_host_offsets_rebuilds_from_eager_break_lengths():
     query = SimpleNamespace(is_cuda=True, numel=lambda: 3)
-    with patch.object(torch.cuda, "is_current_stream_capturing", return_value=True):
-        assert kda_flashkda._pla_host_offsets([19, 45], query, 64) is None
     # Breakable attention executes eagerly on replay: recompute from this call's
     # lengths rather than retaining the tuple used during graph warmup.
-    with patch.object(torch.cuda, "is_current_stream_capturing", return_value=False):
-        lengths = [19, 45]
-        assert kda_flashkda._pla_host_offsets(lengths, query, 64) == (0, 19, 64)
-        lengths[:] = [45, 19]
-        assert kda_flashkda._pla_host_offsets(lengths, query, 64) == (0, 45, 64)
+    lengths = [19, 45]
+    assert kda_flashkda._pla_host_offsets(lengths, query, 64) == (0, 19, 64)
+    lengths[:] = [45, 19]
+    assert kda_flashkda._pla_host_offsets(lengths, query, 64) == (0, 45, 64)
 
 
 def test_cuda_flashkda_does_not_receive_pla_host_offsets():
     kernel = kda_flashkda.FlashKDAKernel()
     q = torch.zeros((1, 64, 4, 128), dtype=torch.bfloat16)
+    v = torch.zeros((1, 4, 64, 128), dtype=torch.bfloat16).transpose(1, 2)
     beta = torch.zeros((1, 64, 4), dtype=torch.bfloat16)
     states = torch.zeros((1, 4, 128, 128), dtype=torch.float32)
     external = SimpleNamespace(fwd=Mock())
@@ -416,10 +532,10 @@ def test_cuda_flashkda_does_not_receive_pla_host_offsets():
         patch.object(kda_flashkda, "_load_flash_kda", return_value=external),
         patch.object(kda_flashkda, "_pla_host_offsets") as host_offsets,
     ):
-        kernel._flashkda_extend(
+        output = kernel._flashkda_extend(
             q,
             q.clone(),
-            q.clone(),
+            v,
             q.clone(),
             beta,
             ssm_states=states,
@@ -433,26 +549,44 @@ def test_cuda_flashkda_does_not_receive_pla_host_offsets():
         )
     host_offsets.assert_not_called()
     external.fwd.assert_called_once()
-    assert "raw_cu_seqlens" not in external.fwd.call_args.kwargs
+    assert output.stride() == v.stride()
+    assert external.fwd.call_args.args[2].is_contiguous()
+    assert external.fwd.call_args.args[6] is output
+    assert external.fwd.call_args.kwargs["cu_seqlens"].dtype == torch.int64
+    assert set(external.fwd.call_args.kwargs) == {
+        "initial_state",
+        "final_state",
+        "cu_seqlens",
+    }
 
 
 @pytest.mark.parametrize(
-    "track_ssm, lower_bound, is_spec_decode",
-    [(True, -5.0, False), (False, None, False), (False, -5.0, True)],
+    "track_ssm, lower_bound, is_spec_decode, pla_enabled",
+    [
+        (True, -5.0, False, True),
+        (False, None, False, True),
+        (False, -5.0, True, True),
+        (False, -5.0, False, False),
+    ],
 )
 def test_ppu_flashkda_fallback_preserves_return_contract(
-    track_ssm, lower_bound, is_spec_decode
+    track_ssm, lower_bound, is_spec_decode, pla_enabled
 ):
     kernel = kda_flashkda.FlashKDAKernel()
     output = torch.zeros((1, 64, 12, 128), dtype=torch.bfloat16)
     result = (output, sentinel.intermediate_states) if track_ssm else output
     track_state = sentinel.track_state if track_ssm else None
     track_chunk_idx = sentinel.track_chunk_idx if track_ssm else None
+    metadata = ForwardMetadata(
+        query_start_loc=sentinel.query_start_loc,
+        mamba_cache_indices=sentinel.cache_indices,
+    )
 
     with (
         patch.object(kda_flashkda, "is_sail", return_value=True),
         patch.object(kernel, "_flashkda_extend") as fused_extend,
-        envs.SGLANG_SAIL_PLA_CUDA.override(True),
+        envs.SGLANG_SAIL_PLA_CUDA.override(pla_enabled),
+        patch.object(kda_flashkda, "_pla_host_offsets") as build_offsets,
         patch(
             "sglang.kernels.ops.attention.fla.kda.chunk_kda", return_value=result
         ) as chunk_kda,
@@ -472,12 +606,16 @@ def test_ppu_flashkda_fallback_preserves_return_contract(
             beta_is_raw=True,
             is_spec_decode=is_spec_decode,
             return_intermediate_states=track_ssm,
+            extend_seq_lens_cpu=[64],
+            pla_prefill_metadata=metadata,
             track_state=track_state,
             track_chunk_idx=track_chunk_idx,
         )
 
     assert actual is result
     fused_extend.assert_not_called()
+    build_offsets.assert_not_called()
+    assert metadata.pla_prefill_host_offsets is None
     chunk_kda.assert_called_once_with(
         q=sentinel.q,
         k=sentinel.k,
@@ -634,37 +772,83 @@ def test_kda_track_path_requests_intermediate_states_only_for_unaligned_rows():
     assert not needs_intermediate_states(True, None)
 
 
-def _fused_decode_coverage_inputs(num_heads):
+def _fused_decode_coverage_inputs(num_heads, dtype=torch.bfloat16):
     head_dim = 128
     seg = num_heads * head_dim
     batch_size = 2
     num_slots = 3
     return (
-        torch.empty(batch_size, 3 * seg, dtype=torch.bfloat16),
-        torch.empty(batch_size, seg, dtype=torch.bfloat16),
-        torch.empty(batch_size, num_heads, dtype=torch.bfloat16),
-        torch.empty(num_slots, 3, 3 * seg, dtype=torch.bfloat16),
+        torch.empty(batch_size, 3 * seg, dtype=dtype),
+        torch.empty(batch_size, seg, dtype=dtype),
+        torch.empty(batch_size, num_heads, dtype=dtype),
+        torch.empty(num_slots, 3, 3 * seg, dtype=dtype),
         torch.empty(num_slots, num_heads, head_dim, head_dim, dtype=torch.float32),
         torch.arange(batch_size, dtype=torch.int32),
-        torch.empty(batch_size, seg, dtype=torch.bfloat16),
+        torch.empty(batch_size, seg, dtype=dtype),
     )
 
 
-def test_ppu_fused_decode_bypasses_community_coverage():
+def test_fused_decode_uses_platform_head_and_layout_contracts():
     with (
         patch.object(kda_fused_decode, "is_sail", return_value=True),
-        patch.object(kda_fused_decode, "SAIL_SUPPORTED_HEADS", {12, 24, 48, 96}),
+        envs.SGLANG_SAIL_PLA_CUDA.override(True),
     ):
-        for num_heads in (12, 24, 48, 96):
+        for num_heads in (4, 6, 8, 12, 16, 24, 48, 64, 96):
             assert kda_fused_decode.covered(*_fused_decode_coverage_inputs(num_heads))
-        assert not kda_fused_decode.covered(*_fused_decode_coverage_inputs(6))
+        assert not kda_fused_decode.covered(*_fused_decode_coverage_inputs(3))
+        legacy = list(_fused_decode_coverage_inputs(12))
+        legacy[0] = legacy[0][:, :-1]
+        assert not kda_fused_decode.covered(*legacy)
+        inputs = list(_fused_decode_coverage_inputs(4))
+        inputs[1] = torch.empty(2, 2 * 4 * 128, dtype=torch.bfloat16)[:, : 4 * 128]
+        assert not kda_fused_decode.covered(*inputs)
+        inputs = list(_fused_decode_coverage_inputs(4))
+        inputs[2] = torch.empty(2, 8, dtype=torch.bfloat16)[:, ::2]
+        assert not kda_fused_decode.covered(*inputs)
 
     with (
         patch.object(kda_fused_decode, "is_sail", return_value=False),
-        patch.object(kda_fused_decode, "SUPPORTED_HEADS", {3, 6, 12}),
+        envs.SGLANG_SAIL_PLA_CUDA.override(False),
     ):
-        assert kda_fused_decode.covered(*_fused_decode_coverage_inputs(6))
+        for num_heads in (3, 6, 8, 12, 16):
+            assert kda_fused_decode.covered(*_fused_decode_coverage_inputs(num_heads))
+        inputs = list(_fused_decode_coverage_inputs(6))
+        inputs[4] = inputs[4].unsqueeze(0)
+        assert kda_fused_decode.covered(*inputs)
+        assert not kda_fused_decode.covered(
+            *_fused_decode_coverage_inputs(6, torch.float16)
+        )
         assert not kda_fused_decode.covered(*_fused_decode_coverage_inputs(24))
+
+
+def test_additional_sail_fused_decode_heads_respect_pla_switch():
+    with (
+        patch.object(kda_fused_decode, "is_sail", return_value=True),
+        envs.SGLANG_SAIL_PLA_CUDA.override(False),
+    ):
+        for num_heads in (4, 6, 8, 16, 64):
+            assert not kda_fused_decode.covered(
+                *_fused_decode_coverage_inputs(num_heads)
+            )
+        assert kda_fused_decode.covered(*_fused_decode_coverage_inputs(12))
+
+
+@pytest.mark.parametrize(
+    "impl,fp16_covered", [("ppu", True), ("ref", False), ("1", False)]
+)
+def test_additional_sail_fused_decode_heads_use_reference_dtype_contract(
+    monkeypatch, impl, fp16_covered
+):
+    monkeypatch.setenv("KDA_DECODE_IMPL", impl)
+    with (
+        patch.object(kda_fused_decode, "is_sail", return_value=True),
+        envs.SGLANG_SAIL_PLA_CUDA.override(True),
+    ):
+        assert kda_fused_decode.covered(*_fused_decode_coverage_inputs(8))
+        assert (
+            kda_fused_decode.covered(*_fused_decode_coverage_inputs(8, torch.float16))
+            is fp16_covered
+        )
 
 
 def test_ppu_fused_decode_dispatches_tp4_without_graph_padding_rows():
@@ -751,8 +935,9 @@ def test_ppu_prepares_fused_decode_handoff_for_k3_tp_layouts():
     with (
         patch.object(kimi_k3, "is_sail", return_value=True),
         patch.object(kimi_k3, "_is_hip", False),
+        envs.SGLANG_SAIL_PLA_CUDA.override(True),
     ):
-        for num_heads in (12, 24, 48, 96):
+        for num_heads in (4, 6, 8, 12, 16, 24, 48, 64, 96):
             attention, layer = _fused_decode_attention(num_heads)
             kimi_k3.KimiK3DeltaAttention._prepare_fused_decode(attention)
 
@@ -762,6 +947,19 @@ def test_ppu_prepares_fused_decode_handoff_for_k3_tp_layouts():
                 4,
                 num_heads * 128,
             )
+
+
+def test_ppu_skips_additional_fused_decode_handoff_when_pla_is_disabled():
+    attention, layer = _fused_decode_attention(8)
+    with (
+        patch.object(kimi_k3, "is_sail", return_value=True),
+        patch.object(kimi_k3, "_is_hip", False),
+        patch.object(kimi_k3, "rank0_log"),
+        envs.SGLANG_SAIL_PLA_CUDA.override(False),
+    ):
+        kimi_k3.KimiK3DeltaAttention._prepare_fused_decode(attention)
+    assert not attention._kda_fused_decode_ready
+    assert layer._k3_fused_decode_args is None
 
 
 def test_non_ppu_keeps_community_fused_decode_preparation_limit():
