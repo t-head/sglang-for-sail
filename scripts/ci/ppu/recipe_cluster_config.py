@@ -77,13 +77,38 @@ def load_settings(directory, expected):
 
 
 def resolve_retention_root(environ, values, fallback):
-    env_root = environ.get("PPU_CI_PRIVATE_RESULTS_ROOT", "").strip()
+    env_root = (environ.get("PPU_CI_PRIVATE_RESULTS_ROOT") or "").strip()
     if env_root:
         return env_root, "env"
-    config_root = values.get("PPU_CI_PRIVATE_RESULTS_ROOT", "").strip()
+    config_root = (values.get("PPU_CI_PRIVATE_RESULTS_ROOT") or "").strip()
     if config_root:
         return config_root, "config"
     return str(fallback), "fallback"
+
+
+def _verify_retention_root(retention_root_raw, retention_source, environ):
+    from recipe_retention import (
+        ensure_retention_base,
+        probe_retention_writable,
+        validate_retention_root,
+    )
+
+    status = {
+        "external_retention_root": retention_source != "fallback",
+        "retention_root_valid": False,
+        "retention_source": retention_source,
+        "retention_writable": False,
+    }
+    try:
+        validated_root = validate_retention_root(retention_root_raw, environ)
+        status["retention_root_valid"] = True
+        retention_base = ensure_retention_base(validated_root)
+        probe_retention_writable(retention_base)
+        status["retention_writable"] = True
+    except (KeyError, TypeError, ValueError, OSError):
+        print(json.dumps({"private_retention_check": status}, sort_keys=True))
+        raise
+    return validated_root, status
 
 
 def main():
@@ -108,31 +133,20 @@ def main():
     )
     if sys.argv[1:] == ["--check"]:
         from recipe_cluster_diagnostics import publish_recent_failures
-        from recipe_retention import (
-            ensure_retention_base,
-            probe_retention_writable,
-            validate_retention_root,
-        )
 
-        status = {
-            "external_retention_root": retention_source != "fallback",
-            "retention_root_valid": False,
-            "retention_source": retention_source,
-            "retention_writable": False,
-        }
-        try:
-            validated_root = validate_retention_root(retention_root_raw, os.environ)
-            status["retention_root_valid"] = True
-            retention_base = ensure_retention_base(validated_root)
-            probe_retention_writable(retention_base)
-            status["retention_writable"] = True
-        except (KeyError, TypeError, ValueError, OSError):
-            print(json.dumps({"private_retention_check": status}, sort_keys=True))
-            raise
+        validated_root, status = _verify_retention_root(
+            retention_root_raw, retention_source, os.environ
+        )
         print("PPU cluster private configuration verified")
         print(json.dumps({"private_retention_check": status}, sort_keys=True))
-        publish_recent_failures(validated_root, int(os.environ["GITHUB_RUN_ID"]))
+        publish_recent_failures(
+            validated_root,
+            int(os.environ["GITHUB_RUN_ID"]),
+            fallback_root=retained.resolve(strict=True),
+        )
         return
+    if os.environ.get("TIER") != "legacy":
+        _verify_retention_root(retention_root_raw, retention_source, os.environ)
     os.execvpe(
         "bash",
         ["bash", "scripts/ci/ppu/run_recipe_cluster.sh"],

@@ -37,27 +37,46 @@ def _safe_subdir(root, parts):
     current = root
     for part in parts:
         current = current / part
-        if current.is_symlink() or not current.is_dir():
+        try:
+            if current.is_symlink() or not current.is_dir():
+                return None
+        except OSError:
             return None
     return current
 
 
-def recent_failures(root, current_run):
-    if root.is_symlink() or not root.is_dir():
-        return []
+def recent_failures(root, current_run, fallback_root=None):
+    roots = [root]
+    if fallback_root is not None and fallback_root != root:
+        roots.append(fallback_root)
     previous = []
-    for parts in (RETENTION_SUBPATH, ("sglang-for-sail",)):
-        parent = _safe_subdir(root, parts)
-        if parent is None:
+    for candidate_root in roots:
+        try:
+            if candidate_root.is_symlink() or not candidate_root.is_dir():
+                continue
+        except OSError:
             continue
-        for run in parent.iterdir():
-            if run.is_symlink() or not run.is_dir():
+        for parts in (RETENTION_SUBPATH, ("sglang-for-sail",)):
+            parent = _safe_subdir(candidate_root, parts)
+            if parent is None:
                 continue
-            if not re.fullmatch(r"[0-9]+-[0-9]+", run.name):
+            try:
+                runs = list(parent.iterdir())
+            except OSError:
                 continue
-            run_id, attempt = map(int, run.name.split("-"))
-            if run_id != current_run:
-                previous.append((run_id, attempt, run))
+            for run in runs:
+                try:
+                    if run.is_symlink() or not run.is_dir():
+                        continue
+                except OSError:
+                    continue
+                if not re.fullmatch(r"[0-9]+-[0-9]+", run.name):
+                    continue
+                run_id, attempt = map(int, run.name.split("-"))
+                if run_id != current_run:
+                    previous.append((run_id, attempt, run))
+            if previous:
+                break
         if previous:
             break
     if not previous:
@@ -127,7 +146,7 @@ def recent_failures(root, current_run):
     return []
 
 
-def publish_recent_failures(root, current_run):
-    records = recent_failures(root, current_run)
+def publish_recent_failures(root, current_run, fallback_root=None):
+    records = recent_failures(root, current_run, fallback_root=fallback_root)
     if records:
         print(json.dumps({"prior_cluster_diagnostics": records}, sort_keys=True))
