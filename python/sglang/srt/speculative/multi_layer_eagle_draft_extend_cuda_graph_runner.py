@@ -895,7 +895,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             buffers.sampling_seed[:raw_bs].copy_(
                 forward_batch.sampling_info.sampling_seed[:raw_bs]
             )
-        # Step5 的历史重放可改变最后有效行；显式索引同时用于 logits 和 token 轮转。
+        # History replay can shift the last valid row. Use its index for logits and token rotation.
         if forward_batch.spec_info.select_index is not None:
             buffers.select_index[:raw_bs].copy_(forward_batch.spec_info.select_index)
 

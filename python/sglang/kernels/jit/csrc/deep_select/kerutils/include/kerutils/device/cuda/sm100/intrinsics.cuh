@@ -6,7 +6,7 @@
 
 namespace kerutils {
 
-// tma gather4 (https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async-bulk-tensor)
+// tma gather4
 // Please pay attention that the coordinates of TMA gather4 are int32, which may lead to overflow under some scenarios
 CUTE_DEVICE
 void tma_gather4(const void* desc_ptr, transac_bar_t &mbar_ptr, void* smem_ptr, int col_idx, int4 row_idxs, int64_t cache_hint) {
@@ -22,7 +22,7 @@ void tma_gather4(const void* desc_ptr, transac_bar_t &mbar_ptr, void* smem_ptr, 
     );
 }
 
-// tma gather4 prefetch (https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async-bulk-prefetch-tensor)
+// tma gather4 prefetch
 // Please pay attention that the coordinates of TMA gather4 are int32, which may lead to overflow under some scenarios
 CUTE_DEVICE
 void tma_gather4_prefetch(const void* desc_ptr, int col_idx, int4 row_idxs, int64_t cache_hint) {
@@ -35,7 +35,7 @@ void tma_gather4_prefetch(const void* desc_ptr, int col_idx, int4 row_idxs, int6
     );
 }
 
-// tma gather4 with cta_group::2, allowing for synchronization across CTAs within a pair of CTAs (https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async-bulk-tensor)
+// tma gather4 with cta_group::2, allowing for synchronization across CTAs within a pair of CTAs
 template<bool USE_CTA0_MBAR = false>
 CUTE_DEVICE void tma_gather4_cta_group_2(const void* desc_ptr, transac_bar_t &mbar_ptr, void* smem_ptr, int col_idx, int4 row_idxs, int64_t cache_hint) {
     uint32_t smem_addr = cute::cast_smem_ptr_to_uint(smem_ptr);
@@ -53,7 +53,7 @@ CUTE_DEVICE void tma_gather4_cta_group_2(const void* desc_ptr, transac_bar_t &mb
     );
 }
 
-// Vectorized addition for float32 (https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-add)
+// Vectorized addition for float32
 CUTE_DEVICE
 float2 float2_add(const float2 &a, const float2 &b) {
     float2 c;
@@ -66,7 +66,7 @@ float2 float2_add(const float2 &a, const float2 &b) {
     return c;
 }
 
-// Vectorized multiplication for float32 (https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-mul)
+// Vectorized multiplication for float32
 CUTE_DEVICE
 float2 float2_mul(const float2 &a, const float2 &b) {
     float2 c;
@@ -78,7 +78,7 @@ float2 float2_mul(const float2 &a, const float2 &b) {
     return c;
 }
 
-// Vectorized fused addition-multiplication for float32 (https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-fma)
+// Vectorized fused addition-multiplication for float32
 CUTE_DEVICE
 float2 float2_fma(const float2 &a, const float2 &b, const float2 &c) {
     // return a*b+c
@@ -99,7 +99,7 @@ float2 float2_neg(const float2 &a) {
     return float2_mul(a, t);
 }
 
-// st.bulk (https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-st-bulk)
+// st.bulk
 CUTE_DEVICE
 void st_bulk(void* dst_ptr, int64_t size) {
     uint32_t dst_addr = cute::cast_smem_ptr_to_uint(dst_ptr);
@@ -121,7 +121,7 @@ struct CLCResult {
     int x, y, z;
 };
 
-// Issue a CLC try_cancel query (https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-clusterlaunchcontrol-try-cancel)
+// Issue a CLC try_cancel query
 CUTE_DEVICE
 void issue_clc_query(transac_bar_t &bar, CLCResponseObj &response_obj) {
     uint32_t response_addr = cute::cast_smem_ptr_to_uint(response_obj.opaque);
@@ -133,7 +133,7 @@ void issue_clc_query(transac_bar_t &bar, CLCResponseObj &response_obj) {
     );
 }
 
-// Issue a CLC try_cancel query with .multicast::cluster::all (https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-clusterlaunchcontrol-try-cancel)
+// Issue a CLC try_cancel query with .multicast::cluster::all
 CUTE_DEVICE
 void issue_clc_query_multicast_cluster_all(transac_bar_t &bar, CLCResponseObj &response_obj) {
     uint32_t response_addr = cute::cast_smem_ptr_to_uint(response_obj.opaque);
@@ -145,7 +145,7 @@ void issue_clc_query_multicast_cluster_all(transac_bar_t &bar, CLCResponseObj &r
     );
 }
 
-// Get the result of a CLC query (https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-clusterlaunchcontrol-query-cancel)
+// Get the result of a CLC query
 // In this function, we separate get_first_ctaid::x/y/z and hope PTXAS's dead code elimination can remove unnecessary instructions
 template<bool USE_LD_ACQUIRE>
 CUTE_DEVICE
@@ -176,7 +176,7 @@ CLCResult get_clc_query_response(CLCResponseObj &response_obj) {
     return result;
 }
 
-// LDG.256 or LDG.256 with non-coherent cache (https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-ld)
+// LDG.256 or LDG.256 with non-coherent cache
 // We use macro instead of function here, since we need a multi-level recursive dispatch based on template parameters if using function
 // NC_STR should be either "" or ".nc"
 // L1_CACHE_HINT_STR should be either "evict_first", "evict_normal", "evict_last", "evict_unchanged", or "no_allocate"
@@ -195,7 +195,7 @@ CLCResult get_clc_query_response(CLCResponseObj &response_obj) {
         ); \
     }
 
-// STG.256 (https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-st)
+// STG.256
 // L1_CACHE_HINT_STR should be either "evict_first", "evict_normal", "evict_last", "evict_unchanged", or "no_allocate"
 // L2_CACHE_HINT_STR should be either "evict_first", "evict_normal", or "evict_last"
 #define KU_STG_256(global_addr, src, L1_CACHE_HINT_STR, L2_CACHE_HINT_STR) \
@@ -215,7 +215,7 @@ CLCResult get_clc_query_response(CLCResponseObj &response_obj) {
 
 namespace kerutils {
 
-// tcgen05.commit.cta_group::1 (https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen-async-sync-operations-commit)
+// tcgen05.commit.cta_group::1
 CUTE_DEVICE
 void umma_arrive_noelect(transac_bar_t &bar) {
     uint32_t bar_intptr = cute::cast_smem_ptr_to_uint(&bar);
@@ -226,7 +226,7 @@ void umma_arrive_noelect(transac_bar_t &bar) {
     );
 }
 
-// tcgen05.commit.cta_group::1, with multicast (https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen-async-sync-operations-commit)
+// tcgen05.commit.cta_group::1, with multicast
 CUTE_DEVICE
 void umma_arrive_multicast_noelect(transac_bar_t &bar, uint16_t cta_mask) {
     uint32_t bar_intptr = cute::cast_smem_ptr_to_uint(&bar);
@@ -237,7 +237,7 @@ void umma_arrive_multicast_noelect(transac_bar_t &bar, uint16_t cta_mask) {
     );
 }
 
-// tcgen05.commit.cta_group::2 (https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen-async-sync-operations-commit)
+// tcgen05.commit.cta_group::2
 CUTE_DEVICE
 void umma_arrive_2x1SM_noelect(transac_bar_t &bar) {
     uint32_t bar_intptr = cute::cast_smem_ptr_to_uint(&bar);
@@ -248,7 +248,7 @@ void umma_arrive_2x1SM_noelect(transac_bar_t &bar) {
     );
 }
 
-// tcgen05.commit.cta_group::2, with multicast (https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen-async-sync-operations-commit)
+// tcgen05.commit.cta_group::2, with multicast
 CUTE_DEVICE
 void umma_arrive_multicast_2x1SM_noelect(transac_bar_t &bar, uint16_t cta_mask) {
     uint32_t bar_intptr = cute::cast_smem_ptr_to_uint(&bar);
@@ -259,18 +259,18 @@ void umma_arrive_multicast_2x1SM_noelect(transac_bar_t &bar, uint16_t cta_mask) 
     );
 }
 
-// tcgen05.fence::before_thread_sync (https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-special-sync-operations-fence)
+// tcgen05.fence::before_thread_sync
 __device__ __forceinline__ void tcgen05_before_thread_sync() {
     asm volatile("tcgen05.fence::before_thread_sync;");
 }
 
-// tcgen05.fence::after_thread_sync (https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-special-sync-operations-fence)
+// tcgen05.fence::after_thread_sync
 __device__ __forceinline__ void tcgen05_after_thread_sync() {
     asm volatile("tcgen05.fence::after_thread_sync;");
 }
 
 
-// Load from tensor memory, 32 data path lanes, 32-bit pattern, repeated N times. (https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-instructions-tcgen05-ld)
+// Load from tensor memory, 32 data path lanes, 32-bit pattern, repeated N times.
 template <int kNumElements>
 __device__ __forceinline__
 void tmem_ld_32dp32bNx(uint32_t tmem_start, void* data_) {
@@ -301,7 +301,7 @@ void tmem_ld_32dp32bNx(uint32_t tmem_start, void* data_) {
 }
 
 // Load from tensor memory with column-wise reduction, 32 data path lanes, 32-bit pattern, repeated N times.
-// (https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-instructions-tcgen05-ld)
+//
 // USE_MAX: true = .max reduction, false = .min reduction
 // USE_ABS: true = .abs qualifier (use absolute values for reduction)
 // USE_NAN: true = .NaN qualifier (propagate NaN in reduction)
@@ -524,7 +524,7 @@ void tmem_ld_red_32dp32bNx(uint32_t tmem_start, void* data_, float& redval) {
 #endif
 }
 
-// Load from tensor memory, 16 data path lanes, 128-bit pattern, repeated N times. (https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-instructions-tcgen05-ld)
+// Load from tensor memory, 16 data path lanes, 128-bit pattern, repeated N times.
 template <int kNumReplications>
 __device__ __forceinline__
 void tmem_ld_16dp128bNx(uint32_t tmem_start, void* data_) {
@@ -551,7 +551,7 @@ void tmem_ld_16dp128bNx(uint32_t tmem_start, void* data_) {
 #endif
 }
 
-// Load from tensor memory, 16 data path lanes, 256-bit pattern, repeated N times. (https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-instructions-tcgen05-ld)
+// Load from tensor memory, 16 data path lanes, 256-bit pattern, repeated N times.
 template <int kNumReplications>
 __device__ __forceinline__
 void tmem_ld_16dp256bNx(uint32_t tmem_start, void* data_) {
@@ -576,7 +576,7 @@ void tmem_ld_16dp256bNx(uint32_t tmem_start, void* data_) {
 #endif
 }
 
-// Store into tensor memory, 32 data path lanes, 32-bit pattern, repeated N times. (https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-instructions-tcgen05-st)
+// Store into tensor memory, 32 data path lanes, 32-bit pattern, repeated N times.
 template <int kNumElements>
 __device__ __forceinline__
 void tmem_st_32dp32bNx(uint32_t tmem_start, void const* data_) {

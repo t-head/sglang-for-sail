@@ -18,7 +18,7 @@ def _tcgen05_mma_kind(op: cute.nvgpu.tcgen05.mma.MmaOp) -> str:
 
     Blackwell FP8 logits use ``kind::f8f6f4``; the existing BF16/FP16
     attention path remains ``kind::f16``. Keeping this at the inline-PTX
-    boundary avoids routing FP8 through a CUDA-core or SM90 implementation.
+    boundary avoids routing FP8 through a scalar-core or SM90 implementation.
     """
     if int(op.a_dtype.width) == 8 and int(op.b_dtype.width) == 8:
         return "f8f6f4"

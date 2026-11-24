@@ -1714,7 +1714,7 @@ def _wrap_model_specific_data(item) -> None:
 def _wrap_auxiliary_transport_value(value, *, use_shm=True):
     """Move a registered auxiliary feature to CPU and use SHM when large.
 
-    CUDA IPC proxies are already transport-ready and are intentionally left
+    Device IPC proxies are already transport-ready and are intentionally left
     untouched. Containers are rebuilt instead of modified in place because
     parallel-sampling requests can share nested model-specific objects.
     """

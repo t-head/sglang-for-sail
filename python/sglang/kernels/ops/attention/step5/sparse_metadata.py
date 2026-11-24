@@ -30,7 +30,7 @@ def step5_pack_decode_regions(
     data is read by Python, so changed-input Graph replay remains supported.
     """
     if region_ids.device.type != "cuda" or torch.version.hip is not None:
-        raise ValueError("Step5 sparse metadata requires NVIDIA CUDA")
+        raise ValueError("Step5 sparse metadata requires a supported device")
     if region_ids.ndim != 2 or region_ids.shape[1] != 513:
         raise ValueError("Step5 region_ids must have shape [T,513]")
     rows = region_ids.shape[0]
@@ -54,7 +54,7 @@ def step5_pack_decode_regions(
         or req_to_token.ndim != 2
         or req_to_token.stride(1) != 1
     ):
-        raise ValueError("Step5 req_to_token requires CUDA integer [requests, context]")
+        raise ValueError("Step5 req_to_token requires device integer [requests, context]")
     if (
         packed_regions.device != region_ids.device
         or packed_regions.dtype != torch.int64

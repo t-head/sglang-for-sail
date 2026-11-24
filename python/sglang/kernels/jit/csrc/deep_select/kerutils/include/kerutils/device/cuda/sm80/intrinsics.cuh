@@ -4,7 +4,7 @@
 
 namespace kerutils {
 
-// cp.async.cg (cache global) with prefetch and predicate (https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async)
+// cp.async.cg (cache global) with prefetch and predicate
 template<PrefetchSize PREFETCH_SIZE=PrefetchSize::B128>
 CUTE_DEVICE
 void cp_async_cacheglobal(const void* src, void* dst, bool pred=true) {
@@ -32,7 +32,7 @@ void cp_async_cacheglobal(const void* src, void* dst, bool pred=true) {
     }
 }
 
-// Create fraction-based cache policy (https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-createpolicy)
+// Create fraction-based cache policy
 template<CacheHint PRIMARY_PRIORITY, CacheHint SECONDARY_PRIORITY>
 CUTE_DEVICE
 int64_t create_fraction_based_cache_policy(float fraction = 1.0f) {
@@ -94,7 +94,7 @@ constexpr int64_t create_simple_cache_policy() {
     }
 }
 
-// AtomicAdd (https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-red)
+// AtomicAdd
 CUTE_DEVICE
 void atomicadd_f32_with_policy_and_pred(void* global_addr, const float &data, int64_t cache_policy, uint32_t pred = true) {
     asm volatile(
@@ -110,7 +110,7 @@ void atomicadd_f32_with_policy_and_pred(void* global_addr, const float &data, in
 }
 
 // Get the id of the current SM
-// About %smid (https://docs.nvidia.com/cuda/parallel-thread-execution/#special-registers-smid): PTX document says that %smid ranges from 0 to %nsmid-1, while "The SM identifier numbering is not guaranteed to be contiguous, so %nsmid may be larger than the physical number of SMs in the device.". However, result shows that, at least for sm90 and sm100, %nsmid is the number of physical SMs - 1. For the sake of safety, I recommend you to check the return of get_sm_id manually or call `get_sm_id_with_range_check()` defined in `device/sm80/helpers.cuh`.
+// About %smid: PTX document says that %smid ranges from 0 to %nsmid-1, while "The SM identifier numbering is not guaranteed to be contiguous, so %nsmid may be larger than the physical number of SMs in the device.". However, result shows that, at least for sm90 and sm100, %nsmid is the number of physical SMs - 1. For the sake of safety, I recommend you to check the return of get_sm_id manually or call `get_sm_id_with_range_check()` defined in `device/sm80/helpers.cuh`.
 // Besides, PTX document also says that this number may change due to preemption, but currently this never happens according to [DATEN GELÖSCHT]
 CUTE_DEVICE
 uint32_t get_sm_id() {
@@ -119,13 +119,13 @@ uint32_t get_sm_id() {
     return ret;
 }
 
-// trap (https://docs.nvidia.com/cuda/parallel-thread-execution/#miscellaneous-instructions-trap)
+// trap
 CUTE_DEVICE
 void trap() {
     asm volatile("trap;\n");
 }
 
-// LDG.128 or LDG.128 with non-coherent cache (https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-ld)
+// LDG.128 or LDG.128 with non-coherent cache
 // We use macro instead of function here, since we need a multi-level recursive dispatch based on template parameters if using function
 // NC_STR should be either "" or ".nc"
 // L1_CACHE_HINT_STR should be either "evict_first", "evict_normal", "evict_last", "evict_unchanged", or "no_allocate"
@@ -143,7 +143,7 @@ void trap() {
         ); \
     }
 
-// STG.128 (https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-st)
+// STG.128
 // L2_CACHE_HINT_STR should be ".L2::evict_XXX" (only available on sm100+) or ""
 #define KU_STG_128(global_addr, src, L1_CACHE_HINT_STR, L2_CACHE_HINT_STR) \
     { \

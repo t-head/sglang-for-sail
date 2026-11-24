@@ -42,7 +42,7 @@ def _prepare_outputs(
         or logits.requires_grad
     ):
         raise ValueError(
-            "logits must be inference-only FP32 [tokens, 352] on CPU/CUDA, "
+            "logits must be inference-only FP32 [tokens, 352] on CPU or a supported device, "
             "with contiguous columns and nonoverlapping rows"
         )
     if (
@@ -109,7 +109,7 @@ class Step5RouterTopKOp(BaseFusedOp):
     storage address ranges distinct from both inputs and each other, including
     external-memory wrappers. Both outputs must be supplied together. Empty
     token rows return without importing or launching the Triton leaf. After
-    warmup, supplied buffers support CUDA Graph capture without scratch allocation
+    warmup, supplied buffers support device graph capture without scratch allocation
     or data-dependent host reads. Only logical output elements are written.
 
     Native torch is a cast-graph diagnostic, not a device sigmoid/division oracle;
@@ -200,7 +200,7 @@ class Step5RouterTopKOp(BaseFusedOp):
         import torch
 
         if logits.device.type != "cuda" or torch.version.hip is not None:
-            raise ValueError("the Triton backend requires NVIDIA CUDA logits")
+            raise ValueError("the Triton backend requires logits on a supported device")
         weights, ids = _prepare_outputs(
             logits=logits, bias=bias, out_weights=out_weights, out_ids=out_ids
         )

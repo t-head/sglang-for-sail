@@ -187,7 +187,7 @@ def build_compression_metadata(
         or (not verify and token_width != 1)
     ):
         raise ValueError(
-            "CSA requires native CUDA request/FULL mapping and chain width"
+            "CSA requires device-resident request/FULL mapping and chain width"
         )
     native = native_positions is not None
     values = [(request_slots, (rows,)), (positions, (rows,)), (valid_rows, (1,))]

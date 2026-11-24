@@ -52,7 +52,7 @@ def step5_select_regions(
     ``req_to_token``.
     """
     if scores.device.type != "cuda" or torch.version.hip is not None:
-        raise ValueError("Step5 selection requires NVIDIA CUDA")
+        raise ValueError("Step5 selection requires a supported device")
     if (
         scores.ndim != 2
         or scores.dtype != torch.float32
@@ -110,7 +110,7 @@ def step5_select_regions(
             or req_to_token.ndim != 2
             or req_to_token.stride(1) != 1
         ):
-            raise ValueError("Step5 selection req_to_token requires CUDA integer [R,C]")
+            raise ValueError("Step5 selection req_to_token requires device integer [R,C]")
     if rows == 0:
         return region_ids, counts
     for out, others in (

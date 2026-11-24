@@ -29,7 +29,7 @@ def build_prefill_compression_inputs(
         or req_to_token.dtype not in (torch.int32, torch.int64)
         or compressed_index_key_pages < 2
     ):
-        raise ValueError("CSA append requires native CUDA request/FULL mapping")
+        raise ValueError("CSA append requires native device request/FULL mapping")
     if any(len(v) != len(request_slots) for v in (prefix_lengths, append_lengths)):
         raise ValueError("CSA append batch lengths differ")
     rows, source = [], 0

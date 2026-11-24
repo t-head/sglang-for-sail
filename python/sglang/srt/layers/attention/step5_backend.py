@@ -317,7 +317,7 @@ class Step5AttentionBackend(AttentionBackend):
         self.attention_shape = (swa_backend.num_attention_heads, swa_backend.head_dim)
         self.fp8_full_kv = getattr(kv_pool, "full_kv_fp8", False)
         self._fp8_prefill = None
-        # Metadata storage only. CUDA graph objects belong to the public runner.
+        # Metadata storage only. device graph objects belong to the public runner.
         self._cuda_graph_max_bs = 0
         self._cuda_graph_metadata = {}
         self.forward_metadata = None
@@ -410,7 +410,7 @@ class Step5AttentionBackend(AttentionBackend):
     @property
     def max_context_len(self):
         # Public speculative mask allocation uses this bound when no host
-        # length sum is available; it must never pull lengths back from CUDA.
+        # length sum is available; it must never pull lengths back from the device.
         return self.context_len
 
     def shared_read_ends(self, fm):
@@ -1002,7 +1002,7 @@ class Step5AttentionBackend(AttentionBackend):
         softmax_scale = layer.scaling
         # Capture may defer the independent Indexer branch until the main KV
         # write is recorded. The fork is unchanged; record it before the join
-        # so CUDA graph replay does not move the main chain onto a new lane.
+        # so device graph replay does not move the main chain onto a new lane.
         if callable(index_selection):
             index_selection = index_selection()
         if index_stream is not None:

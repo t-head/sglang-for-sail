@@ -1180,7 +1180,7 @@ class Step5PoolConfigurator(MemoryPoolConfigurator):
         ):
             raise ValueError("unsupported Step5 native KV construction mode")
         if kvc.device == "cuda" and torch.cuda.current_device() != kvc.gpu_id:
-            raise ValueError("current CUDA device differs from the Step5 worker gpu_id")
+            raise ValueError("current device differs from the Step5 worker gpu_id")
         if get_is_capture_mode() or (
             kvc.device == "cuda" and torch.cuda.is_current_stream_capturing()
         ):

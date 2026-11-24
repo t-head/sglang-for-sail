@@ -166,7 +166,7 @@ def prepare_scoring(
     """Prepare scoring inputs, or only metadata when Q/W come from fused norm.
 
     Without q, the packing branch is compiled out. Call once from the forward's
-    metadata build so CUDA Graph replay refreshes metadata shared across layers.
+    metadata build so device graph replay refreshes metadata shared across layers.
     """
     w = workspace
     rows = requests.numel()

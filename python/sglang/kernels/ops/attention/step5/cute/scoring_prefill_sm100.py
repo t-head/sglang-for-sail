@@ -1802,7 +1802,7 @@ def _prefill_paged_weighted_relu_logits_impl(
     )
     summary_page_size = int(summary.shape[1])
     if index_q.device.type != "cuda":
-        raise RuntimeError("paged prefill WGMMA logits requires CUDA tensors")
+        raise RuntimeError("paged prefill WGMMA logits requires device tensors")
     q_input = index_q
     k_input = (
         summary.view(torch.float8_e4m3fn) if summary.dtype == torch.uint8 else summary

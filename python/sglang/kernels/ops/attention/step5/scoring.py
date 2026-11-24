@@ -101,12 +101,12 @@ def step5_paged_scores(
     Zeros are written as +0.0, never -0.0: ``step5_select_regions`` hands the
     values to a radix top-k, which orders by bit pattern and would rank -0.0
     below +0.0, breaking the small-region-id tie-break.
-    SM10x / PPU radix 的有效长度 selector 可设为 false：未来列及无需排名的
-    短历史行可以保留旧值，消费者不得读取它们。输入不变，输出不得与输入共享存储。
+    The SM10x and PPU radix selectors can disable full-width writes.
+    Consumers may only read ranked history. Input and output must use separate storage.
     Warm up before Graph capture.
     """
     if q.device.type != "cuda" or torch.version.hip is not None:
-        raise ValueError("Step5 scoring requires NVIDIA CUDA")
+        raise ValueError("Step5 scoring requires a supported device")
     if type(clear_future) is not bool:
         raise ValueError("Step5 scoring clear_future must be a bool")
     if q.ndim != 3 or q.shape[1] not in (2, 4) or q.shape[2] != 256:

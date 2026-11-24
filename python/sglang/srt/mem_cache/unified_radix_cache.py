@@ -1923,7 +1923,7 @@ class UnifiedRadixCache(BasePrefixCache):
             # is operation-owned (freed at each ack): nothing is evictable.
             return 0
         result = self.tree_core.drive_host_eviction(component_type, num_tokens)
-        # 释放会消费 host_frees；先统计实际 host 行，排除孤立的 device 行。
+        # Count the actual host rows before host_frees is consumed.
         host_evicted = (
             {
                 comp: sum(v.numel() for v in values)

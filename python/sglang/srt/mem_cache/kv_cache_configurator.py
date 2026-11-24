@@ -489,8 +489,8 @@ class KVCacheConfigurator:
         self.hybrid_kda_config = hybrid_kda_config(self.model_config)
         self._resolve_kv_shard()
         self.draft_owns_its_depth = self.layer_info.draft_owns_its_depth
-        # Step5 draft 共享目标的物理 FULL->SWA 映射；其预算按 SWA 容量计费，
-        # 不使用通用 MTP 的 FULL 容量 identity 映射。
+        # The Step5 draft shares the target's physical FULL-to-SWA mapping and uses
+        # the SWA capacity for budgeting.
         self.draft_swa_full_capacity = (
             self.draft_owns_its_depth
             and bool(self.layer_info.swa_attention_layer_ids)

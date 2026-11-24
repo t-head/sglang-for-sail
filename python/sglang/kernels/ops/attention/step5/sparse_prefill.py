@@ -67,7 +67,7 @@ def step5_sparse_prefill(
     The consumer applies both exact membership and token-level causal masking.
 
     Caller owns disjoint buffers and stream ordering. Warm compilation before
-    capture; this entry allocates no CUDA storage and performs no host reads of
+    capture; this entry allocates no device storage and performs no host reads of
     device values. Shape-polymorphic compiled functions retain no input tensors.
     """
     if sm100_workspace is not None:
@@ -105,7 +105,7 @@ def step5_sparse_prefill(
         return
 
     if q.device.type != "cuda" or torch.version.hip is not None:
-        raise ValueError("Step5 sparse prefill requires NVIDIA CUDA")
+        raise ValueError("Step5 sparse prefill requires a supported device")
     if q.ndim != 3 or q.shape[1] not in (4, 8, 16) or q.shape[2] != 192:
         raise ValueError("Step5 Q requires shape [T,4/8/16,192]")
     if k.ndim != 3 or tuple(k.shape[1:]) != (1, 192) or k.shape[0] % 64:
@@ -269,7 +269,7 @@ def step5_sparse_prefill_selected(
     )
 
     # Values depend on this layer's Top-K; only their storage is shared.
-    # CUDA stores int64 low/high words in this order. Copy the two strided
+    # The device stores int64 low/high words in this order. Copy the two strided
     # views into contiguous kernel inputs; an int32 out= right-shift would
     # narrow the operand before shifting and lose the physical region ID.
     words = packed.view(torch.int32)

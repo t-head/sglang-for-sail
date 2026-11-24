@@ -87,7 +87,7 @@ def _bench_shape(*, rows, context, args, flush):
                           f"speedup={medians['baseline']/medians[name]:.3f}x  "
                           f"exact={q['bitwise_equal']} top512={q['top512_equal']} "
                           f"mismatches={q['mismatches']} max_abs={q['max_abs']:.6g}", flush=True)
-                print(f"  合格最优: {winner}; pack中位数(us): "
+                print(f"  Fastest qualified: {winner}; median pack time (us): "
                       f"{ {name: round(statistics.median(values), 2) for name, values in pack_samples.items()} }", flush=True)
                 results.append(dict(rows=rows, context=context, width=width, mode=mode, group_rows=group,
                                     cache=cache, configs={name: runner["config"] for name, runner in runners.items()},
@@ -120,15 +120,15 @@ def _qualify_production_graph(case, runners, prefix):
             graph.replay()
             expected_scores = runners["baseline"]["score"]()
             if not torch.equal(compact["out"].view(torch.int32), expected_scores.view(torch.int32)):
-                raise RuntimeError("生产 graph 重放的 score 未刷新")
+                raise RuntimeError("Graph replay did not refresh production scores")
             expected = selection_snapshot(runners["baseline"])
             valid = columns[None, :] < workspace.counts[:, None]
             if bool((valid & (workspace.packed < 0)).any()):
-                raise RuntimeError("生产 graph 重放的有效 packed 输出中存在负项")
+                raise RuntimeError("Graph replay produced a negative live packed entry")
             selected = torch.where(valid, workspace.packed, -1).sort(dim=1).values
             actual = (selected, workspace.counts, workspace.lengths)
             if not all(torch.equal(a, b) for a, b in zip(actual, expected)):
-                raise RuntimeError("生产 graph 重放的 selector 输出未刷新")
+                raise RuntimeError("Graph replay did not refresh the production selector output")
     finally:
         for name, value in saved.items():
             case[name].copy_(value)
@@ -155,9 +155,9 @@ def _bench_production_shape(*, rows, context, args, flush):
             }
             scratch = runners["compact"]["workspace"].compact_scoring
             if scratch is None:
-                raise RuntimeError("测试 shape 未启用 compact，不能作为优化性能证据")
+                raise RuntimeError("This shape does not enable compact scoring")
             if any(r["workspace"].ppu_selector is None for r in runners.values()):
-                raise RuntimeError("真实 radix selector 不可用，不能作为生产链路对照")
+                raise RuntimeError("The radix selector is unavailable for a production-path comparison")
             baseline = runners["baseline"]["score"]().clone()
             qualification = compare_scores(runners["compact"]["score"](), baseline)
             expected = selection_snapshot(runners["baseline"])
@@ -175,7 +175,7 @@ def _bench_production_shape(*, rows, context, args, flush):
             if not all(qualification[k] for k in (
                 "bitwise_equal", "top512_equal", "selector_equal", "selector_valid",
             )):
-                raise RuntimeError(f"生产入口对齐失败: {qualification}")
+                raise RuntimeError(f"Production entry point mismatch: {qualification}")
             qualification["graph_refresh_equal"] = _qualify_production_graph(
                 case, runners, context - rows,
             )
@@ -222,28 +222,28 @@ def main():
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if any(mode not in ("fp8", "bf16") for mode in args.modes.split(",")):
-        parser.error("modes 必须是 fp8/bf16")
+        parser.error("modes must be fp8 or bf16")
     if any(mode not in ("warm", "cold") for mode in args.cache_modes.split(",")):
-        parser.error("cache-modes 必须是 warm/cold")
+        parser.error("cache modes must be warm or cold")
     if args.repeats < 3:
-        parser.error("至少需要 3 次重复")
+        parser.error("At least three repetitions are required")
     torch.cuda.set_device(0)
     props = torch.cuda.get_device_properties(0)
     metadata = dict(device=props.name, capability=torch.cuda.get_device_capability(),
                     torch=torch.__version__, triton=triton.__version__, sms=props.multi_processor_count,
                     seed=args.seed, cache_flush_bytes=128 * 1024 * 1024,
-                    scope="预量化 Q；计时包含 wipe + 每次 K pack + scoring；不含分配/selector",
-                    inputs="synthetic；physical pages 随机打散，page 内连续；不是服务现场 dump",
-                    statistics="随机交错顺序；CUDA graph 单次调用；中位数；cold flush 不计入时间")
+                    scope="Prequantized Q. Times include wipe, K packing, and scoring, excluding allocation and selection.",
+                    inputs="Synthetic. Physical pages are shuffled and each page is contiguous.",
+                    statistics="Median graph call time over shuffled trials, excluding cold-cache flushing")
     if args.production:
-        metadata["scope"] = "公共入口；每层 wipe + pack + scoring，另测包含真实 radix selector/address fold；不含分配或整模型"
+        metadata["scope"] = "Public API. Includes wipe, packing, and scoring per layer. Separate timings include selection and address folding."
     print(json.dumps(metadata, ensure_ascii=False), flush=True)
     flush = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
     shapes = [(args.rows, context) for context in map(int, args.contexts.split(","))]
     if args.tails:
         shapes += [(2751, 76479), (5016, 76479)]
     if any(rows <= 0 or context < rows for rows, context in shapes):
-        parser.error("context 必须不小于正数 rows")
+        parser.error("context must cover the positive row count")
     results = []
     bench_shape = _bench_production_shape if args.production else _bench_shape
     for rows, context in shapes:
@@ -252,7 +252,7 @@ def main():
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(dict(metadata=metadata, results=results), indent=2,
                                          ensure_ascii=False) + "\n")
-        print(f"结果已保存: {args.output}", flush=True)
+        print(f"Results saved to {args.output}", flush=True)
 
 
 if __name__ == "__main__":

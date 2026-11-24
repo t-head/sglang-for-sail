@@ -507,9 +507,9 @@ def merge_variable_split_nat_lse_states_sm90_gqa(
     if stream is not None:
         raise ValueError("split-KV merge uses the TVM-FFI environment stream")
     if partial_out.device.type != "cuda" or partial_lse.device.type != "cuda":
-        raise ValueError("partial_out/partial_lse must be CUDA tensors")
+        raise ValueError("partial_out/partial_lse must be device tensors")
     if out.device != partial_out.device or lse.device != partial_out.device:
-        raise ValueError("out/lse must be on the same CUDA device as partial_out")
+        raise ValueError("out/lse must be on the same device as partial_out")
     if partial_out.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         raise TypeError(f"partial_out must be fp16/bf16/fp32, got {partial_out.dtype}")
     if out.dtype not in (torch.float16, torch.bfloat16):
@@ -607,7 +607,7 @@ def merge_dynamic_split_nat_lse_states_sm90_gqa(
         raise ValueError("dynamic split-KV merge uses the TVM-FFI environment stream")
     tensors = (partial_out, partial_lse, region_counts, out, lse)
     if any(tensor.device.type != "cuda" for tensor in tensors):
-        raise ValueError("dynamic split-KV merge requires CUDA tensors")
+        raise ValueError("dynamic split-KV merge requires device tensors")
     if any(tensor.device != partial_out.device for tensor in tensors[1:]):
         raise ValueError("dynamic split-KV merge tensors must share one device")
     if partial_out.dtype not in (torch.float16, torch.bfloat16, torch.float32):

@@ -2655,7 +2655,7 @@ def _flash_attn_fwd_combine(
         torch.float32,
     ], "out_partial must be fp16, bf16, or fp32"
     if not is_fake_mode():
-        assert out_partial.is_cuda and lse_partial.is_cuda, "tensors must be on CUDA device"
+        assert out_partial.is_cuda and lse_partial.is_cuda, "tensors must be on the device"
     # Determine if this is variable length based on dimensions
     is_varlen = out_partial.dim() == 4
     # Validate optional tensors

@@ -266,7 +266,7 @@ def run_degenerate_rows():
 
 
 def _bench(fn, iters=20, reps=5):
-    """Per-call device time via CUDA graph replay (host enqueue excluded)."""
+    """Per-call device time via device graph replay (host enqueue excluded)."""
     for _ in range(5):
         fn()
     torch.cuda.synchronize()

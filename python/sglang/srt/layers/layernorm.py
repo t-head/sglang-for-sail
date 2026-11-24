@@ -1312,7 +1312,7 @@ class GemmaRMSNorm(BaseFusedOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        # Idle ranks can reach this public op with zero rows. CUDA norm
+        # Idle ranks can reach this public op with zero rows. device normalization
         # launchers need a nonempty grid; retain the usual residual contract.
         if x.numel() == 0:
             if residual is not None:

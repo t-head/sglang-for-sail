@@ -29,7 +29,7 @@ def _prepare_output(input: torch.Tensor, out: Optional[torch.Tensor]) -> torch.T
         or input.requires_grad
     ):
         raise ValueError(
-            "input must be inference-only BF16 [tokens, 2*width] on CPU/CUDA, "
+            "input must be inference-only BF16 [tokens, 2*width] on CPU or a supported device, "
             "with positive width, contiguous columns and nonoverlapping rows"
         )
     shape = (input.shape[0], input.shape[1] // 2)
@@ -114,7 +114,7 @@ class SiluClampAndMulOp(BaseFusedOp):
         import torch
 
         if input.device.type != "cuda" or torch.version.hip is not None:
-            raise ValueError("the Triton backend requires an NVIDIA CUDA tensor")
+            raise ValueError("the Triton backend requires a supported device tensor")
         out = _prepare_output(input=input, out=out)
         if input.shape[0] == 0:
             return out

@@ -620,8 +620,8 @@ class TestSWARetainWindow(CustomTestCase):
 
     def test_the_free_at_a_checkpoint_keeps_every_slot_the_draft_reads(self):
         pre_len = 20
-        # 此夹具没有 bigram，page_size=1；插入边界就是已提交长度。
-        # draft 仍读取 [pre_len - _DRAFT_REACH, pre_len)，不能只检查游标。
+        # This fixture has no bigrams and page size one, so the boundary is the committed length.
+        # The draft reads the full history window [pre_len - _DRAFT_REACH, pre_len).
         for draft_swa_window, frontier in (
             (_DRAFT_REACH, pre_len - _DRAFT_REACH),
             (0, pre_len - _WINDOW),

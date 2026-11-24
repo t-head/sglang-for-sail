@@ -174,10 +174,10 @@ def step5_sparse_decode_partials(
 
     Caller owns disjoint metadata, partials and their lifetime/stream ordering.
     Warm compilation before Graph capture. The cache retains compiled functions
-    only; this entry allocates no CUDA storage and performs no synchronization.
+    only; this entry allocates no device storage and performs no synchronization.
     """
     if q.device.type != "cuda" or torch.version.hip is not None:
-        raise ValueError("Step5 sparse decode requires NVIDIA CUDA")
+        raise ValueError("Step5 sparse decode requires a supported device")
     if q.ndim != 3 or q.shape[1] not in (4, 8, 16) or q.shape[2] != 192:
         raise ValueError("Step5 Q requires shape [T,4/8/16,192]")
     rows, heads, _ = q.shape

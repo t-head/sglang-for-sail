@@ -61,7 +61,7 @@ do {                                                                            
     cudaError_t status_ = (call);                                                                             \
     if (status_ != cudaSuccess) {                                                                             \
         char _ku_buf[1024];                                                                                   \
-        snprintf(_ku_buf, sizeof(_ku_buf), "CUDA error (%s:%d): %s", __FILE__, __LINE__, cudaGetErrorString(status_)); \
+        snprintf(_ku_buf, sizeof(_ku_buf), "Device runtime error (%s:%d): %s", __FILE__, __LINE__, cudaGetErrorString(status_)); \
         fprintf(stderr, "%s\n", _ku_buf);                                                                    \
         THROW_KU_EXCEPTION("CUDA", _ku_buf);                                                                  \
     }                                                                                                         \

@@ -187,7 +187,7 @@ __global__ __launch_bounds__(kBlockSize, 1) void finalize_kernel(const __grid_co
     AlignedVector<output_pair_t, kPairs> out;
 #pragma unroll
     for (uint32_t e = 0; e < kPairs; ++e) {
-      // Step5 先物化 BF16 路由结果，再加 shared；默认不引入此截断。
+      // Step5 materializes the BF16 routed result before adding the shared output.
       if constexpr (kRoundRouted) acc[e] = cast<fp32x2_t>(cast<bf16x2_t>(acc[e]));
       if constexpr (kHasShared) {
         const auto sh = cast<fp32x2_t>(cur.shared[e]);

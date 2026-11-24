@@ -91,7 +91,7 @@ void unpack_packed_regions(const tvm::ffi::TensorView packed,
              logical_starts.device().device_type == kDLCUDA &&
              physical_regions.device().device_id == device.device_id &&
              logical_starts.device().device_id == device.device_id)
-      << "Step5 selection and its planes must share one CUDA device";
+      << "Step5 selection and its planes must share a single device";
   if (words == 0) return;
   hggcStream_t stream = LaunchKernel::resolve_device(device);
   constexpr int kThreads = 256;

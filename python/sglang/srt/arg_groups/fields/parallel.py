@@ -305,7 +305,7 @@ class Parallel(msgspec.Struct):
             "buffer). Use for models that manage SP scatter/gather at the "
             "model level (e.g., perform their own all_gather/reduce_scatter "
             "inside attention) and do not consume the upstream gathered_buffer. "
-            "Without this, the cuda graph runner pads num_tokens to attn_tp_size, "
+            "Without this, the device graph runner pads num_tokens to attn_tp_size, "
             "which can cause kernel autotuners to select wrong-sized variants "
             "at small batches.",
             resolvable=True,

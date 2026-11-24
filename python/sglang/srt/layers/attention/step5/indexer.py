@@ -32,9 +32,9 @@ from sglang.srt.utils.device import is_sail
 
 @lru_cache(maxsize=None)
 def _cuda_fp8_saturates(device: torch.device) -> bool:
-    """Probe once per CUDA device before capture; Torch cast policy can differ."""
+    """Probe once per device before capture; Torch cast policy can differ."""
     if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError("Warm up the Step5 FP8 cast before CUDA graph capture")
+        raise RuntimeError("Warm up the Step5 FP8 cast before device graph capture")
     bits = (
         torch.tensor([1024.0], dtype=torch.bfloat16, device=device)
         .to(torch.float8_e4m3fn)
@@ -42,7 +42,7 @@ def _cuda_fp8_saturates(device: torch.device) -> bool:
         .item()
     )
     if bits not in (0x7E, 0x7F):
-        raise RuntimeError(f"Unsupported Torch CUDA E4M3 overflow encoding: {bits}")
+        raise RuntimeError(f"Unsupported Torch device E4M3 overflow encoding: {bits}")
     return bits == 0x7E
 
 

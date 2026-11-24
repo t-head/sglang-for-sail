@@ -1030,7 +1030,7 @@ def invoke_fused_moe_kernel(
     if fp8_use_rn_division and (
         not _is_cuda or not use_fp8_w8a8 or block_shape is None
     ):
-        raise ValueError("RN division requires CUDA block-wise FP8 MoE")
+        raise ValueError("RN division requires device block-wise FP8 MoE")
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
     assert a_output_slices in (1, 2)

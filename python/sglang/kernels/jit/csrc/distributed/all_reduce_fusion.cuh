@@ -486,7 +486,7 @@ __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize, kVecs>::k
   } else {
     __shared__ float smem_sq[kClusterSize][kNumWarps];
     if constexpr (kResidual) {
-      // 让后续 GEMM 提前准备权重；其 PDL wait 仍保护激活读取。
+      // Let the next GEMM prepare its weights early. Its PDL wait guards the activation read.
       PDLTriggerSecondary<kUsePDL>();
     }
     if constexpr (kMhc) {
@@ -510,7 +510,7 @@ __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize, kVecs>::k
           const auto [ra, rb] = cast<fp32x2_t>(res[j]);
           acc[v][j] = fp32x2_t{acc[v][j].x + ra, acc[v][j].y + rb};
           res[j] = cast<bf16x2_t>(acc[v][j]);
-          // Step5 在归一化前截断残差和，原接口仍使用未截断的 FP32 和。
+          // Step5 rounds the residual sum before normalization. The original API uses the FP32 sum.
           if constexpr (kResidual) acc[v][j] = cast<fp32x2_t>(res[j]);
         }
         res.store(params.residual_out + static_cast<int64_t>(row_idx) * kHiddenDim, hvec + v * kBlockSize);
@@ -667,7 +667,7 @@ struct MoeFinalizeAllReduceKernel {
         std::nullopt);
   }
 
-  /// Step5 在归一化前使用 BF16 残差和，不改变原 run_residual_norm 的精度契约。
+  /// Step5 normalizes the BF16 residual sum. run_residual_norm retains its precision contract.
   static void run_step5_residual_norm(
       CommunicatorRef ref,
       TensorView out,

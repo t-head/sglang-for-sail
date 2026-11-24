@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Step5 scoring 的测试夹具与独立实验；不接入生产派发。"""
+"""Standalone fixtures and experiments for Step5 scoring."""
 
 import torch
 import triton
@@ -131,15 +131,15 @@ def _score_compact(
 
 
 def make_case(*, lengths, prefixes, heads=4, width=None, seed=0, easy=False, padding=0):
-    """每个 logical page 映射到随机且不重叠的 physical page。"""
+    """Map each logical page to a random, distinct physical page."""
     if len(lengths) != len(prefixes) or not lengths or min(lengths) <= 0:
-        raise ValueError("lengths/prefixes 必须描述非空请求")
+        raise ValueError("lengths and prefixes must describe nonempty requests")
     generator = torch.Generator().manual_seed(seed)
     context = max(p + n for p, n in zip(prefixes, lengths))
     map_cols = triton.cdiv(context, 64) * 64
     regions = width if width is not None else triton.cdiv(context, 8)
     if regions < triton.cdiv(context, 8):
-        raise ValueError("score width 不能截断请求")
+        raise ValueError("score width must cover every request")
     requests = len(lengths)
     pages_per_request = map_cols // 64
     pages = requests * pages_per_request
@@ -245,7 +245,7 @@ def make_runner(case, variant, *, fp8=True, group_rows=8, block_regions=32, grid
 
 
 def make_production_runner(case, *, compact=True, weights=None, q=None, weight_scale=None):
-    """真实公共 scoring/selection 入口；调用者在外层固定灰度开关和 FP8 模式。"""
+    """Call the public scoring and selection APIs with options set by the caller."""
     from sglang.kernels.ops.attention.step5.scoring import step5_paged_scores
     from sglang.srt.layers.attention.step5.region_selection import (
         allocate_selection_workspace,
@@ -281,7 +281,7 @@ def make_production_runner(case, *, compact=True, weights=None, q=None, weight_s
 
 
 def sparse_request_slots(case, slots=(37, 103), capacity=160):
-    """请求池很大时，紧凑 K 的 request 维仍只包含本 forward 的请求段。"""
+    """Compact K includes only the current forward's requests, regardless of pool size."""
     mapping = torch.zeros(
         (capacity, case["mapping"].shape[1]), dtype=torch.int32, device="cuda",
     )
@@ -296,13 +296,13 @@ def selection_snapshot(runner):
     packed, counts, lengths = runner["run"]()
     columns = torch.arange(packed.shape[1], device=packed.device)
     valid = columns[None, :] < counts[:, None]
-    # PPU atomic staging 的槽序不稳定；只有有效项集合属于输出契约。
+    # Atomic staging can reorder entries. The contract covers the set of live entries.
     selected = torch.where(valid, packed, -1).sort(dim=1).values
     return selected.clone(), counts.clone(), lengths.clone()
 
 
 def reference_scores(case, rows=None):
-    """独立 Torch FP32 oracle；先逐 head ReLU，再求加权和。"""
+    """Independent Torch FP32 reference with per-head ReLU followed by a weighted sum."""
     q = case["q"].cpu().view(torch.float8_e4m3fn).float()
     weights = case["weights"].cpu()
     owners, positions = case["owners"].cpu(), case["positions"].cpu()

@@ -74,7 +74,7 @@ def _check_and_expand_block(
             f"{name}_block_cnt and {name}_block_idx must be on the same device"
         )
     if not cnt.is_cuda or not idx.is_cuda:
-        raise ValueError(f"{name}_block tensors must live on CUDA")
+        raise ValueError(f"{name}_block tensors must live on the device")
     expanded_cnt = _expand_sparsity_tensor(
         cnt, expected_count_shape, f"{name}_block_cnt"
     )
@@ -171,7 +171,7 @@ def compute_block_sparsity(
     Args:
         config: A configuration object containing model and tiling parameters.
         mask_mod_flex: The mask function for generic flex attention patterns.
-        device: The device to create tensors on (e.g., 'cuda').
+        device: The device on which to create tensors.
         cu_seqlens_q: Cumulative sequence lengths for Q (for varlen).
         cu_seqlens_k: Cumulative sequence lengths for K (for varlen).
         aux_tensors: A list of auxiliary tensors, e.g., for document masking.

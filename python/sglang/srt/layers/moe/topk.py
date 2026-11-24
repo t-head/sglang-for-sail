@@ -265,7 +265,7 @@ class TopKConfig:
     renormalize: bool = True
     shared_experts: SharedExpertsConfig = SharedExpertsConfig()
     custom_routing_function: Optional[Callable] = None
-    # Opt-in callbacks accept the device count and mask CUDA padded IDs.
+    # Opt-in callbacks accept the device count and mask device padded IDs.
     # Postprocessing retains ownership when remapping/capture can alter IDs.
     custom_routing_handles_padding: bool = False
     correction_bias: Optional[torch.Tensor] = None
@@ -776,7 +776,7 @@ class TopK(BaseFusedOp):
             expert_location_dispatch_info=expert_location_dispatch_info,
         )
         if self.replicated_inputs and info is not None:
-            # Step5 本地 partial-output 路径要求同行输入在各 rank 选中同一副本。
+            # The local partial-output path requires the same replica selection across ranks.
             if info.ep_dispatch_algorithm == "fake":
                 raise ValueError(
                     "Replicated MoE inputs do not support rank-random fake logits"
@@ -2917,7 +2917,7 @@ def select_experts(
     renormalize = topk_config.renormalize
     num_shared_topk_slots = topk_config.num_shared_topk_slots
     custom_routing_function = topk_config.custom_routing_function
-    # Only fold the final CUDA ID mask into a custom router when no later
+    # Only fold the final device ID mask into a custom router when no later
     # routing transform can replace IDs. Capture observes unmasked logical IDs
     # on the legacy path, so retain that ordering when capture is active.
     custom_padding_fused = (
@@ -3201,7 +3201,7 @@ def select_experts(
                 **_fused_topk_kwargs,
             )
     else:
-        # 仅在 callback 能负责最终 ID mask 时传入 padding 数量。
+        # Pass the padding count only when the callback can apply the final ID mask.
         fold_scale_after_routing = True
         padding_kwargs = (
             {"num_token_non_padded": num_token_non_padded}

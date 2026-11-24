@@ -185,7 +185,7 @@ class StaticKVStorage:
         *,
         draft_kv_pools: Optional[Tuple] = None,
     ) -> None:
-        """绑定 PD 的主 draft 和有序多层 draft；变更后重建 state entries。"""
+        """Bind the PD draft and its ordered layers, then rebuild the state entries."""
         pools = (
             self._draft_kv_pools if draft_kv_pools is None else tuple(draft_kv_pools)
         )
@@ -1349,7 +1349,7 @@ def _static_state_entries(
         if row_ptrs:
             add(StateType.REQUEST_ROW, row_ptrs, row_lens, row_item_lens)
 
-    # 附加的页状态和请求行状态沿用 pool 提供的顺序。
+    # Use the pool's ordering for page state and request-row state.
     getter = getattr(token_to_kv_pool, "get_pd_state_components", None)
     if getter is not None:
         for name, buf_infos in getter():
@@ -1380,7 +1380,7 @@ def _static_state_entries(
             layer_ids=owner_view.model_layer_ids,
         )
 
-    # 多层 draft 沿用目标 FULL→SWA 映射，各自注册独立的窗口组件。
+    # Each draft layer uses the target's FULL-to-SWA map and registers its own window state.
     from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
     swa_mapping = getattr(token_to_kv_pool, "full_to_swa_index_mapping", None)

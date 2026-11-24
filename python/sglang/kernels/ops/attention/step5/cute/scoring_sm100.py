@@ -115,8 +115,7 @@ def _load_f32_global(tensor: cute.Tensor, coord: tuple[Int32, Int32, Int32]) -> 
 
 @cute.jit
 def _device_contract_trap() -> None:
-    # Note(wangbojun/codex): Runtime metadata stays device-resident under CUDA
-    # Graph, so malformed active metadata must fail here without a host read.
+    # Note(wangbojun/codex): Runtime metadata stays on the device during graph replay, so malformed active metadata must fail here without a host read.
     llvm.inline_asm(
         None,
         [],

@@ -4,7 +4,7 @@
 
 namespace kerutils {
 
-// st.async (https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-st-async)
+// st.async
 template<typename T>
 CUTE_DEVICE
 static void st_async(void* dst_ptr, const T& data, transac_bar_t &mbar) {
@@ -36,7 +36,7 @@ T* get_cta0_addr(const T* p) {
     return (T*)((int64_t)(p) & CTA0_ADDR_MASK);
 }
 
-// TMA bulk reduce add (cp.reduce.async.bulk), shared to global, float32, add. (https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-reduce-async-bulk)
+// TMA bulk reduce add (cp.reduce.async.bulk), shared to global, float32, add.
 CUTE_DEVICE
 void tma_bulk_reduce_add(void const* src_ptr, void* dst_ptr, int32_t store_bytes) {
     uint32_t smem_int_ptr = cute::cast_smem_ptr_to_uint(src_ptr);
@@ -46,25 +46,25 @@ void tma_bulk_reduce_add(void const* src_ptr, void* dst_ptr, int32_t store_bytes
                      : "memory");
 }
 
-// Cluster barrier arrive with .release modifier. (https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-barrier-cluster)
+// Cluster barrier arrive with .release modifier.
 CUTE_DEVICE
 void barrier_cluster_arrive_release() {
     asm volatile("barrier.cluster.arrive.release;" : : : "memory");
 }
 
-// Cluster barrier arrive with .relaxed modifier. (https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-barrier-cluster)
+// Cluster barrier arrive with .relaxed modifier.
 CUTE_DEVICE
 void barrier_cluster_arrive_relaxed() {
     asm volatile("barrier.cluster.arrive.relaxed;" : : :);
 }
 
-// Cluster barrier wait with .acquire modifier. (https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-barrier-cluster)
+// Cluster barrier wait with .acquire modifier.
 CUTE_DEVICE
 void barrier_cluster_wait_acquire() {
     asm volatile("barrier.cluster.wait.acquire;" : : : "memory");
 }
 
-// mbarrier.arrive with .relaxed.cluster qualifier (https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-mbarrier-arrive)
+// mbarrier.arrive with .relaxed.cluster qualifier
 CUTE_DEVICE
 void mbarrier_arrive_relaxed_cluster(transac_bar_t &mbar) {
     uint32_t smem_addr = cute::cast_smem_ptr_to_uint(&mbar);
@@ -76,7 +76,7 @@ void mbarrier_arrive_relaxed_cluster(transac_bar_t &mbar) {
         : "r"(smem_addr));
 }
 
-// AtomicAdd with v4.f32 type (https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-red)
+// AtomicAdd with v4.f32 type
 CUTE_DEVICE
 void atomicadd_f32x4_with_policy_and_pred(void* global_addr, const float4 &data, int64_t cache_policy, uint32_t pred = true) {
     asm volatile(
@@ -91,7 +91,7 @@ void atomicadd_f32x4_with_policy_and_pred(void* global_addr, const float4 &data,
     );
 }
 
-// cp.async.bulk, from .shared::cta to .shared::cluster (https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async-bulk)
+// cp.async.bulk, from .shared::cta to .shared::cluster
 CUTE_DEVICE
 void cp_async_bulk_shared_cta_to_shared_cluster(void* dst_ptr, const void* src_ptr, int32_t load_bytes, transac_bar_t &mbar) {
     uint32_t dst_smem_addr = cute::cast_smem_ptr_to_uint(dst_ptr);

@@ -98,7 +98,7 @@ def _device_arch(index: int) -> tuple[int, int]:
 
 
 def device_cache_key(device: torch.device) -> tuple[str, int, tuple[int, int]]:
-    # Persistent artifacts must not collide when CUDA ordinal zero refers to
+    # Persistent artifacts must not collide when device ordinal zero refers to
     # different architectures across deployments sharing a cache directory.
     index = device.index if device.index is not None else torch.cuda.current_device()
     return device.type, int(index), _device_arch(int(index))

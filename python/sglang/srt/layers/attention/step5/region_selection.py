@@ -340,7 +340,7 @@ def select_step5_regions(
                 row_to_req=row_to_req[start:end],
                 positions=positions[start:end],
                 out=tile_scores,
-                # 已分配的 PPU radix 只读取有效历史，短历史直接保留全部。
+                # The PPU radix selector reads live history only and keeps short histories intact.
                 clear_future=not (
                     workspace.use_cute or workspace.ppu_selector is not None
                 ),

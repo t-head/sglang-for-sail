@@ -1062,7 +1062,7 @@ def build_mega_moe_fp8_block_experts_weights(experts, chunk: int = 16) -> None:
     experts.w2_weight_scale_inv.format_ue8m0 = True
     experts.mega_l1_weights = (mega_l1, w13_sf_utccp)
     experts.mega_l2_weights = (mega_l2, w2_sf_utccp)
-    # 独立注册 UTCCP 副本，让 EPLB 与非转置参数 scales 一起搬迁。
+    # Register the UTCCP copy so EPLB moves it with the untransposed scales.
     experts.register_parameter(
         "mega_w13_weight_scale_utccp",
         torch.nn.Parameter(w13_sf_utccp, requires_grad=False),
@@ -1126,7 +1126,7 @@ def forward_mega_moe_local_experts(
         mma_type=mma_type,
     )
     if is_sail() or _device_sm == 90:
-        # 目标的 PPU/SM90 预分发有独立 ABI；输入 ID 仍按真实 storage 分片过滤。
+        # Use the PPU/SM90 dispatch ABI and filter IDs by the actual storage shard.
         local_ids = topk_ids.to(torch.int64) - expert_offset
         local_ids = torch.where(
             (local_ids >= 0) & (local_ids < num_local), local_ids, -1

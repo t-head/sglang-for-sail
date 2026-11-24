@@ -1342,7 +1342,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
             cache.checkpoint(req, up_to=req.extend_end)
 
-        # 无 bigram 且 page_size=1，插入边界为全部已提交 token。
+        # Without bigrams and with page size one, the boundary covers all committed tokens.
         cushion = max(self.cfg.sliding_window_size, self.cfg.page_size)
         expected_evicted = pre_len - cushion
         self.assertEqual(
@@ -1410,7 +1410,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
     def test_swa_eager_eviction_noop_when_within_window(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
 
-        # 此夹具没有 bigram；完整插入窗口的边界为 4，而非旧调用的 5-1。
+        # Without bigrams, the complete insertion window ends at four.
         pre_len = max(self.cfg.sliding_window_size, self.cfg.page_size)
         tokens = self._make_seq(1, pre_len)
         req, kv_indices = self._make_inflight_req(

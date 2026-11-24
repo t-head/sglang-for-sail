@@ -430,7 +430,7 @@ def schedule_sm100_union_exact_prefill(
     if union_counts.dtype != torch.int32 or union_counts.ndim != 1:
         raise ValueError("union_counts must be a 1D int32 tensor")
     if not union_counts.is_cuda or not union_counts.is_contiguous():
-        raise ValueError("union_counts must be contiguous CUDA storage")
+        raise ValueError("union_counts must be contiguous device storage")
     if union_counts.device != workspace.block_counts.device:
         raise ValueError("union_counts and workspace must be on the same device")
     if int(union_counts.numel()) != workspace.group_capacity:
@@ -1059,7 +1059,7 @@ def _validate_tensor(
             f"dtype={tensor.dtype}"
         )
     if tensor.device != device or not tensor.is_cuda or not tensor.is_contiguous():
-        raise ValueError(f"{name} must be contiguous CUDA storage on {device}")
+        raise ValueError(f"{name} must be contiguous device storage on {device}")
 
 
 def _token_wise_flash_attn_prefill_union_sm100_gqa_impl(
@@ -1327,7 +1327,7 @@ def token_wise_flash_attn_prefill_union_sm100_gqa_prepared_func(
     lse: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
 ) -> torch.Tensor:
-    """Launch attention after workspace preparation on the same CUDA stream."""
+    """Launch attention after workspace preparation on the same device stream."""
     return _token_wise_flash_attn_prefill_union_sm100_gqa_impl(
         q,
         k_cache,

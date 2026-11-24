@@ -1833,7 +1833,7 @@ class SchedulerDisaggregationPrefillMixin:
                 )
 
             def _step5_pages_payload():
-                # 与 decode 使用同一个页对齐 prefix，按 FULL 页逐项配对。
+                # Match FULL pages using the same page-aligned prefix as decode.
                 return suffix_page_indices(
                     self.req_to_token_pool.req_to_token,
                     req.kv.req_pool_idx,

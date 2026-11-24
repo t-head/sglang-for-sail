@@ -125,7 +125,7 @@ pub(super) fn validate_input_ids(g: &GenerateRequest, vocab_size: u64) -> Result
     Ok(())
 }
 
-/// 验证生成 prompt，不截断；供 tokenizer 和 MM processed hook 共用。
+/// Check the full generation prompt for the tokenizer and multimodal hook.
 pub(crate) fn fit_input(input_ids: &mut TokenIds, limits: &Limits) -> Result<(), Error> {
     let input_len = input_ids.len() as u64;
     let max_req_len = limits.context_len;
@@ -138,7 +138,7 @@ pub(crate) fn fit_input(input_ids: &mut TokenIds, limits: &Limits) -> Result<(),
     Ok(())
 }
 
-/// 接纳 prompt 后，将生成长度限制在剩余 context 内。
+/// After accepting a prompt, limit generation to the remaining context.
 pub(super) fn check_total_tokens(g: &mut GenerateRequest, limits: &Limits) -> Result<(), Error> {
     fit_input(g.input_ids.as_mut().unwrap_or(&mut Vec::new()), limits)?;
     let input_len = g.input_ids.as_ref().map_or(0, |ids| ids.len()) as u64;

@@ -6,7 +6,7 @@
 //
 // Radix scheme: [11, 11, 10] (3 rounds) replacing the original [8,8,8,8].
 // Rounds 0-1 use 2048-bin histograms (11-bit extraction); round 2 uses
-// 1024 bins (10-bit).  Only standard CUDA APIs are used.
+// 1024 bins (10-bit).  Only standard device APIs are used.
 
 #include <algorithm>
 #include <cstdint>
@@ -363,7 +363,7 @@ __global__ void dsa_radix_selector_kernel(
   }
   __syncthreads();
 
-  // 历史全部保留时不读取 scores，允许打分阶段跳过这些行。
+  // If all history is kept, skip the score reads and let the scoring stage skip those rows.
   if (current <= topk) {
     for (int region = thread; region < current; region += kThreads) {
       store_region(region, region, request, head, heads, output_width,
@@ -678,7 +678,7 @@ __global__ void dsa_radix_chunk_kernel(
   for (int slot = thread; slot < topk; slot += kThreads) {
     output_row[slot] = -1;
   }
-  // 短历史由 merge 直接生成，空 chunk 也无需扫描或执行 radix 同步。
+  // The merge handles short histories directly. Empty chunks skip scanning and radix synchronization.
   if (current <= topk || valid_length == 0) return;
   if (thread == 0) {
     storage.prefix_value = 0;
@@ -837,7 +837,7 @@ __global__ void dsa_radix_merge_kernel(
   }
   __syncthreads();
 
-  // 容量超过 16384 也可能是短历史，不能读取未计算的 scores 或候选。
+  // A capacity above 16384 can still hold short history. Do not read uncomputed scores or candidates.
   if (current <= topk) {
     for (int region = thread; region < current; region += kThreads) {
       store_region(region, region, request, head, heads, output_width,
@@ -1027,7 +1027,7 @@ void dsa_radix_select(
   static_assert(kMergeSmem <= 48 * 1024,
                 "merge shared memory exceeds default 48KB limit");
   // Both structs fit within the default 48KB dynamic shared memory limit,
-  // so no cudaFuncSetAttribute is needed.
+  // so no a dynamic shared-memory attribute is needed.
 
   if (regions <= kStreamingChunkRegions) {
     dsa_radix_selector_kernel<<<query_rows * heads, kThreads, kSelectorSmem,

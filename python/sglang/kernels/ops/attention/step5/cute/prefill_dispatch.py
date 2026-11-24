@@ -30,7 +30,7 @@ def compile_prefill(
         return fake(Int32, (cute.sym_int(),), (1,), 4)
 
     # Query, group and native KV capacities are runtime dimensions. Only the
-    # union row stride is specialized; fake descriptors allocate no CUDA data.
+    # union row stride is specialized; fake descriptors allocate no device data.
     return cute.compile(
         SparsePrefillSm103(union_capacity, logical_q_heads=logical_q_heads),
         fake(

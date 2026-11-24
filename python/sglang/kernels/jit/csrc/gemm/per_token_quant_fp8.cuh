@@ -203,7 +203,7 @@ __device__ __forceinline__ void load_128b_aiu(
 }
 #endif
 
-// PPU 1.7 uses linear bulk AIU copies, completed by a per-warp mbarrier.
+// Linear bulk AIU copies complete through a per-warp memory barrier.
 #if defined(SGL_PER_TOKEN_QUANT_SAIL_BULK) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 __device__ __forceinline__ void load_token_aiu_bulk(void* dst, const void* src, uint32_t bytes, uint64_t* barrier) {
   namespace ptx = cuda::ptx;
@@ -222,7 +222,7 @@ __device__ __forceinline__ void load_token_aiu_bulk(void* dst, const void* src, 
   }
   __syncwarp();
   if (lane_id == 0) {
-    // This SDK's cuda::ptx API does not expose mbarrier.inval.
+    // This SDK's PTX wrapper does not expose mbarrier.inval.
     const uint32_t bar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(barrier));
     asm volatile("mbarrier.inval.shared.b64 [%0];" ::"r"(bar_addr) : "memory");
   }

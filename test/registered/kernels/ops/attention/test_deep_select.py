@@ -129,7 +129,7 @@ def test_variable_row_end():
 
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
-    reason="Step 5 DeepSelect requires CUDA SM10x",
+    reason="Step 5 DeepSelect requires SM10x",
 )
 def test_step5_fp32_shortcut_and_streaming():
     k, width = 512, 32768

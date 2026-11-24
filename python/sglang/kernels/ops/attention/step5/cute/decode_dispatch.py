@@ -53,7 +53,7 @@ def compile_decode(
         )
 
     # Row count, physical page count and request count are runtime dimensions.
-    # Fake descriptors allocate no CUDA storage and hold no request tensors.
+    # Fake descriptors allocate no device storage and hold no request tensors.
     return cute.compile(
         kernel,
         fake(

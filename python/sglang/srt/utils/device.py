@@ -623,10 +623,10 @@ def is_pin_memory_available(device=None) -> bool:
 def async_h2d(
     args: List | np.ndarray, *, dtype: torch.dtype, device: torch.device
 ) -> torch.Tensor:
-    """将主机数据暂存到可用的 pinned memory，并异步复制到设备。"""
+    """Stage host data in pinned memory if available and copy to the device asynchronously."""
     pin = is_pin_memory_available(device)
     if isinstance(args, np.ndarray):
-        # ndarray 不支持直接构造 pinned tensor；copy_ 同时完成 dtype 转换。
+        # An ndarray cannot directly create a pinned tensor. copy_ also converts the dtype.
         host = torch.empty(args.shape, dtype=dtype, pin_memory=pin)
         host.copy_(torch.from_numpy(args))
     else:

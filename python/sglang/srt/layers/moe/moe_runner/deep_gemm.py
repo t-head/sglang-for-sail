@@ -1684,7 +1684,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if self.swiglu_limit is not None:
             swiglu_limit_arg = self.swiglu_limit
 
-        # 先保留 BF16 product 的舍入，再按当前 GEMM recipe 量化。
+        # Round the product to BF16 before quantizing it with the current GEMM recipe.
         if self.silu_clamp is not None:
             activation = self.silu_clamp(
                 gateup_output.view(-1, gateup_output.shape[-1])

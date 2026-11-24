@@ -1086,7 +1086,7 @@ pub struct MmSpec {
     pub pipeline: MmPipelineSpec,
 }
 
-// 保留目标 Image pipeline；Step3VL 的独立几何由本次移植的处理器负责。
+// Keep the target image pipeline and use the Step3VL processor for its geometry.
 #[derive(Clone, Debug)]
 pub enum MmPipelineSpec {
     Image(sglang_processor::dynamo_multimodal::registry::ProcessorSpec),

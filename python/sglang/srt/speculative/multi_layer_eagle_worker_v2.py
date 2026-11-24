@@ -249,7 +249,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             boundary_kv_fix_enabled()
             and self.topk == 1
             and self.speculative_num_steps > 1
-            # 保留目标的 mamba/sconv 适用范围，并加入 Step5 的无卷积历史重放。
+            # Keep the existing mamba/sconv path and allow Step5's replay without convolution.
             and (self.req_to_token_pool.holds_state_slots or self.is_step5_mtp)
         ):
             return
@@ -830,7 +830,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         staged: bool = False,
         iteration_ids: Optional[IterationIds] = None,
     ):
-        # 打包使用原始 verify 链；Step5 在构造 ForwardBatch 前准备私有窗口。
+        # Pack the original verification chain. Step5 prepares its own window before building the batch.
         target_tokens = batch.input_ids
         # Batch 2: Draft extend
         draft_extend_width = (
@@ -984,8 +984,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             forward_batch.spec_info.select_index = (
                 select_index if prune_logits else None
             )
-            # 每个 depth 使用私有 batch；Step5 在窗口填充后由 runner 规划。
-            # 其他模型保留目标的 pre-pad 计划，NPU 仍允许 post-pad 重建。
+            # Each depth has a private batch. The runner plans Step5 after window padding.
+            # Other models keep pre-pad planning and the NPU can still rebuild after padding.
             for step in range(self.speculative_num_steps):
                 forward_batch.req_to_token_pool = self.draft_runner_list[
                     step
@@ -1133,7 +1133,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         )
 
     def clear_cache_pool(self):
-        # Scheduler 在 drained flush 边界清空请求池后，也使 worker 的历史 stash 失效。
+        # When the scheduler flushes a drained request pool, invalidate the worker's history cache.
         valid_lens = self.draft_worker.boundary_kv_stash_valid_lens
         if valid_lens is not None:
             valid_lens.zero_()

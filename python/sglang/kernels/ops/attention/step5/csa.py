@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Metadata entry for a fresh, complete Step5 CSA region; CUDA arithmetic only."""
+"""Metadata entry for a fresh, complete Step5 CSA region; device arithmetic only."""
 
 from __future__ import annotations
 
@@ -21,10 +21,10 @@ def _storage_overlaps(left: torch.Tensor, right: torch.Tensor) -> bool:
 def _validate_buffers(
     index_key: torch.Tensor, compression_logits: torch.Tensor, out: torch.Tensor
 ) -> int:
-    """Validate host-visible metadata on CPU/CUDA without reading tensor values.
+    """Validate host-visible metadata on CPU or a supported device without reading tensor values.
 
     CPU acceptance here only permits metadata tests. The public computation
-    entry separately requires NVIDIA CUDA and has no CPU arithmetic fallback.
+    entry separately requires a supported device and has no CPU arithmetic fallback.
     """
     import torch
 
@@ -94,14 +94,14 @@ def step5_csa_region(
     contract does not apply to an existing accumulator or incomplete region.
 
     Empty N returns out without importing/launching the Triton leaf. Warm up
-    before CUDA Graph capture; subsequent calls use the supplied writer buffer
+    before device graph capture; subsequent calls use the supplied writer buffer
     and perform no data-dependent host reads or scratch allocation.
     """
     import torch
 
     regions = _validate_buffers(index_key, compression_logits, out)
     if index_key.device.type != "cuda" or torch.version.hip is not None:
-        raise ValueError("Step5 CSA region arithmetic requires NVIDIA CUDA")
+        raise ValueError("Step5 CSA region arithmetic requires a supported device")
     if regions == 0:
         return out
     from sglang.kernels.ops.attention.step5.csa_region_triton import (

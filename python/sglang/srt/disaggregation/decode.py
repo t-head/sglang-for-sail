@@ -2206,7 +2206,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
 
         def _step5_pages_payload():
-            # Step5 页级 sidecar 随 FULL KV 后缀传输，保留缓存/待恢复前缀。
+            # Send Step5 page state with the FULL KV suffix and preserve the restore prefix.
             return suffix_page_indices(
                 self.req_to_token_pool.req_to_token,
                 decode_req.req.kv.req_pool_idx,

@@ -451,7 +451,7 @@ def _get_processor(
             processor.tokenizer = tokenizer
 
     _install_tokenizer_warnings_filter(tokenizer)
-    # 修复 v5 构造器覆盖的 tokenizer.json 组件，再恢复目标的 BOS/EOS 行为。
+    # Restore the serialized tokenizer components and the checkpoint's BOS/EOS behavior.
     _fix_v5_tokenizer_components(tokenizer, tokenizer_name, revision)
     _fix_v5_add_bos_eos_token(tokenizer, tokenizer_name, revision)
 

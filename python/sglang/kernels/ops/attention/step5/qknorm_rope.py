@@ -28,7 +28,7 @@ def _can_use_qknorm_cute(device: torch.device) -> bool:
 
 
 def _can_use_qknorm_triton(device: torch.device) -> bool:
-    """The portable Triton port runs on every CUDA device the CuTe one misses."""
+    """The portable Triton port runs on every device the CuTe one misses."""
     # Imported here, not at module scope: `current_platform` is a lazy module
     # attribute, so a top-level import would resolve the platform too early.
     from sglang.srt.platforms import current_platform
@@ -134,7 +134,7 @@ def _qknorm_rope(
     kv_write: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     if qkv.device.type != "cuda" or torch.version.hip is not None:
-        raise ValueError("Step5 Q/K norm requires NVIDIA CUDA")
+        raise ValueError("Step5 Q/K norm requires a supported device")
     if rotary_cache.ndim != 2 or rotary_cache.shape[1] not in (64, 192):
         raise ValueError("Step5 main rotary cache must have width 64 or 192")
     if rotary_cache.shape[0] == 0 or not math.isfinite(eps) or eps <= 0:

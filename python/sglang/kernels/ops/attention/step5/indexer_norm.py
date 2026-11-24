@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CUDA entry for Step5 BF16 indexer normalization and partial NeoX RoPE."""
+"""Device entry for Step5 BF16 indexer normalization and partial NeoX RoPE."""
 
 import math
 
@@ -76,7 +76,7 @@ def step5_indexer_norm_rope(
     normalized Q/K round to BF16 before FP32 rotation and BF16 output.
     Positions[T] must lie in [0, cache.shape[0]); the serving owner validates
     this bound. Inputs must be finite and output storage disjoint from inputs.
-    fp8_saturate selects the CUDA Torch cast policy established by the caller.
+    fp8_saturate selects the Torch device cast policy established by the caller.
     With packed_workspace, q_out must be None: Q/W write directly into the
     scoring ABI and the first return value is None. packed_q_e4m3 preserves
     the selected original cast policy. Metadata must be prepared separately
@@ -84,7 +84,7 @@ def step5_indexer_norm_rope(
     Warm up before Graph capture. No allocation or host tensor-value reads.
     """
     if q.device.type != "cuda" or torch.version.hip is not None:
-        raise ValueError("Step5 indexer requires NVIDIA CUDA")
+        raise ValueError("Step5 indexer requires a supported device")
     if q.ndim != 3 or q.shape[1] not in (2, 4) or q.shape[2] != 256:
         raise ValueError("Step5 index Q requires [tokens, 2 or 4, 256]")
     if not math.isfinite(eps) or eps <= 0 or not isinstance(zero_centered, bool):

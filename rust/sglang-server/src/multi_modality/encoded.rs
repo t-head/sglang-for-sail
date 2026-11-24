@@ -217,7 +217,7 @@ impl MmEncodedItem {
         hash.update(metadata);
         hash.update((data.len() as u64).to_be_bytes());
         hash.update(data);
-        // 辅助图像张量同样决定模型输出；无 aux 时保持目标原有 identity。
+        // Auxiliary image tensors affect model output. Keep the existing identity without them.
         if !self.aux.is_empty() {
             hash.update(b"sglang-rust-mm-aux-v1");
             hash.update((self.aux.len() as u64).to_be_bytes());

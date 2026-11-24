@@ -411,7 +411,7 @@ class FlashAttentionForwardSm100:
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
         This method prepares the input tensors for processing, validates their shapes and types,
-        configures the computation parameters, and launches the CUDA kernel.
+        configures the computation parameters, and launches the attention kernel.
 
         The method handles:
         1. Tensor layout transformations for specific memory access patterns
@@ -1191,7 +1191,7 @@ class FlashAttentionForwardSm100:
         )
         max_effective_n_blocks = utils.warp_reduce(local_max_effective_n_blocks, max)
 
-        # Note(wangbojun/codex): schedule by real q/k lengths. CUDA graph
+        # Note(wangbojun/codex): schedule by real q/k lengths. device graph
         # padding rows have q_len=0 or kv_len=0 and therefore contribute no
         # partial work, while workspace shape remains graph-stable.
         split_overhead_blocks = Int32(128)

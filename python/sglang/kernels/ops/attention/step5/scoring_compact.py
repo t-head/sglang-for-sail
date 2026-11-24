@@ -88,7 +88,7 @@ def _score_compact(
     mixed = (request != base_request) & (request != 0) & row_valid
     uniform = tl.sum(mixed.to(tl.int32), axis=0) == 0
     if EARLY_EXIT or not CLEAR_FUTURE:
-        # 短历史整组在加载 Q / 发起 MMA 前退出，边界混合组仍共用同一 MMA。
+        # All-short groups exit before loading Q or issuing MMA. Mixed groups share one MMA.
         live, max_live, last_tile = _live_extent(
             position, row_valid, request, BLOCK_R, REGIONS, CLEAR_FUTURE,
         )

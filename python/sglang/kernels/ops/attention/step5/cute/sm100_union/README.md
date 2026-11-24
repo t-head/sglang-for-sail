@@ -1,9 +1,9 @@
 # Step5 SM100 union prefill
 
-Private dependencies from StepFun commit b3055a1c0e5a17da35bbf36d8f60651e073706c3. Original source hashes and local modifications are recorded in MANIFEST.json. Copyright and license headers are retained.
+This private implementation derives from StepFun commit b3055a1c0e5a17da35bbf36d8f60651e073706c3. See [MANIFEST.json](MANIFEST.json) for the original source hashes and local modifications. Source files retain their copyright and license headers.
 
-This fork does not import or replace the public SGLang FA4 implementation. Package initializers are inert. FakeTensor descriptors are constructed locally without monkeypatching CUTLASS or modifying installed files. Compilation uses SGLang's cache owner with recursive source fingerprinting.
+The implementation builds local FakeTensor descriptors and uses recursive source fingerprints for the SGLang compilation cache. It owns its dependencies and schedule buffers separately from the public SGLang FA4 implementation.
 
-The candidate consumes compact Q/O rows. Query group count comes from union metadata, not ceil(T/qgroup). Private load and output hooks apply the group's compact-row offset. WorkQGlobal is the native per-query position vector; WorkQLocal/WorkQLen are compact start/end rows. The schedule computes union-relative causal limits, and retains the tail-load validity mask.
+The schedule reads compact query and output rows. Union metadata supplies the query group count and each group's compact-row offset. `WorkQGlobal` stores per-query positions. `WorkQLocal` and `WorkQLen` locate the query rows within each group. The schedule computes causal limits relative to each union and masks invalid tail loads.
 
-The public entry is step5_sparse_prefill. Backend-owned typed schedule buffers are allocated before decoder layers. Enabled by default on compute capability 10.x; disable it with SPARSE_PREFILL_SM100 in step5/options.py. No padded Q/O buffers or adapter packing kernels are used. Native SWA remains unchanged.
+`step5_sparse_prefill` enables this path by default on devices with compute capability 10.x. Set `SPARSE_PREFILL_SM100` in `step5/options.py` to disable it. The backend allocates typed schedule buffers before the decoder layers and sends compact rows directly to the kernel.

@@ -58,7 +58,7 @@ def local_expert_lookup(
     if table_numel == 0:
         raise ValueError("the expert table must not be empty")
     # A fixed block keeps the decode shape from recompiling: only the grid
-    # follows numel, and a CUDA-graph capture bakes in whichever grid it saw.
+    # follows numel, and a device graph capture bakes in whichever grid it saw.
     _local_expert_lookup_kernel[(triton.cdiv(numel, _BLOCK),)](
         topk_ids,
         table,

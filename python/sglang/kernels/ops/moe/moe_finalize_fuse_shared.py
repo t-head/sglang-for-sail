@@ -20,7 +20,7 @@ def _jit_finalize_module(
     output_dtype: torch.dtype = torch.bfloat16,
     round_routed: bool = False,
 ) -> Module:
-    # FP32 输出的向量同样限制在 16 字节，兼容 pre-Blackwell。
+    # Limit FP32 output vectors to 16 bytes for pre-Blackwell devices.
     widths = (8, 4, 2) if output_dtype == torch.bfloat16 else (4, 2)
     vec = next(v for v in widths if hidden % v == 0)
     args = make_cpp_args(
@@ -47,18 +47,18 @@ def moe_finalize_fuse_shared(
     output_dtype: torch.dtype = torch.bfloat16,
     round_routed: bool = False,
 ) -> torch.Tensor:
-    """以 FP32 累加路由专家结果，跳过 index=-1 的行，最后加 shared_output。
+    """Accumulate routed expert outputs in FP32, skip index -1, then add shared_output.
 
-    gemm2_out 为 [num_permuted_rows, padded_hidden] BF16；路由 index 为
-    [num_tokens * top_k] INT32，权重为 [num_tokens, top_k] FP32 或 BF16。
-    shared_output 为可选的 [num_tokens, hidden] BF16，hidden <= padded_hidden。
-    out 为可选的单位列步长输出缓冲区，允许行步长和截取 padded hidden；
-    output_dtype 控制最终存储，round_routed 在加 shared 前先将路由结果截为 BF16。
-    默认保持原 FP32 累加后一次 BF16 存储的行为。
+    gemm2_out is BF16 [num_permuted_rows, padded_hidden]. Routing indices are
+    INT32 [num_tokens * top_k]. Routing weights are FP32 or BF16.
+    shared_output is optional BF16 [num_tokens, hidden] with hidden <= padded_hidden.
+    out is an optional output with unit column stride. Padded rows and sliced width are supported.
+    output_dtype selects the output type. round_routed rounds to BF16 before adding shared_output.
+    By default, accumulate in FP32 and convert to BF16 once on store.
 
-    启用 PDL 时，routing_ready=True 表示路由在本 kernel launch 前已经完成，
-    可在 PDL wait 前读取；shared_output 始终在 wait 后读取。若生产者在等待
-    路由之前就触发 dependents，必须传 False。
+    With PDL, routing_ready=True allows reading routing before the PDL wait.
+    Always read shared_output after the wait. Pass False if the producer triggers
+    dependent kernels before routing is available.
     """
     assert output_dtype in (torch.bfloat16, torch.float32)
     assert gemm2_out.dtype == torch.bfloat16 and gemm2_out.dim() == 2

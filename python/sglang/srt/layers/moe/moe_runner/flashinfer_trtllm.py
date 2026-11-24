@@ -2483,7 +2483,7 @@ def fused_experts_megamoe_to_flashinfer_trtllm_bf16(
     quant_info: MoeQuantInfo,
     runner_config: MoeRunnerConfig,
 ) -> StandardCombineInput:
-    # MegaMoE 的 BF16 层使用 StandardDispatcher；Step5 负责归约本地贡献。
+    # BF16 MegaMoE layers use StandardDispatcher. Step5 reduces the local contributions.
     if not isinstance(quant_info, FlashInferTrtllmBf16MoeQuantInfo):
         raise TypeError("MegaMoE's TRTLLM fallback only supports BF16 experts")
     if runner_config.silu_clamp_mode != "post":

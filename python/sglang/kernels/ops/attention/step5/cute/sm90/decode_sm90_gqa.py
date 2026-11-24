@@ -2282,7 +2282,7 @@ class TokenWiseFlashAttnFwdSm90GQADecode:
             or k_cache.device.type != "cuda"
             or v_cache.device.type != "cuda"
         ):
-            raise ValueError("q/k_cache/v_cache must be CUDA tensors")
+            raise ValueError("q/k_cache/v_cache must be device tensors")
         if q.ndim != 3:
             raise ValueError(
                 f"Expected q shape (Tq, {self.logical_q_heads}, {self.HEAD_DIM}), got {tuple(q.shape)}"
@@ -2297,7 +2297,7 @@ class TokenWiseFlashAttnFwdSm90GQADecode:
                 or not query_start_loc.is_contiguous()
             ):
                 raise ValueError(
-                    "ragged MTP decode requires contiguous CUDA int32 "
+                    "ragged MTP decode requires a contiguous device int32 "
                     "query_start_loc with shape [requests + 1]"
                 )
         if k_cache.ndim != 4 or v_cache.ndim != 4:
@@ -2452,7 +2452,7 @@ class TokenWiseFlashAttnFwdSm90GQADecode:
             or not valid_rows.is_contiguous()
         ):
             raise ValueError(
-                "valid_rows must be a contiguous CUDA int32 tensor with shape [1]"
+                "valid_rows must be a contiguous device int32 tensor with shape [1]"
             )
         if query_start_loc is None:
             query_start_loc = valid_rows

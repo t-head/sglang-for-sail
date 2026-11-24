@@ -235,7 +235,7 @@ fn generate_req(id: u64, sampling_params: SamplingParams) -> Request {
     }
 }
 
-/// 接纳 prompt 后，超出 context 的输出预算被 clamp，prompt 保持完整。
+/// After accepting a prompt, clamp the output budget to the remaining context.
 #[test]
 fn total_tokens_over_context_is_clamped() {
     let limits = Limits {
@@ -253,13 +253,13 @@ fn total_tokens_over_context_is_clamped() {
     assert!(check_total_tokens(&mut g, &limits).is_ok());
     assert_eq!(g.sampling_params.max_new_tokens, Some(7));
     assert_eq!(g.input_ids.as_deref(), Some(&[1, 2, 3][..]));
-    // prompt 与输出恰好填满 context 时预算保持不变。
+    // Keep both lengths when the prompt and output exactly fill the context.
     g.sampling_params.max_new_tokens = Some(7);
     assert!(check_total_tokens(&mut g, &limits).is_ok());
     assert_eq!(g.sampling_params.max_new_tokens, Some(7), "left alone");
 }
 
-/// 未指定输出上限时交由 scheduler；显式值和默认值均在接纳后 clamp。
+/// Defer an unset output limit to the scheduler. Clamp either budget after accepting the prompt.
 #[test]
 fn omitted_max_new_tokens_under_a_context_length_passes_a_near_limit_prompt() {
     let limits = Limits {
@@ -292,7 +292,7 @@ fn omitted_max_new_tokens_under_a_context_length_passes_a_near_limit_prompt() {
     }
 }
 
-/// EAGLE draft 的 scratch 槽位不占用用户可见的 context 预算。
+/// EAGLE draft scratch slots do not count against the user-visible context.
 #[test]
 fn reserved_tokens_do_not_count_toward_the_limit() {
     let args = ServerArgs {
@@ -307,7 +307,7 @@ fn reserved_tokens_do_not_count_toward_the_limit() {
     let mut g = GenerateRequest {
         input_ids: Some(vec![1, 2, 3]),
         sampling_params: SamplingParams {
-            max_new_tokens: Some(3), // prompt 与输出合计 6，scratch 另计。
+            max_new_tokens: Some(3), // Prompt and output total six tokens, excluding scratch.
             ..Default::default()
         },
         ..Default::default()
@@ -316,7 +316,7 @@ fn reserved_tokens_do_not_count_toward_the_limit() {
     assert_eq!(g.sampling_params.max_new_tokens, Some(3));
 }
 
-/// 输出预算超过剩余空间时 clamp；充足空间或未设上限时保留原值。
+/// Clamp the output budget to the remaining context when needed.
 #[test]
 fn auto_truncate_clamps_and_unknowns_skip() {
     let sp = |max_new_tokens| SamplingParams {
@@ -355,7 +355,7 @@ fn auto_truncate_clamps_and_unknowns_skip() {
     assert!(check_total_tokens(&mut g, &roomy).is_ok());
 }
 
-/// 默认输出预算同样受剩余 context 限制，且不能豁免 prompt 接纳检查。
+/// The remaining context also bounds a default budget. Prompt admission checks still apply.
 #[test]
 fn defaulted_max_new_tokens_is_clamped_before_the_scheduler() {
     for allow_auto_truncate in [false, true] {
@@ -427,7 +427,7 @@ fn input_length_is_checked_unconditionally() {
     g.sampling_params.max_new_tokens = None;
     assert!(check_total_tokens(&mut g, &limits).is_ok());
 
-    // embedding 的截断开关不能允许截断 generation prompt。
+    // The embedding truncation option does not apply to generation prompts.
     let args = ServerArgs {
         model_config: ModelConfig {
             context_len: limits.context_len,
@@ -546,7 +546,7 @@ fn limits_resolve_the_hidden_states_mode() {
     assert_eq!(mode(Some("full"), false), HiddenStatesMode::Full);
 }
 
-/// drive 必须注销不满足输出预留的请求；接纳的请求在发送前 clamp 输出预算。
+/// Unregister requests that cannot reserve output and clamp accepted budgets before sending.
 #[test]
 fn over_context_request_deregisters_and_admitted_cap_is_clamped() {
     let (mut intake, detok_rx, consumer, _tm_tx, _mm_rx) = make_intake_with(Limits {

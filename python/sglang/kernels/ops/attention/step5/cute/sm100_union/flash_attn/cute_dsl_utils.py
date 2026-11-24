@@ -164,7 +164,7 @@ def cute_compile_patched(*args, **kwargs):
             except Exception as exc:
                 # Note(wangbojun/codex): Some runtime images ship a cuobjdump that
                 # cannot disassemble Blackwell cubins. Keep the cubin for later
-                # CUDA 13.2 tooling instead of failing the model startup path.
+                # the expected compiler toolchain instead of failing the model startup path.
                 print(
                     f"[cute_compile_patched] cubin dumped to {cubin_path}; "
                     f"SASS extraction skipped: {exc}",

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""本地 PPU scoring UT：物理映射、逐 head ReLU、ragged 和 graph 重放。"""
+"""PPU scoring tests for page mapping, per-head ReLU, ragged input, and graph replay."""
 
 import unittest
 
@@ -19,11 +19,11 @@ class TestStep5ScoreRegions(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         if not torch.cuda.is_available():
-            raise unittest.SkipTest("需要可用的 PPU/CUDA")
+            raise unittest.SkipTest("A supported accelerator is required")
         torch.cuda.set_device(0)
 
     def test_physical_mapping_ragged_causality(self):
-        """随机 physical page 不能改变 logical causality，尾 span 不能越界。"""
+        """Physical page order preserves logical causality and stays within bounds."""
         for heads in (2, 4):
             case = make_case(
                 lengths=(7, 13, 9), prefixes=(0, 4097, 8193), heads=heads,
@@ -38,7 +38,7 @@ class TestStep5ScoreRegions(CustomTestCase):
                         self.assertTrue(torch.equal(actual.view(torch.int32), expected.view(torch.int32)))
 
     def test_random_scores_top512(self):
-        """重排加载或 tile 不应改变原 MMA 的分数及 top-512 tie-break。"""
+        """Changing load order or tiling preserves MMA scores and the top-512 tie break."""
         case = make_case(lengths=(33, 17), prefixes=(8191, 4101), width=1037, seed=23)
         for fp8 in (True, False):
             baseline = make_runner(case, "baseline", fp8=fp8)["run"]().clone()
@@ -50,7 +50,7 @@ class TestStep5ScoreRegions(CustomTestCase):
                     self.assertTrue(comparison["top512_equal"], comparison)
 
     def test_wider_query_groups(self):
-        """16/32 行复用仍必须逐 query 保留 causal mask 和 head reduction。"""
+        """Row reuse preserves per-query causal masking and head reduction."""
         case = make_case(lengths=(65, 3), prefixes=(8179, 4101), width=1033, easy=True, padding=7, seed=31)
         expected = reference_scores(case).cuda()
         for fp8 in (True, False):
@@ -61,7 +61,7 @@ class TestStep5ScoreRegions(CustomTestCase):
                         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def test_relu_order_and_positive_zero(self):
-        """ReLU 必须在 head sum 前；负权重产生的零必须归一到 +0。"""
+        """Apply ReLU before summing heads and canonicalize negative zero."""
         case = make_case(lengths=(9,), prefixes=(4104,), width=517, heads=2, easy=True)
         case["keys"].fill_(0x38)
         case["physical_keys"].fill_(1.0)
@@ -83,7 +83,7 @@ class TestStep5ScoreRegions(CustomTestCase):
                 case["weights"].fill_(1.0)
 
     def test_graph_replay_refreshes_live_keys(self):
-        """同一 graph 的 history 大、小、大变化不能消费 stale K 或 scores。"""
+        """Large, small, and large histories under one graph cannot reuse stale K or scores."""
         case = make_case(lengths=(37,), prefixes=(8192,), width=1037, easy=True, padding=3, seed=41)
         for fp8 in (True, False):
             for variant in VARIANTS:

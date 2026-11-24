@@ -7,9 +7,8 @@ import torch
 def _can_use_prefill_union_cute(device: torch.device) -> bool:
     """The CuTe DSL union needs Hopper/Blackwell; other devices use the Triton port.
 
-    The CuTe DSL cannot run on sm80 PPU (the driver reports CUDA 13.0, below the
-    13.4 the prebuilt cutlass-dsl requires), so route capability 9/10 to CuTe and
-    everything else to ``prefill_union_triton``, matching the rest of Step5.
+    Use CuTe for capability 9 or 10. Use ``prefill_union_triton`` on other
+    devices, including PPU with capability 8.0.
     """
     return (
         device.type == "cuda"
@@ -51,7 +50,7 @@ def step5_build_prefill_union(
     this entry neither allocates storage nor reads device values on the host.
     """
     if logical_starts.device.type != "cuda" or torch.version.hip is not None:
-        raise ValueError("Step5 prefill union requires NVIDIA CUDA")
+        raise ValueError("Step5 prefill union requires a supported device")
     if logical_starts.ndim != 2 or logical_starts.shape[1] != 513:
         raise ValueError("Step5 prefill selection requires shape [T,513]")
     if group_query_start.ndim != 1 or union_physical.ndim != 2:

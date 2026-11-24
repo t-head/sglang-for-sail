@@ -1308,7 +1308,7 @@ mod tests {
         );
     }
 
-    /// processed 只观察接纳的完整 prompt；拒绝的 generation prompt 不截断、不观察。
+    /// Observe the full accepted prompt. Rejected prompts are neither truncated nor observed.
     #[test]
     fn processed_sees_the_ids_fitted_to_the_context() {
         use std::sync::Mutex;

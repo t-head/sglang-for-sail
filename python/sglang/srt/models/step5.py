@@ -579,7 +579,7 @@ class Step5MoE(nn.Module):
             fp8_use_rn_division=(
                 # RN (round-to-nearest) division is an FP8 block-wise accuracy
                 # feature: invoke_fused_moe_kernel rejects it unless the MoE is
-                # CUDA block-wise FP8. Keep it off for INT8 (compressed-tensors
+                # device block-wise FP8. Keep it off for INT8 (compressed-tensors
                 # W8A8), nvfp4, per-tensor FP8, and BF16 routed experts.
                 not self.keep_bf16_experts
                 and isinstance(quant_config, Fp8Config)
@@ -1189,7 +1189,7 @@ class Step5Attention(nn.Module):
             if use_alt_stream and not fused_projection:
                 # DSA already joined this branch before sparse attention.
                 # Recording another join after it would migrate the main
-                # CUDA graph replay chain again.
+                # device graph replay chain again.
                 if not (defer_side_work and self.is_dsa):
                     current_stream.wait_stream(self.alt_stream)
                 gate.record_stream(current_stream)
