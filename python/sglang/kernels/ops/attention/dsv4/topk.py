@@ -11,7 +11,8 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.utils import is_xpu
+from sglang.srt.environ import envs
+from sglang.srt.utils import is_sail, is_xpu
 
 from .candidate_table import CANDIDATE_BLOCK_SIZE
 from .utils import make_name
@@ -500,7 +501,25 @@ def topk_transform_sparse(
     """Top-``k`` (``k = out_indices.shape[1]``) of each row of the bf16 sparse
     ``logits`` within its first ``valid_lens[b]`` columns, ``-1`` padded, unordered;
     column ``j`` is written as ``blocks[b, j // 8] * 8 + j % 8``: pool slots for the
-    published blocks as pool slots / 8, compressed positions for logical ids."""
+    published blocks as pool slots / 8, compressed positions for logical ids.
+
+    PPU DeepSelect is used only with SGLANG_OPT_DSV41_DEEP_SELECT_TOPK=1
+    and a compatible BF16 backend.
+    """
+    if (
+        is_sail()
+        and logits.dtype == torch.bfloat16
+        and envs.SGLANG_OPT_DSV41_DEEP_SELECT_TOPK.get()
+    ):
+        from sglang.srt.hardware_backend.ppu.attention.ppu_deep_select_hooks import (
+            _ppu_is_deep_select_supported,
+            topk_transform_sparse_deep_select,
+        )
+
+        if _ppu_is_deep_select_supported():
+            topk_transform_sparse_deep_select(logits, valid_lens, blocks, out_indices)
+            return
+
     topk_transform_bf16_small(
         logits, valid_lens, blocks, out_indices, CANDIDATE_BLOCK_SIZE
     )

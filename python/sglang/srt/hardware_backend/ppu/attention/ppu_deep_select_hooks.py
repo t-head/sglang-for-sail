@@ -27,16 +27,9 @@ def _ppu_is_deep_select_supported() -> bool:
     )
 
 
-@plugin_hook(
-    "sglang.kernels.ops.attention.dsv4.topk.topk_transform_sparse",
-    type=HookType.AROUND,
-)
-def _ppu_topk_transform_sparse(original_fn, logits, valid_lens, blocks, out_indices):
-    """Rank compact sparse rows with the wheel, then restore block positions."""
+def topk_transform_sparse_deep_select(logits, valid_lens, blocks, out_indices):
+    """Rank eligible compact sparse rows with the wheel and restore positions."""
     import torch
-
-    if logits.dtype != torch.bfloat16 or not _ppu_is_deep_select_supported():
-        return original_fn(logits, valid_lens, blocks, out_indices)
 
     rows, topk = out_indices.shape
     if rows == 0 or topk == 0:

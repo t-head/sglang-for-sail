@@ -8,14 +8,15 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from sglang.kernels.ops.attention import deep_select
 from sglang.kernels.ops.attention.dsa.deep_select import topk_transform_ragged
 from sglang.kernels.ops.attention.dsv4 import index_logits
-from sglang.kernels.ops.attention.dsv4.topk import topk_transform_sparse
+from sglang.kernels.ops.attention.dsv4 import topk as topk_ops
 from sglang.srt.hardware_backend.ppu.attention import ppu_deep_select_hooks
 from sglang.srt.utils import is_sail
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_ppu_ci
 
-register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_ppu_ci(est_time=20, stage="stage-a", runner_config="1-gpu-ppu")
 
 pytestmark = pytest.mark.skipif(
     not is_sail(), reason="Requires the PPU deep_select wheel"
@@ -26,8 +27,11 @@ pytestmark = pytest.mark.skipif(
 def bf16_deep_select(monkeypatch):
     # Patch the cached resolver itself, not its environment input. Restoring the
     # patch leaves the original resolver and its existing cache untouched.
+    if not deep_select._wheel_available():
+        pytest.skip("DeepSelect wheel unavailable in this PPU image")
     monkeypatch.setattr(index_logits, "index_logits_dtype", lambda: torch.bfloat16)
     assert ppu_deep_select_hooks._ppu_is_deep_select_supported()
+    monkeypatch.setenv("SGLANG_OPT_DSV41_DEEP_SELECT_TOPK", "1")
 
 
 @pytest.mark.parametrize("topk", [1, 8, 512, 2048])
@@ -46,7 +50,7 @@ def bf16_deep_select(monkeypatch):
 )
 @pytest.mark.parametrize("distribution", ["random", "ties", "negative_inf"])
 @torch.inference_mode()
-def test_deep_select_ragged_windows(topk, width, layout, distribution):
+def test_deep_select_ragged_windows(topk, width, layout, distribution, bf16_deep_select):
     torch.manual_seed(width)
     rows, device = 4, "cuda"
     padded_width = (width + 511) // 512 * 512
@@ -113,7 +117,7 @@ def test_deep_select_ragged_windows(topk, width, layout, distribution):
 
 
 @torch.inference_mode()
-def test_deep_select_empty_rows():
+def test_deep_select_empty_rows(bf16_deep_select):
     scores = torch.empty((0, 1024), dtype=torch.bfloat16, device="cuda")
     lengths = torch.empty(0, dtype=torch.int32, device="cuda")
     out = topk_transform_ragged(scores, lengths, 2048, lengths)
@@ -125,7 +129,14 @@ def test_deep_select_empty_rows():
 @pytest.mark.parametrize("width", [1025, 4093, 16384])
 @pytest.mark.parametrize("graph", [False, True])
 @torch.inference_mode()
-def test_deep_select_sparse_block_positions(topk, width, graph, bf16_deep_select):
+def test_deep_select_sparse_block_positions(
+    topk, width, graph, bf16_deep_select, monkeypatch
+):
+    monkeypatch.setattr(
+        topk_ops,
+        "topk_transform_bf16_small",
+        Mock(side_effect=AssertionError("generic fallback used")),
+    )
     torch.manual_seed(width + topk)
     rows = 4
     stride = (width + 511) // 512 * 512
@@ -141,9 +152,7 @@ def test_deep_select_sparse_block_positions(topk, width, graph, bf16_deep_select
     out = torch.empty(rows, topk, device="cuda", dtype=torch.int32)
 
     def run():
-        return ppu_deep_select_hooks._ppu_topk_transform_sparse(
-            topk_transform_sparse, scores, lengths, blocks, out
-        )
+        return topk_ops.topk_transform_sparse(scores, lengths, blocks, out)
 
     def check_output():
         torch.cuda.synchronize()
@@ -180,9 +189,9 @@ def test_deep_select_sparse_block_positions(topk, width, graph, bf16_deep_select
             check_output()
 
 
-def test_deep_select_sparse_consumer_hook():
-    # Applying hooks mutates imported bindings process-wide. Exercise the actual
-    # registration and the sparse-table consumer in a fresh process.
+def test_deep_select_sparse_consumer_dispatch_without_hook(bf16_deep_select):
+    # Exercise the sparse consumer's imported entry in a fresh process, without
+    # applying the plugin registry. A direct helper call would miss this wiring.
     subprocess.run(
         [
             sys.executable,
@@ -194,25 +203,20 @@ def test_deep_select_sparse_consumer_hook():
                 from sglang.kernels.ops.attention.dsv4 import index_logits, topk
                 from sglang.srt.layers.attention.dsv4.v41_indexer import sparse_table
                 from sglang.srt.hardware_backend.ppu.attention import ppu_deep_select_hooks as hooks
-                from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+                from sglang.srt.plugins.hook_registry import HookRegistry
 
                 target = "sglang.kernels.ops.attention.dsv4.topk.topk_transform_sparse"
-                registered = HookRegistry._hooks.get(target, [])
-                assert any(kind == HookType.AROUND and fn is hooks._ppu_topk_transform_sparse
-                           for kind, fn, _ in registered), "sparse hook not registered"
-                HookRegistry._hooks = {target: registered}
-                HookRegistry._patched = set()
-                before = [sparse_table.topk_transform_sparse]
-                HookRegistry.apply_hooks()
-                assert sparse_table.topk_transform_sparse is not before[0]
+                assert not HookRegistry._hooks.get(target), "unexpected sparse hook"
                 assert sparse_table.topk_transform_sparse is topk.topk_transform_sparse
 
                 scores = torch.tensor([[1, 4, 2, 3, 0, 0, 0, 0]], device="cuda", dtype=torch.bfloat16)
                 lengths = torch.tensor([4], device="cuda", dtype=torch.int32)
                 blocks = torch.tensor([[17]], device="cuda", dtype=torch.int32)
                 out = torch.empty(1, 2, device="cuda", dtype=torch.int32)
-                with patch.object(index_logits, "index_logits_dtype", return_value=torch.bfloat16), \
-                     patch.object(topk, "topk_transform_bf16_small", side_effect=AssertionError("generic fallback used")):
+                with (
+                    patch.object(index_logits, "index_logits_dtype", return_value=torch.bfloat16),
+                    patch.object(topk, "topk_transform_bf16_small", side_effect=AssertionError("generic fallback used")),
+                ):
                     assert hooks._ppu_is_deep_select_supported()
                     sparse_table.topk_transform_sparse(scores, lengths, blocks, out)
                 torch.testing.assert_close(out.sort().values,
@@ -225,8 +229,34 @@ def test_deep_select_sparse_consumer_hook():
     )
 
 
+@pytest.mark.parametrize("setting", [None, "0"])
+def test_deep_select_sparse_is_disabled_by_default(setting, monkeypatch):
+    if setting is None:
+        monkeypatch.delenv("SGLANG_OPT_DSV41_DEEP_SELECT_TOPK", raising=False)
+    else:
+        monkeypatch.setenv("SGLANG_OPT_DSV41_DEEP_SELECT_TOPK", setting)
+    scores = torch.empty((1, 8), dtype=torch.bfloat16)
+    lengths = torch.empty(1, dtype=torch.int32)
+    blocks = torch.empty((1, 1), dtype=torch.int32)
+    out = torch.empty((1, 2), dtype=torch.int32)
+    support = Mock(side_effect=AssertionError("disabled option probed the wheel"))
+    fallback = Mock()
+    monkeypatch.setattr(
+        ppu_deep_select_hooks, "_ppu_is_deep_select_supported", support
+    )
+    monkeypatch.setattr(topk_ops, "topk_transform_bf16_small", fallback)
+
+    topk_ops.topk_transform_sparse(scores, lengths, blocks, out)
+
+    support.assert_not_called()
+    fallback.assert_called_once_with(
+        scores, lengths, blocks, out, topk_ops.CANDIDATE_BLOCK_SIZE
+    )
+
+
 @torch.inference_mode()
 def test_deep_select_sparse_without_backend_uses_original(monkeypatch):
+    monkeypatch.setenv("SGLANG_OPT_DSV41_DEEP_SELECT_TOPK", "1")
     monkeypatch.setattr(
         ppu_deep_select_hooks, "_ppu_is_deep_select_supported", lambda: False
     )
@@ -236,11 +266,12 @@ def test_deep_select_sparse_without_backend_uses_original(monkeypatch):
     lengths = torch.tensor([4], device="cuda", dtype=torch.int32)
     blocks = torch.tensor([[17]], device="cuda", dtype=torch.int32)
     out = torch.empty(1, 2, device="cuda", dtype=torch.int32)
-    original = Mock(wraps=topk_transform_sparse)
-    ppu_deep_select_hooks._ppu_topk_transform_sparse(
-        original, scores, lengths, blocks, out
+    original = Mock(wraps=topk_ops.topk_transform_bf16_small)
+    monkeypatch.setattr(topk_ops, "topk_transform_bf16_small", original)
+    topk_ops.topk_transform_sparse(scores, lengths, blocks, out)
+    original.assert_called_once_with(
+        scores, lengths, blocks, out, topk_ops.CANDIDATE_BLOCK_SIZE
     )
-    original.assert_called_once_with(scores, lengths, blocks, out)
     torch.testing.assert_close(
         out.sort().values,
         torch.tensor([[137, 139]], device="cuda", dtype=torch.int32),
@@ -249,19 +280,18 @@ def test_deep_select_sparse_without_backend_uses_original(monkeypatch):
 
 @pytest.mark.parametrize("rows,topk", [(0, 512), (4, 0)])
 @torch.inference_mode()
-def test_deep_select_sparse_empty_output(rows, topk, bf16_deep_select):
+def test_deep_select_sparse_empty_output(rows, topk, bf16_deep_select, monkeypatch):
     scores = torch.empty(rows, 1024, device="cuda", dtype=torch.bfloat16)
     lengths = torch.zeros(rows, device="cuda", dtype=torch.int32)
     blocks = torch.empty(rows, 128, device="cuda", dtype=torch.int32)
     out = torch.empty(rows, topk, device="cuda", dtype=torch.int32)
     original = Mock(side_effect=AssertionError("empty output used generic fallback"))
-    assert (
-        ppu_deep_select_hooks._ppu_topk_transform_sparse(
-            original, scores, lengths, blocks, out
-        )
-        is None
-    )
+    wheel = Mock(side_effect=AssertionError("empty output used DeepSelect wheel"))
+    monkeypatch.setattr(topk_ops, "topk_transform_bf16_small", original)
+    monkeypatch.setattr(deep_select, "_wheel_topk", wheel)
+    assert topk_ops.topk_transform_sparse(scores, lengths, blocks, out) is None
     original.assert_not_called()
+    wheel.assert_not_called()
     assert out.numel() == 0
 
 
