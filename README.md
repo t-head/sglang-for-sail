@@ -1,5 +1,9 @@
 # SGLang: Fast inference for LLMs and multimodal models
 
+> [!NOTE]
+> **T-Head PPU Fork (`t-head/sglang-for-sail`)**: Default branch `sail_ci_cd` tracks upstream sync and Nightly dispatch.
+> Active PPU release branches: [`yuhe/v1.0.0`](https://github.com/t-head/sglang-for-sail/tree/yuhe/v1.0.0) ([Recipe CI Matrix](https://github.com/t-head/sglang-for-sail/blob/yuhe/v1.0.0/test/ppu/README.md) · [PPU CI Guide](https://github.com/t-head/sglang-for-sail/blob/yuhe/v1.0.0/scripts/ci/ppu/README.md)) and [`release/v0.5.23`](https://github.com/t-head/sglang-for-sail/tree/release/v0.5.23) ([PPU Test Assets](https://github.com/t-head/sglang-for-sail/tree/release/v0.5.23/test/ppu) · [PPU CI Guide](https://github.com/t-head/sglang-for-sail/blob/release/v0.5.23/scripts/ci/ppu/README.md)).
+
 <p align="center" id="sglangtop">
 <img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="SGLang" width="400">
 </p>
