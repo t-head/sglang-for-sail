@@ -22,17 +22,19 @@ _FP8_BLOCK_THREADS = 256
 
 
 @cache_once
-def _jit_tp_module(apply_clamp: bool, block_n: int) -> Module:
+def _jit_tp_module(apply_clamp: bool, block_n: int, use_valid_prefix: bool) -> Module:
     if not is_sail():
         raise RuntimeError(_PPU_ONLY_MSG.format(name="silu_and_mul_post_quant_mxfp4"))
     clamp_str = "true" if apply_clamp else "false"
+    prefix_str = "true" if use_valid_prefix else "false"
     return load_jit(
         "silu_and_mul_post_quant_mxfp4",
+        prefix_str,
         str(block_n),
         clamp_str,
         cuda_files=["elementwise/silu_and_mul_post_quant_mxfp4.cuh"],
         cuda_wrappers=[
-            ("run", f"SiluMulMxfp4TP<{block_n},{clamp_str}>::run"),
+            ("run", f"SiluMulMxfp4TP<{block_n},{clamp_str},{prefix_str}>::run"),
         ],
         extra_cuda_cflags=["-use_fast_math"],
     )
@@ -41,6 +43,7 @@ def _jit_tp_module(apply_clamp: bool, block_n: int) -> Module:
 def silu_and_mul_post_quant_mxfp4(
     gateup: torch.Tensor,
     swiglu_limit: Optional[float] = None,
+    expert_ids: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert gateup.ndim == 2, "input must be 2D (N, 2H)"
     assert gateup.dtype == torch.bfloat16, "input must be bfloat16"
@@ -73,8 +76,15 @@ def silu_and_mul_post_quant_mxfp4(
     apply_clamp = swiglu_limit is not None
     limit_val = float(swiglu_limit) if apply_clamp else 0.0
 
-    module = _jit_tp_module(apply_clamp, block_n)
-    module.run(gateup, out_quant, out_scale, limit_val)
+    # Fused MoE metadata contains a compact valid prefix and a -1 tail.
+    # The tail is not consumed by Down or output restoration and is left unwritten.
+    use_valid_prefix = expert_ids is not None
+    if use_valid_prefix:
+        assert expert_ids.ndim == 1 and expert_ids.numel() == N
+        assert expert_ids.dtype == torch.int32 and expert_ids.device == gateup.device
+        assert expert_ids.is_contiguous()
+    module = _jit_tp_module(apply_clamp, block_n, use_valid_prefix)
+    module.run(gateup, out_quant, out_scale, limit_val, expert_ids)
 
     return out_quant, out_scale[:S_valid, :].t()
 

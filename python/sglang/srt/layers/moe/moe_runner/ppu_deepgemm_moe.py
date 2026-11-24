@@ -983,7 +983,11 @@ def deep_moe_impl_fused(
             silu_and_mul_post_quant_mxfp4,
         )
 
-        a, a_scale = silu_and_mul_post_quant_mxfp4(out1, swiglu_limit=swiglu_limit)
+        a, a_scale = silu_and_mul_post_quant_mxfp4(
+            out1,
+            swiglu_limit=swiglu_limit,
+            expert_ids=expert_ids if use_fused_path else None,
+        )
     else:
         if activation == "situ":
             out2 = situ_and_mul(
