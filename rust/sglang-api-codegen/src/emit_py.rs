@@ -34,6 +34,7 @@ options exactly as the Rust server does. Decode with
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import msgspec
@@ -85,6 +86,24 @@ def _expect_int(v: Any, expected: str) -> int:
     if _is_int(v):
         return v
     raise _invalid_type(v, expected=expected)
+
+
+# Read once at import; set before starting the server.
+_OPT_API_INT_LIST = os.environ.get("SGLANG_OPT_API_INT_LIST", "0") == "1"
+
+if _OPT_API_INT_LIST:
+    def _expect_int_list(v: Any, expected: str) -> List[int]:
+        values = _expect_seq(v, expected="a sequence")
+        if type(values) is list and len(values) >= 64:
+            try:
+                # Validate large token arrays in C, without coercing bool/float/str.
+                # Discard the converted copy to preserve Python int subclasses.
+                msgspec.convert(values, type=List[int], strict=True)
+            except msgspec.ValidationError:
+                pass  # Keep the schema's first-error text and accepted Python types.
+            else:
+                return list(values)
+        return [_expect_int(e, expected=expected) for e in values]
 
 
 def _expect_uint(v: Any, expected: str) -> int:
@@ -734,9 +753,20 @@ fn emit_bare_list_codec(out: &mut String, m: &MessageModel, item: &FieldModel) {
         FieldKind::RepeatedMessage { rust_path } => format!("decode_{rust_path}(e)"),
         other => panic!("{name}: bare_list item must be repeated, got {other:?}"),
     };
-    out.push_str(&format!(
-        "def decode_{name}(value: Any) -> {name}:\n    return [{elem} for e in _expect_seq(value, expected=\"a sequence\")]\n\n\n"
-    ));
+    let expected = match &item.kind {
+        FieldKind::RepeatedScalar { ty: ScalarTy::I32 } => Some("i32"),
+        FieldKind::RepeatedScalar { ty: ScalarTy::I64 } => Some("i64"),
+        _ => None,
+    };
+    if let Some(expected) = expected {
+        out.push_str(&format!(
+            "if _OPT_API_INT_LIST:\n    def decode_{name}(value: Any) -> {name}:\n        return _expect_int_list(value, expected=\"{expected}\")\nelse:\n    def decode_{name}(value: Any) -> {name}:\n        return [{elem} for e in _expect_seq(value, expected=\"a sequence\")]\n\n\n"
+        ));
+    } else {
+        out.push_str(&format!(
+            "def decode_{name}(value: Any) -> {name}:\n    return [{elem} for e in _expect_seq(value, expected=\"a sequence\")]\n\n\n"
+        ));
+    }
     out.push_str(&format!(
         "def encode_{name}(v: {name}) -> List[Any]:\n    return {}\n\n\n",
         enc_expr(&item.kind, "v")
