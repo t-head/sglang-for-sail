@@ -129,8 +129,8 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                         "interleave DSA CP does not support DP attention."
                     )
                 if "810E" not in current_platform.get_device_name():
-                    assert cfg.tp_size <= 8, (
-                        "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+                    assert cfg.tp_size <= 16, (
+                        "Context parallelism currently supports up to 16 devices across at most two nodes."
                     )
                 else:
                     assert cfg.tp_size <= 16, (
