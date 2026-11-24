@@ -36,6 +36,13 @@ class NotifySummaryTest(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
 
+    def test_version_label_in_title_and_markdown(self):
+        report = {"results": [{"model": "example", "status": "pass"}]}
+        with patch.dict("os.environ", {"NOTIFY_VERSION": "v1.0.0"}):
+            payload = notify.make_payload(report, "", "mon")["markdown"]
+        self.assertTrue(payload["title"].startswith("[sglang | v1.0.0] "))
+        self.assertTrue(payload["text"].startswith("### [sglang | v1.0.0] "))
+
     def test_all_green_has_aligned_columns_and_no_mentions(self):
         report = {
             "elapsed_s": 3701,

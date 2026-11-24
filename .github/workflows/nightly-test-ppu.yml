@@ -83,8 +83,13 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: ppu-${{ inputs.tier || 'model_sanity' }}-${{ github.ref }}-${{ github.run_id }}
-  cancel-in-progress: false
+  # Share the Nightly lock across releases, including direct dispatch.
+  group: ${{ (inputs.tier || 'model_sanity') == 'model_sanity' &&
+    (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
+    (startsWith(github.workflow_ref, 't-head/sglang-for-sail/.github/workflows/nightly-dispatch-ppu.yml@') ||
+     startsWith(github.workflow_ref, 't-head/sglang-for-sail/.github/workflows/nightly-test-ppu.yml@')) &&
+    'sglang-ppu-nightly' || format('ppu-{0}-{1}-{2}', inputs.tier || 'model_sanity', github.ref, github.run_id) }}
+  queue: max
 
 env:
   PPU_CI_K8S_CONFIG_SHA256: '180dcea0645c98f89109617547ce31000d4cd84850cd3fdfb7771030985962ec'
