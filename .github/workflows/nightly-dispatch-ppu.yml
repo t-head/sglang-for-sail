@@ -59,8 +59,13 @@ jobs:
           script: |
             const {selectRefs} = require('./scripts/ci/ppu/nightly_dispatch.cjs');
             const getHead = async branch => {
-              const {data} = await github.rest.repos.getBranch({...context.repo, branch});
-              return data.commit.sha;
+              try {
+                const {data} = await github.rest.repos.getBranch({...context.repo, branch});
+                return data.commit.sha;
+              } catch (error) {
+                if (error?.status === 404) return null;
+                throw error;
+              }
             };
             const refs = await selectRefs({
               event: context.eventName, activeRefs: process.env.ACTIVE_REFS,

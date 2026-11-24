@@ -5,6 +5,15 @@ const transition = "yuhe/v1.0.0";
 const v100 = "release/v1.0.0";
 const supported = [v0523, transition, v100];
 
+async function headOrNull(getHead, branch) {
+  try {
+    return await getHead(branch);
+  } catch (error) {
+    if (error?.status === 404) return null;
+    throw error;
+  }
+}
+
 async function selectRefs({event, activeRefs, target, getHead}) {
   if (event === "schedule") {
     const refs = (activeRefs || `${v0523},${transition}`).split(",").map(ref => ref.trim());
@@ -22,8 +31,9 @@ async function selectRefs({event, activeRefs, target, getHead}) {
   }
 
   if (/^[0-9a-f]{40}$/.test(requested)) {
-    if (await getHead(v0523) === requested) return {v0523: requested, v100: ""};
-    if (await getHead(transition) === requested || await getHead(v100) === requested) {
+    if (await headOrNull(getHead, v0523) === requested) return {v0523: requested, v100: ""};
+    if (await headOrNull(getHead, transition) === requested ||
+        await headOrNull(getHead, v100) === requested) {
       return {v0523: "", v100: requested};
     }
   }
