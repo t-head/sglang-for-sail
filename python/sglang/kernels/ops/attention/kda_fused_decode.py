@@ -21,6 +21,7 @@ Everything else falls back to the unfused chain.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -31,14 +32,15 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_sail
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 _SUPPORTED_HEADS = {3, 6, 12}
-if is_sail():
-    _SUPPORTED_HEADS = {12, 24, 48, 96}
+_SAIL_ORIGINAL_HEADS = {12, 24, 48, 96}
+_SAIL_ADDITIONAL_HEADS = {4, 6, 8, 16, 64}
 _CONV_STATE_W = 3  # kernel width 4 -> 3 cached tokens
 
 
@@ -67,13 +69,16 @@ def covered(
     packed [T, 3*H*128] qkv rows, transposed [slots, 3, 3*H*128] conv pool, fp32
     [slots, H, 128, 128] ssm pool (inner-contiguous, any slot pitch — the
     kernel reads the real slot stride), one token per request."""
+    if is_sail():
+        return _sail_covered(
+            mixed_qkv, a, b, conv_states, ssm_states, cache_indices, onorm_g
+        )
+
     if ssm_states.ndim < 4:
         return False
     H, V, K = ssm_states.shape[-3:]
     if H not in _SUPPORTED_HEADS:
         return False
-    if is_sail():
-        return True
 
     seg = H * 128
     conv_dim = 3 * seg
@@ -112,6 +117,64 @@ def covered(
         and ssm_states.stride(-2) == K
         and ssm_states.stride(-3) == V * K
         and cache_indices.is_contiguous()
+    )
+
+
+def _sail_covered(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    conv_states: torch.Tensor,
+    ssm_states: torch.Tensor,
+    cache_indices: torch.Tensor,
+    onorm_g: torch.Tensor,
+) -> bool:
+    if ssm_states.ndim != 4:
+        return False
+    H, V, K = ssm_states.shape[-3:]
+    if H in _SAIL_ORIGINAL_HEADS:
+        # The existing SAIL model handoff already prepares the PLA inputs.
+        return True
+    if H not in _SAIL_ADDITIONAL_HEADS:
+        return False
+    if not envs.SGLANG_SAIL_PLA_CUDA.get():
+        return False
+
+    seg = H * 128
+    conv_dim = 3 * seg
+    dtype = mixed_qkv.dtype
+    if mixed_qkv.ndim != 2 or mixed_qkv.shape[-1] != conv_dim:
+        return False
+    # PLA's reference implementation only accepts BF16 activations.
+    if dtype != torch.bfloat16 and (
+        dtype != torch.float16 or os.getenv("KDA_DECODE_IMPL") in ("ref", "1")
+    ):
+        return False
+    return (
+        V == 128
+        and K == 128
+        and a.ndim == 2
+        and a.shape[-1] == seg
+        and b.ndim == 2
+        and b.shape[-1] == H
+        and onorm_g.ndim == 2
+        and onorm_g.shape[-1] == seg
+        and conv_states.ndim == 3
+        and conv_states.shape[-2:] == (_CONV_STATE_W, conv_dim)
+        and a.dtype == b.dtype == onorm_g.dtype == conv_states.dtype == dtype
+        and ssm_states.dtype == torch.float32
+        and cache_indices.dtype == torch.int32
+        and mixed_qkv.stride(-1) == 1
+        and a.stride(-1) == 1
+        and b.stride(-1) == 1
+        and onorm_g.stride(-1) == 1
+        and conv_states.stride(-1) == 1
+        and ssm_states.stride(-1) == 1
+        and ssm_states.stride(-2) == K
+        and ssm_states.stride(-3) == V * K
+        and cache_indices.is_contiguous()
+        and a.is_contiguous()
+        and conv_states.stride(-2) == conv_dim
     )
 
 

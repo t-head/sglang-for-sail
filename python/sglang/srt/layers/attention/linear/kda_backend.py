@@ -544,6 +544,8 @@ def ragged_verify_dense_scatter_indices(
 class KDAAttnBackend(MambaAttnBackendBase):
     """Attention backend for KDA (Kimi Delta Attention) linear attention."""
 
+    reuse_prefill_initial_state_mask: bool = True
+
     # The verify kernel is varlen and the conv path scatters ragged tokens
     # to its dense layout, so ragged verify graphs are supported.
     supports_ragged_verify_graph: bool = True
@@ -1110,7 +1112,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             layer.bias,
             activation="silu",
             conv_states=conv_states,
-            has_initial_state=forward_batch.extend_prefix_lens > 0,
+            has_initial_state=self._prefill_has_initial_state(forward_batch),
             cache_indices=cache_indices,
             query_start_loc=self.forward_metadata.query_start_loc,
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
@@ -1242,6 +1244,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
             lower_bound=layer.lower_bound,
             beta_is_raw=True,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            req_pool_indices_cpu=forward_batch.req_pool_indices_cpu,
+            pla_prefill_metadata=(
+                self.forward_metadata
+                if is_sail()
+                and forward_batch.forward_mode.is_extend()
+                and forward_batch.tbo_parent_token_range is None
+                else None
+            ),
             extend_prefix_lens=forward_batch.extend_prefix_lens,
             layer_id=layer.layer_id,
             # draft_extend_v2 must stay rollback-able, so kernels that commit state
