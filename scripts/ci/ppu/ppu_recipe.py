@@ -482,12 +482,17 @@ def resolve_recipe(
 
     dp_raw = _flag_value(ordered, "--dp-size")
     tp_raw = _flag_value(ordered, "--tp-size")
-    if dp_raw is not None:
-        ppu_count = int(dp_raw) * (int(tp_raw) if tp_raw is not None else 1)
-    elif tp_raw is not None:
-        ppu_count = int(tp_raw)
+    pp_raw = _flag_value(ordered, "--pp-size")
+    topo_nodes = int(ppu_blk["topology"]["nodes"])
+    topo_devices_per_node = int(ppu_blk["topology"]["devices_per_node"])
+    if dp_raw is not None or tp_raw is not None or pp_raw is not None:
+        ppu_count = (
+            (int(dp_raw) if dp_raw is not None else 1)
+            * (int(tp_raw) if tp_raw is not None else 1)
+            * (int(pp_raw) if pp_raw is not None else 1)
+        )
     else:
-        ppu_count = int(ppu_blk["topology"]["devices_per_node"])
+        ppu_count = topo_nodes * topo_devices_per_node
 
     digest_payload = {
         "framework": ppu_blk["framework"],
@@ -516,6 +521,8 @@ def resolve_recipe(
         "flags": flags_only,
         "server_env": server_env,
         "ppu_count": ppu_count,
+        "nodes": topo_nodes,
+        "devices_per_node": topo_devices_per_node,
         "model_id": model_blk["model_id"],
         "hf_model_id": hf_model_id,
         "resolved_model": resolved_model,
@@ -609,6 +616,9 @@ def _validate_flag_list(tokens: Any, *, context: str) -> None:
         "--load-format",
         "--enable-metrics",
         "--config",
+        "--nnodes",
+        "--node-rank",
+        "--dist-init-addr",
     }
     for flag, val, _ in _parse_flag_entries(raw):
         if flag in managed:
@@ -698,13 +708,23 @@ def validate_serving_recipe_structure(
         required={"kind", "nodes", "devices_per_node"},
         context=f"{context}.ppu.topology",
     )
-    if topo["kind"] not in {"single_node", "multi_node_ep", "pd_disagg"}:
+    if topo["kind"] not in {"single_node", "multi_node", "multi_node_ep", "pd_disagg"}:
         raise ValidationError(f"{context}.ppu.topology.kind invalid: {topo['kind']!r}")
-    if not isinstance(topo["nodes"], int) or topo["nodes"] <= 0:
+    if type(topo["nodes"]) is not int or topo["nodes"] <= 0:
         raise ValidationError(f"{context}.ppu.topology.nodes must be positive int")
-    if not isinstance(topo["devices_per_node"], int) or topo["devices_per_node"] <= 0:
+    if type(topo["devices_per_node"]) is not int or topo["devices_per_node"] <= 0:
         raise ValidationError(
             f"{context}.ppu.topology.devices_per_node must be positive int"
+        )
+    if topo["kind"] == "single_node" and topo["nodes"] != 1:
+        raise ValidationError(
+            f"{context}.ppu.topology.nodes must be 1 for single_node topology"
+        )
+    if topo["kind"] in {"multi_node", "multi_node_ep"} and (
+        topo["nodes"] < 2 or topo["devices_per_node"] != 8
+    ):
+        raise ValidationError(
+            f"{context}.ppu.topology: multi-node requires nodes >= 2 and devices_per_node == 8"
         )
 
     external_env = set(

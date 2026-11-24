@@ -397,6 +397,78 @@ class SGLangNotificationTest(unittest.TestCase):
                         "build", nightly.collect(root)["results"][0]["phase"]
                     )
 
+    def test_nightly_collector_handles_multinode_job_name(self):
+        import ppu_notify_nightly as nightly
+
+        model = "qwen3.8-2.4t-mxfp4"
+        source = "a" * 40
+        environment = {
+            "GITHUB_WORKFLOW_REF": "t-head/sglang-for-sail/.github/workflows/nightly-dispatch-ppu.yml@refs/heads/sail_ci_cd",
+            "NOTIFY_MATRIX": json.dumps(
+                {"include": [{"model": model, "ppu_count": 8, "nnodes": 2}]}
+            ),
+            "NOTIFY_SOURCE_SHA": source,
+            "NOTIFY_GATE_RESULT": "success",
+            "NOTIFY_GATE_APPROVED": "true",
+            "NOTIFY_PLAN_RESULT": "success",
+            "NOTIFY_BUILD_RESULT": "skipped",
+            "NOTIFY_EVAL_RESULT": "success",
+            "NOTIFY_MATRIX_RESULT": "success",
+        }
+        payload = {
+            "schema": "ppu-sanity/v1",
+            "model": model,
+            "tier": "model_sanity",
+            "source_sha": source,
+            "route": "prebuilt-image",
+            "private_retention": True,
+            "outcome": "pass",
+            "gsm8k_score": 0.9757,
+            "golden_score": 0.9757,
+            "gsm8k_correct": 1287,
+            "gsm8k_count": 1319,
+            "accuracy_within_band": True,
+            "baseline_established": True,
+            "kv_gauge_zero_verified": True,
+            "c1_passed": True,
+            "c16_passed": True,
+            "sse_verified": True,
+            "parser_checked": True,
+            "cold_start_s": 7273.386,
+            "eval_s": 979.235,
+            "bench_s": 223.303,
+            "queue_s": 0.0,
+            "cache_mode": "sanity_throughput_guard",
+            "config_digest": "c" * 64,
+            "recipe_tree_sha256": "d" * 64,
+            "runtime_image": "@sha256:" + "e" * 64,
+            "runtime_versions": {
+                "sgl_kernel": "0.4.11",
+                "sglang": "0.0.0.dev0",
+                "torch": "2.13.0",
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            evidence = root / f"model_sanity-{model}-1" / "recipe.json"
+            evidence.parent.mkdir()
+            evidence.write_text(json.dumps(payload))
+            jobs = {
+                f"release-v100 / Model Sanity ({model}, 2x8)": notify.JobExecution(
+                    "success", 1, 789, 7200
+                )
+            }
+            with (
+                patch.dict("os.environ", environment, clear=True),
+                patch.object(nightly, "run_jobs", return_value=(jobs, 120)) as fetch,
+            ):
+                result = nightly.collect(root)["results"][0]
+                fetch.assert_called_once_with(set(jobs))
+                self.assertEqual(result["model"], model)
+                self.assertEqual(result["status"], "pass")
+                self.assertEqual(result["job_id"], 789)
+                self.assertEqual(result["job_elapsed_s"], 7200)
+
 
 if __name__ == "__main__":
     unittest.main()

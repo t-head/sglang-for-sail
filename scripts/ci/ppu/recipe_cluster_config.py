@@ -142,6 +142,7 @@ def main():
         publish_recent_failures(
             validated_root,
             int(os.environ["GITHUB_RUN_ID"]),
+            model_filter=os.environ.get("PPU_CI_MODEL_FILTER", ""),
             fallback_root=retained.resolve(strict=True),
         )
         return

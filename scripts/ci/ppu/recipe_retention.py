@@ -160,6 +160,31 @@ def retain(environ) -> None:
     if not partial:
         required.update(RESULT_FILES)
     entries = ["launcher.log", *RESULT_FILES, *OPTIONAL_FILES]
+    for path in sorted(source_dir.glob("pod-status-worker-*.json")):
+        if path.is_file() and not path.is_symlink():
+            entries.append(path.relative_to(source_dir).as_posix())
+    ranks_root = source_dir / "ranks"
+    ranks_optional: set[str] = set()
+    if ranks_root.is_dir() and not ranks_root.is_symlink():
+        for pattern in (
+            "rank-*.status",
+            "barrier/*.json",
+            "rank-*/runtime.log",
+            "rank-*/worker-phase.txt",
+            "rank-*/results/sglang_serve_*.log",
+        ):
+            try:
+                matches = sorted(ranks_root.glob(pattern))
+            except OSError:
+                continue
+            for path in matches:
+                try:
+                    if path.is_file() and not path.is_symlink():
+                        rel = path.relative_to(source_dir).as_posix()
+                        entries.append(rel)
+                        ranks_optional.add(rel)
+                except OSError:
+                    continue
     review_root = source_dir / "results/evalscope"
     if review_root.is_dir() and not review_root.is_symlink():
         entries.extend(
@@ -176,7 +201,7 @@ def retain(environ) -> None:
             source = source_dir / relative_path
             name = (
                 relative_path
-                if relative_path.startswith("results/evalscope/")
+                if relative_path.startswith(("results/evalscope/", "ranks/"))
                 else source.name
             )
             try:
@@ -189,7 +214,12 @@ def retain(environ) -> None:
                 raise ValueError("expected a regular recipe output")
             copied = published / name
             copied.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            shutil.copyfile(source, copied)
+            try:
+                shutil.copyfile(source, copied)
+            except PermissionError:
+                if relative_path in ranks_optional:
+                    continue
+                raise
             copied.chmod(0o600)
             digest = hashlib.sha256()
             with copied.open("rb") as stream:

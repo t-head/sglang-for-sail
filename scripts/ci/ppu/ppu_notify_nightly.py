@@ -8,13 +8,21 @@ from functools import partial
 from ppu_notify_summary import MODEL, json_file, model_result, run_jobs
 from recipe_publish import validate
 
-STARTUP = ("server_startup", "server_exit", "readiness_timeout", "chat_probe")
+STARTUP = (
+    "page_cache_warm",
+    "server_startup",
+    "server_exit",
+    "worker_exit",
+    "readiness_timeout",
+    "chat_probe",
+)
 SETUP = (
     "runner_preflight",
     "cluster_submit",
     "cluster_worker",
     "wheel_verification",
     "image_resolution",
+    "multinode_network",
     "runtime_dependencies",
     "eval_environment",
     "platform_check",
@@ -62,7 +70,14 @@ def collect(root):
     # direct dispatch exposes the inner job name without that prefix.
     workflow = os.environ.get("GITHUB_WORKFLOW_REF", "")
     prefix = "release-v100 / " if "/nightly-dispatch-ppu.yml@" in workflow else ""
-    names = {f"{prefix}Model Sanity ({model})": model for model in models}
+    names = {
+        (
+            f"{prefix}Model Sanity ({item['model']}, {item['nnodes']}x{item.get('ppu_count', 8)})"
+            if item.get("nnodes", 1) > 1
+            else f"{prefix}Model Sanity ({item['model']})"
+        ): item["model"]
+        for item in matrix["include"]
+    }
     jobs, elapsed = run_jobs(set(names))
     if (
         os.environ["NOTIFY_GATE_RESULT"] != "success"

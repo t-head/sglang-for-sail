@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Run Fast Sanity or Model Sanity inside an isolated candidate container."""
 
+from __future__ import annotations
+
 import argparse
+import concurrent.futures
 import contextlib
 import http.client
 import importlib.util
@@ -12,6 +15,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from urllib.error import URLError
@@ -34,6 +38,8 @@ MODEL_SANITY_READY_TIMEOUTS = {
     "moonshotai/Kimi-K2.6": 6000,
     # The first Qwen TP4 run loaded 93 of 131 shards in 39 minutes.
     "Qwen/Qwen3.8-Flash-Next": 5100,
+    # 213-shard cold load (1.27 TiB) across 2 nodes plus DeepGEMM/graph warmup.
+    "Qwen/Qwen3.8-2.4T-A95B": 10800,
 }
 
 
@@ -50,13 +56,488 @@ class StartupError(RuntimeError):
     pass
 
 
+def _barrier_write(barrier_dir: Path, filename: str, payload: dict) -> None:
+    barrier_dir.mkdir(parents=True, exist_ok=True)
+    tmp = barrier_dir / f".{filename}.{os.getpid()}.tmp"
+    tmp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, barrier_dir / filename)
+
+
+def _barrier_names(barrier_dir: Path | None) -> set[str]:
+    if barrier_dir is None or not barrier_dir.is_dir():
+        return set()
+    # os.listdir issues readdir on NFS, avoiding stale negative dentry caches.
+    return set(os.listdir(barrier_dir))
+
+
+def _peer_failures(barrier_dir: Path | None, *, own_rank: int) -> list[str]:
+    own_name = f"fail-rank-{own_rank}.json"
+    return sorted(
+        name
+        for name in _barrier_names(barrier_dir)
+        if name.startswith("fail-rank-") and name.endswith(".json") and name != own_name
+    )
+
+
+def _stop_process_group(process: subprocess.Popen) -> tuple[bool, int | None]:
+    """Terminate process group; return (signal_sent, returncode)."""
+    if process.poll() is not None:
+        return (False, process.returncode)
+    signal_sent = True
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        signal_sent = False
+    try:
+        rc = process.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        rc = process.wait(timeout=5)
+    return (signal_sent, rc)
+
+
+def _flag_value(flags: list[str], name: str) -> str | None:
+    value = None
+    prefix = f"{name}="
+    for idx, token in enumerate(flags):
+        if token == name and idx + 1 < len(flags):
+            value = flags[idx + 1]
+        elif token.startswith(prefix):
+            value = token[len(prefix) :]
+    return value
+
+
+def select_pp_stage_shards(
+    snapshot: Path, *, pp_size: int, pp_rank: int
+) -> tuple[list[Path], tuple[int, int], int]:
+    """Return the safetensors shards needed by this pipeline-parallel stage."""
+    config_path = snapshot / "config.json"
+    index_path = snapshot / "model.safetensors.index.json"
+    if not config_path.is_file() or not index_path.is_file():
+        return [], (0, 0), 0
+    cfg = json.loads(config_path.read_text(encoding="utf-8"))
+    num_layers = cfg.get("num_hidden_layers")
+    if num_layers is None and isinstance(cfg.get("text_config"), dict):
+        num_layers = cfg["text_config"].get("num_hidden_layers")
+    if not isinstance(num_layers, int) or num_layers < pp_size:
+        return [], (0, 0), 0
+    per_stage = num_layers // pp_size
+    remainder = num_layers % pp_size
+    start = pp_rank * per_stage + min(pp_rank, remainder)
+    end = start + per_stage + (1 if pp_rank < remainder else 0)
+
+    weight_map = json.loads(index_path.read_text(encoding="utf-8")).get(
+        "weight_map", {}
+    )
+    all_files = set(weight_map.values())
+    layer_re = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+    selected_names: set[str] = set()
+    for tensor_name, rel_file in weight_map.items():
+        if "mtp" in tensor_name:
+            continue
+        match = layer_re.search(tensor_name)
+        if match is not None:
+            layer_idx = int(match.group(1))
+            if start <= layer_idx < end:
+                selected_names.add(rel_file)
+            continue
+        if "embed_tokens" in tensor_name:
+            if pp_rank == 0:
+                selected_names.add(rel_file)
+        elif "lm_head" in tensor_name or tensor_name.endswith("norm.weight"):
+            if pp_rank == pp_size - 1:
+                selected_names.add(rel_file)
+        else:
+            selected_names.add(rel_file)
+
+    paths: list[Path] = []
+    for rel_file in sorted(selected_names):
+        rel = Path(rel_file)
+        if rel.is_absolute() or ".." in rel.parts:
+            raise ValueError(f"invalid shard path in safetensors index: {rel_file}")
+        candidate = snapshot / rel
+        if candidate.is_file():
+            paths.append(candidate)
+    return paths, (start, end), len(all_files)
+
+
+def warm_pp_stage_shards(
+    snapshot: Path,
+    *,
+    flags: list[str],
+    nnodes: int,
+    node_rank: int,
+    barrier_dir: Path | None,
+    max_workers: int = 8,
+    timeout_s: float = 10800.0,
+    poll_s: float = 2.0,
+) -> float:
+    """Warm only this node's PP-stage shards into the Linux OS page cache.
+
+    Under PP=nnodes, each node only loads 1/nnodes of the layers. Reading only
+    those shards sequentially in 16 MiB blocks cuts shared-NFS traffic in half
+    compared to full-checkpoint prefetch and avoids per-node load-time skew
+    before distributed KV-cache sizing collectives run.
+    """
+    pp_raw = _flag_value(flags, "--pp-size")
+    if nnodes <= 1 or pp_raw is None or not pp_raw.isdigit() or int(pp_raw) != nnodes:
+        return 0.0
+    shards, (start_layer, end_layer), total_shards = select_pp_stage_shards(
+        snapshot, pp_size=nnodes, pp_rank=node_rank
+    )
+    if not shards:
+        return 0.0
+
+    phase("page_cache_warm")
+    start = time.monotonic()
+    cancel = threading.Event()
+
+    def _on_signal(_signum, _frame):
+        cancel.set()
+
+    is_main = threading.current_thread() is threading.main_thread()
+    prev_term = signal.signal(signal.SIGTERM, _on_signal) if is_main else None
+    prev_int = signal.signal(signal.SIGINT, _on_signal) if is_main else None
+    try:
+        chunk_bytes = 16 * 1024 * 1024
+
+        def _read_shard(path: Path) -> int:
+            read_total = 0
+            with path.open("rb") as stream:
+                while not cancel.is_set():
+                    if barrier_dir is not None and _peer_failures(
+                        barrier_dir, own_rank=node_rank
+                    ):
+                        cancel.set()
+                        break
+                    block = stream.read(chunk_bytes)
+                    if not block:
+                        break
+                    read_total += len(block)
+            return read_total
+
+        total_bytes = 0
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(max_workers, len(shards))
+        ) as executor:
+            futures = [executor.submit(_read_shard, path) for path in shards]
+            for fut in concurrent.futures.as_completed(futures):
+                total_bytes += fut.result()
+
+        if cancel.is_set():
+            raise StartupError("page_cache_warm_cancelled")
+
+        warm_only_s = time.monotonic() - start
+        if barrier_dir is not None:
+            _barrier_write(
+                barrier_dir,
+                f"warm-rank-{node_rank}.json",
+                {
+                    "rank": node_rank,
+                    "shards": len(shards),
+                    "total_shards": total_shards,
+                    "elapsed_s": round(warm_only_s, 2),
+                },
+            )
+            expected = {f"warm-rank-{r}.json" for r in range(nnodes)}
+            deadline = start + timeout_s
+            while time.monotonic() < deadline:
+                if cancel.is_set():
+                    raise StartupError("page_cache_warm_cancelled")
+                if _peer_failures(barrier_dir, own_rank=node_rank):
+                    phase("worker_exit")
+                    raise StartupError("worker_exit")
+                if expected.issubset(_barrier_names(barrier_dir)):
+                    break
+                time.sleep(poll_s)
+            else:
+                phase("readiness_timeout")
+                raise StartupError("page_cache_warm_timeout")
+
+        elapsed_s = time.monotonic() - start
+        RESULTS.mkdir(parents=True, exist_ok=True)
+        (RESULTS / "page-cache-warm.log").write_text(
+            f"pp_warm_done rank={node_rank}/{nnodes} layers={start_layer}..{end_layer - 1} "
+            f"shards={len(shards)}/{total_shards} bytes={total_bytes} "
+            f"warm_s={warm_only_s:.2f} total_s={elapsed_s:.2f}\n",
+            encoding="utf-8",
+        )
+        return elapsed_s
+    except Exception:
+        if barrier_dir is not None:
+            _barrier_write(
+                barrier_dir,
+                f"fail-rank-{node_rank}.json",
+                {"rank": node_rank, "exit_code": 1, "reason": "page_cache_warm"},
+            )
+        raise
+    finally:
+        if is_main:
+            signal.signal(signal.SIGTERM, prev_term)
+            signal.signal(signal.SIGINT, prev_int)
+
+
+def _multinode_argv(
+    base_argv: list[str], *, nnodes: int, node_rank: int, dist_init_addr: str
+) -> list[str]:
+    if nnodes <= 1:
+        return list(base_argv)
+    if not dist_init_addr or ":" not in dist_init_addr:
+        raise ValueError("multi-node execution requires PPU_CI_DIST_INIT_ADDR")
+    return [
+        *base_argv,
+        "--nnodes",
+        str(nnodes),
+        "--node-rank",
+        str(node_rank),
+        "--dist-init-addr",
+        dist_init_addr,
+    ]
+
+
+def _wait_workers_exit(
+    barrier_dir: Path, nnodes: int, *, timeout: float = 60.0, poll_s: float = 1.0
+) -> None:
+    expected = {f"exit-rank-{rank}.json" for rank in range(1, nnodes)}
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        names = _barrier_names(barrier_dir)
+        if _peer_failures(barrier_dir, own_rank=0):
+            phase("worker_exit")
+            raise RuntimeError("a multi-node worker exited with failure")
+        if expected.issubset(names):
+            for name in sorted(expected):
+                record = json.loads((barrier_dir / name).read_text(encoding="utf-8"))
+                if record.get("exit_code") != 0:
+                    phase("worker_exit")
+                    raise RuntimeError(f"worker {name} exited non-zero")
+            return
+        time.sleep(poll_s)
+    phase("worker_exit")
+    raise TimeoutError("timed out waiting for multi-node workers to exit")
+
+
+def run_worker_node(
+    config: dict,
+    label: str,
+    *,
+    nnodes: int,
+    node_rank: int,
+    dist_init_addr: str,
+    barrier_dir: Path,
+    poll_s: float = 2.0,
+) -> dict:
+    argv = _multinode_argv(
+        config["argv"],
+        nnodes=nnodes,
+        node_rank=node_rank,
+        dist_init_addr=dist_init_addr,
+    )
+    terminated_by_signal = {"signum": None}
+
+    def _on_signal(signum, _frame):
+        terminated_by_signal["signum"] = signum
+
+    is_main = threading.current_thread() is threading.main_thread()
+    prev_term = signal.signal(signal.SIGTERM, _on_signal) if is_main else None
+    prev_int = signal.signal(signal.SIGINT, _on_signal) if is_main else None
+    try:
+        with (RESULTS / f"sglang_serve_{label}.log").open("wb") as log:
+            phase("server_startup")
+            process = subprocess.Popen(
+                argv,
+                env={**os.environ, **config["server_env"]},
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            try:
+                while True:
+                    # Check process liveness FIRST so a real non-zero exit that
+                    # happened before rank0.done is never rewritten to exit 0.
+                    rc = process.poll()
+                    if rc is not None:
+                        names = _barrier_names(barrier_dir)
+                        done_ok = False
+                        if rc == 0 and "rank0.done" in names:
+                            try:
+                                done_doc = json.loads(
+                                    (barrier_dir / "rank0.done").read_text(
+                                        encoding="utf-8"
+                                    )
+                                )
+                                done_ok = done_doc.get("status") == "ok"
+                            except (OSError, json.JSONDecodeError):
+                                done_ok = False
+                        if done_ok:
+                            _barrier_write(
+                                barrier_dir,
+                                f"exit-rank-{node_rank}.json",
+                                {
+                                    "rank": node_rank,
+                                    "exit_code": 0,
+                                    "reason": "rank0_done",
+                                },
+                            )
+                            return {"outcome": "pass", "node_rank": node_rank}
+                        phase("server_exit")
+                        exit_code = rc if rc != 0 else 1
+                        _barrier_write(
+                            barrier_dir,
+                            f"fail-rank-{node_rank}.json",
+                            {
+                                "rank": node_rank,
+                                "exit_code": exit_code,
+                                "reason": "server_exit",
+                            },
+                        )
+                        _barrier_write(
+                            barrier_dir,
+                            f"exit-rank-{node_rank}.json",
+                            {
+                                "rank": node_rank,
+                                "exit_code": exit_code,
+                                "reason": "server_exit",
+                            },
+                        )
+                        raise StartupError("server_exit")
+                    names = _barrier_names(barrier_dir)
+                    if "rank0.done" in names:
+                        signal_sent, stop_rc = _stop_process_group(process)
+                        expected_signal_rcs = {
+                            0,
+                            -signal.SIGTERM,
+                            -signal.SIGKILL,
+                            128 + signal.SIGTERM,
+                            128 + signal.SIGKILL,
+                        }
+                        if not signal_sent and stop_rc != 0:
+                            phase("server_exit")
+                            exit_code = stop_rc if stop_rc not in (None, 0) else 1
+                            _barrier_write(
+                                barrier_dir,
+                                f"fail-rank-{node_rank}.json",
+                                {
+                                    "rank": node_rank,
+                                    "exit_code": exit_code,
+                                    "reason": "server_exit",
+                                },
+                            )
+                            _barrier_write(
+                                barrier_dir,
+                                f"exit-rank-{node_rank}.json",
+                                {
+                                    "rank": node_rank,
+                                    "exit_code": exit_code,
+                                    "reason": "server_exit",
+                                },
+                            )
+                            raise StartupError("server_exit")
+                        if stop_rc not in expected_signal_rcs:
+                            phase("server_exit")
+                            exit_code = stop_rc if stop_rc not in (None, 0) else 1
+                            _barrier_write(
+                                barrier_dir,
+                                f"fail-rank-{node_rank}.json",
+                                {
+                                    "rank": node_rank,
+                                    "exit_code": exit_code,
+                                    "reason": "server_exit",
+                                },
+                            )
+                            _barrier_write(
+                                barrier_dir,
+                                f"exit-rank-{node_rank}.json",
+                                {
+                                    "rank": node_rank,
+                                    "exit_code": exit_code,
+                                    "reason": "server_exit",
+                                },
+                            )
+                            raise StartupError("server_exit")
+                        _barrier_write(
+                            barrier_dir,
+                            f"exit-rank-{node_rank}.json",
+                            {
+                                "rank": node_rank,
+                                "exit_code": 0,
+                                "reason": "rank0_done",
+                            },
+                        )
+                        return {"outcome": "pass", "node_rank": node_rank}
+                    if terminated_by_signal["signum"] is not None:
+                        _stop_process_group(process)
+                        code = 128 + terminated_by_signal["signum"]
+                        _barrier_write(
+                            barrier_dir,
+                            f"fail-rank-{node_rank}.json",
+                            {
+                                "rank": node_rank,
+                                "exit_code": code,
+                                "reason": "signal",
+                            },
+                        )
+                        _barrier_write(
+                            barrier_dir,
+                            f"exit-rank-{node_rank}.json",
+                            {
+                                "rank": node_rank,
+                                "exit_code": code,
+                                "reason": "signal",
+                            },
+                        )
+                        return {"outcome": "fail", "node_rank": node_rank}
+                    if _peer_failures(barrier_dir, own_rank=node_rank):
+                        phase("worker_exit")
+                        _stop_process_group(process)
+                        _barrier_write(
+                            barrier_dir,
+                            f"exit-rank-{node_rank}.json",
+                            {
+                                "rank": node_rank,
+                                "exit_code": 1,
+                                "reason": "peer_failed",
+                            },
+                        )
+                        return {"outcome": "fail", "node_rank": node_rank}
+                    time.sleep(poll_s)
+            finally:
+                if process.poll() is None:
+                    _stop_process_group(process)
+    finally:
+        if is_main:
+            signal.signal(signal.SIGTERM, prev_term)
+            signal.signal(signal.SIGINT, prev_int)
+
+
 @contextlib.contextmanager
-def server(config, label, timings, ready_timeout):
+def server(
+    config,
+    label,
+    timings,
+    ready_timeout,
+    *,
+    nnodes=1,
+    node_rank=0,
+    dist_init_addr="",
+    barrier_dir=None,
+    signal_done_on_exit=False,
+):
+    argv = _multinode_argv(
+        config["argv"],
+        nnodes=nnodes,
+        node_rank=node_rank,
+        dist_init_addr=dist_init_addr,
+    )
+    status = {"ok": False}
     with (RESULTS / f"sglang_serve_{label}.log").open("wb") as log:
         phase("server_startup")
         start = time.monotonic()
         process = subprocess.Popen(
-            config["argv"],
+            argv,
             env={**os.environ, **config["server_env"]},
             stdout=log,
             stderr=subprocess.STDOUT,
@@ -64,6 +545,11 @@ def server(config, label, timings, ready_timeout):
         )
         try:
             while time.monotonic() - start < ready_timeout:
+                if barrier_dir is not None and _peer_failures(
+                    barrier_dir, own_rank=node_rank
+                ):
+                    phase("worker_exit")
+                    raise StartupError("worker_exit")
                 if process.poll() is not None:
                     phase("server_exit")
                     raise StartupError("server_exit")
@@ -81,16 +567,26 @@ def server(config, label, timings, ready_timeout):
                 raise StartupError("readiness_timeout")
             timings["cold_start_s"] = round(time.monotonic() - start, 3)
             yield
+            status["ok"] = True
         finally:
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                process.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=5)
+            wait_error = None
+            if barrier_dir is not None and signal_done_on_exit:
+                # Publish rank0.done BEFORE stopping rank 0's server, and on the
+                # normal path wait for live workers to stop cleanly while rank 0
+                # is still up so workers never see a premature disconnect.
+                _barrier_write(
+                    barrier_dir,
+                    "rank0.done",
+                    {"status": "ok" if status["ok"] else "error"},
+                )
+                if status["ok"] and nnodes > 1:
+                    try:
+                        _wait_workers_exit(barrier_dir, nnodes)
+                    except Exception as exc:
+                        wait_error = exc
+            _stop_process_group(process)
+            if wait_error is not None:
+                raise wait_error
 
 
 def probes(cfg, *, fast):
@@ -107,9 +603,15 @@ def probes(cfg, *, fast):
             (key, cfg[key]) for key in ("temperature", "top_p", "top_k") if key in cfg
         )
     else:
-        payload["thinking"] = {"type": "disabled"}
+        if "thinking" in cfg:
+            if cfg["thinking"] is not None:
+                payload["thinking"] = cfg["thinking"]
+        else:
+            payload["thinking"] = {"type": "disabled"}
+        if "chat_template_kwargs" in cfg:
+            payload["chat_template_kwargs"] = cfg["chat_template_kwargs"]
     with request(
-        "/v1/chat/completions", json.dumps(payload).encode(), timeout=90
+        "/v1/chat/completions", json.dumps(payload).encode(), timeout=180
     ) as response:
         answer = json.load(response)["choices"][0]
     (RESULTS / "chat-probe-response.json").write_text(json.dumps(answer) + "\n")
@@ -131,7 +633,7 @@ def probes(cfg, *, fast):
     finish_seen = False
     done_seen = False
     with request(
-        "/v1/chat/completions", json.dumps(payload).encode(), timeout=90
+        "/v1/chat/completions", json.dumps(payload).encode(), timeout=180
     ) as response:
         if response.headers.get_content_type() != "text/event-stream":
             raise ValueError("expected SSE")
@@ -233,7 +735,8 @@ def evaluate(stage, config):
         / "test/ppu/golden"
         / f"accuracy_{config['golden_model_key']}_890p.json"
     )
-    golden = json.loads(golden_path.read_text())
+    has_golden = golden_path.is_file()
+    golden = json.loads(golden_path.read_text()) if has_golden else None
     expected = dataset["num_expected"]
     dataset_id = f"{dataset['id']}@{dataset['version']}"
     dataset_options = {
@@ -244,7 +747,10 @@ def evaluate(stage, config):
         or expected != 1319
         or stage["dataset"] != dataset_id
         or stage["limit"] is not None
-        or golden["schema_version"] != 2
+    ):
+        raise ValueError("golden evaluation contract mismatch")
+    if has_golden and (
+        golden["schema_version"] != 2
         or golden["benchmark"] != "gsm8k"
         or golden["chip"] != "890p"
         or golden["model"] != config["golden_model_key"]
@@ -294,6 +800,14 @@ def evaluate(stage, config):
             stream.write(
                 json.dumps({"question_id": question, "correct": answer}) + "\n"
             )
+    if not has_golden:
+        return {
+            "gsm8k_score": score,
+            "gsm8k_correct": correct,
+            "gsm8k_count": count,
+            "accuracy_within_band": False,
+            "baseline_established": False,
+        }
     return {
         "gsm8k_score": score,
         "gsm8k_correct": correct,
@@ -481,23 +995,86 @@ def run(policy_path, tier, queue_s):
     if uses_cache_ref:
         resolve["cache_revision"] = snapshot_revision
     config = resolve_recipe(recipe, **resolve)
+    expected_nnodes = int(
+        os.environ.get("PPU_CI_NNODES", os.environ.get("RECIPE_NNODES", "1"))
+    )
     expected_width = int(os.environ.get("RECIPE_PPU_COUNT", "8"))
+    node_rank = int(
+        os.environ.get("PPU_CI_NODE_RANK", os.environ.get("NODE_RANK", "0"))
+    )
     if (
-        config["ppu_count"] != expected_width
+        expected_nnodes < 1
+        or not (0 <= node_rank < expected_nnodes)
+        or config["nodes"] != expected_nnodes
+        or config["devices_per_node"] != expected_width
+        or config["ppu_count"] != expected_nnodes * expected_width
         or policy["model_id"] != config["model_id"]
     ):
         raise ValueError("incorrect recipe identity or device width")
+
+    dist_init_addr = os.environ.get("PPU_CI_DIST_INIT_ADDR", "")
+    barrier_dir = None
+    if expected_nnodes > 1:
+        ranks_dir = os.environ.get("PPU_CI_RANKS_DIR", "")
+        if not ranks_dir or not dist_init_addr:
+            raise ValueError(
+                "multi-node execution requires ranks dir and rendezvous address"
+            )
+        barrier_dir = Path(ranks_dir) / "barrier"
+
+    warm_s = 0.0
+    if tier == "model_sanity" and expected_nnodes > 1:
+        warm_s = warm_pp_stage_shards(
+            Path(model_path),
+            flags=config["flags"],
+            nnodes=expected_nnodes,
+            node_rank=node_rank,
+            barrier_dir=barrier_dir,
+        )
+
+    if expected_nnodes > 1 and node_rank > 0:
+        label = (
+            "fast_2l"
+            if tier == "fast_sanity" and config["layer_override"] is not None
+            else ("fast_full" if tier == "fast_sanity" else "model_sanity")
+        )
+        return run_worker_node(
+            config,
+            label,
+            nnodes=expected_nnodes,
+            node_rank=node_rank,
+            dist_init_addr=dist_init_addr,
+            barrier_dir=barrier_dir,
+        )
+
     result = {
         "queue_s": queue_s,
         "config_digest": config["config_digest"],
         "parser_checked": True,
     }
+    server_kwargs = {}
+    if expected_nnodes > 1:
+        server_kwargs = dict(
+            nnodes=expected_nnodes,
+            node_rank=0,
+            dist_init_addr=dist_init_addr,
+            barrier_dir=barrier_dir,
+            signal_done_on_exit=True,
+        )
     if tier == "fast_sanity":
         sanity = policy["tiers"][tier]
         cold_total = 0
         start = time.monotonic()
         has_layer_override = config["layer_override"] is not None
-        full_ready_timeout = 1000
+        if (
+            expected_nnodes > 1
+            and sanity.get("fallback_full_layers")
+            and has_layer_override
+        ):
+            raise ValueError(
+                "multi-node fast_sanity does not support fallback_full_layers"
+            )
+        full_ready_timeout = 1800 if expected_nnodes > 1 else 1000
         if policy["model_id"] in {"zai-org/GLM-5.3", "Qwen/Qwen3.8-Flash-Next"}:
             # Cold graph capture and the first kernel compilation need extra time.
             full_ready_timeout = 1350
@@ -507,6 +1084,7 @@ def run(policy_path, tier, queue_s):
                 "fast_2l" if has_layer_override else "fast_full",
                 result,
                 420 if has_layer_override else full_ready_timeout,
+                **server_kwargs,
             ):
                 probes(sanity["probe"], fast=True)
         except StartupError as error:
@@ -526,7 +1104,9 @@ def run(policy_path, tier, queue_s):
     else:
         stages = {stage["kind"]: stage for stage in policy["tiers"][tier]["stages"]}
         ready_timeout = MODEL_SANITY_READY_TIMEOUTS.get(policy["model_id"], 2400)
-        with server(config, "model_sanity", result, ready_timeout):
+        with server(config, "model_sanity", result, ready_timeout, **server_kwargs):
+            if warm_s > 0:
+                result["cold_start_s"] = round(result["cold_start_s"] + warm_s, 3)
             probes(stages["sanity"]["probe"], fast=False)
             result["sse_verified"] = True
             start = time.monotonic()
@@ -579,7 +1159,11 @@ def main():
     os.umask(0o077)
     RESULTS.mkdir(parents=True, exist_ok=True)
     result = run(args.policy, args.tier, args.queue_s)
-    (RESULTS / "summary.json").write_text(json.dumps(result, sort_keys=True) + "\n")
+    node_rank = int(
+        os.environ.get("PPU_CI_NODE_RANK", os.environ.get("NODE_RANK", "0"))
+    )
+    if node_rank == 0:
+        (RESULTS / "summary.json").write_text(json.dumps(result, sort_keys=True) + "\n")
     return int(result["outcome"] != "pass")
 
 

@@ -1,0 +1,44 @@
+{
+  "schema_version": 2,
+  "model": "qwen3.8_2.4t_mxfp4_tp8_pp2",
+  "chip": "890p",
+  "checkpoint": "T-HEAD/Qwen3.8-2.4T-A95B-FP8-mxfp4-fp8-030",
+  "checkpoint_tail": "T-HEAD/Qwen3.8-2.4T-A95B-FP8-mxfp4-fp8-030",
+  "benchmark": "gsm8k",
+  "evalscope_version": "1.15.0",
+  "dataset": {
+    "dataset_id": "gsm8k@2026-11",
+    "few_shot_num": 4,
+    "few_shot_random": false,
+    "subset_list": [
+      "main"
+    ],
+    "num_expected": 1319
+  },
+  "serving": {
+    "ppu_count": 16,
+    "nnodes": 2,
+    "tensor_parallel_size": 8,
+    "pipeline_parallel_size": 2,
+    "gpu_memory_utilization": 0.8,
+    "max_model_len": 262144,
+    "seed": null
+  },
+  "generation": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "max_tokens": 10240,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+    "repetition_penalty": 1.0
+  },
+  "score": 0.9757,
+  "score_num": 1287,
+  "tolerance": {
+    "mode": "band",
+    "abs": 0.02
+  },
+  "measured_at": "2026-11-24T07:27:15Z",
+  "baseline_origin": "SGLang 890P 2-node TP8xPP2 real-weight Model Sanity; candidate 6a0e38d386d667bb70e8991215e3219c7cd187d3; https://github.com/t-head/sglang-for-sail/actions/runs/45327837198/artifacts/14898374133"
+}

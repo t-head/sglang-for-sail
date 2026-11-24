@@ -35,9 +35,36 @@ read_output() {
     awk -F= -v key="$1" '$1 == key {print substr($0, length(key)+2)}' "$GITHUB_OUTPUT" | tail -1
 }
 
+WORKER_POD_COUNT=1
+
+collect_pod_statuses() {
+    local count="${WORKER_POD_COUNT:-1}"
+    local i out
+    local collected=0
+    for (( i = 0; i < count; i++ )); do
+        out="$raw/pod-status-worker-$i.json"
+        if timeout 15s kubectl -n "$INPUT_NAMESPACE" get pod "$JOB_NAME-worker-$i" -o json > "$out" 2>/dev/null && [[ -s "$out" ]]; then
+            collected=$(( collected + 1 ))
+        else
+            rm -f -- "$out"
+        fi
+    done
+    if [[ -s "$raw/pod-status-worker-0.json" ]]; then
+        cp -- "$raw/pod-status-worker-0.json" "$raw/pod-status.json" || true
+    fi
+    (( collected == count ))
+}
+
 record_runtime_image() {
+    local count="${WORKER_POD_COUNT:-1}"
+    local i
+    local files=()
+    for (( i = 0; i < count; i++ )); do
+        [[ -s "$raw/pod-status-worker-$i.json" ]] || return 1
+        files+=("$raw/pod-status-worker-$i.json")
+    done
     local public_digest
-    public_digest=$(python3 -B scripts/ci/ppu/recipe_image.py verify-pod "$1" \
+    public_digest=$(python3 -B scripts/ci/ppu/recipe_image.py verify-pods "${files[@]}" \
         --expected-repo "$EXPECTED_IMAGE_REPO" \
         --expected-digest "$EXPECTED_IMAGE_DIGEST") || return 1
     if [[ "$SKIP_WHEEL_INSTALL" == true ]]; then
@@ -52,7 +79,20 @@ record_runtime_image() {
     fi
 }
 
+verify_cluster_cleanup() {
+    local remaining remaining_svc remaining_pg
+    remaining=$(timeout 15s kubectl -n "$INPUT_NAMESPACE" get pods -l "ppu-job=$JOB_NAME" -o name) || return 1
+    [[ -z "$remaining" ]] || return 1
+    if (( INPUT_NNODES > 0 )); then
+        remaining_svc=$(timeout 15s kubectl -n "$INPUT_NAMESPACE" get svc "$JOB_NAME" --ignore-not-found -o name) || return 1
+        remaining_pg=$(timeout 15s kubectl -n "$INPUT_NAMESPACE" get podgroups.scheduling.x-k8s.io "$JOB_NAME" --ignore-not-found -o name) || return 1
+        [[ -z "$remaining_svc" && -z "$remaining_pg" ]] || return 1
+    fi
+    [[ ! -e "$SOURCE_STAGE_DIR" ]]
+}
+
 export JOB_NAME="" SOURCE_STAGE_DIR="" INPUT_JOB_STATUS=failed INPUT_WORKFLOW_STATUS=failure
+cleanup_state="${RUNNER_TEMP:-/tmp}/ppu-cleanup-state.json"
 phase() { printf '%s\n' "$1" > "$raw/recipe-phase.txt"; }
 child=""
 run_backend() {
@@ -73,13 +113,12 @@ finish() {
         wait "$child" 2>/dev/null
     fi
     if [[ -n "$JOB_NAME" && -n "$SOURCE_STAGE_DIR" ]]; then
-        timeout 15s kubectl -n "$INPUT_NAMESPACE" get pod "$JOB_NAME-worker-0" -o json > "$raw/pod-status.json" || true
-        if [[ "$mode" != legacy && ! -f "$raw/provenance.json" && -s "$raw/pod-status.json" ]]; then
-            record_runtime_image "$raw/pod-status.json" || true
+        if [[ "$INPUT_WORKFLOW_STATUS" != cancelled ]] && collect_pod_statuses && [[ "$mode" != legacy && ! -f "$raw/provenance.json" ]]; then
+            record_runtime_image || true
         fi
-        if ! bash "$infra/cleanup.sh" ||
-            ! remaining=$(timeout 15s kubectl -n "$INPUT_NAMESPACE" get pods -l "ppu-job=$JOB_NAME" -o name) ||
-            [[ -n "$remaining" || -e "$SOURCE_STAGE_DIR" ]]; then
+        if bash "$infra/cleanup.sh" && verify_cluster_cleanup; then
+            rm -f -- "$cleanup_state"
+        else
             rc=1
             phase cleanup
         fi
@@ -138,14 +177,35 @@ SKIP_WHEEL_INSTALL=${PPU_CI_SKIP_WHEEL_INSTALL:-false}
 EXPECTED_IMAGE_REPO=""
 EXPECTED_IMAGE_DIGEST=""
 RECIPE_TREE_SHA256=""
+RECIPE_NNODES=${RECIPE_NNODES:-1}
+[[ "$RECIPE_NNODES" =~ ^[1-9][0-9]*$ ]]
 case "$mode" in
     fast_sanity|model_sanity)
         [[ "$MODEL_KEY" =~ ^[a-z0-9][a-z0-9.-]*$ && -f "test/ppu/policy/models/$MODEL_KEY.yaml" ]]
         INPUT_NODE_SELECTOR=board-type=ZW-M890P
-        [[ "${RECIPE_PPU_COUNT:?}" =~ ^(2|4|8)$ ]]
+        WORKER_POD_COUNT=$RECIPE_NNODES
+        if (( RECIPE_NNODES > 1 )); then
+            if [[ "${PPU_CI_ALLOW_MULTINODE_HOST_ACCESS:-false}" != true ]]; then
+                echo "multi-node host access is not authorized for this run" >&2
+                exit 2
+            fi
+            [[ "${RECIPE_PPU_COUNT:?}" == 8 ]] || exit 2
+            INPUT_NNODES=$RECIPE_NNODES
+            mkdir -p "$raw/ranks/barrier"
+            for (( _rank = 1; _rank < RECIPE_NNODES; _rank++ )); do
+                mkdir -p "$raw/ranks/rank-$_rank/results"
+            done
+            export CONTAINER_OPTIONS=$'privileged: true\nhost_ipc: true\nhost_network: true\nshm_size: "128Gi"'
+            INPUT_TIMEOUT_MINUTES=330
+            [[ "$mode" != fast_sanity ]] || INPUT_TIMEOUT_MINUTES=60
+        else
+            [[ "${RECIPE_PPU_COUNT:?}" =~ ^(2|4|8)$ ]] || exit 2
+            INPUT_NNODES=0
+            export CONTAINER_OPTIONS='shm_size: "128Gi"'
+            INPUT_TIMEOUT_MINUTES=330
+            [[ "$mode" != fast_sanity ]] || INPUT_TIMEOUT_MINUTES=30
+        fi
         INPUT_NPROC_PER_NODE=$RECIPE_PPU_COUNT
-        INPUT_TIMEOUT_MINUTES=330
-        [[ "$mode" != fast_sanity ]] || INPUT_TIMEOUT_MINUTES=30
         resolved_image_json=$(python3 -B scripts/ci/ppu/recipe_image.py resolve \
             --image-tag "${PPU_CI_RUNTIME_IMAGE_TAG:-}" \
             --image-digest "${PPU_CI_RUNTIME_IMAGE_DIGEST:-}")
@@ -157,7 +217,7 @@ case "$mode" in
         [[ "${PPU_CI_JIT_ROOT:?}" == /* && "$PPU_CI_JIT_ROOT" != *[:,$'\r\n']* ]]
         export INPUT_HOST_VOLUMES="$PPU_CI_JIT_ROOT:/recipe-jit"
         export PPU_CI_RECIPE_IMAGE_KEY
-        export CONTAINER_OPTIONS='shm_size: "128Gi"'
+        export RECIPE_NNODES
         phase wheel_verification
         if [[ "$SKIP_WHEEL_INSTALL" == true ]]; then
             [[ -n "${PPU_CI_RUNTIME_IMAGE_TAG:-}${PPU_CI_RUNTIME_IMAGE_DIGEST:-}" ]]
@@ -176,6 +236,7 @@ case "$mode" in
         ;;
     legacy)
         [[ "$SKIP_WHEEL_INSTALL" == false ]]
+        [[ "$RECIPE_NNODES" == 1 ]]
         [[ -d wheels && ! -L wheels ]]
         [[ "${PPU_CI_BOARD:?}" == ZW-M890P || "$PPU_CI_BOARD" == OAM-810E ]]
         INPUT_NODE_SELECTOR="board-type=$PPU_CI_BOARD"
@@ -186,7 +247,7 @@ case "$mode" in
         ;;
     *) exit 2 ;;
 esac
-export INPUT_NODE_SELECTOR INPUT_NPROC_PER_NODE INPUT_TIMEOUT_MINUTES INPUT_IMAGE
+export INPUT_NNODES INPUT_NODE_SELECTOR INPUT_NPROC_PER_NODE INPUT_TIMEOUT_MINUTES INPUT_IMAGE
 export INPUT_COMMAND="exec bash /workspace/source/scripts/ci/ppu/run_recipe_pod.sh"
 PPU_CI_WORKER_ARTIFACT_DIR="${pod_root%/}/$(basename -- "$raw")"
 export PPU_CI_WORKER_ARTIFACT_DIR
@@ -206,6 +267,7 @@ else:
     keys += [
         "MODEL_KEY",
         "RECIPE_PPU_COUNT",
+        "RECIPE_NNODES",
         "PPU_CI_RECIPE_IMAGE_KEY",
         "PPU_CI_HF_CACHE_ROOT",
         "PPU_CI_SKIP_WHEEL_INSTALL",
@@ -254,24 +316,31 @@ export SOURCE_STAGE_DIR="$stage_dir/source.tar.gz"
 tar -czf "$SOURCE_STAGE_DIR" --exclude='./.ppu-infra' --exclude='./.git/config' \
     --exclude='./.git/config.worktree' --exclude='./.git/hooks' \
     --exclude='./.git/modules' --exclude='./.git/worktrees' -C "$GITHUB_WORKSPACE" .
+jq -n \
+    --arg job_name "$JOB_NAME" \
+    --arg namespace "$INPUT_NAMESPACE" \
+    --argjson nnodes "$INPUT_NNODES" \
+    --arg source_stage_dir "$SOURCE_STAGE_DIR" \
+    '{job_name:$job_name, namespace:$namespace, nnodes:$nnodes, source_stage_dir:$source_stage_dir}' \
+    > "${cleanup_state}.tmp" && mv -- "${cleanup_state}.tmp" "$cleanup_state"
 run_backend "$infra/submit.sh"
 [[ $(read_output job_status) == scheduled ]]
 export JOB_START_TIME JOB_DEADLINE
 JOB_START_TIME=$(read_output start_time)
 JOB_DEADLINE=$(read_output deadline)
 [[ "$JOB_START_TIME" =~ ^[0-9]+$ && "$JOB_DEADLINE" =~ ^[0-9]+$ ]]
-queue_s=$(read_output queue_duration_seconds)
-[[ "$queue_s" =~ ^[0-9]+$ ]] || exit 1
 
 phase cluster_worker
 run_backend "$infra/monitor.sh"
 INPUT_JOB_STATUS=$(read_output job_status)
 [[ "$INPUT_JOB_STATUS" == succeeded ]]
+queue_s=$(read_output queue_duration_seconds)
+[[ "$queue_s" =~ ^[0-9]+$ ]] || exit 1
 if [[ "$mode" != legacy ]]; then
-    # The kubelet reports the worker's resolved pullable image reference.
+    # Kubelet reports the resolved pullable image reference for every worker Pod.
     phase image_resolution
-    timeout 15s kubectl -n "$INPUT_NAMESPACE" get pod "$JOB_NAME-worker-0" -o json > "$raw/pod-status.json"
-    record_runtime_image "$raw/pod-status.json"
+    collect_pod_statuses
+    record_runtime_image
     jq --argjson queue "$queue_s" '.queue_s = $queue' "$raw/results/summary.json" > "$raw/summary.tmp"
     mv -- "$raw/summary.tmp" "$raw/results/summary.json"
 fi

@@ -215,6 +215,30 @@ def verify_pod_status(
     )
 
 
+def verify_pod_statuses(
+    pod_status_paths: list[Path],
+    env: dict[str, str],
+    *,
+    expected_repo: str = "",
+    expected_digest: str = "",
+) -> str:
+    if not pod_status_paths:
+        raise ValueError("at least one worker pod status file is required")
+    resolved = [
+        verify_pod_status(
+            path,
+            env,
+            expected_repo=expected_repo,
+            expected_digest=expected_digest,
+        )
+        for path in pod_status_paths
+    ]
+    unique = set(resolved)
+    if len(unique) != 1:
+        raise ValueError("worker pods resolved inconsistent runtime image digests")
+    return resolved[0]
+
+
 def docker_pull_and_verify(
     env: dict[str, str],
     pull_log: Path,
@@ -335,6 +359,11 @@ def main() -> int:
     p_pod.add_argument("--expected-repo", default="")
     p_pod.add_argument("--expected-digest", default="")
 
+    p_pods = sub.add_parser("verify-pods")
+    p_pods.add_argument("pod_statuses", nargs="+", type=Path)
+    p_pods.add_argument("--expected-repo", default="")
+    p_pods.add_argument("--expected-digest", default="")
+
     p_pull = sub.add_parser("docker-pull")
     p_pull.add_argument("pull_log", type=Path)
     p_pull.add_argument("--image-tag", default="")
@@ -359,6 +388,15 @@ def main() -> int:
         if args.command == "verify-pod":
             public_digest = verify_pod_status(
                 args.pod_status,
+                os.environ,
+                expected_repo=args.expected_repo,
+                expected_digest=args.expected_digest,
+            )
+            print(public_digest)
+            return 0
+        if args.command == "verify-pods":
+            public_digest = verify_pod_statuses(
+                args.pod_statuses,
                 os.environ,
                 expected_repo=args.expected_repo,
                 expected_digest=args.expected_digest,

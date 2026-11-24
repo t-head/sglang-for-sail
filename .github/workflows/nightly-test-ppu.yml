@@ -34,7 +34,7 @@ on:
   workflow_call:
     outputs:
       sanity-result:
-        value: ${{ inputs.tier == 'cluster_preflight' && jobs.cluster-preflight.outputs.result || jobs.recipe-sanity.outputs.result }}
+        value: ${{ inputs.tier == 'cluster_preflight' && jobs.cluster-preflight.outputs.result || jobs.recipe-sanity-finish.outputs.result }}
     inputs:
       ref:
         type: string
@@ -102,10 +102,19 @@ jobs:
       github.repository == 't-head/sglang-for-sail' &&
       (github.event_name != 'pull_request_target' || inputs.tier == 'fast_sanity' ||
        github.event.action != 'labeled' ||
-       contains(fromJSON('["run-ci","run-ci-ppu-nightly"]'), github.event.label.name))
+       contains(fromJSON('["run-ci","run-ci-ppu-nightly","run-ci-ppu-multinode"]'), github.event.label.name))
     uses: ./.github/workflows/ppu-approval.yml
     with:
       label: ${{ inputs.tier == 'fast_sanity' && 'run-ci-ppu' || 'run-ci-ppu-nightly' }}
+      ref: ${{ inputs.target_ref || inputs.ref || '' }}
+
+  pr-gate-multinode:
+    if: >-
+      github.repository == 't-head/sglang-for-sail' &&
+      inputs.tier != 'cluster_preflight'
+    uses: ./.github/workflows/ppu-approval.yml
+    with:
+      label: run-ci-ppu-multinode
       ref: ${{ inputs.target_ref || inputs.ref || '' }}
 
   cluster-preflight:
@@ -130,6 +139,8 @@ jobs:
           path: .ppu-infra
           persist-credentials: false
       - id: check
+        env:
+          PPU_CI_MODEL_FILTER: ${{ inputs.model_filter || '' }}
         run: python3 -B scripts/ci/ppu/recipe_cluster_config.py --check
 
   plan:
@@ -139,7 +150,11 @@ jobs:
     timeout-minutes: 10
     outputs:
       source-sha: ${{ steps.plan.outputs.source }}
+      all-models: ${{ steps.plan.outputs.all_models }}
       models: ${{ steps.plan.outputs.models }}
+      has-single-node: ${{ steps.plan.outputs.has_single_node }}
+      multinode-models: ${{ steps.plan.outputs.multinode_models }}
+      has-multi-node: ${{ steps.plan.outputs.has_multi_node }}
       input-artifact-id: ${{ steps.plan.outputs.artifact }}
       input-run-id: ${{ steps.plan.outputs.run_id }}
       skip-wheel-install: ${{ steps.plan.outputs.skip_wheel_install }}
@@ -180,7 +195,15 @@ jobs:
           fi
           python3 -B scripts/ci/ppu/recipe_image.py validate-inputs \
             --image-tag "$IMAGE_TAG" --image-digest "$IMAGE_DIGEST"
-          models=$(python3 -B scripts/ci/ppu/recipe_select.py "$TIER" --model-filter "$MODEL_FILTER")
+          all_models=$(python3 -B scripts/ci/ppu/recipe_select.py "$TIER" --model-filter "$MODEL_FILTER" --topology all)
+          models=$(python3 -B scripts/ci/ppu/recipe_select.py "$TIER" --model-filter "$MODEL_FILTER" --topology single_node)
+          multinode_models=$(python3 -B scripts/ci/ppu/recipe_select.py "$TIER" --model-filter "$MODEL_FILTER" --topology multi_node)
+          has_single_node=$(jq -r 'if (.include | length) > 0 then "true" else "false" end' <<< "$models")
+          has_multi_node=$(jq -r 'if (.include | length) > 0 then "true" else "false" end' <<< "$multinode_models")
+          if [[ "$has_single_node" != true && "$has_multi_node" != true ]]; then
+            echo "::error::No models selected for tier $TIER" >&2
+            exit 1
+          fi
           SKIP_WHEEL_INSTALL=false
           if [[ "$SKIP_BUILD" == true ]]; then
             if [[ -n "$WHEEL_ID" ]]; then
@@ -216,8 +239,8 @@ jobs:
               done
             fi
           fi
-          printf 'source=%s\nmodels=%s\nartifact=%s\nrun_id=%s\nskip_wheel_install=%s\n' \
-            "$source" "$models" "$WHEEL_ID" "$WHEEL_RUN" "$SKIP_WHEEL_INSTALL" >> "$GITHUB_OUTPUT"
+          printf 'source=%s\nall_models=%s\nmodels=%s\nhas_single_node=%s\nmultinode_models=%s\nhas_multi_node=%s\nartifact=%s\nrun_id=%s\nskip_wheel_install=%s\n' \
+            "$source" "$all_models" "$models" "$has_single_node" "$multinode_models" "$has_multi_node" "$WHEEL_ID" "$WHEEL_RUN" "$SKIP_WHEEL_INSTALL" >> "$GITHUB_OUTPUT"
 
   ppu-build:
     needs: plan
@@ -314,6 +337,7 @@ jobs:
     needs: [plan, ppu-build, evalscope-wheels]
     if: >-
       !cancelled() && needs.plan.result == 'success' &&
+      needs.plan.outputs.has-single-node == 'true' &&
       (inputs.tier == 'fast_sanity' || needs.evalscope-wheels.result == 'success') &&
       (needs.ppu-build.result == 'success' ||
        ((needs.plan.outputs.input-artifact-id != '' || needs.plan.outputs.skip-wheel-install == 'true') &&
@@ -329,6 +353,8 @@ jobs:
     env:
       MODEL_KEY: ${{ matrix.model }}
       RECIPE_PPU_COUNT: ${{ matrix.ppu_count || 8 }}
+      RECIPE_NNODES: '1'
+      PPU_CI_ALLOW_MULTINODE_HOST_ACCESS: 'false'
       PPU_CI_SOURCE_SHA: ${{ needs.plan.outputs.source-sha }}
       PPU_CI_RUNTIME_IMAGE_TAG: ${{ inputs.image_tag || '' }}
       PPU_CI_RUNTIME_IMAGE_DIGEST: ${{ inputs.image_digest || '' }}
@@ -371,6 +397,10 @@ jobs:
         run: |
           export PPU_PUBLIC_SUMMARY="$GITHUB_STEP_SUMMARY"
           exec bash scripts/ci/ppu/run_recipe_cluster.sh
+      - name: Guarantee cluster cleanup on cancel or interrupt
+        if: always() && steps.cluster.outcome != 'skipped'
+        shell: bash
+        run: bash scripts/ci/ppu/cleanup_recipe_cluster.sh
       - name: Approve only the checked public evidence file
         id: evidence
         if: always() && steps.cluster.outcome != 'skipped'
@@ -388,9 +418,130 @@ jobs:
           path: ppu-public/recipe.json
           if-no-files-found: error
 
+  recipe-sanity-multinode:
+    outputs:
+      result: ${{ steps.cluster.outcome }}
+    name: ${{ inputs.tier == 'fast_sanity' && 'Fast Sanity' || 'Model Sanity' }} (${{ matrix.model }}, ${{ matrix.nnodes }}x8)
+    needs: [pr-gate-multinode, plan, ppu-build, evalscope-wheels, recipe-sanity]
+    if: >-
+      !cancelled() && needs.plan.result == 'success' &&
+      needs.plan.outputs.has-multi-node == 'true' &&
+      needs.pr-gate-multinode.outputs.approved == 'true' &&
+      needs.pr-gate-multinode.outputs.sha == needs.plan.outputs.source-sha &&
+      (needs.recipe-sanity.result == 'success' || needs.recipe-sanity.result == 'skipped') &&
+      (inputs.tier == 'fast_sanity' || needs.evalscope-wheels.result == 'success') &&
+      (needs.ppu-build.result == 'success' ||
+       ((needs.plan.outputs.input-artifact-id != '' || needs.plan.outputs.skip-wheel-install == 'true') &&
+        needs.ppu-build.result == 'skipped'))
+    runs-on: k8s-runner-group-cpu-thead
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: ${{ inputs.tier == 'fast_sanity' && 75 || 360 }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.plan.outputs.multinode-models) }}
+    env:
+      MODEL_KEY: ${{ matrix.model }}
+      RECIPE_PPU_COUNT: ${{ matrix.ppu_count || 8 }}
+      RECIPE_NNODES: ${{ matrix.nnodes || 2 }}
+      PPU_CI_ALLOW_MULTINODE_HOST_ACCESS: 'true'
+      PPU_CI_SOURCE_SHA: ${{ needs.plan.outputs.source-sha }}
+      PPU_CI_RUNTIME_IMAGE_TAG: ${{ inputs.image_tag || '' }}
+      PPU_CI_RUNTIME_IMAGE_DIGEST: ${{ inputs.image_digest || '' }}
+      PPU_CI_SKIP_WHEEL_INSTALL: ${{ needs.plan.outputs.skip-wheel-install }}
+      PPU_CI_K8S_RUNTIME_DIGEST: ${{ secrets.PPU_CI_K8S_RUNTIME_DIGEST }}
+      PPU_CI_RECIPE_IMAGE_REPO: ${{ secrets.PPU_CI_RECIPE_IMAGE_REPO }}
+      PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS: ${{ secrets.PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ needs.plan.outputs.source-sha }}
+          persist-credentials: false
+      - name: Fetch exact candidate bundle
+        if: needs.plan.outputs.skip-wheel-install != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.plan.outputs.input-artifact-id || needs.ppu-build.outputs.wheel-artifact-id }}
+          run-id: ${{ needs.plan.outputs.input-run-id || github.run_id }}
+          github-token: ${{ github.token }}
+          merge-multiple: true
+          path: wheels
+      - name: Fetch the isolated evaluator wheelhouse
+        if: inputs.tier != 'fast_sanity'
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.evalscope-wheels.outputs.artifact-id }}
+          merge-multiple: true
+          path: evalscope-wheels
+      - name: Fetch pinned Cluster Run backend
+        uses: actions/checkout@v4
+        with:
+          repository: t-head/ci-infra
+          ref: 96e25147971f5d2a04d828f8ad508cae38a4fa8a
+          path: .ppu-infra
+          persist-credentials: false
+      - name: Orchestrate multi-node PPU Pods with private logs
+        id: cluster
+        shell: bash
+        run: |
+          export PPU_PUBLIC_SUMMARY="$GITHUB_STEP_SUMMARY"
+          exec bash scripts/ci/ppu/run_recipe_cluster.sh
+      - name: Guarantee cluster cleanup on cancel or interrupt
+        if: always() && steps.cluster.outcome != 'skipped'
+        shell: bash
+        run: bash scripts/ci/ppu/cleanup_recipe_cluster.sh
+      - name: Approve only the checked public evidence file
+        id: evidence
+        if: always() && steps.cluster.outcome != 'skipped'
+        shell: bash
+        run: |
+          if [[ -f ppu-public/recipe.json && ! -L ppu-public/recipe.json ]] &&
+            python3 -B scripts/ci/ppu/recipe_publish.py --verify-only ppu-public/recipe.json >/dev/null 2>&1; then
+            printf 'approved=true\n' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Upload checked public evidence
+        if: always() && steps.evidence.outputs.approved == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TIER }}-${{ matrix.model }}-${{ github.run_attempt }}
+          path: ppu-public/recipe.json
+          if-no-files-found: error
+
+  recipe-sanity-finish:
+    outputs:
+      result: ${{ steps.summary.outputs.result }}
+    needs: [plan, recipe-sanity, recipe-sanity-multinode]
+    if: always() && inputs.tier != 'cluster_preflight' && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - id: summary
+        env:
+          SINGLE_RESULT: ${{ needs.recipe-sanity.result }}
+          MULTI_RESULT: ${{ needs.recipe-sanity-multinode.result }}
+          HAS_SINGLE: ${{ needs.plan.outputs.has-single-node }}
+          HAS_MULTI: ${{ needs.plan.outputs.has-multi-node }}
+        run: |
+          result=success
+          if [[ "$SINGLE_RESULT" == cancelled || "$MULTI_RESULT" == cancelled ]]; then
+            result=cancelled
+          elif [[ "$SINGLE_RESULT" == failure || "$MULTI_RESULT" == failure ]]; then
+            result=failure
+          elif [[ "$HAS_SINGLE" == true && "$SINGLE_RESULT" != success ]]; then
+            result=failure
+          elif [[ "$HAS_MULTI" == true && "$MULTI_RESULT" != success ]]; then
+            result=failure
+          elif [[ "$SINGLE_RESULT" != success && "$MULTI_RESULT" != success ]]; then
+            result=failure
+          fi
+          printf 'result=%s\n' "$result" >> "$GITHUB_OUTPUT"
+          [[ "$result" == success ]]
+
   notify-summary:
     name: Notify Nightly summary
-    needs: [pr-gate, plan, ppu-build, evalscope-wheels, recipe-sanity]
+    needs: [pr-gate, plan, ppu-build, evalscope-wheels, recipe-sanity, recipe-sanity-multinode, recipe-sanity-finish]
     if: >-
       always() && !cancelled() && github.repository == 't-head/sglang-for-sail' &&
       (inputs.tier || 'model_sanity') == 'model_sanity' &&
@@ -443,8 +594,8 @@ jobs:
           NOTIFY_PLAN_RESULT: ${{ needs.plan.result }}
           NOTIFY_BUILD_RESULT: ${{ needs.ppu-build.result }}
           NOTIFY_EVAL_RESULT: ${{ needs.evalscope-wheels.result }}
-          NOTIFY_MATRIX_RESULT: ${{ needs.recipe-sanity.result }}
-          NOTIFY_MATRIX: ${{ needs.plan.outputs.models }}
+          NOTIFY_MATRIX_RESULT: ${{ needs.recipe-sanity-finish.result }}
+          NOTIFY_MATRIX: ${{ needs.plan.outputs.all-models }}
           NOTIFY_SOURCE_SHA: ${{ needs.plan.outputs.source-sha }}
           PPU_CI_NOTIFY_WEBHOOK_URL: ${{ secrets.PPU_CI_NOTIFY_WEBHOOK_URL }}
           PPU_CI_NOTIFY_SIGNING_SECRET: ${{ secrets.PPU_CI_NOTIFY_SIGNING_SECRET }}

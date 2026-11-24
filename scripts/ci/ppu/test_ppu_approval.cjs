@@ -393,3 +393,13 @@ test("allowlisted GitHub App bots can dispatch trusted release targets without w
     sha: "",
   });
 });
+
+test("multinode host-access approval requires dedicated run-ci-ppu-multinode label on PRs", async () => {
+  // Standard PR approval (run-ci + run-ci-ppu) must NOT satisfy run-ci-ppu-multinode.
+  const std = fixture("run-ci-ppu");
+  assert.equal(await approved({...std, label: "run-ci-ppu-multinode"}), false);
+
+  // Dedicated fresh run-ci-ppu-multinode label from a maintainer approves the PR SHA.
+  const multi = fixture("run-ci-ppu-multinode");
+  assert.deepEqual(await approved.resolve(multi), {approved: true, sha: head});
+});
