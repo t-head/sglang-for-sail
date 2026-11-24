@@ -13,6 +13,8 @@ from unittest.mock import MagicMock, patch
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
 
+import yaml
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ppu_notify_summary as notify
 
@@ -34,13 +36,36 @@ class NotifySummaryTest(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
 
-    def test_all_green_has_no_mentions(self):
-        report = {"elapsed_s": 3701, "results": [{"model": "atlas", "status": "pass"}]}
-        payload = notify.make_payload(report, "{invalid", "mon")
-        self.assertNotIn("at", payload)
-        self.assertNotIn("@member", payload["markdown"]["text"])
-        self.assertIn("[✅ 全绿 1/1]", payload["markdown"]["title"])
-        self.assertIn("1h 01m 41s", payload["markdown"]["text"])
+    def test_all_green_has_aligned_columns_and_no_mentions(self):
+        report = {
+            "elapsed_s": 3701,
+            "results": [
+                {
+                    "model": "atlas",
+                    "status": "pass",
+                    "score": 0.9682,
+                    "golden_score": 0.9682,
+                    "job_elapsed_s": 3480,
+                },
+                {"model": "longer-model", "status": "pass", "job_elapsed_s": 24},
+            ],
+        }
+        for version in ("v1.0.0", "v0.5.23"):
+            with self.subTest(version=version):
+                with patch.dict("os.environ", {"NOTIFY_VERSION": version}):
+                    payload = notify.make_payload(report, "{invalid", "mon")
+                title = f"[sglang | {version}] PPU Nightly 晨报"
+                message = payload["markdown"]["text"]
+                self.assertEqual(title, payload["markdown"]["title"])
+                self.assertTrue(message.startswith(f"### {title}\n\n"))
+                self.assertIn("通过 **2/2** · 失败 **0** · 总耗时 1h 01m 41s", message)
+                self.assertNotIn("at", payload)
+                self.assertNotIn("🔴", message)
+                header, atlas, longer = message.split("```text\n")[1].splitlines()[:3]
+                self.assertEqual(header.index("GSM8K"), atlas.index("96.82% (96.82%)"))
+                self.assertEqual(header.index("GSM8K"), longer.index("—"))
+                self.assertEqual(header.index("Time"), atlas.index("58m"))
+                self.assertEqual(header.index("Time"), longer.index("24s"))
 
     def test_partial_failure_routes_only_to_duty_and_failed_model_owner(self):
         report = {
@@ -53,6 +78,8 @@ class NotifySummaryTest(unittest.TestCase):
                     "score": 0.90,
                     "golden_score": 0.95,
                     "first_failing_sha": "b" * 40,
+                    "job_id": 456,
+                    "job_elapsed_s": 3480,
                 },
             ]
         }
@@ -68,15 +95,20 @@ class NotifySummaryTest(unittest.TestCase):
             {"atMobiles": ["+10000000000"], "atUserIds": ["duty"], "isAtAll": False},
             payload["at"],
         )
-        self.assertIn("[❌ 1 项失败 · 待认领]", payload["markdown"]["title"])
         message = payload["markdown"]["text"]
+        self.assertLess(
+            message.index("🔴 失败用例 (1)"), message.index("🟢 通过用例 (1)")
+        )
+        self.assertIn("\n\n#### 🔴 失败用例 (1)\n\n- `borealis`", message)
+        self.assertIn("\n\n#### 🟢 通过用例 (1)\n\n```text", message)
         for word in (
             "@duty",
             "@+10000000000",
             "90.00% vs 95.00%",
             "b" * 40,
             "10:30",
-            "/actions/runs/123",
+            "耗时 58m",
+            "[直达 Job](https://github.com/example/framework/actions/runs/123/job/456)",
         ):
             self.assertIn(word, message)
         self.assertNotIn("green-owner", message)
@@ -92,12 +124,47 @@ class NotifySummaryTest(unittest.TestCase):
                     "score": "PRIVATE-SCORE",
                     "golden_score": 0.9,
                     "log": "PRIVATE-LOG",
+                    "job_id": "456)/PRIVATE-JOB-URL",
+                    "job_elapsed_s": "PRIVATE-TIME",
+                    "first_failing_sha": "PRIVATE-SHA",
                 }
             ]
         }
-        payload = notify.make_payload(report, "", "fri")
-        self.assertIn("unknown", payload["markdown"]["text"])
-        self.assertNotIn("PRIVATE", payload["markdown"]["text"])
+        with patch.dict(
+            "os.environ",
+            {
+                "NOTIFY_REF": "PRIVATE-REF",
+                "NOTIFY_VERSION": "PRIVATE-VERSION",
+            },
+        ):
+            payload = notify.make_payload(report, "", "fri")
+        self.assertIn("unknown · 耗时 —", payload["markdown"]["text"])
+        self.assertIn(
+            "[整轮 Run](https://github.com/example/framework/actions/runs/123)",
+            payload["markdown"]["text"],
+        )
+        self.assertNotIn("直达 Job", payload["markdown"]["text"])
+        self.assertNotIn("PRIVATE", str(payload))
+
+    def test_workflow_limits_manual_notifications_to_selected_full_runs(self):
+        workflow = (
+            Path(__file__).resolve().parents[3]
+            / ".github/workflows/nightly-test-ppu.yml"
+        )
+        job = yaml.safe_load(workflow.read_text())["jobs"]["notify-summary"]
+        condition = " ".join(job["if"].split())
+        self.assertTrue(condition.startswith("always() && !cancelled() &&"))
+        self.assertIn(
+            "(github.event_name == 'workflow_dispatch' && inputs.model_filter == '' && "
+            "needs.pr-gate.result == 'success' && needs.pr-gate.outputs.approved == 'true' && "
+            "needs.plan.result == 'success' &&",
+            condition,
+        )
+        self.assertIn(
+            "(github.event_name == 'schedule' && startsWith(github.workflow_ref, "
+            "'t-head/sglang-for-sail/.github/workflows/nightly-dispatch-ppu.yml@refs/heads/')) ||",
+            condition,
+        )
 
     def test_hmac_signature_encodes_query_and_replaces_stale_signature(self):
         url = "https://example.test/hooks?key=alpha%2Bbeta&timestamp=old&sign=old"
@@ -205,7 +272,13 @@ class NotifySummaryTest(unittest.TestCase):
             patch.object(notify.time, "time", return_value=1672628460),
         ):
             jobs, elapsed = notify.run_jobs({"retry", "prior"})
-        self.assertEqual({"retry": ("failure", 2), "prior": ("success", 1)}, jobs)
+        self.assertEqual(
+            {
+                "retry": notify.JobExecution("failure", 2, 202, 30),
+                "prior": notify.JobExecution("success", 1, 101, 1800),
+            },
+            jobs,
+        )
         self.assertEqual(60, elapsed)
 
         def original_evidence(attempt):
@@ -228,20 +301,26 @@ class NotifySummaryTest(unittest.TestCase):
         roster = '{"models":{"prior":[{"user_id":"prior-owner"}],"retry":[{"user_id":"retry-owner"}]}}'
         payload = notify.make_payload({"results": results}, roster, "mon")
         self.assertEqual(["retry-owner"], payload["at"]["atUserIds"])
-        self.assertIn("[❌ 1 项失败 · 待认领]", payload["markdown"]["title"])
+        self.assertIn("/actions/runs/123/job/202", payload["markdown"]["text"])
 
     def test_missing_evidence_and_conflicting_job_result_fail_closed(self):
         def missing(_attempt):
             raise FileNotFoundError
 
-        result = notify.model_result("atlas", ("success", 2), missing)
+        result = notify.model_result(
+            "atlas", notify.JobExecution("success", 2, 201, None), missing
+        )
         self.assertEqual(
             ("fail", "missing evidence"), (result["status"], result["phase"])
         )
         result = notify.model_result(
-            "atlas", ("failure", 2), lambda _: ("pass", "unknown", None, None)
+            "atlas",
+            notify.JobExecution("failure", 2, 201, 30),
+            lambda _: ("pass", "unknown", None, None),
         )
         self.assertEqual("fail", result["status"])
+        self.assertEqual(201, result["job_id"])
+        self.assertEqual(30, result["job_elapsed_s"])
 
 
 class SGLangNotificationTest(unittest.TestCase):
@@ -255,6 +334,7 @@ class SGLangNotificationTest(unittest.TestCase):
             "NOTIFY_MATRIX": json.dumps({"include": [{"model": model}]}),
             "NOTIFY_SOURCE_SHA": source,
             "NOTIFY_GATE_RESULT": "success",
+            "NOTIFY_GATE_APPROVED": "true",
             "NOTIFY_PLAN_RESULT": "success",
             "NOTIFY_BUILD_RESULT": "skipped",
             "NOTIFY_EVAL_RESULT": "success",
@@ -277,7 +357,11 @@ class SGLangNotificationTest(unittest.TestCase):
             evidence = root / f"model_sanity-{model}-2" / "recipe.json"
             evidence.parent.mkdir()
             evidence.write_text(json.dumps(payload))
-            jobs = {f"release-v100 / Model Sanity ({model})": ("failure", 2)}
+            jobs = {
+                f"release-v100 / Model Sanity ({model})": notify.JobExecution(
+                    "failure", 2, 456, 30
+                )
+            }
             with (
                 patch.dict("os.environ", environment, clear=True),
                 patch.object(nightly, "run_jobs", return_value=(jobs, 60)) as fetch,
@@ -286,6 +370,17 @@ class SGLangNotificationTest(unittest.TestCase):
                 fetch.assert_called_once_with(set(jobs))
                 self.assertEqual("gsm8k_score vs golden", result["phase"])
                 self.assertEqual(0.88, result["score"])
+                self.assertEqual(0.97, result["golden_score"])
+                self.assertEqual(456, result["job_id"])
+                self.assertEqual(30, result["job_elapsed_s"])
+                with patch.dict("os.environ", {"NOTIFY_GATE_APPROVED": "false"}):
+                    self.assertEqual(
+                        "approval", nightly.collect(root)["results"][0]["phase"]
+                    )
+                with patch.dict("os.environ", {"NOTIFY_PLAN_RESULT": "failure"}):
+                    self.assertEqual(
+                        "selection", nightly.collect(root)["results"][0]["phase"]
+                    )
                 evidence.write_text(json.dumps({**payload, "source_sha": "b" * 40}))
                 self.assertEqual(
                     "missing evidence", nightly.collect(root)["results"][0]["phase"]
