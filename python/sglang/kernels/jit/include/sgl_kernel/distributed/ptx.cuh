@@ -214,7 +214,11 @@ SGL_DEVICE uint32_t atomic_add_acq_rel_gpu(uint32_t* ptr, uint32_t val) {
 // ---------------------------------------------------------------------------
 
 SGL_DEVICE void multimem_store_relaxed(uint32_t* mc_ptr, uint32_t val) {
+#if SGL_ARCH_HOPPER_OR_GREATER
   asm volatile("multimem.st.relaxed.sys.global.b32 [%0], %1;" : : "l"(mc_ptr), "r"(val) : "memory");
+#else
+  assert(false && "multimem store is only supported on Hopper or later architecture");
+#endif
 }
 
 SGL_DEVICE void multimem_red_add_relaxed(uint32_t* mc_ptr, uint32_t val) {
@@ -252,7 +256,11 @@ SGL_DEVICE void store_relaxed_sys(uint64_t* ptr, uint64_t val) {
 }
 
 SGL_DEVICE void multimem_store_relaxed(uint64_t* mc_ptr, uint64_t val) {
+#if SGL_ARCH_HOPPER_OR_GREATER
   asm volatile("multimem.st.relaxed.sys.global.b64 [%0], %1;" : : "l"(mc_ptr), "l"(val) : "memory");
+#else
+  assert(false && "multimem store is only supported on Hopper or later architecture");
+#endif
 }
 
 }  // namespace device::ptx
