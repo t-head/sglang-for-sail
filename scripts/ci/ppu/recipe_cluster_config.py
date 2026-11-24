@@ -15,6 +15,7 @@ CONFIG_NAME = ".sglang-recipe-ci-v0523"
 SETTINGS = {
     "PPU_CI_K8S_STAGE_ROOT",
     "PPU_CI_K8S_PRIVATE_WORKER_ROOT",
+    "PPU_CI_PRIVATE_RESULTS_ROOT",
     "PPU_CI_K8S_RUNTIME_DIGEST",
     "PPU_CI_RUNTIME_IMAGE",
     "PPU_CI_RECIPE_IMAGE_REPO",
@@ -75,6 +76,16 @@ def load_settings(directory, expected):
     return values
 
 
+def resolve_retention_root(environ, values, fallback):
+    env_root = environ.get("PPU_CI_PRIVATE_RESULTS_ROOT", "").strip()
+    if env_root:
+        return env_root, "env"
+    config_root = values.get("PPU_CI_PRIVATE_RESULTS_ROOT", "").strip()
+    if config_root:
+        return config_root, "config"
+    return str(fallback), "fallback"
+
+
 def main():
     backend = Path(os.environ["GITHUB_WORKSPACE"]) / ".ppu-infra"
     head = subprocess.check_output(
@@ -92,11 +103,35 @@ def main():
         raise ValueError("invalid private results directory")
     if info.st_uid != os.geteuid():
         raise ValueError("the runner does not own the private results directory")
+    retention_root_raw, retention_source = resolve_retention_root(
+        os.environ, values, retained
+    )
     if sys.argv[1:] == ["--check"]:
         from recipe_cluster_diagnostics import publish_recent_failures
+        from recipe_retention import (
+            ensure_retention_base,
+            probe_retention_writable,
+            validate_retention_root,
+        )
 
+        status = {
+            "external_retention_root": retention_source != "fallback",
+            "retention_root_valid": False,
+            "retention_source": retention_source,
+            "retention_writable": False,
+        }
+        try:
+            validated_root = validate_retention_root(retention_root_raw, os.environ)
+            status["retention_root_valid"] = True
+            retention_base = ensure_retention_base(validated_root)
+            probe_retention_writable(retention_base)
+            status["retention_writable"] = True
+        except (KeyError, TypeError, ValueError, OSError):
+            print(json.dumps({"private_retention_check": status}, sort_keys=True))
+            raise
         print("PPU cluster private configuration verified")
-        publish_recent_failures(retained, int(os.environ["GITHUB_RUN_ID"]))
+        print(json.dumps({"private_retention_check": status}, sort_keys=True))
+        publish_recent_failures(validated_root, int(os.environ["GITHUB_RUN_ID"]))
         return
     os.execvpe(
         "bash",
@@ -104,7 +139,8 @@ def main():
         {
             **os.environ,
             **values,
-            "PPU_CI_PRIVATE_RESULTS_ROOT": str(retained),
+            "PPU_CI_K8S_HOST_SCRATCH_ROOT": str(retained),
+            "PPU_CI_PRIVATE_RESULTS_ROOT": retention_root_raw,
             "PPU_CI_K8S_LOADED_CONFIG_SHA256": expected,
         },
     )

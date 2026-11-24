@@ -5,6 +5,7 @@ import json
 import re
 
 from recipe_publish import MODEL_POLICY_ROOT
+from recipe_retention import RETENTION_SUBPATH
 
 RULES = {
     "image_pull": r"ErrImagePull|ImagePullBackOff|failed to pull image|manifest unknown",
@@ -44,17 +45,33 @@ def diagnostic_codes(text):
     return [name for name, pattern in RULES.items() if re.search(pattern, text, re.I)]
 
 
+def _safe_subdir(root, parts):
+    current = root
+    for part in parts:
+        current = current / part
+        if current.is_symlink() or not current.is_dir():
+            return None
+    return current
+
+
 def recent_failures(root, current_run):
-    parent = root / "sglang-for-sail"
-    if not parent.is_dir():
-        return []
     previous = []
-    for run in parent.iterdir():
-        if not re.fullmatch(r"[0-9]+-[0-9]+", run.name):
+    for parts in (RETENTION_SUBPATH, ("sglang-for-sail",)):
+        parent = _safe_subdir(root, parts)
+        if parent is None:
             continue
-        run_id, attempt = map(int, run.name.split("-"))
-        if run_id != current_run:
-            previous.append((run_id, attempt, run))
+        for run in parent.iterdir():
+            if run.is_symlink() or not run.is_dir():
+                continue
+            if not re.fullmatch(r"[0-9]+-[0-9]+", run.name):
+                continue
+            run_id, attempt = map(int, run.name.split("-"))
+            if run_id != current_run:
+                previous.append((run_id, attempt, run))
+        if previous:
+            break
+    if not previous:
+        return []
     models = sorted(
         policy.stem
         for policy in MODEL_POLICY_ROOT.glob("*.yaml")
