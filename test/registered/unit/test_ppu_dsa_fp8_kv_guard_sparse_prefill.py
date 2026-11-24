@@ -228,7 +228,9 @@ class TestPpuDsaFp8KvCacheGuard(unittest.TestCase):
                     view = ResolvedView(SimpleNamespace(**fields))
                 else:
                     view = _view(**kwargs)
-                self.assertEqual(_run_guard(sail=sail, sm=sm, view=view), expected, name)
+                self.assertEqual(
+                    _run_guard(sail=sail, sm=sm, view=view), expected, name
+                )
 
     def test_sparse_fp8_validator_refuses_zero_rope(self):
         module = self._dsa_backend_module()

@@ -1454,7 +1454,6 @@ class DeepseekSparseAttnBackend(
         ):
             begin_page_broadcast(page_table, cache_seqlens_int32)
 
-
         page_table_1_flattened = None
         topk_indices_offset = None
 

@@ -57,6 +57,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.disaggregation import utils as dutils
+from sglang.srt.disaggregation.utils import require_dsa_cp_hicache_layout
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -653,7 +654,9 @@ class TestResolvedDsaCpAlignment(CustomTestCase):
             unittest.mock.patch.object(
                 dutils,
                 "get_disagg",
-                unittest.mock.Mock(return_value=SimpleNamespace(disaggregation_mode="prefill")),
+                unittest.mock.Mock(
+                    return_value=SimpleNamespace(disaggregation_mode="prefill")
+                ),
             )
         )
         stack.enter_context(
@@ -811,7 +814,9 @@ class TestLayerSplitScratchInvalidation(CustomTestCase):
             pending_remote_kv_layer_id=pending_layer,
             remote_kv_layer_id=remote_layer,
             pending_remote_kv_broadcast=pending_layer is not None,
-            index_key_cache=SimpleNamespace(invalidate=lambda layer: calls.append(("index", layer))),
+            index_key_cache=SimpleNamespace(
+                invalidate=lambda layer: calls.append(("index", layer))
+            ),
             _finalize_pending_kv_broadcast=lambda *, set_remote_layer_id: calls.append(
                 ("finalize", set_remote_layer_id)
             ),
@@ -956,7 +961,12 @@ class TestHostWriteThroughInvalidatesScratch(CustomTestCase):
         )
 
         DSAIndexerPoolHost.load_to_device_per_layer(
-            host, self._device_pool(lambda layer: seen.append(layer)), None, None, 3, "kernel"
+            host,
+            self._device_pool(lambda layer: seen.append(layer)),
+            None,
+            None,
+            3,
+            "kernel",
         )
 
         self.assertEqual(seen, [])
@@ -989,7 +999,12 @@ class TestHostWriteThroughInvalidatesScratch(CustomTestCase):
         )
 
         MLATokenToKVPoolHost.load_to_device_per_layer(
-            host, self._device_pool(lambda layer: seen.append(layer)), None, None, 3, "kernel"
+            host,
+            self._device_pool(lambda layer: seen.append(layer)),
+            None,
+            None,
+            3,
+            "kernel",
         )
 
         self.assertEqual(seen, [])
@@ -1020,7 +1035,9 @@ class TestDraftTransferIdsFollowTargetLayerNum(CustomTestCase):
 
     def test_draft_ids_start_at_the_live_target_layer_count(self):
         draft_a, draft_b = object(), object()
-        host, calls = self._host(sharded=True, target_layer_num=2, drafts=(draft_a, draft_b))
+        host, calls = self._host(
+            sharded=True, target_layer_num=2, drafts=(draft_a, draft_b)
+        )
         device_pool = SimpleNamespace(layer_num=9)
 
         DSAIndexerPoolHost.backup_from_device_all_layer(
