@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-
 from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
@@ -205,10 +204,14 @@ class DSATopKBackend(Enum):
                     from sglang.kernels.ops.attention.dsv4.topk import (
                         topk_transform_ragged_v2,
                     )
+
                     out = logits.new_empty((logits.shape[0], topk), dtype=torch.int32)
                     topk_transform_ragged_v2(
-                        logits, lengths, out_offsets=raw_offsets,
-                        out_indices=out, row_starts=row_starts,
+                        logits,
+                        lengths,
+                        out_offsets=raw_offsets,
+                        out_indices=out,
+                        row_starts=row_starts,
                     )
                     return out
             score = logits if logits.dtype == torch.float32 else logits.float()

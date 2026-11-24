@@ -10,7 +10,9 @@ import torch
 import torch.distributed as dist
 
 
-def build_batch_page_ids(token_table, seq_lens, page_size, num_pages, group=None, verify=False):
+def build_batch_page_ids(
+    token_table, seq_lens, page_size, num_pages, group=None, verify=False
+):
     """Union of valid request pages, including cached prefixes and null page.
 
     Called on the *global*, unsharded request table before CP selects local
@@ -28,8 +30,9 @@ def build_batch_page_ids(token_table, seq_lens, page_size, num_pages, group=None
         raise ValueError("One sequence length is required per request")
     starts = torch.arange(0, token_table.shape[1], page_size, device=token_table.device)
     valid = starts.unsqueeze(0) < seq_lens.unsqueeze(1)
-    pages = torch.div(token_table[:, ::page_size][valid], page_size,
-                      rounding_mode="floor").to(torch.int64)
+    pages = torch.div(
+        token_table[:, ::page_size][valid], page_size, rounding_mode="floor"
+    ).to(torch.int64)
     bitmap = torch.zeros(num_pages, dtype=torch.int32, device=token_table.device)
     # Page zero is used by padding/dummy accesses and must be refreshed too.
     bitmap[0] = 1
@@ -42,15 +45,18 @@ def build_batch_page_ids(token_table, seq_lens, page_size, num_pages, group=None
         # Visit every valid token rather than sampling one token per page.
         offsets = torch.arange(token_table.shape[1], device=token_table.device)
         token_mask = offsets.unsqueeze(0) < seq_lens.unsqueeze(1)
-        all_pages = torch.div(token_table[token_mask], page_size,
-                              rounding_mode="floor").to(torch.int64)
+        all_pages = torch.div(
+            token_table[token_mask], page_size, rounding_mode="floor"
+        ).to(torch.int64)
         expected = torch.zeros_like(bitmap)
         expected[0] = 1
         expected.scatter_(0, all_pages, 1)
         if group is not None:
             dist.all_reduce(expected, op=dist.ReduceOp.MAX, group=group)
         if not torch.equal(bitmap, expected):
-            raise RuntimeError("LayerSplit batch-page plan does not cover all valid token pages")
+            raise RuntimeError(
+                "LayerSplit batch-page plan does not cover all valid token pages"
+            )
     return result
 
 
@@ -75,7 +81,8 @@ class BatchPageBroadcastPlan:
         if packed is None:
             packed = torch.empty(
                 (self.page_ids.numel(),) + tuple(destination_pages.shape[1:]),
-                dtype=destination_pages.dtype, device=destination_pages.device,
+                dtype=destination_pages.dtype,
+                device=destination_pages.device,
             )
             self.workspaces[key] = packed
         if source_pages is not None:
@@ -83,5 +90,7 @@ class BatchPageBroadcastPlan:
         collective(packed)
         destination_pages.index_copy_(0, self.page_ids, packed)
         self.transferred_bytes += packed.numel() * packed.element_size()
-        self.full_buffer_bytes += destination_pages.numel() * destination_pages.element_size()
+        self.full_buffer_bytes += (
+            destination_pages.numel() * destination_pages.element_size()
+        )
         self.collectives += 1

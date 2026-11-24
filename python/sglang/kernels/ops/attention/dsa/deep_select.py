@@ -34,7 +34,6 @@ def _pack_ragged_scores(
         tl.store(packed + row * PACKED_ROW_STRIDE + cols, values, mask=cols < length)
 
 
-
 @triton.jit(do_not_specialize=["SCORE_ROW_STRIDE", "PACKED_ROW_STRIDE"])
 def _pack_ragged_scores_runtime(
     scores,

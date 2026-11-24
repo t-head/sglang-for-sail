@@ -284,7 +284,9 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         )
 
         pages = build_batch_page_ids(
-            token_table, seq_lens, self.page_size,
+            token_table,
+            seq_lens,
+            self.page_size,
             self.remote_kv_buffer.shape[0] // self.page_size,
             group=get_parallel().attn_cp_group.device_group,
             verify=self.batch_page_verify,
@@ -297,7 +299,8 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         if not getattr(self, "_batch_page_plan_logged", False):
             logger.info(
                 "LayerSplit batch-page transport active: rank=%s, pages=%s/%s, verify=%s",
-                self.layer_shard_rank, pages.numel(),
+                self.layer_shard_rank,
+                pages.numel(),
                 self.remote_kv_buffer.shape[0] // self.page_size,
                 self.batch_page_verify,
             )
@@ -346,7 +349,8 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
 
         def collective(packed):
             self._broadcast_full_tensor_from_owner(
-                packed, layer_id,
+                packed,
+                layer_id,
                 src_tensor=packed if src_tensor is not None else None,
                 use_layer_broadcast_comm=use_layer_broadcast_comm,
             )
@@ -358,7 +362,9 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             # Never enable this during TTFT measurement.
             reference = torch.empty_like(tensor)
             self._broadcast_full_tensor_from_owner(
-                reference, layer_id, src_tensor=src_tensor,
+                reference,
+                layer_id,
+                src_tensor=src_tensor,
                 use_layer_broadcast_comm=use_layer_broadcast_comm,
             )
             reference_pages = reference.view_as(destination_pages)
@@ -373,7 +379,8 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             if self.batch_page_verified_collectives % self.layer_num == 0:
                 logger.info(
                     "LayerSplit byte comparisons passed: rank=%s, collectives=%s",
-                    self.layer_shard_rank, self.batch_page_verified_collectives,
+                    self.layer_shard_rank,
+                    self.batch_page_verified_collectives,
                 )
         return tensor
 
