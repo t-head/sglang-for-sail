@@ -34,7 +34,7 @@ from sglang.srt.runtime_context import (
 logger = logging.getLogger(__name__)
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     concat_cast_kv_fp8_pad,
-    dequantize_k_cache_paged_dsa,
+    dequantize_k_cache_paged_dsa_dispatch,
     gather_cast_kv_fp8_pad_paged,
     gather_dequant_requant_fp8_paged_dsa,
 )
@@ -58,6 +58,7 @@ from sglang.kernels.ops.quantization.dsa_quant_k_cache import quantize_k_cache
 from sglang.srt.configs.model_config import (
     get_dsa_index_kpool,
 )
+from sglang.srt.disaggregation.utils import supports_dsa_cp_prefix_cache
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dsa_backend_kpool import (
@@ -553,10 +554,23 @@ def _validate_flashmla_sparse_q8_backend(
                 "--kv-cache-dtype bfloat16."
             )
         if device_sm_major != 9:
-            raise ValueError(
-                "--dsa-prefill-backend flashmla_sparse_q8 is SM90-only; got compute "
-                f"capability sm_{device_sm_major}x."
-            )
+            # PPU (sail) does not run the Hopper kernel this rule describes: on
+            # sm89+ it consumes the same fp8 q/KV prep through flash_mla's
+            # quantized sparse-prefill entry (the contract carried on the 0.5.21
+            # adaptation line). Reject PPU below sm89, and reject any build whose
+            # flash_mla lacks the entry, at launch rather than mid-forward.
+            if not (_is_sail and get_platform().device_sm >= 89):
+                raise ValueError(
+                    "--dsa-prefill-backend flashmla_sparse_q8 is SM90-only; got compute "
+                    f"capability sm_{device_sm_major}x."
+                )
+            import flash_mla
+
+            if not hasattr(flash_mla, "flash_mla_sparse_quantized_fwd"):
+                raise ValueError(
+                    "--dsa-prefill-backend flashmla_sparse_q8 on PPU requires a "
+                    "flash_mla build that exports flash_mla_sparse_quantized_fwd."
+                )
         # A mixed batch takes the PAGED top-k transform, which belongs to the
         # bf16 kernel. forward_extend refuses it, but the flag is readable here,
         # so the refusal belongs at launch rather than on the first mixed batch
@@ -1565,6 +1579,39 @@ class DeepseekSparseAttnBackend(
                 else None
             )
             if strategy is not None:
+                if use_kpool and supports_dsa_cp_prefix_cache():
+                    # A reused prefix must end on a kpool boundary. The compress
+                    # tail buffer is per-request, so a partial pool belonging to
+                    # the shared prefix is invisible to this request's pooled
+                    # top-k read: the indexer would silently drop candidates.
+                    # The admission gate enforces this; this is the last line of
+                    # defence before the reads below.
+                    kpool = max(1, int(self.dsa_index_kpool))
+                    for seq_len_i, ext_i in zip(
+                        indexer_seq_lens_cpu, extend_seq_lens_cpu, strict=True
+                    ):
+                        prefix_len = int(seq_len_i) - int(ext_i)
+                        assert prefix_len >= 0 and prefix_len % kpool == 0, (
+                            "DSA prefill CP prefix reuse is not kpool-aligned: "
+                            f"indexer_seq_len={int(seq_len_i)} "
+                            f"extend_len={int(ext_i)} prefix_len={prefix_len} "
+                            f"index_kpool={kpool}"
+                        )
+                    # Writes must cover only the new tokens: shared prefix
+                    # pages are read-only for this request (no cross-request
+                    # corruption through the CP full-copy pools). TBO pads
+                    # out_cache_loc up to the attn-tp multiple, so compare
+                    # against the unpadded token count and allow the pad slack.
+                    out_cache_loc = forward_batch.out_cache_loc
+                    if out_cache_loc is not None:
+                        # Host-side token count only: num_token_non_padded is a
+                        # GPU scalar and reading it would sync every layer. The
+                        # >= check tolerates the TBO pad-up to attn-tp multiple.
+                        expected = sum(int(x) for x in extend_seq_lens_cpu)
+                        assert out_cache_loc.shape[0] >= expected, (
+                            "out_cache_loc shorter than the new tokens "
+                            f"({out_cache_loc.shape[0]} < {expected})"
+                        )
                 seqlens_expanded = strategy.shard_local_tokens(seqlens_expanded)
                 extend_seq_lens_cpu, extend_seq_lens, bs_idx_cpu, bs_idx = (
                     strategy.shard_per_request(extend_seq_lens_cpu, extend_seq_lens)
@@ -1572,6 +1619,21 @@ class DeepseekSparseAttnBackend(
                 indexer_seq_lens_cpu = indexer_seq_lens_cpu[bs_idx_cpu]
                 indexer_seq_lens = indexer_seq_lens[bs_idx]
                 cache_seqlens_int32 = cache_seqlens_int32[bs_idx]
+                # Prefix accounting under CP: the indexer reads the full
+                # sequence (prefix + this rank's extend rows) from the pool, so
+                # the per-request sequence length must never be shorter than
+                # the rank-local extend length it has to cover.
+                if len(indexer_seq_lens_cpu) != 0:
+                    _seq_lens_per_req = indexer_seq_lens_cpu.tolist()
+                    assert all(
+                        int(total) >= int(local_extend)
+                        for total, local_extend in zip(
+                            _seq_lens_per_req, extend_seq_lens_cpu
+                        )
+                    ), (
+                        "DSA prefill CP: seq_lens must be >= local extend lens "
+                        f"({_seq_lens_per_req} vs {list(extend_seq_lens_cpu)})"
+                    )
                 cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
                 max_seqlen_k = (
                     int(indexer_seq_lens_cpu.max().item() + draft_token_num)
@@ -2840,7 +2902,7 @@ class DeepseekSparseAttnBackend(
                             0, page_table_1_flattened.long()
                         )
                     else:
-                        kv_cache = dequantize_k_cache_paged_dsa(
+                        kv_cache = dequantize_k_cache_paged_dsa_dispatch(
                             kv_cache, page_table_1_flattened
                         )
                 else:
@@ -3475,9 +3537,12 @@ class DeepseekSparseAttnBackend(
         The top-k width is -1 padded to a multiple of 128 before the pad band
         is sized (kpool rows are index_topk + index_kpool - 1 wide).
         """
-        from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
-            sparse_mla_q8kv8_prefill_fwd,
-        )
+        if _is_sail:
+            from flash_mla import flash_mla_sparse_quantized_fwd
+        else:
+            from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
+                sparse_mla_q8kv8_prefill_fwd,
+            )
 
         num_tokens, num_heads, d_nope = q_nope.shape
         head_dim = d_nope + q_rope.shape[-1]
@@ -3650,20 +3715,36 @@ class DeepseekSparseAttnBackend(
             )
             self._q8kv8_out_bufs = out_bufs
 
-        o, _, _ = sparse_mla_q8kv8_prefill_fwd(
-            q=q_fp8,
-            kv=kv_padded,
-            indices=page_table_1.unsqueeze(1),
-            sm_scale=sm_scale,
-            q_scale=identity_scale,
-            kv_scale=identity_scale,
-            d_v=v_head_dim,
-            attn_sink=None,
-            topk_length=topk_length,
-            out=out_bufs[0][:s_q],
-            max_logits=out_bufs[1][:s_q],
-            lse=out_bufs[2][:s_q],
-        )
+        if _is_sail:
+            # PPU: identical fp8 q/KV prep and identity scale, consumed by the
+            # flash_mla quantized entry (0.5.21 argument set); the sm90 kernel's
+            # aux outputs (max_logits/lse) are not part of this contract.
+            o, _, _ = flash_mla_sparse_quantized_fwd(
+                q=q_fp8,
+                kv=kv_padded,
+                indices=page_table_1.unsqueeze(1),
+                sm_scale=sm_scale,
+                d_v=v_head_dim,
+                attn_sink=None,
+                topk_length=topk_length,
+                out=out_bufs[0][:s_q],
+                compute_aux=False,
+            )
+        else:
+            o, _, _ = sparse_mla_q8kv8_prefill_fwd(
+                q=q_fp8,
+                kv=kv_padded,
+                indices=page_table_1.unsqueeze(1),
+                sm_scale=sm_scale,
+                q_scale=identity_scale,
+                kv_scale=identity_scale,
+                d_v=v_head_dim,
+                attn_sink=None,
+                topk_length=topk_length,
+                out=out_bufs[0][:s_q],
+                max_logits=out_bufs[1][:s_q],
+                lse=out_bufs[2][:s_q],
+            )
 
         # Trim the output back to the original head count if we padded.
         if need_padding:
