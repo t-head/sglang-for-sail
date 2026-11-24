@@ -489,8 +489,8 @@ class RecipeContractTest(unittest.TestCase):
             ("minimax-m3-fp8", 8, 6600),
             ("deepseek-v4-pro", 8, 6000),
             ("kimi-k2.6", 8, 6000),
-            ("glm-5.3", 8, 4500),
-            ("glm-5.3-tp4", 4, 4500),
+            ("glm-5.3", 8, 6600),
+            ("glm-5.3-tp4", 4, 6600),
             ("qwen3.8-flash-next", 8, 5100),
             ("qwen3.8-flash-next-tp4", 4, 5100),
             ("deepseek-v4-flash", 8, 2400),
@@ -1828,6 +1828,21 @@ exit 1
             expected_expr = f"${{{{ secrets.{secret_key} }}}}"
             self.assertEqual(recipe_env[secret_key], expected_expr)
             self.assertEqual(pr_fast_secrets[secret_key], expected_expr)
+
+    def test_nightly_model_sanity_throttles_concurrency(self):
+        import yaml
+
+        workflow = yaml.load(
+            (REPO_ROOT / ".github/workflows/nightly-test-ppu.yml").read_text(
+                encoding="utf-8"
+            ),
+            Loader=yaml.BaseLoader,
+        )
+        strategy = workflow["jobs"]["recipe-sanity"]["strategy"]
+        self.assertEqual(
+            strategy["max-parallel"],
+            "${{ inputs.tier == 'fast_sanity' && 32 || 4 }}",
+        )
 
 
 if __name__ == "__main__":
