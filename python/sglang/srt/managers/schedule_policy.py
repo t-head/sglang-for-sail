@@ -1148,12 +1148,15 @@ class PrefillAdder:
                 return req
             if self.kv_shard_granule:
                 # Align the absolute boundary to keep pages within one scratch region.
-                # If no budget remains, use a full chunk to make progress.
                 prefix_len = req.prefix_len
                 floored = (
                     prefix_len + _rem_tokens
                 ) // self.kv_shard_granule * self.kv_shard_granule - prefix_len
-                _rem_tokens = floored if floored > 0 else self.rem_chunk_tokens
+                if floored > 0:
+                    _rem_tokens = floored
+                elif _rem_tokens < self.rem_chunk_tokens:
+                    return req
+                # A configured chunk shorter than the granule can run unaligned.
 
         # A mid-chunk rank prefills this pass regardless of the delayer
         # verdict, so report prefillable=True and ignore the result.
