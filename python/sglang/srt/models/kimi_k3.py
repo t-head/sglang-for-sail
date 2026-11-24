@@ -1107,6 +1107,9 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             )
             if not is_sail() or mma_type == "mxf4xmxf4":
                 situ_kwargs["recipe"] = (1, 1, 32)
+            if not is_sail():
+                # PPU MegaMoE entries do not accept the community token hint.
+                situ_kwargs["global_num_tokens"] = _mega_moe_global_tokens_hint(buf)
             mega_moe_kernel(
                 y,
                 self.experts.mega_l1_weights,
@@ -1114,7 +1117,6 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 buf,
                 activation="situ",
                 fast_math=True,
-                global_num_tokens=_mega_moe_global_tokens_hint(buf),
                 **situ_kwargs,
             )
         y = y[:num_tokens]
