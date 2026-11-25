@@ -51,10 +51,11 @@ class TritonGDNKernel(LinearAttnKernelBase):
     extend_honors_slot_pitch: bool = True
 
     def __init__(self):
+        super().__init__()
         self._triton_capture_signatures = OrderedDict()
 
     def _prepare_triton_capture(
-        self, q, k, v, g, beta, ssm_states, query_start_loc, normalize_qk
+        self, q, k, v, a, b, A_log, dt_bias, ssm_states, query_start_loc
     ):
         from sglang.kernels.ops.attention.fla.chunk import CHUNK_SIZE
         from sglang.kernels.ops.attention.fla.index import (
@@ -71,16 +72,22 @@ class TritonGDNKernel(LinearAttnKernelBase):
         signature = (
             tuple(
                 (t.device, t.dtype, tuple(t.shape), tuple(t.stride()))
-                for t in (q, k, v, g, beta)
+                for t in (q, k, v, a, b)
             ),
             ssm_states.dtype,
             query_start_loc.numel(),
             query_start_loc.dtype,
-            normalize_qk,
         )
         if signature not in self._triton_capture_signatures:
             # Autotuning must also finish before capture. Use a scratch pool:
             # warmup must not apply the recurrence twice to the caller's state.
+            from sglang.kernels.ops.attention.linear.fused_gdn_gating import (
+                fused_gdn_gating,
+            )
+
+            # Only cold Triton preparation needs activated gates. Steady-state
+            # packed PLA calls consume raw a/b and perform their own gating.
+            g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
             count = query_start_loc.numel() - 1
             scratch = ssm_states.new_zeros((count, *ssm_states.shape[1:]))
             slots = torch.arange(count, dtype=query_start_loc.dtype, device=q.device)
@@ -94,7 +101,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
                 initial_state_indices=slots,
                 cu_seqlens=query_start_loc,
                 head_first=False,
-                use_qk_l2norm_in_kernel=normalize_qk,
+                use_qk_l2norm_in_kernel=True,
                 inplace_update=True,
             )
             self._triton_capture_signatures[signature] = None
@@ -102,6 +109,91 @@ class TritonGDNKernel(LinearAttnKernelBase):
                 self._triton_capture_signatures.popitem(last=False)
         else:
             self._triton_capture_signatures.move_to_end(signature)
+
+    def packed_prefill(
+        self,
+        packed_qkv,
+        a,
+        b,
+        *,
+        A_log,
+        dt_bias,
+        num_qk_heads,
+        num_v_heads,
+        ssm_states,
+        cache_indices,
+        query_start_loc,
+        seq_lens_cpu,
+        inplace_update=True,
+        use_qk_l2norm_in_kernel=True,
+        **kwargs,
+    ):
+        """Attempt PLA before SRT splits QKV or computes activated gates."""
+        if not (
+            envs.SGLANG_SAIL_PLA_CUDA.get()
+            and is_sail()
+            and packed_qkv.ndim == 2
+            and packed_qkv.is_cuda
+            and inplace_update
+            and use_qk_l2norm_in_kernel
+            and kwargs.get("out") is None
+            and kwargs.get("output_indices") is None
+            and kwargs.get("chunk_indices") is None
+            and not kwargs.get("requires_intermediate_states", False)
+            and not kwargs.get("needs_track_state", False)
+            and kwargs.get("track_state") is None
+            and not kwargs.get("num_state_checkpoints", 0)
+            and query_start_loc.ndim == 1
+            and cache_indices.ndim == 1
+            and query_start_loc.numel() == cache_indices.numel() + 1
+            and cache_indices.dtype in (torch.int32, torch.int64)
+            and query_start_loc.dtype in (torch.int32, torch.int64)
+            and cache_indices.device == packed_qkv.device
+            and query_start_loc.device == packed_qkv.device
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        from sglang.srt.layers.attention.linear.kernels.gdn_pla import (
+            pla_gdn_prefill,
+            pla_gdn_prefill_supported,
+            pla_host_offsets,
+        )
+
+        offsets = pla_host_offsets(seq_lens_cpu, query_start_loc, packed_qkv.shape[0])
+        if offsets is None or not pla_gdn_prefill_supported(
+            packed_qkv,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            ssm_states,
+            num_qk_heads=num_qk_heads,
+            num_v_heads=num_v_heads,
+        ):
+            return None
+        # Alias the original post-conv buffer; never concatenate split copies.
+        tokens = packed_qkv.shape[0]
+        width_qk = num_qk_heads * 128
+        q, k, v = packed_qkv.split((width_qk, width_qk, num_v_heads * 128), dim=-1)
+        q = q.view(1, tokens, num_qk_heads, 128)
+        k = k.view(1, tokens, num_qk_heads, 128)
+        v = v.view(1, tokens, num_v_heads, 128)
+        self._prepare_triton_capture(
+            q, k, v, a, b, A_log, dt_bias, ssm_states, query_start_loc
+        )
+        return pla_gdn_prefill(
+            packed_qkv,
+            a,
+            b,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            num_qk_heads=num_qk_heads,
+            num_v_heads=num_v_heads,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            raw_cu_seqlens=offsets,
+        )
 
     def packed_decode(
         self,
@@ -262,55 +354,6 @@ class TritonGDNKernel(LinearAttnKernelBase):
                 "chunk_indices": kwargs["chunk_indices"],
                 "chunk_offsets": kwargs["chunk_offsets"],
             }
-        # Share the established PLA switch, while retaining v1.0 mapped MIS
-        # outputs and static prefill Graph tables on their existing Triton path.
-        if (
-            envs.SGLANG_SAIL_PLA_CUDA.get()
-            and is_sail()
-            and q.is_cuda
-            and inplace_update
-            and out is None
-            and not graph_table_args
-            and not kwargs.get("requires_intermediate_states", False)
-            and not kwargs.get("needs_track_state", False)
-            and kwargs.get("track_state") is None
-            and not kwargs.get("num_state_checkpoints", 0)
-            and not torch.cuda.is_current_stream_capturing()
-        ):
-            from sglang.srt.layers.attention.linear.kernels.gdn_pla import (
-                pla_gdn_prefill,
-                pla_gdn_prefill_supported,
-                pla_host_offsets,
-            )
-
-            offsets = pla_host_offsets(
-                kwargs.get("seq_lens_cpu"), query_start_loc, q.shape[1]
-            )
-            if offsets is not None and pla_gdn_prefill_supported(
-                q, k, v, g, beta, ssm_states
-            ):
-                self._prepare_triton_capture(
-                    q,
-                    k,
-                    v,
-                    g,
-                    beta,
-                    ssm_states,
-                    query_start_loc,
-                    use_qk_l2norm_in_kernel,
-                )
-                return pla_gdn_prefill(
-                    q,
-                    k,
-                    v,
-                    g,
-                    beta,
-                    ssm_states=ssm_states,
-                    cache_indices=cache_indices,
-                    query_start_loc=query_start_loc,
-                    raw_cu_seqlens=offsets,
-                    normalize_qk=use_qk_l2norm_in_kernel,
-                )
 
         if is_cpu():
             if not inplace_update:

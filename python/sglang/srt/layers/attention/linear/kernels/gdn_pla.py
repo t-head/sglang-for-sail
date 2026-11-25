@@ -10,37 +10,50 @@ from sglang.srt.layers.attention.linear.kernels.state_pool_io import (
 )
 
 
-def pla_gdn_prefill_supported(q, k, v, g, beta, ssm_states):
-    """Admit only FlashQLA's advertised geometry and precision domain."""
+def pla_gdn_prefill_supported(
+    packed_qkv, a, b, A_log, dt_bias, ssm_states, *, num_qk_heads, num_v_heads
+):
+    """Admit the packed Q|K|V and raw-gating ABI without materializing inputs."""
     if (
-        any(t.ndim != 4 for t in (q, k, v))
-        or q.shape[0] != 1
-        or q.shape[1] == 0
-        or q.shape[:2] != k.shape[:2]
-        or q.shape[:2] != v.shape[:2]
-        or q.shape[2] != k.shape[2]
-        or any(t.shape[-1] != 128 for t in (q, k, v))
-        or q.dtype not in (torch.float16, torch.bfloat16)
-        or k.dtype != q.dtype
-        or v.dtype != q.dtype
-        or g is None
-        or beta is None
-        or g.dtype != torch.float32
-        or beta.dtype != torch.float32
-        or tuple(g.shape) != tuple(v.shape[:3])
-        or tuple(beta.shape) != tuple(v.shape[:3])
+        packed_qkv.ndim != 2
+        or packed_qkv.shape[0] == 0
+        or num_qk_heads <= 0
+        or num_v_heads <= 0
+        or packed_qkv.shape[1] != (2 * num_qk_heads + num_v_heads) * 128
+        or packed_qkv.dtype not in (torch.float16, torch.bfloat16)
+        or packed_qkv.stride(1) != 1
+        or packed_qkv.stride(0) < packed_qkv.shape[1]
+        or a is None
+        or b is None
+        or A_log is None
+        or dt_bias is None
+        or any(
+            t.ndim != 2
+            or tuple(t.shape) != (packed_qkv.shape[0], num_v_heads)
+            or t.dtype != packed_qkv.dtype
+            or t.stride(1) != 1
+            or t.stride(0) < num_v_heads
+            for t in (a, b)
+        )
+        or any(
+            t.ndim != 1
+            or t.numel() != num_v_heads
+            or t.dtype not in (torch.float32, torch.float16, torch.bfloat16)
+            or not t.is_contiguous()
+            for t in (A_log, dt_bias)
+        )
         or ssm_states.ndim != 4
-        or tuple(ssm_states.shape[1:]) != (v.shape[2], 128, 128)
+        or tuple(ssm_states.shape[1:]) != (num_v_heads, 128, 128)
         or ssm_states.dtype not in (torch.float32, torch.bfloat16)
-        or any(t.device != q.device for t in (k, v, g, beta, ssm_states))
+        or any(
+            t.device != packed_qkv.device for t in (a, b, A_log, dt_bias, ssm_states)
+        )
     ):
         return False
 
-    # The optional installed PLA library owns its supported head combinations.
-    # Unknown native failures remain visible once an input has been admitted.
     from pla.prefill.flashqla.ops import SUPPORTED_HEAD_CONFIGS
 
-    return (v.shape[2], k.shape[2]) in SUPPORTED_HEAD_CONFIGS
+    return (num_v_heads, num_qk_heads) in SUPPORTED_HEAD_CONFIGS
 
 
 def pla_host_offsets(seq_lens_cpu, query_start_loc, num_tokens):
@@ -60,48 +73,51 @@ def pla_host_offsets(seq_lens_cpu, query_start_loc, num_tokens):
 
 
 def pla_gdn_prefill(
-    q,
-    k,
-    v,
-    g,
-    beta,
+    packed_qkv,
+    a,
+    b,
     *,
+    A_log,
+    dt_bias,
+    num_qk_heads,
+    num_v_heads,
     ssm_states,
     cache_indices,
     query_start_loc,
     raw_cu_seqlens,
-    normalize_qk=True,
 ):
-    # Keep the optional native extension out of the default Triton import path.
-    # Requires indexed FlashQLA with raw_cu_seqlens/normalize_qk and
-    # final_state_dtype support; g/beta are already activated by the caller.
-    from pla.prefill.flashqla import chunk_gated_delta_rule_fwd
+    # This entry consumes post-convolution Q|K|V and UNACTIVATED a/b. PLA
+    # applies -exp(A_log)*softplus(a+dt_bias), sigmoid(b), and Q/K L2 norm.
+    # Do not feed activated g/beta here or normalize Q/K in the caller.
+    from pla.prefill.flashqla import gdn_prefill_packed_qkv_fwd
 
-    # The indexed API uses [slot, H, V, K], unlike legacy non-indexed PLA
-    # states [batch, H, K, V]. Preserve both that layout and the state dtype.
-    # v1.0 pools reserve slot zero as the padding sink. Fixed-size device
-    # gather/scatter gives every sequence an independent scratch state, including
-    # negative/zero slots, without .any(), .item() or boolean compaction on GPU.
+    # Indexed PLA uses [slot,H,V,K] and requires contiguous scratch states.
+    # Preserve v1's slot-zero padding sink and independent negative-slot rows;
+    # the original pool may be strided and is written back on the device.
     pool_rows, live_rows, state = gather_pool_states(ssm_states, cache_indices)
+    # Advanced indexing/where can preserve a transposed pool's inner strides.
+    # The native indexed-state ABI requires row-major [slot,H,V,K] scratch.
+    state = state.contiguous()
     indices = torch.arange(
         cache_indices.numel(), dtype=torch.int32, device=cache_indices.device
     )
-
-    _, _, output, _, _ = chunk_gated_delta_rule_fwd(
-        q=q.contiguous(),
-        k=k.contiguous(),
-        v=v.contiguous(),
-        g=g.contiguous(),
-        beta=beta.contiguous(),
+    _, _, output, _, _ = gdn_prefill_packed_qkv_fwd(
+        packed_qkv=packed_qkv,
+        raw_gate_a=a,
+        raw_beta_b=b,
+        # The original gating kernel converts these parameters to FP32 before
+        # arithmetic. Widening FP16/BF16 here is exact; stored weights are not
+        # changed. The packed ABI requires both parameter vectors in FP32.
+        A_log=A_log.float(),
+        dt_bias=dt_bias.float(),
+        num_qk_heads=num_qk_heads,
+        num_v_heads=num_v_heads,
         initial_state=state,
         initial_state_indices=indices,
         cu_seqlens=query_start_loc.to(dtype=torch.int32).contiguous(),
-        normalize_qk=normalize_qk,
         raw_cu_seqlens=raw_cu_seqlens,
         output_final_state=False,
         final_state_dtype=ssm_states.dtype,
     )
     scatter_pool_states(ssm_states, pool_rows, live_rows, state)
-    # Indexed PLA writes final states in place. Its ht is NOT the per-chunk h
-    # needed for prefix tracking; those batches are dispatched to Triton.
     return output, None, None
