@@ -106,7 +106,8 @@ def _expand_index_page_table_kernel(
     BPP: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    # Widen before multiplying: a strided view can exceed int32 row offsets.
+    row = tl.program_id(0).to(tl.int64)
     p = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     m = p < n_pages
     page = tl.load(pt_ptr + row * pt_stride + p, mask=m, other=0)
@@ -114,7 +115,7 @@ def _expand_index_page_table_kernel(
     k = tl.arange(0, BPP)
     expanded = base[:, None] + k[None, :]
     tl.store(
-        out_ptr + row * (n_pages * BPP) + p[:, None] * BPP + k[None, :],
+        out_ptr + (row * n_pages + p[:, None]) * BPP + k[None, :],
         expanded.to(tl.int32),
         mask=m[:, None],
     )
