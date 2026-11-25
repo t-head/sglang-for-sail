@@ -30,7 +30,7 @@ from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
     cp_shard_hidden_states,
-    cp_split_before_forward,
+    cp_shard_position_ids,
     is_cp_active,
 )
 from sglang.srt.layers.dp_attention import (
@@ -2083,9 +2083,10 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
 
         shards_rows = _shards_rows_over_cp(forward_batch)
         if shards_rows:
-            hidden_states, positions = cp_split_before_forward(
-                hidden_states, positions, forward_batch
-            )
+            # PP proxies carry local rows. Positions are global on every stage.
+            if self.pp_group.is_first_rank:
+                hidden_states = cp_shard_hidden_states(hidden_states, forward_batch)
+            positions = cp_shard_position_ids(positions, forward_batch)
 
         breakable_ple = (
             self.has_ple

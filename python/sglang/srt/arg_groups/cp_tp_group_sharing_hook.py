@@ -55,17 +55,17 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
     # This hook runs before speculative defaults and NEXTN alias resolution.
     # Native MTP keeps the target's CP/TP placement. DFLASH consumes the
     # target's gathered hidden states and runs its draft with ordinary TP.
-    # Only GLM-5.3-Flash has these speculative paths ported.
     if cfg.speculative_algorithm is not None:
         if arch == "KimiK31ForConditionalGeneration":
             if cfg.speculative_algorithm.upper() != "DFLASH":
                 raise ValueError(
                     "Kimi-K3.1 CP-TP group sharing only supports --speculative-algorithm DFLASH."
                 )
-        elif model.hf_config.architectures[0] != "Glm5NextForConditionalGeneration":
-            raise ValueError(
-                "--speculative-algorithm is not supported with CP-TP group sharing."
-            )
+        elif (
+            model.hf_config.architectures[0] == "Qwen4ExpForConditionalGeneration"
+            and cfg.speculative_algorithm.upper() == "DFLASH"
+        ):
+            raise ValueError("Qwen4 CP-TP group sharing supports native MTP only.")
         if (
             arch != "KimiK31ForConditionalGeneration"
             and cfg.speculative_algorithm != "DFLASH"
@@ -94,7 +94,6 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
             "ep-size > 1": view.ep_size > 1,
             "moe-a2a-backend": view.moe_a2a_backend != "none",
             "enable-waterfill": cfg.enable_waterfill,
-            "pp-size > 1": cfg.pp_size > 1,
             # Prefill only: a decode node serves plain TP.
             "disaggregation-mode decode": cfg.disaggregation_mode == "decode",
         }

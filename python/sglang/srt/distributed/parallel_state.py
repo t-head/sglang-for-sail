@@ -92,7 +92,9 @@ _is_musa = is_musa()
 # rows / NaN under DP attention + TP MoE on MI355X). Set to 0 to restore it.
 _AITER_CAPTURE_COPY_IN = os.environ.get("SGLANG_AITER_CAPTURE_COPY_IN", "0") == "1"
 
-TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
+TensorMetadata = namedtuple(
+    "TensorMetadata", ["device", "dtype", "size"], module=__name__
+)
 
 # use int value instead of ReduceOp.SUM to support torch compile
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
