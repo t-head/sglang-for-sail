@@ -1223,7 +1223,7 @@ class SchedulerMetricsReporter:
         group = getattr(self.scheduler.tree_cache, "host_pool_group", None)
         if group is not None:
             self.stats.hicache_host_pool_tokens = {
-                entry.name.value: (
+                entry.name: (
                     entry.host_pool.logical_size - entry.host_pool.available_size(),
                     entry.host_pool.logical_size,
                 )
