@@ -26,7 +26,7 @@ from ppu_recipe import (
 )
 from recipe_bundle import sha256, wheel_inventory
 from recipe_cluster_config import BACKEND_SHA, CONFIG_NAME, load_settings
-from recipe_cluster_diagnostics import diagnostic_codes
+from recipe_cluster_diagnostics import diagnostic_codes, recent_failures
 from recipe_publish import publish, validate
 from recipe_report import legacy_result
 from recipe_report import main as report_recipe
@@ -1316,6 +1316,9 @@ class ClusterConfigBootstrapTest(unittest.TestCase):
             fresh_archive = root / "fresh-archive"
             fresh_archive.mkdir(mode=0o755)
             fresh_archive.chmod(0o755)
+            (fresh_archive / "sglang/logs/sglang-for-sail/99999-1/results").mkdir(
+                parents=True
+            )
             old_run = retained / "sglang-for-sail/770-1/fast_sanity/qwen3.8-27b"
             old_run.mkdir(parents=True)
             (old_run / "index.json").write_text("{}", encoding="utf-8")
@@ -1368,6 +1371,115 @@ class ClusterConfigBootstrapTest(unittest.TestCase):
                 str(retained), migrated_check.stdout + migrated_check.stderr
             )
 
+    def test_same_parent_run_retains_both_source_versions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            archive = root / "archive"
+            archive.mkdir(mode=0o700)
+            source = root / "scratch"
+            (source / "results").mkdir(parents=True)
+            (source / "results/summary.json").write_text('{"outcome": "pass"}')
+            (source / "launcher.log").write_text("ok\n")
+            (source / "provenance.json").write_text(
+                json.dumps(
+                    {
+                        "runtime_image": fast_result()["runtime_image"],
+                        "recipe_tree_sha256": "c" * 64,
+                    }
+                )
+            )
+            env = {
+                "TIER": "model_sanity",
+                "MODEL_KEY": "glm-5.3-flash",
+                "GITHUB_RUN_ID": "12345",
+                "GITHUB_RUN_ATTEMPT": "1",
+                "PPU_CI_PRIVATE_RESULTS_ROOT": str(archive),
+                "RUNNER_TEMP": str(root / "runner-temp"),
+                "GITHUB_WORKSPACE": str(root / "workspace"),
+                "PPU_CI_ARTIFACT_DIR": str(source),
+                "RECIPE_OUTCOME": "success",
+            }
+            for attempt, use_report in (("1", False), ("2", True)):
+                run = archive / "sglang/logs/sglang-for-sail" / f"12345-{attempt}"
+                env["GITHUB_RUN_ATTEMPT"] = attempt
+                for checkout_sha in ("a" * 40, "b" * 40):
+                    env["PPU_CI_SOURCE_SHA"] = checkout_sha
+                    with self.subTest(attempt=attempt, sha=checkout_sha):
+                        if use_report:
+                            report = root / f"report-{checkout_sha[:12]}.json"
+                            with (
+                                patch.dict(os.environ, env),
+                                patch.object(
+                                    sys, "argv", ["recipe_report", str(report)]
+                                ),
+                            ):
+                                self.assertEqual(report_recipe(), 0)
+                            result = json.loads(report.read_text())
+                            self.assertEqual(result["outcome"], "pass")
+                            self.assertIs(result["private_retention"], True)
+                            self.assertEqual(result["source_sha"], checkout_sha)
+                        else:
+                            retain(env)
+                        scope = run / checkout_sha[:12]
+                        tier = scope / env["TIER"]
+                        dest = tier / env["MODEL_KEY"]
+                        index_path = dest / "index.json"
+                        self.assertEqual(
+                            json.loads(index_path.read_text()),
+                            {
+                                "checkout_sha": checkout_sha,
+                                "run_id": env["GITHUB_RUN_ID"],
+                                "attempt": attempt,
+                                "tier": env["TIER"],
+                                "model_key": env["MODEL_KEY"],
+                                "files": {
+                                    name: sha256(dest / name)
+                                    for name in (
+                                        "launcher.log",
+                                        "summary.json",
+                                        "provenance.json",
+                                    )
+                                },
+                            },
+                        )
+                        for directory in (run, scope, tier, dest):
+                            self.assertEqual(
+                                stat.S_IMODE(directory.lstat().st_mode), 0o700
+                            )
+                        self.assertEqual(
+                            stat.S_IMODE(index_path.lstat().st_mode), 0o600
+                        )
+                        with self.assertRaisesRegex(
+                            FileExistsError, "retention destination already exists"
+                        ):
+                            retain(env)
+
+    def test_recent_failures_combines_source_scopes_and_legacy_layout(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run = root / "sglang/logs/sglang-for-sail/12345-2"
+            for scope, log in (
+                ("a" * 12, "ImagePullBackOff"),
+                ("b" * 12, "ImagePullBackOff\nInsufficient cpu"),
+                ("", "permission denied"),
+            ):
+                model = run / scope / "model_sanity/glm-5.3-flash"
+                model.mkdir(parents=True)
+                (model / "index.json").write_text("{}")
+                (model / "launcher.log").write_text(log)
+
+            self.assertEqual(
+                recent_failures(root, 12346),
+                [
+                    {
+                        "run_id": 12345,
+                        "tier": "model_sanity",
+                        "model": "glm-5.3-flash",
+                        "codes": ["capacity_cpu", "image_pull", "permission_denied"],
+                    }
+                ],
+            )
+
     def test_retain_accepts_0755_prefix_dirs_and_rejects_bad_run_dir_or_symlink(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp).resolve()
@@ -1401,7 +1513,8 @@ class ClusterConfigBootstrapTest(unittest.TestCase):
             retain(env)
 
             dest = (
-                archive / "sglang/logs/sglang-for-sail/12345-2/fast_sanity/qwen3.8-27b"
+                archive
+                / "sglang/logs/sglang-for-sail/12345-2/aaaaaaaaaaaa/fast_sanity/qwen3.8-27b"
             )
             self.assertTrue((dest / "index.json").is_file())
             self.assertTrue((dest / "launcher.log").is_file())
@@ -1416,7 +1529,10 @@ class ClusterConfigBootstrapTest(unittest.TestCase):
             )
             self.assertEqual(
                 stat.S_IMODE(
-                    (archive / "sglang/logs/sglang-for-sail/12345-2/fast_sanity")
+                    (
+                        archive
+                        / "sglang/logs/sglang-for-sail/12345-2/aaaaaaaaaaaa/fast_sanity"
+                    )
                     .lstat()
                     .st_mode
                 ),
@@ -1431,6 +1547,21 @@ class ClusterConfigBootstrapTest(unittest.TestCase):
                 ValueError, "unexpected retention directory type or mode"
             ):
                 retain({**env, "GITHUB_RUN_ID": "12346", "GITHUB_RUN_ATTEMPT": "1"})
+
+            bad_scope = archive / "sglang/logs/sglang-for-sail/12345-2" / ("b" * 12)
+            bad_scope.mkdir(mode=0o755)
+            bad_scope.chmod(0o755)
+            bad_scope_env = {**env, "PPU_CI_SOURCE_SHA": "b" * 40}
+            with self.assertRaisesRegex(
+                ValueError, "unexpected retention directory type or mode"
+            ):
+                retain(bad_scope_env)
+            bad_scope.rmdir()
+            bad_scope.symlink_to(bad_scope.with_name("a" * 12))
+            with self.assertRaisesRegex(
+                ValueError, "unexpected retention directory type or mode"
+            ):
+                retain(bad_scope_env)
 
             # Symlink prefix component must be rejected.
             sym_archive = root / "sym-archive"
@@ -1625,7 +1756,7 @@ class ClusterTransportTest(unittest.TestCase):
                 if not tampered:
                     archived_index = (
                         retained
-                        / "sglang/logs/sglang-for-sail/12-1/fast_sanity"
+                        / "sglang/logs/sglang-for-sail/12-1/aaaaaaaaaaaa/fast_sanity"
                         / model
                         / "index.json"
                     )
@@ -1743,7 +1874,8 @@ class ClusterTransportTest(unittest.TestCase):
             self.assertEqual(len(list(scratch.glob("cluster.*/launcher.log"))), 1)
             self.assertEqual(list(archive.glob("cluster.*")), [])
             archived_dir = (
-                archive / "sglang/logs/sglang-for-sail/42-1/fast_sanity/qwen3.8-27b"
+                archive
+                / "sglang/logs/sglang-for-sail/42-1/aaaaaaaaaaaa/fast_sanity/qwen3.8-27b"
             )
             self.assertTrue((archived_dir / "index.json").is_file())
             self.assertTrue((archived_dir / "launcher.log").is_file())
