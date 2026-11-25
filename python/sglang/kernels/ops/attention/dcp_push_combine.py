@@ -37,9 +37,18 @@ def _jit_module(world_size: int) -> Module:
         "dcp_push_combine",
         *args,
         cuda_files=["dsa/dcp_push_combine.cuh"],
-        cuda_wrappers=[("run", f"DcpPushCombineKernel<{args}>::run")],
+        cuda_wrappers=[
+            ("run", f"DcpPushCombineKernel<{args}>::run"),
+            ("max_active_blocks", f"DcpPushCombineKernel<{args}>::max_active_blocks"),
+        ],
         extra_cuda_cflags=["-O3"],
     )
+
+
+def max_active_blocks(world_size: int, device_id: int) -> int:
+    """Maximum co-resident push-combine blocks on ``device_id``, queried from
+    runtime occupancy so every block in a Lamport grid can run concurrently."""
+    return int(_jit_module(world_size).max_active_blocks(device_id))
 
 
 _COMM_MAP: dict[int, Communicator] = {}

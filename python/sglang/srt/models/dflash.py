@@ -503,6 +503,8 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
             self.absorb_kv_b_proj()
 
         self.kv_b_proj.weight.weight_loader = load_kv_b_proj
+        self.dcp_v_preproject = is_sail()
+        self._dcp_v_weights: Optional[torch.Tensor] = None
 
     def _load_fused_a_proj_shard(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, shard_id: int
@@ -526,6 +528,8 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
             self.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
         )
         self.w_vc = bind_or_assign(self.w_vc, w_vc.contiguous().transpose(1, 2))
+        if self._dcp_v_weights is not None:
+            self._prepare_dcp_v_weights(get_parallel().dcp_group)
 
     def forward(
         self,

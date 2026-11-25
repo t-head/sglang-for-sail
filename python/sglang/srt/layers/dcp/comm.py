@@ -38,12 +38,13 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.runtime_context import get_parallel, get_platform
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_sail
 from sglang.srt.utils.common import is_fi_a2a_supported
 
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
+_is_sail = is_sail()
 
 
 def _ag_lse(cp_attn_lse: torch.Tensor, cp_group: GroupCoordinator) -> torch.Tensor:
@@ -521,11 +522,16 @@ def init_dcp_push_combine(cp_group: "GroupCoordinator", num_heads: int) -> None:
         * (num_heads // cp_group.world_size)
         * pc.SLOT_BYTES_PER_ROW
     )
+    device = torch.device("cuda", torch.cuda.current_device())
+    max_push_blocks = (
+        pc.max_active_blocks(cp_group.world_size, device.index) if _is_sail else None
+    )
     comm = CustomAllReduceV2(
         cp_group.cpu_group,
-        torch.device("cuda", torch.cuda.current_device()),
+        device,
         max_pull_size=0,
         max_push_size=slot_bytes,
+        max_push_blocks=max_push_blocks,
     )
     if comm.disabled:
         logger.warning(
