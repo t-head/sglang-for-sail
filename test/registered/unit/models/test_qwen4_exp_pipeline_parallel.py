@@ -58,6 +58,19 @@ class TestQwenExpContextParallelRows(unittest.TestCase):
         self.shard_positions.assert_called_once_with(self.positions, self.batch)
         self.assertIs(result, local_rows)
 
+    def test_mtp_fuses_matching_local_rows(self):
+        target = self.hidden + 100
+        self.batch.spec_info = SimpleNamespace(hidden_states=target)
+        fuse = Mock(side_effect=torch.add)
+
+        result = self.forward(inputs_embeds=self.hidden, mtp_input_fusion=fuse)
+
+        fuse.assert_called_once()
+        embeddings, target_states = fuse.call_args.args
+        torch.testing.assert_close(embeddings, self.hidden[::2])
+        torch.testing.assert_close(target_states, target[::2])
+        torch.testing.assert_close(result, (self.hidden + target)[::2])
+
 
 if __name__ == "__main__":
     unittest.main()

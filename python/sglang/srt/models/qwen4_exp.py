@@ -4,7 +4,7 @@ import math
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Iterable, Optional, Set, Tuple, Union
+from typing import Any, Callable, Iterable, Optional, Set, Tuple, Union
 
 import msgspec
 import sympy
@@ -2063,13 +2063,26 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         forward_batch: ForwardBatch,
         inputs_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        mtp_input_fusion: Optional[
+            Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+        ] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], PPProxyTensors]:
+        shards_rows = _shards_rows_over_cp(forward_batch)
         if self.pp_group.is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_tokens(input_ids)
             residual_batch.start(forward_batch)
+            if shards_rows:
+                hidden_states = cp_shard_hidden_states(hidden_states, forward_batch)
+            if mtp_input_fusion is not None:
+                target_hidden_states = forward_batch.spec_info.hidden_states
+                if shards_rows:
+                    target_hidden_states = cp_shard_hidden_states(
+                        target_hidden_states, forward_batch
+                    )
+                hidden_states = mtp_input_fusion(hidden_states, target_hidden_states)
         else:
             assert pp_proxy_tensors is not None
             # Only the first stage embeds multimodal inputs; the last stage needs
@@ -2081,11 +2094,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 pp_proxy_tensors, forward_batch
             )
 
-        shards_rows = _shards_rows_over_cp(forward_batch)
         if shards_rows:
-            # PP proxies carry local rows. Positions are global on every stage.
-            if self.pp_group.is_first_rank:
-                hidden_states = cp_shard_hidden_states(hidden_states, forward_batch)
             positions = cp_shard_position_ids(positions, forward_batch)
 
         breakable_ple = (
