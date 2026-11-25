@@ -874,6 +874,70 @@ def test_topk_v2_candidates_match_ragged(seq: int, with_row_starts: bool) -> Non
         assert bool((cand[row, ~valid, 0] == 0).all())
 
 
+@pytest.mark.skipif(is_hip(), reason="CUDA candidate epilogue")
+@pytest.mark.parametrize("seq", [100, 2048, 5000, 12000, 24000, 40000])
+@pytest.mark.parametrize("with_row_starts", [False, True])
+@torch.inference_mode()
+def test_topk_v2_candidates_bf16(seq: int, with_row_starts: bool) -> None:
+    """Native bf16 candidate top-k handles unaligned strides/starts, wide range,
+    and stable ties without mutating the input buffer."""
+    k, batch, world, rank = 2048, 5, 8, 5
+    g = torch.Generator(device="cuda").manual_seed(seq + 101)
+    # Deliberately unaligned row stride (not a multiple of 4 or 8).
+    width = seq + 19
+    scores = torch.randn(batch, width, generator=g, device="cuda").to(torch.bfloat16)
+    # Row 0: normal + ties + values beyond fp16 max; Row 1: overflow ties (> k)
+    # including -0.0/+0.0; Row 2: shorter window with -inf ties;
+    # Row 3: saturated top bin (4095) with > k values including +inf; Row 4: empty.
+    scores[0, :3] = torch.tensor([1e5, -1e5, 7e4], device="cuda", dtype=torch.bfloat16)
+    scores[0, 7:400] = scores[0, 7:8]
+    scores[1].zero_()
+    scores[1, ::2] = torch.tensor(-0.0, device="cuda", dtype=torch.bfloat16)
+    scores[1, 17] = 1.0
+    scores[2].fill_(float("-inf"))
+    scores[2, 5:10] = 2.0
+    scores[3].fill_(2e5)
+    scores[3, 10:25] = float("inf")
+    before = scores.clone()
+    seq_lens = torch.tensor(
+        [seq, seq, max(seq // 3, 1), seq, 0], dtype=torch.int32, device="cuda"
+    )
+    starts = (
+        torch.tensor([0, 3, 13, 1, 5], dtype=torch.int32, device="cuda")
+        if with_row_starts
+        else None
+    )
+    cand = torch.full((batch, k, 2), -2, dtype=torch.int32, device="cuda")
+    topk_transform_candidates_v2(
+        scores,
+        seq_lens,
+        out_candidates=cand,
+        world=world,
+        rank=rank,
+        row_starts=starts,
+        stable_ties=True,
+    )
+    assert torch.equal(scores, before), "bf16 candidates must not mutate scores"
+    for row in range(batch):
+        length = int(seq_lens[row])
+        start = 0 if starts is None else int(starts[row])
+        window = scores[row, start : start + length]
+        expected_n = min(length, k)
+        expected = (
+            torch.argsort(window.float(), descending=True, stable=True)[:expected_n]
+            .sort()
+            .values
+        )
+        pos = cand[row, :, 1].long()
+        valid = pos >= 0
+        assert int(valid.sum()) == expected_n
+        assert torch.equal(pos[valid].sort().values, expected * world + rank)
+        local = (pos[valid] - rank) // world
+        want_bits = window[local].float().view(torch.int32)
+        assert torch.equal(cand[row, valid, 0], want_bits)
+        assert bool((cand[row, ~valid, 0] == 0).all())
+
+
 @pytest.mark.skipif(not is_hip(), reason="ROCm split path")
 @pytest.mark.parametrize("nvals", [64, 1024, 16384])
 @pytest.mark.parametrize("batch,seq", [(1, 131072), (8, 131072)])

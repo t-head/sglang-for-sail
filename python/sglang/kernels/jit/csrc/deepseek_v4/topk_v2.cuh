@@ -44,6 +44,10 @@ using Register2 = impl::TopKRegister<2>;   // <= 8192, register-resident, 1 read
 using Register4 = impl::TopKRegister<4>;   // <= 16384, register-resident, 1 read
 using Candidate = impl::TopKCandidate<4>;  // <= 2048 blocks of 8, 1 gathered read
 using Streaming = impl::TopKStreaming;
+using BF16Register1 = impl::TopKBF16Register<1>;  // <= 8192, register-resident, 1 read
+using BF16Register2 = impl::TopKBF16Register<2>;  // <= 16384, register-resident, 1 read
+using BF16Register4 = impl::TopKBF16Register<4>;  // <= 32768, register-resident, 1 read
+using BF16Streaming = impl::TopKBF16Streaming;
 
 constexpr uint32_t kBlockSize = impl::TopKConfig::kBlockSize;
 constexpr uint32_t kOccupancy = impl::TopKConfig::kOccupancy;
@@ -503,6 +507,66 @@ TOPK_KERNEL void topk_candidates_kernel(const __grid_constant__ TopKCandidatesPa
   }
 
   ragged_window_topk<kPDL>(score, row_start, seq_len, topk, s_topk_indices, 0, &smem);
+  device::PDLTriggerSecondary<kPDL>();
+  __syncthreads();
+  for_each_item(topk, [&](uint32_t tx, uint32_t) { emit(tx, s_topk_indices[tx]); });
+}
+
+struct TopKCandidatesBF16Params {
+  const bf16_t* __restrict__ scores;
+  const int32_t* __restrict__ seq_lens;
+  const int32_t* __restrict__ row_starts;  // null => every window starts at 0
+  int32_t* __restrict__ candidates;        // [rows, topk, 2]
+  int64_t score_stride;
+  uint32_t topk;
+  int32_t cand_world;
+  int32_t cand_rank;
+};
+
+template <bool kPDL, int kLevel>
+TOPK_KERNEL void topk_candidates_bf16_kernel(const __grid_constant__ TopKCandidatesBF16Params params) {
+  device::enable_smem_spilling();
+  __shared__ impl::TopKBF16Base::Smem smem;
+  __shared__ int32_t s_topk_indices[kMaxTopK];
+
+  const auto bx = blockIdx.x;
+  const auto seq_len = static_cast<uint32_t>(params.seq_lens[bx]);
+  const auto row_start = params.row_starts == nullptr ? 0u : static_cast<uint32_t>(params.row_starts[bx]);
+  const auto topk = params.topk;
+  const auto out = reinterpret_cast<int2*>(params.candidates) + bx * static_cast<int64_t>(topk);
+  const auto* row = params.scores + bx * params.score_stride + row_start;
+  const auto emit = [&](uint32_t tx, int32_t idx) {
+    out[tx] = idx >= 0
+                  ? make_int2(__float_as_int(device::cast<float>(row[idx])), idx * params.cand_world + params.cand_rank)
+                  : make_int2(0, -1);
+  };
+
+  if (seq_len <= topk) {
+    device::PDLWaitPrimary<kPDL>();
+    device::PDLTriggerSecondary<kPDL>();
+    for_each_item(topk, [&](uint32_t tx, uint32_t) { emit(tx, tx < seq_len ? static_cast<int32_t>(tx) : -1); });
+    return;
+  }
+
+  const auto problem = TopKProblem{
+      .in = nullptr,
+      .out = s_topk_indices,
+      .topk = topk,
+      .seq_len = seq_len,
+  };
+  if constexpr (kLevel == 0) {
+    BF16Register1::forward<kPDL>(row, problem, &smem);
+  } else if constexpr (kLevel == 1) {
+    BF16Register2::forward<kPDL>(row, problem, &smem);
+  } else if constexpr (kLevel == 2) {
+    BF16Register4::forward<kPDL>(row, problem, &smem);
+  } else {
+    if (seq_len <= BF16Register2::kMaxSeqLen) {
+      BF16Register2::forward<kPDL>(row, problem, &smem);
+    } else {
+      BF16Streaming::forward<kPDL>(row, problem, &smem);
+    }
+  }
   device::PDLTriggerSecondary<kPDL>();
   __syncthreads();
   for_each_item(topk, [&](uint32_t tx, uint32_t) { emit(tx, s_topk_indices[tx]); });
@@ -1814,12 +1878,14 @@ struct TopKKernel {
     auto L = SymbolicSize{"max_seq_len"};
     auto S = SymbolicSize{"score_stride"};
     auto K = SymbolicSize{"topk"};
+    auto dtype_ = SymbolicDType{};
+    dtype_.set_options<float, bf16_t>();
     auto device_ = SymbolicDevice{};
     device_.set_options<kDLGPU>();
 
     TensorMatcher({B, L})  // score
         .with_strides({S, 1})
-        .with_dtype<float>()
+        .with_dtype(dtype_)
         .with_device(device_)
         .verify(scores);
     TensorMatcher({B})  // seq_lens
@@ -1839,10 +1905,40 @@ struct TopKKernel {
       row_starts_ptr = static_cast<const int32_t*>(row_starts.value().data_ptr());
     }
 
-    RuntimeCheck(S.unwrap() % 4 == 0, "score_stride must be a multiple of 4 (16-byte vectorized load)");
     const auto topk = static_cast<uint32_t>(K.unwrap());
     RuntimeCheck(topk > 0 && topk <= kMaxTopK, "topk must be in (0, 2048]");
     RuntimeCheck(world >= 1 && rank >= 0 && rank < world, "invalid world/rank");
+
+    if (dtype_.is_type<bf16_t>()) {
+      const auto params = TopKCandidatesBF16Params{
+          .scores = static_cast<const bf16_t*>(scores.data_ptr()),
+          .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
+          .row_starts = row_starts_ptr,
+          .candidates = static_cast<int32_t*>(candidates.data_ptr()),
+          .score_stride = S.unwrap(),
+          .topk = topk,
+          .cand_world = static_cast<int32_t>(world),
+          .cand_rank = static_cast<int32_t>(rank),
+      };
+      const auto max_seq_len = static_cast<uint32_t>(L.unwrap());
+      const auto launch_bf16 = [&]<int kLevel>() {
+        LaunchKernel(static_cast<uint32_t>(B.unwrap()), kBlockSize, device_.unwrap())
+            .config({.use_pdl = kUsePDL})
+            .launch(topk_candidates_bf16_kernel<kUsePDL, kLevel>, params);
+      };
+      if (max_seq_len <= BF16Register1::kMaxSeqLen) {
+        launch_bf16.template operator()<0>();
+      } else if (max_seq_len <= BF16Register2::kMaxSeqLen) {
+        launch_bf16.template operator()<1>();
+      } else if (max_seq_len <= BF16Register4::kMaxSeqLen) {
+        launch_bf16.template operator()<2>();
+      } else {
+        launch_bf16.template operator()<3>();
+      }
+      return;
+    }
+
+    RuntimeCheck(S.unwrap() % 4 == 0, "score_stride must be a multiple of 4 (16-byte vectorized load)");
 
     const auto params = TopKCandidatesParams{
         .scores = static_cast<float*>(scores.data_ptr()),
