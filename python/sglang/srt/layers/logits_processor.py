@@ -1570,7 +1570,8 @@ class LogitsProcessor(nn.Module):
 
     def _can_gather_attn_tp_to_float32(self, logits: torch.Tensor) -> bool:
         return (
-            self.vocab_size % self.attn_tp_size == 0
+            self.valid_vocab_size == self.vocab_size
+            and self.vocab_size % self.attn_tp_size == 0
             and not self.do_tensor_parallel_all_gather_dp_attn
             and logits.is_cuda
             and not (_is_npu or _is_cpu)
