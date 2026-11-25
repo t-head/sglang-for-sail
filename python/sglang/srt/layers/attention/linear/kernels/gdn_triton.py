@@ -1,11 +1,14 @@
+from collections import OrderedDict
 from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
 from sglang.srt.utils import is_cpu, is_npu, is_xpu
+from sglang.srt.utils.device import is_sail
 
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
@@ -46,6 +49,59 @@ class TritonGDNKernel(LinearAttnKernelBase):
     supports_strided_target_verify_qkv: bool = True
     # The chunk kernel steps slots by the pool's stride(0) in int64.
     extend_honors_slot_pitch: bool = True
+
+    def __init__(self):
+        self._triton_capture_signatures = OrderedDict()
+
+    def _prepare_triton_capture(
+        self, q, k, v, g, beta, ssm_states, query_start_loc, normalize_qk
+    ):
+        from sglang.kernels.ops.attention.fla.chunk import CHUNK_SIZE
+        from sglang.kernels.ops.attention.fla.index import (
+            prepare_chunk_indices,
+            prepare_chunk_offsets,
+        )
+
+        # Populate the exact metadata cache keys used by direct capture. PLA's
+        # own host plan does not populate these Triton caches.
+        prepare_chunk_indices(query_start_loc, CHUNK_SIZE)
+        prepare_chunk_offsets(query_start_loc, CHUNK_SIZE)
+        output_chunk_size = min(CHUNK_SIZE, max(16, 1 << (q.shape[1] - 1).bit_length()))
+        prepare_chunk_indices(query_start_loc, output_chunk_size)
+        signature = (
+            tuple(
+                (t.device, t.dtype, tuple(t.shape), tuple(t.stride()))
+                for t in (q, k, v, g, beta)
+            ),
+            ssm_states.dtype,
+            query_start_loc.numel(),
+            query_start_loc.dtype,
+            normalize_qk,
+        )
+        if signature not in self._triton_capture_signatures:
+            # Autotuning must also finish before capture. Use a scratch pool:
+            # warmup must not apply the recurrence twice to the caller's state.
+            count = query_start_loc.numel() - 1
+            scratch = ssm_states.new_zeros((count, *ssm_states.shape[1:]))
+            slots = torch.arange(count, dtype=query_start_loc.dtype, device=q.device)
+            chunk_gated_delta_rule(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=scratch,
+                initial_state_indices=slots,
+                cu_seqlens=query_start_loc,
+                head_first=False,
+                use_qk_l2norm_in_kernel=normalize_qk,
+                inplace_update=True,
+            )
+            self._triton_capture_signatures[signature] = None
+            if len(self._triton_capture_signatures) > 64:
+                self._triton_capture_signatures.popitem(last=False)
+        else:
+            self._triton_capture_signatures.move_to_end(signature)
 
     def packed_decode(
         self,
@@ -206,6 +262,56 @@ class TritonGDNKernel(LinearAttnKernelBase):
                 "chunk_indices": kwargs["chunk_indices"],
                 "chunk_offsets": kwargs["chunk_offsets"],
             }
+        # Share the established PLA switch, while retaining v1.0 mapped MIS
+        # outputs and static prefill Graph tables on their existing Triton path.
+        if (
+            envs.SGLANG_SAIL_PLA_CUDA.get()
+            and is_sail()
+            and q.is_cuda
+            and inplace_update
+            and out is None
+            and not graph_table_args
+            and not kwargs.get("requires_intermediate_states", False)
+            and not kwargs.get("needs_track_state", False)
+            and kwargs.get("track_state") is None
+            and not kwargs.get("num_state_checkpoints", 0)
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            from sglang.srt.layers.attention.linear.kernels.gdn_pla import (
+                pla_gdn_prefill,
+                pla_gdn_prefill_supported,
+                pla_host_offsets,
+            )
+
+            offsets = pla_host_offsets(
+                kwargs.get("seq_lens_cpu"), query_start_loc, q.shape[1]
+            )
+            if offsets is not None and pla_gdn_prefill_supported(
+                q, k, v, g, beta, ssm_states
+            ):
+                self._prepare_triton_capture(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    ssm_states,
+                    query_start_loc,
+                    use_qk_l2norm_in_kernel,
+                )
+                return pla_gdn_prefill(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                    raw_cu_seqlens=offsets,
+                    normalize_qk=use_qk_l2norm_in_kernel,
+                )
+
         if is_cpu():
             if not inplace_update:
                 raise NotImplementedError(

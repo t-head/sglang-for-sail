@@ -1631,6 +1631,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             h_track_buf = None
             if (
                 forward_metadata.has_mamba_track_mask
+                and forward_metadata.track_ssm_h_src is not None
                 and forward_metadata.track_ssm_h_src.numel() > 0
                 and self.kernel_dispatcher.extend_kernel.supports_track_state_snapshot
             ):
@@ -1651,6 +1652,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states=ssm_states_contig,
                 cache_indices=state_cache_indices,
                 query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
                 state_checkpoint_cu_starts=(
                     forward_metadata.state_checkpoint_cu_starts
                 ),
@@ -1668,6 +1670,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 track_state=h_track_buf,
                 needs_track_state=(
                     forward_metadata.has_mamba_track_mask
+                    and forward_metadata.track_ssm_h_src is not None
                     and forward_metadata.track_ssm_h_src.numel() > 0
                 ),
                 track_chunk_idx=(
