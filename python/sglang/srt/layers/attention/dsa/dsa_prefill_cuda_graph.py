@@ -147,7 +147,51 @@ def pcg_dsa_indexer_prefill_split(
         enable_dual_stream=False,
         forward_batch=forward_batch,
     )
-    if (
+    if indexer.use_fp4:
+        # The FP4/MXFP4 indexer format must reach `_get_topk_ragged` as a
+        # (packed, scale_factors) tuple, exactly like the eager path produces.
+        # Reconstitute the gate input from the quantized activation tuple,
+        # compute head-gate weights via the piecewise-graph custom op (no
+        # q_scale factor), and slice both packed Q members to the unpadded
+        # token count.
+        from sglang.kernels.ops.attention.dsa.triton_kernel import (
+            downcast_to_mxfp4_indexer,
+        )
+        from sglang.srt.layers.attention.dsa.dsa_indexer import (
+            logits_head_gate_no_q_scale_pcg,
+        )
+
+        if isinstance(x, tuple):
+            x_q, x_s = x[0], x[1]
+            x_for_gate = None
+            if (
+                x_s is not None
+                and x_q.dim() == 2
+                and x_s.dim() == 2
+                and x_q.shape[0] == x_s.shape[0]
+            ):
+                m, n, ng = x_q.shape[0], x_q.shape[1], x_s.shape[1]
+                if ng > 0 and n % ng == 0:
+                    x_for_gate = (
+                        x_q.to(torch.float32)
+                        .view(m, ng, n // ng)
+                        .mul_(x_s.to(torch.float32).unsqueeze(-1))
+                        .view(m, n)
+                        .to(torch.bfloat16)
+                    )
+            if x_for_gate is None:
+                x_for_gate = x_q.to(torch.bfloat16)
+        else:
+            x_for_gate = x
+        q_packed, q_sf = downcast_to_mxfp4_indexer(query, -1)
+        q_fp8 = (q_packed[:extend_num_tokens], q_sf[:extend_num_tokens])
+        weights = logits_head_gate_no_q_scale_pcg(
+            x_for_gate,
+            indexer.weights_proj.weight,
+            indexer.n_heads**-0.5,
+            indexer.softmax_scale,
+        )
+    elif (
         _is_cuda
         and indexer.bf16_head_gate
         and indexer.skip_rope
