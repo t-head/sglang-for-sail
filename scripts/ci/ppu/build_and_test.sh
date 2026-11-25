@@ -166,9 +166,9 @@ if [[ "$ppu_compute_capability" == "8.9" ]]; then
         grep -Eq "^Ran $gdn_expected tests in " "$artifacts/$gdn_name.log"
         grep -Fxq 'OK' "$artifacts/$gdn_name.log"
     }
-    run_gdn_pla_test gdn-contract test/registered/unit/layers/attention/test_gdn_pla_prefill.py 3
+    run_gdn_pla_test gdn-contract test/registered/unit/layers/attention/test_gdn_pla_prefill.py 8
     run_gdn_pla_test gdn-state test/registered/unit/layers/attention/test_mamba_track_state_dtype.py 7
-    run_gdn_pla_test gdn-ppu test/registered/kernels/ops/attention/test_gdn_pla_prefill.py 5
+    run_gdn_pla_test gdn-ppu test/registered/kernels/ops/attention/test_gdn_pla_prefill.py 7
 else
     printf 'GDN PLA native regressions are not scheduled for compute capability %s.\n' "$ppu_compute_capability"
 fi

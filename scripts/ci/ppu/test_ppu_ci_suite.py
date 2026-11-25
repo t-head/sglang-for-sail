@@ -70,9 +70,9 @@ class TestPPUCISuite(CustomTestCase):
             + source.split(begin, 1)[1].split(end, 1)[0]
         )
         files = [
-            ("gdn-contract", "unit/layers/attention/test_gdn_pla_prefill.py", 3),
+            ("gdn-contract", "unit/layers/attention/test_gdn_pla_prefill.py", 8),
             ("gdn-state", "unit/layers/attention/test_mamba_track_state_dtype.py", 7),
-            ("gdn-ppu", "kernels/ops/attention/test_gdn_pla_prefill.py", 5),
+            ("gdn-ppu", "kernels/ops/attention/test_gdn_pla_prefill.py", 7),
         ]
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "repo with spaces"

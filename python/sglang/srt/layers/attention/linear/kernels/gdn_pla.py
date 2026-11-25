@@ -5,6 +5,70 @@ from numbers import Integral
 import torch
 
 
+def gather_pool_states(states, indices):
+    # v0.5.23 permits slot zero; only negative indices are padding.
+    live = (indices >= 0).view(-1, *((1,) * (states.ndim - 1)))
+    state = torch.where(live, states[indices.clamp_min(0)], 0).contiguous()
+    return indices, live, state
+
+
+def scatter_pool_states(states, indices, live, updates):
+    if states.device.type == "cpu":
+        # CPU contract/reference path; no device synchronization is involved.
+        valid = live.reshape(-1)
+        states[indices[valid]] = updates[valid].to(states.dtype)
+    else:
+        from sglang.kernels.ops.mamba.state_pool_rows import scatter_state_pool_rows_
+
+        scatter_state_pool_rows_(states, updates, indices)
+
+
+def pla_gdn_prefill_supported(
+    packed_qkv, a, b, A_log, dt_bias, ssm_states, *, num_qk_heads, num_v_heads
+):
+    """Admit the packed Q|K|V and raw-gating ABI without materializing inputs."""
+    if (
+        packed_qkv.ndim != 2
+        or packed_qkv.shape[0] == 0
+        or num_qk_heads <= 0
+        or num_v_heads <= 0
+        or packed_qkv.shape[1] != (2 * num_qk_heads + num_v_heads) * 128
+        or packed_qkv.dtype not in (torch.float16, torch.bfloat16)
+        or packed_qkv.stride(1) != 1
+        or packed_qkv.stride(0) < packed_qkv.shape[1]
+        or a is None
+        or b is None
+        or A_log is None
+        or dt_bias is None
+        or any(
+            t.ndim != 2
+            or tuple(t.shape) != (packed_qkv.shape[0], num_v_heads)
+            or t.dtype != packed_qkv.dtype
+            or t.stride(1) != 1
+            or t.stride(0) < num_v_heads
+            for t in (a, b)
+        )
+        or any(
+            t.ndim != 1
+            or t.numel() != num_v_heads
+            or t.dtype not in (torch.float32, torch.float16, torch.bfloat16)
+            or not t.is_contiguous()
+            for t in (A_log, dt_bias)
+        )
+        or ssm_states.ndim != 4
+        or tuple(ssm_states.shape[1:]) != (num_v_heads, 128, 128)
+        or ssm_states.dtype not in (torch.float32, torch.bfloat16)
+        or any(
+            t.device != packed_qkv.device for t in (a, b, A_log, dt_bias, ssm_states)
+        )
+    ):
+        return False
+
+    from pla.prefill.flashqla.ops import SUPPORTED_HEAD_CONFIGS
+
+    return (num_v_heads, num_qk_heads) in SUPPORTED_HEAD_CONFIGS
+
+
 def pla_host_offsets(seq_lens_cpu, query_start_loc, num_tokens):
     """Reject stale/padded batch metadata without reading device offsets."""
     if isinstance(seq_lens_cpu, torch.Tensor) and seq_lens_cpu.device.type == "cpu":
@@ -22,54 +86,51 @@ def pla_host_offsets(seq_lens_cpu, query_start_loc, num_tokens):
 
 
 def pla_gdn_prefill(
-    q,
-    k,
-    v,
-    g,
-    beta,
+    packed_qkv,
+    a,
+    b,
     *,
+    A_log,
+    dt_bias,
+    num_qk_heads,
+    num_v_heads,
     ssm_states,
     cache_indices,
     query_start_loc,
     raw_cu_seqlens,
 ):
-    # Keep the optional native extension out of the default Triton import path.
-    # Requires indexed FlashQLA with raw_cu_seqlens/normalize_qk and
-    # final_state_dtype support; g/beta are already activated by the caller.
-    from pla.prefill.flashqla import chunk_gated_delta_rule_fwd
+    # This entry consumes post-convolution Q|K|V and UNACTIVATED a/b. PLA
+    # applies -exp(A_log)*softplus(a+dt_bias), sigmoid(b), and Q/K L2 norm.
+    # Do not feed activated g/beta here or normalize Q/K in the caller.
+    from pla.prefill.flashqla import gdn_prefill_packed_qkv_fwd
 
-    # The indexed API uses [slot, H, V, K], unlike legacy non-indexed PLA
-    # states [batch, H, K, V]. Preserve both that layout and the state dtype.
-    needs_gather = not ssm_states.is_contiguous() or bool((cache_indices < 0).any())
-    if needs_gather:
-        valid = cache_indices >= 0
-        state = ssm_states[cache_indices.clamp_min(0)].contiguous()
-        state.masked_fill_(~valid.view(-1, *([1] * (state.ndim - 1))), 0)
-    else:
-        state = ssm_states
-    indices = cache_indices.to(dtype=torch.int32).contiguous()
-    if needs_gather:
-        indices = torch.arange(
-            indices.numel(), dtype=torch.int32, device=indices.device
-        )
-
-    _, _, output, _, _ = chunk_gated_delta_rule_fwd(
-        q=q.contiguous(),
-        k=k.contiguous(),
-        v=v.contiguous(),
-        g=g.contiguous(),
-        beta=beta.contiguous(),
+    # Indexed PLA uses [slot,H,V,K] and requires contiguous scratch states.
+    # Preserve v0.5.23's valid slot zero and independent negative-slot rows;
+    # the original pool may be strided and is written back on the device.
+    pool_rows, live_rows, state = gather_pool_states(ssm_states, cache_indices)
+    # Advanced indexing/where can preserve a transposed pool's inner strides.
+    # The native indexed-state ABI requires row-major [slot,H,V,K] scratch.
+    state = state.contiguous()
+    indices = torch.arange(
+        cache_indices.numel(), dtype=torch.int32, device=cache_indices.device
+    )
+    _, _, output, _, _ = gdn_prefill_packed_qkv_fwd(
+        packed_qkv=packed_qkv,
+        raw_gate_a=a,
+        raw_beta_b=b,
+        # The original gating kernel converts these parameters to FP32 before
+        # arithmetic. Widening FP16/BF16 here is exact; stored weights are not
+        # changed. The packed ABI requires both parameter vectors in FP32.
+        A_log=A_log.float(),
+        dt_bias=dt_bias.float(),
+        num_qk_heads=num_qk_heads,
+        num_v_heads=num_v_heads,
         initial_state=state,
         initial_state_indices=indices,
         cu_seqlens=query_start_loc.to(dtype=torch.int32).contiguous(),
-        normalize_qk=True,
         raw_cu_seqlens=raw_cu_seqlens,
         output_final_state=False,
         final_state_dtype=ssm_states.dtype,
     )
-    if needs_gather:
-        # Negative slots are zero-initialized scratch rows, never pool slots.
-        ssm_states[cache_indices[valid]] = state[valid]
-    # Indexed PLA writes final states in place. Its ht is NOT the per-chunk h
-    # needed for prefix tracking; those batches are dispatched to Triton.
+    scatter_pool_states(ssm_states, pool_rows, live_rows, state)
     return output, None, None
