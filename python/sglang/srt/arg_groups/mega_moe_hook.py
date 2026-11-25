@@ -64,6 +64,9 @@ def check_mega_moe_compat(server_args: ServerArgs) -> None:
         )
     platform = get_platform()
     if platform.is_ppu:
+        if platform.device_sm == 80:
+            # The SM80 path depends on the resolved model and quantization.
+            return
         if platform.device_sm < 89:
             raise ValueError("--moe-a2a-backend megamoe on PPU requires SM89 or newer.")
         _require_ppu_mega_moe_deep_gemm_apis()
@@ -120,6 +123,23 @@ def validate_mega_moe_token_budget_for_model(server_args: ServerArgs) -> None:
     if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
         return
     model_config = model_config_of(server_args)
+    platform = get_platform()
+    if platform.is_ppu and platform.device_sm == 80:
+        if not (
+            model_config.hf_config.model_type == "deepseek_v41"
+            and model_config.quantization == "w8a8_int8"
+            and not model_config.is_fp4_experts
+        ):
+            raise ValueError(
+                "--moe-a2a-backend megamoe on PPU SM80 requires DeepSeek-V4.1 "
+                "with INT8 experts and --quantization w8a8_int8."
+            )
+        from sglang.srt.layers.moe.mega_moe_sm80 import (
+            require_sm80_int8_mega_moe_apis,
+        )
+
+        require_sm80_int8_mega_moe_apis()
+
     model_arch = model_config.hf_config.architectures[0]
     if mega_moe_needs_token_budget(
         model_arch, model_config.hf_quant_config, cfg.quantization

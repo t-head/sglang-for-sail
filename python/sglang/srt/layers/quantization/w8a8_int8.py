@@ -15,6 +15,10 @@ from sglang.srt.layers.amx_utils import (
     _amx_process_weight_after_loading,
 )
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.mega_moe_sm80 import (
+    SM80_INT8_MMA_TYPE,
+    build_sm80_mega_moe_experts_weights,
+)
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
@@ -29,6 +33,7 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignor
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import (
     cpu_has_amx_support,
+    get_device_sm,
     is_cpu,
     is_cuda,
     is_host_cpu_arm64,
@@ -376,6 +381,12 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+        if _is_sail and get_device_sm() == 80 and get_moe_a2a_backend().is_megamoe():
+            build_sm80_mega_moe_experts_weights(layer)
+            return
+
         if _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
         else:
@@ -447,6 +458,9 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> torch.Tensor:
+        if getattr(layer, "_mega_moe_mma_type", None) == SM80_INT8_MMA_TYPE:
+            raise RuntimeError("Prepared INT8 MegaMoE weights require the MegaMoE path")
+
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
         from sglang.srt.layers.moe.token_dispatcher.deepep import (
             DeepEPLLDispatchOutput,

@@ -19,6 +19,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.mega_moe_sm80 import SM80_INT8_MMA_TYPE
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -1024,6 +1025,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         experts_shared_outer_loras: bool = False,
         max_lora_rank: Optional[int] = None,
     ):
+        if getattr(base_layer, "_mega_moe_mma_type", None) == SM80_INT8_MMA_TYPE:
+            raise ValueError(
+                "PPU SM80 INT8 MegaMoE does not support routed-expert LoRA."
+            )
+
         # initializes FusedMoE with its own moe_runner for base path
         super().__init__(base_layer, lora_backend)
 
