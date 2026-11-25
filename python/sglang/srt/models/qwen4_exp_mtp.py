@@ -201,16 +201,18 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
             input_embeds = self._prepare_input_embeds(
                 input_ids, forward_batch, input_embeds
             )
-            hidden_states = forward_batch.spec_info.hidden_states
-            if not forward_batch.forward_mode.is_idle():
-                hidden_states = self._mtp_input_fusion(input_embeds, hidden_states)
+            mtp_input_fusion = self._mtp_input_fusion
+            if forward_batch.forward_mode.is_idle():
+                input_embeds = forward_batch.spec_info.hidden_states
+                mtp_input_fusion = None
 
             with get_global_expert_distribution_recorder().disable_this_region():
                 model_output = self.model(
                     input_ids,
                     positions,
                     forward_batch,
-                    hidden_states,
+                    input_embeds,
+                    mtp_input_fusion=mtp_input_fusion,
                 )
 
             hc_hidden_states = None
