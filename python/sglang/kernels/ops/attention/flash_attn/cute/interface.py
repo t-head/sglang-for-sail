@@ -101,6 +101,12 @@ def _get_device_arch():
     return major * 10 + int(minor)
 
 
+def supports_head_gate(arch: int | None = None) -> bool:
+    if arch is None:
+        arch = _get_device_arch()
+    return arch // 10 in (10, 11)
+
+
 @lru_cache(maxsize=None)
 def _get_device_num_sms(device: torch.device) -> int:
     """Return the stable SM count without querying CUDA on every launch."""
@@ -403,6 +409,8 @@ def _flash_attn_fwd(
     fake_mode = is_fake_mode()
     arch = _get_device_arch() if _arch is None else _arch
     arch_forward_host = get_forward_host(arch)
+    if head_gate is not None and not supports_head_gate(arch):
+        raise ValueError("head_gate is only supported on SM100/SM110 FA4")
     requested_num_splits = num_splits
     if (
         not fake_mode
