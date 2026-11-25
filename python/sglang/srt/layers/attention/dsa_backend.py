@@ -280,6 +280,8 @@ def _adjacent_absorbed_q(
 
 def _flashmla_kv_padded_heads(num_heads: int) -> int:
     """Pad query heads to the supported 64/128-head FlashMLA variants."""
+    if _is_sail:
+        return num_heads
     if num_heads <= 64:
         return 64
     if num_heads <= 128:
