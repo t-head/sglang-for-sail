@@ -16,6 +16,7 @@ from typing import Any, Dict, Optional
 import msgspec
 
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import safe_pickle_loads
 
 logger = logging.getLogger(__name__)
@@ -174,13 +175,22 @@ def is_ipc_quant_supported(quant_method: str, quant_config: Any) -> bool:
 
 
 def check_ipc_quant_support(
-    quant_method: str, quant_config: Any, *, where: str
+    quant_method: str, quant_config: Any, *, where: str, hf_config=None
 ) -> None:
     """Hard-error unless `quant_method` is verified safe for IPC zero-copy sharing.
 
     `where` is a short tag (e.g. "daemon"/"client") used only in the error
     message. Raises UnsupportedQuantForIPCError with an actionable message.
     """
+    if envs.SGLANG_PPU_DENSE_GEMM_MODE.get() == "w8a8" and get_platform().is_ppu:
+        from sglang.srt.configs.model_config import is_kimi_k3
+
+        if is_kimi_k3(hf_config):
+            raise UnsupportedQuantForIPCError(
+                f"[weight_cache:{where}] Kimi online W8A8 changes BF16 projections "
+                "to channel-wise FP8 after loading. The IPC client expects BF16 "
+                "weights. Use --weight-cache-mode off with W8A8."
+            )
     if is_ipc_quant_supported(quant_method, quant_config):
         return
     verified = ", ".join(

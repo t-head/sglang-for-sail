@@ -1080,6 +1080,12 @@ class DefaultModelLoader(BaseModelLoader):
         if QuantizedRLModelLoader.is_reload_scenario(model):
             return
         for module, quant_method in _modules_with_quant_method(model):
+            # A BF16 reload shadow lives on the host. Staging the whole module
+            # here would upload the full BF16 projection and undo the tiling.
+            if getattr(module, "_ppu_reload_on_host", False):
+                quant_method.finish_reload_from_host(module, target_device)
+                del module._ppu_reload_on_host
+                continue
             # When quant methods need to process weights after loading
             # (for repacking, quantizing, etc), they expect parameters
             # to be on the global target device. This scope is for the
@@ -1089,11 +1095,25 @@ class DefaultModelLoader(BaseModelLoader):
                 quant_method.process_weights_after_loading(module)
 
     @staticmethod
-    def restore_weights_before_loading(model, target_device):
+    def restore_weights_before_loading(model, target_device, *, from_disk=False):
         """Undo in-place quant packing so fresh weights can be loaded."""
         if QuantizedRLModelLoader.is_reload_scenario(model):
             return
         for module, quant_method in _modules_with_quant_method(model):
+            if getattr(module, "_ppu_reload_on_host", False):
+                # A disk-load retry can overwrite an existing staging buffer.
+                continue
+            if (
+                hasattr(quant_method, "stage_reload_on_host")
+                and (
+                    module.weight.device.type == "cpu"
+                    or (from_disk and module.weight.device.type == target_device.type)
+                )
+                and module.weight.dtype == torch.float8_e4m3fn
+            ):
+                quant_method.stage_reload_on_host(module)
+                module._ppu_reload_on_host = True
+                continue
             # AMX packing and the MXFP4 backend wrappers are duck-typed and cannot restore
             if isinstance(quant_method, QuantizeMethodBase):
                 with device_loading_context(module, target_device):
@@ -1820,6 +1840,12 @@ class PreshardedModelLoader(DefaultModelLoader):
             "enable_dp_lm_head": parallel.enable_dp_lm_head,
             "enable_fp32_lm_head": get_exec().features.enable_fp32_lm_head,
             "quantization": model_config.quantization,
+            "ppu_dense_gemm_mode": envs.SGLANG_PPU_DENSE_GEMM_MODE.get(),
+            "ppu_dense_replicated_q": bool(
+                envs.SGLANG_PPU_DENSE_GEMM_MODE.get() == "w8a8"
+                and parallel.dcp_enabled
+                and parallel.dcp_replicate_q_proj
+            ),
             "model_dtype": str(model_config.dtype),
             "ep_num_redundant_experts": get_exec().moe.ep_num_redundant_experts,
             "enable_eplb": get_exec().moe.enable_eplb,

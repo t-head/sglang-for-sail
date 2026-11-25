@@ -2288,6 +2288,7 @@ class Envs:
     # `apply()`, so unsetting it only rolls back eager calls; those captured
     # graphs need recapture or a process restart.
     SGLANG_SAIL_DEEPGEMM_DENSE_BF16 = EnvBool(False)
+    SGLANG_PPU_DENSE_GEMM_MODE = EnvStr("bf16")
     SGLANG_SAIL_DEEPGEMM_MOE = EnvBool(False)
     # Repack MXFP4 MoE weights into the INT4 layout consumed by the PPU
     # DeepGEMM W4A16 kernel. This is distinct from native MXFP4 W4A4.

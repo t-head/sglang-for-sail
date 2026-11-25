@@ -26,6 +26,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import override_platform
 from sglang.srt.weight_cache.protocol import (
     CacheConfig,
     UnsupportedQuantForIPCError,
@@ -346,6 +347,25 @@ class TestDaemonLaunchConfiguration(CustomTestCase):
 
 
 class TestIpcQuantAllowlist(CustomTestCase):
+    def test_kimi_online_w8a8_rejected_on_ppu(self):
+        kimi = SimpleNamespace(architectures=["KimiK31ForConditionalGeneration"])
+        other = SimpleNamespace(architectures=["LlamaForCausalLM"])
+        for side in ("daemon", "client"):
+            with self.subTest(side=side), override_platform(is_ppu=True):
+                with envs.SGLANG_PPU_DENSE_GEMM_MODE.override("w8a8"):
+                    with self.assertRaisesRegex(
+                        UnsupportedQuantForIPCError, "--weight-cache-mode off"
+                    ):
+                        check_ipc_quant_support("", None, where=side, hf_config=kimi)
+                    check_ipc_quant_support("", None, where=side, hf_config=other)
+                with envs.SGLANG_PPU_DENSE_GEMM_MODE.override("bf16"):
+                    check_ipc_quant_support("", None, where=side, hf_config=kimi)
+        with (
+            override_platform(is_ppu=False),
+            envs.SGLANG_PPU_DENSE_GEMM_MODE.override("w8a8"),
+        ):
+            check_ipc_quant_support("", None, where="client", hf_config=kimi)
+
     def test_unquantized_is_supported(self):
         self.assertTrue(is_ipc_quant_supported("", None))
 

@@ -1561,6 +1561,7 @@ class KimiK3MoE(nn.Module):
             if (
                 fused_norm
                 and self._gemm_ag_up_eligible
+                and self.routed_expert_up_proj.weight.dtype == torch.bfloat16
                 and k3_ar_fusion.gemm_ag_up_fits(num_tokens)
             ):
                 return k3_ar_fusion.gemm_ag_up_proj(
@@ -2002,6 +2003,10 @@ class KimiK3DeltaAttention(nn.Module):
             # Split-path f_b GEMM still uses this when the fused in-proj
             # is above the token threshold.
             self._bfa_f_b_w = self.f_b_proj.weight
+            return
+        if self.use_fused_input_projection and getattr(
+            self.fused_qkvg_proj.quant_method, "channelwise_ppu_fp8", False
+        ):
             return
         if self.use_fused_input_projection and self._merge_scaled_bfa_weights():
             return
@@ -3347,6 +3352,16 @@ class KimiK3LinearForCausalLM(nn.Module):
         self.model = KimiK3LinearModel(
             config, quant_config, prefix=maybe_prefix(prefix, "model")
         )
+        if get_platform().is_ppu:
+            dense_mode = envs.SGLANG_PPU_DENSE_GEMM_MODE.get()
+            if dense_mode == "w8a8":
+                from sglang.srt.layers.quantization.kimi_ppu_fp8 import (
+                    enable_kimi_dense_fp8,
+                )
+
+                enable_kimi_dense_fp8(self.model.layers)
+            elif dense_mode != "bf16":
+                raise ValueError(f"Unsupported Kimi PPU dense GEMM mode: {dense_mode}")
         self.start_layer = self.model.start_layer
         self.end_layer = self.model.end_layer
         self.pp_group = get_parallel().pp_group

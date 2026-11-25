@@ -215,7 +215,9 @@ class WeightUpdater:
 
         def model_load_weights(model, iter):
             # Expert loaders may copy in parallel; restore before any thread writes.
-            DefaultModelLoader.restore_weights_before_loading(model, target_device)
+            DefaultModelLoader.restore_weights_before_loading(
+                model, target_device, from_disk=True
+            )
             loader.load_weights_and_postprocess(model, iter, target_device)
             return model
 
