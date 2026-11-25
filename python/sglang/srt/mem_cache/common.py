@@ -19,6 +19,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictResult,
     MatchPrefixParams,
     MatchResult,
+    drop_misaligned_dsa_cp_prefix_reuse,
+    enforce_dsa_cp_prefix_cache_alignment,
     zero_match_result,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
@@ -231,6 +233,7 @@ def match_kv_cache(
     if token_ids is None:
         token_ids = req.origin_input_ids + req.output_ids
 
+    mamba_held_before_match = req.kv.holds_mamba if cow_mamba else None
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
             key=_req_radix_key(tree_cache, req, token_ids, max_prefix_len),
@@ -241,6 +244,18 @@ def match_kv_cache(
     )
     if envs.SGLANG_RADIX_FORCE_MISS.get():
         match_result = zero_match_result(
+            tree_cache, match_result, extra_key=req.extra_key
+        )
+    if cow_mamba:
+        match_result = drop_misaligned_dsa_cp_prefix_reuse(
+            tree_cache,
+            req,
+            match_result,
+            mamba_held_before_match=mamba_held_before_match,
+            extra_key=req.extra_key,
+        )
+    else:
+        match_result = enforce_dsa_cp_prefix_cache_alignment(
             tree_cache, match_result, extra_key=req.extra_key
         )
     req.prefix_len = match_result.device_prefix_len

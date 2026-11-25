@@ -704,6 +704,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         is_draft: bool = False,
     ):
         assert not self._is_dummy, "load on a dummy (non-src MLA) host pool"
+        if not is_draft and device_pool.layer_shard_enabled:
+            device_pool.invalidate_kv_buffer_for_layer(
+                device_pool.start_layer + layer_id
+            )
         if not is_draft and layer_id not in self._target_layer_indices:
             return
         host_indices = maybe_dcp_kernel_indices(
