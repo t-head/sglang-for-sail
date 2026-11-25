@@ -147,6 +147,14 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
             ):
                 self.assertEqual(backend.supports_prefill_graph_extend(), captured)
 
+    def test_explicit_static_gdn_graph_keeps_priority_over_pla(self):
+        with (
+            envs.SGLANG_SAIL_PLA_CUDA.override(True),
+            envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.override(True),
+            self._setup() as backend,
+        ):
+            self.assertTrue(backend.supports_prefill_graph_extend())
+
     def test_another_extend_kernel_is_captured_only_where_an_external_body_asks(self):
         for body_seqs, captured in (("no body", False), (None, False), (8, True)):
             with (
