@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.arg_groups.deepseek_v4_hook import _dsv41_dspark_pd_verify_supported
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import (
     _handle_dspark,
@@ -209,6 +210,42 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
         """Negative control: TP MoE continues to accept compact verify."""
         with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
             _handle_dspark(self._dp_server_args(moe_a2a_backend="none"))
+
+    def test_ppu_megamoe_pd_compact_is_decode_only(self):
+        with (
+            patch("sglang.srt.utils.common.is_sail", return_value=True),
+            patch("sglang.srt.arg_groups.deepseek_v4_hook.is_sail", return_value=True),
+            envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"),
+            envs.SGLANG_ENABLE_PPU_DSPARK_MEGAMOE_COMPACT.override(True),
+        ):
+            for role, transport, nnodes, accepted in (
+                ("decode", "mooncake", 1, True),
+                ("prefill", "mooncake", 1, False),
+                ("decode", "nixl", 1, False),
+                ("decode", "mooncake", 2, False),
+            ):
+                with self.subTest(role=role, transport=transport, nnodes=nnodes):
+                    args = self._dp_server_args(moe_a2a_backend="megamoe")
+                    args.ep_size = 8
+                    args.moe_dense_tp_size = 1
+                    args.nnodes = nnodes
+                    args.disaggregation_mode = role
+                    args.disaggregation_transfer_backend = transport
+                    args.speculative_draft_model_path = args.model_path
+                    if accepted:
+                        self.assertTrue(_dsv41_dspark_pd_verify_supported(args))
+                        _handle_dspark(args)
+                    else:
+                        with self.assertRaisesRegex(ValueError, "PPU DSpark MegaMoE"):
+                            _handle_dspark(args)
+
+            decode = self._dp_server_args(moe_a2a_backend="megamoe")
+            decode.disaggregation_mode = "decode"
+            decode.disaggregation_transfer_backend = "mooncake"
+            with envs.SGLANG_ENABLE_PPU_DSPARK_MEGAMOE_COMPACT.override(False):
+                self.assertFalse(_dsv41_dspark_pd_verify_supported(decode))
+            with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+                self.assertTrue(_dsv41_dspark_pd_verify_supported(decode))
 
     def test_prefill_coordination_requires_static_verify(self):
         with envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.override(True):

@@ -1,6 +1,8 @@
+import argparse
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsAdditiveCostTable,
@@ -67,6 +69,247 @@ class TestSpsCostTableLookup(CustomTestCase):
         table = _make_table()
         self.assertEqual(table.lookup(65), 480.0)
         self.assertEqual(table.lookup(10_000), 480.0)
+
+
+class TestPhysicalGraphSps(CustomTestCase):
+    def test_native_fit_uses_replayed_graph_instead_of_budget(self):
+        from sglang.benchmark.dspark_sps_profiler import build_table_from_summaries
+
+        summaries = [
+            dict(
+                batch_size_per_rank=bs,
+                batch_tokens=logical,
+                graph_tokens=physical,
+                graph_cost_supported=True,
+                frac=0.35,
+                steps_per_sec=1 / seconds,
+            )
+            for bs, logical, physical, seconds in (
+                (16, 22, 48, 0.04),
+                (16, 90, 96, 0.05),
+                (32, 44, 48, 0.043),
+                (32, 88, 96, 0.053),
+            )
+        ]
+        kwargs = dict(max_batch_tokens=None, offdiag=True)
+        table = build_table_from_summaries(summaries=summaries, **kwargs)
+        self.assertEqual(table.m_axis, "graph_tokens")
+        self.assertEqual(table.m_probes, [48, 96])
+        self.assertAlmostEqual(
+            table.graph_step_time(num_reqs=16, graph_tokens=48), 0.04
+        )
+        self.assertAlmostEqual(
+            table.graph_step_time(num_reqs=32, graph_tokens=96), 0.053
+        )
+        self.assertEqual(
+            SpsAdditiveCostTable.from_json(table.to_json()).to_json(), table.to_json()
+        )
+        with self.assertRaisesRegex(ValueError, "physical graph size"):
+            table.step_time(num_reqs=16, budget=22)
+        del summaries[0]["graph_tokens"]
+        with self.assertRaisesRegex(ValueError, "actually replayed"):
+            build_table_from_summaries(summaries=summaries, **kwargs)
+        del summaries[0]["graph_cost_supported"]
+        with self.assertRaisesRegex(ValueError, "Cannot mix"):
+            build_table_from_summaries(summaries=summaries, **kwargs)
+        for summary in summaries[1:]:
+            del summary["graph_cost_supported"]
+        legacy = build_table_from_summaries(summaries=summaries, **kwargs)
+        self.assertEqual(legacy.m_axis, "logical_tokens")
+
+    def test_graph_capability_and_key_are_saved_by_collection(self):
+        from sglang.benchmark.dspark_sps_profiler import (
+            LoadInfo,
+            SpsRow,
+            postprocess_round,
+            round_summary_dict,
+        )
+
+        def rows(replay_key):
+            return [
+                SpsRow(
+                    forward_ct=i,
+                    num_running_reqs=16,
+                    num_verify_tokens=48,
+                    step_time=0.04,
+                    verify_tokens_graph_key=replay_key,
+                )
+                for i in range(20)
+            ]
+
+        args = dict(
+            batch_size_per_rank=16,
+            dp_size=2,
+            verify_num_draft_tokens=6,
+            min_steady_steps=8,
+            load_info=LoadInfo(32, 64, 1.0, True),
+            frac=0.35,
+            graph_cost_supported=True,
+        )
+        outcome = postprocess_round(rank_rows=[rows(48), rows(48)], **args)
+        summary = round_summary_dict(outcome=outcome, repeat=0)
+        self.assertIs(summary["graph_cost_supported"], True)
+        self.assertEqual(summary["graph_tokens"], 48)
+        self.assertEqual(summary["batch_tokens"], 44)
+        with self.assertRaisesRegex(RuntimeError, "actually replayed"):
+            postprocess_round(rank_rows=[rows(48), rows(-1)], **args)
+
+
+class TestPdSpsProfiler(CustomTestCase):
+    @staticmethod
+    def _flush_clock():
+        elapsed = 0.0
+
+        def sleep(seconds):
+            nonlocal elapsed
+            elapsed += seconds
+
+        return Mock(
+            monotonic=Mock(side_effect=lambda: elapsed), sleep=Mock(side_effect=sleep)
+        )
+
+    def test_pd_flush_retries_transport_errors_and_busy_response(self):
+        from sglang.benchmark import dspark_sps_profiler as profiler
+
+        clock = self._flush_clock()
+        attempts = [
+            profiler.requests.exceptions.ConnectionError(),
+            profiler.requests.exceptions.Timeout(),
+            Mock(status_code=400),
+            Mock(status_code=200),
+        ]
+        with (
+            patch.object(profiler, "time", clock),
+            patch.object(profiler.requests, "post", side_effect=attempts) as post,
+        ):
+            profiler.flush_pd_cache(base_url="http://engine")
+        self.assertEqual(post.call_count, 4)
+        self.assertEqual(clock.sleep.call_count, 3)
+
+    def test_pd_flush_does_not_retry_http_auth_failure(self):
+        from sglang.benchmark import dspark_sps_profiler as profiler
+
+        response = profiler.requests.Response()
+        response.status_code = 403
+        response.url = "http://engine/flush_cache"
+        clock = self._flush_clock()
+        with (
+            patch.object(profiler, "time", clock),
+            patch.object(profiler.requests, "post", return_value=response) as post,
+            self.assertRaises(profiler.requests.exceptions.HTTPError) as error,
+        ):
+            profiler.flush_pd_cache(base_url="http://engine")
+        self.assertIs(error.exception.response, response)
+        post.assert_called_once()
+        clock.sleep.assert_not_called()
+
+    def test_pd_flush_timeout_fails_closed_and_caps_request_time(self):
+        from sglang.benchmark import dspark_sps_profiler as profiler
+
+        clock = self._flush_clock()
+        with (
+            patch.object(profiler, "time", clock),
+            patch.object(profiler, "DEFAULT_TIMEOUT", 1.5),
+            patch.object(
+                profiler.requests, "post", return_value=Mock(status_code=400)
+            ) as post,
+            self.assertRaisesRegex(
+                TimeoutError, "Could not confirm PD cache flush"
+            ) as error,
+        ):
+            profiler.flush_pd_cache(base_url="http://engine")
+        self.assertEqual(
+            [call.kwargs["timeout"] for call in post.call_args_list], [1.5, 0.5]
+        )
+        self.assertEqual(
+            [call.args[0] for call in clock.sleep.call_args_list], [1.0, 0.5]
+        )
+        self.assertEqual(error.exception.__cause__.response.status_code, 400)
+
+    def test_endpoint_arguments_distinguish_colocate_from_pd(self):
+        from sglang.benchmark.dspark_sps_profiler import (
+            add_run_args,
+            resolve_profile_url,
+        )
+
+        parser = argparse.ArgumentParser()
+        add_run_args(parser)
+        colocate = parser.parse_args(["--base-url", "http://engine"])
+        self.assertEqual(resolve_profile_url(colocate), "http://engine")
+        pd = parser.parse_args(
+            ["--prefill-url", "http://prefill", "--decode-url", "http://decode"]
+        )
+        self.assertEqual(resolve_profile_url(pd), "http://decode")
+        partial = parser.parse_args(
+            ["--base-url", "http://decode", "--prefill-url", "http://prefill"]
+        )
+        with self.assertRaisesRegex(ValueError, "both --prefill-url and --decode-url"):
+            resolve_profile_url(partial)
+
+    def test_discovers_prefill_bootstrap_and_checks_roles(self):
+        from sglang.benchmark import dspark_sps_profiler as profiler
+
+        d_info = dict(
+            disaggregation_mode="decode", disaggregation_transfer_backend="mooncake"
+        )
+        p_info = dict(
+            disaggregation_mode="prefill",
+            disaggregation_transfer_backend="mooncake",
+            disaggregation_bootstrap_port=31003,
+        )
+        reply = Mock()
+        reply.json.return_value = p_info
+        args = dict(
+            base_url="http://decode:31002",
+            info=d_info,
+            prefill_url="http://prefill:31001/",
+            bootstrap_host=None,
+            bootstrap_port=None,
+        )
+        with patch.object(profiler.requests, "get", return_value=reply) as get:
+            pd = profiler.fetch_pd_profile_target(**args)
+            get.assert_called_once_with(
+                "http://prefill:31001/server_info", timeout=profiler.DEFAULT_TIMEOUT
+            )
+            self.assertEqual((pd.bootstrap_host, pd.bootstrap_port), ("prefill", 31003))
+            override = profiler.fetch_pd_profile_target(
+                **dict(args, bootstrap_host="kv-host", bootstrap_port=31004)
+            )
+            self.assertEqual(
+                (override.bootstrap_host, override.bootstrap_port), ("kv-host", 31004)
+            )
+            p_info["disaggregation_transfer_backend"] = "fake"
+            with self.assertRaisesRegex(ValueError, "same real KV"):
+                profiler.fetch_pd_profile_target(**args)
+        with self.assertRaisesRegex(ValueError, "PD Decode engine"):
+            profiler.fetch_pd_profile_target(
+                **dict(args, info={"disaggregation_mode": "prefill"})
+            )
+
+    def test_paired_bootstrap_payloads_assign_only_decode_rank(self):
+        from sglang.benchmark.dspark_sps_profiler import (
+            PdProfileTarget,
+            pd_profile_payloads,
+        )
+
+        target = PdProfileTarget("http://prefill:31001", "kv-host", 31003)
+        pairs = pd_profile_payloads(
+            pd=target,
+            input_ids=[[10], [11], [20], [21]],
+            dp_size=2,
+            first_room=501,
+            temperature=1,
+            max_new_tokens=100,
+        )
+        for rank, (prefill, decode) in enumerate(pairs):
+            self.assertNotIn("routed_dp_rank", prefill)
+            self.assertEqual(decode, dict(prefill, routed_dp_rank=rank))
+            self.assertEqual(
+                prefill["bootstrap_room"], [501 + 2 * rank, 502 + 2 * rank]
+            )
+            self.assertEqual(prefill["bootstrap_host"], ["kv-host"] * 2)
+            self.assertEqual(prefill["bootstrap_port"], [31003] * 2)
+            self.assertEqual(prefill["input_ids"], [[10 + 10 * rank], [11 + 10 * rank]])
 
 
 class TestLoadSpsTableFromPath(CustomTestCase):

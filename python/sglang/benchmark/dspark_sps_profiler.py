@@ -10,11 +10,15 @@ import json
 import logging
 import math
 import random
+import secrets
 import statistics
+import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 import msgspec
 import numpy as np
@@ -26,6 +30,8 @@ logger = logging.getLogger(__name__)
 def _load_module_by_path(name: str, path: Path):
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
+    # msgspec resolves postponed annotations via the defining module.
+    sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -50,7 +56,7 @@ except ImportError as exc:
     )
     _benchmark_dir = Path(__file__).resolve().parent
     _table_module = _load_module_by_path(
-        "dspark_sps",
+        "_dspark_sps_fit_table",
         _benchmark_dir.parent / "srt/speculative/dspark_components/dspark_sps.py",
     )
     SpsAdditiveCostTable = _table_module.SpsAdditiveCostTable
@@ -74,6 +80,7 @@ STEP_TIME_FLOOR_SECONDS = 0.02
 WARMUP_ROUND_STEADY_STEPS = 16
 POLL_INTERVAL_SECONDS = 2.0
 LOAD_JOIN_TIMEOUT_SECONDS = 60.0
+PD_FLUSH_REQUEST_TIMEOUT_SECONDS = 5.0
 MATCH_FRACTION_WARN = 0.9
 MATCH_FRACTION_ERROR = 0.5
 PROFILE_SEED = 42
@@ -100,6 +107,7 @@ class SpsRow(msgspec.Struct, frozen=True):
     num_running_reqs: int
     num_verify_tokens: int
     step_time: float
+    verify_tokens_graph_key: int = -1
 
 
 # Server-side per-step record feed: the DsparkInfoDumper 'core' +
@@ -109,6 +117,12 @@ INFO_RECORD_ENABLE_HINT = (
     "SGLANG_DSPARK_ENABLE_SPS_RECORD=1 (or SGLANG_DSPARK_DEBUG_DUMP="
     "core,step_cpu_time) and SGLANG_RAGGED_VERIFY_MODE=static"
 )
+
+
+class PdProfileTarget(msgspec.Struct, frozen=True):
+    prefill_url: str
+    bootstrap_host: str
+    bootstrap_port: int
 
 
 class ServerContext(msgspec.Struct, frozen=True):
@@ -121,6 +135,8 @@ class ServerContext(msgspec.Struct, frozen=True):
     cuda_graph_max_bs: Optional[int]
     skip_max_running_requests_threshold: float
     skip_token_capacity_threshold: float
+    graph_cost_supported: bool = False
+    pd_target: Optional[PdProfileTarget] = None
 
 
 class RoundSettings(msgspec.Struct, frozen=True):
@@ -150,6 +166,8 @@ class RoundOutcome(msgspec.Struct, frozen=True):
     rank_rows: list[list[SpsRow]]
     load_info: LoadInfo
     frac: Optional[float] = None
+    graph_tokens: Optional[int] = None
+    graph_cost_supported: bool = False
 
 
 def out_paths(*, out: str) -> dict[str, Path]:
@@ -172,6 +190,9 @@ def run_profile(
     repeats: int,
     local_tokenizer_path: Optional[str],
     fracs: Optional[list[float]],
+    prefill_url: Optional[str] = None,
+    prefill_bootstrap_host: Optional[str] = None,
+    prefill_bootstrap_port: Optional[int] = None,
 ) -> None:
     if get_tokenizer is None:
         raise RuntimeError(
@@ -185,6 +206,10 @@ def run_profile(
             "(SGLANG_RAGGED_VERIFY_MODE=static, SGLANG_DSPARK_ENABLE_SPS_RECORD=1); "
             "pass --base-url <url> (it never launches a server)."
         )
+    if prefill_url is None and (
+        prefill_bootstrap_host is not None or prefill_bootstrap_port is not None
+    ):
+        raise ValueError("Prefill bootstrap overrides require --prefill-url.")
 
     offdiag = fracs is not None
     if offdiag:
@@ -196,20 +221,28 @@ def run_profile(
                     "the full uniform tier and inside the captured cuda graphs."
                 )
 
+    context = fetch_server_context(
+        base_url=base_url.rstrip("/"),
+        local_tokenizer_path=local_tokenizer_path,
+        allowed_modes=("compact", "cap-accept") if offdiag else ("static",),
+        **(
+            dict(
+                prefill_url=prefill_url,
+                prefill_bootstrap_host=prefill_bootstrap_host,
+                prefill_bootstrap_port=prefill_bootstrap_port,
+            )
+            if prefill_url is not None
+            else {}
+        ),
+    )
+    vocab_size = len(get_tokenizer(context.tokenizer_path))
+    batch_sizes = sorted(set(batch_sizes))
+    validate_sweep_against_server(context=context, batch_sizes=batch_sizes)
     paths = out_paths(out=out)
     paths["table"].parent.mkdir(parents=True, exist_ok=True)
     for path in (paths["records"], paths["rounds"]):
         if path.exists():
             path.unlink()
-
-    context = fetch_server_context(
-        base_url=base_url,
-        local_tokenizer_path=local_tokenizer_path,
-        allowed_modes=("compact", "cap-accept") if offdiag else ("static",),
-    )
-    vocab_size = len(get_tokenizer(context.tokenizer_path))
-    batch_sizes = sorted(set(batch_sizes))
-    validate_sweep_against_server(context=context, batch_sizes=batch_sizes)
     rng = random.Random(PROFILE_SEED)
 
     frac_sweep: list[Optional[float]] = sorted(fracs) if offdiag else [None]
@@ -309,7 +342,9 @@ def fit_profile(
     offdiag = any(summary.get("frac") is not None for summary in summaries)
 
     table = build_table_from_summaries(
-        summaries=summaries, max_batch_tokens=max_batch_tokens, offdiag=offdiag
+        summaries=summaries,
+        max_batch_tokens=max_batch_tokens,
+        offdiag=offdiag,
     )
     paths["table"].write_text(table.to_json(), encoding="utf-8")
     if offdiag:
@@ -327,8 +362,13 @@ def fit_profile(
         )
 
     if plot:
+        graph_tier_cost = (
+            isinstance(table, SpsAdditiveCostTable) and table.m_axis == "graph_tokens"
+        )
         plot_fit(
-            cells=summaries_to_cells(summaries=summaries),
+            cells=summaries_to_cells(
+                summaries=summaries, graph_tier_cost=graph_tier_cost
+            ),
             table=table,
             plot_path=paths["plot"],
         )
@@ -349,6 +389,9 @@ def profile_all(
     local_tokenizer_path: Optional[str],
     fracs: Optional[list[float]],
     plot: bool,
+    prefill_url: Optional[str] = None,
+    prefill_bootstrap_host: Optional[str] = None,
+    prefill_bootstrap_port: Optional[int] = None,
 ) -> None:
     run_profile(
         base_url=base_url,
@@ -358,6 +401,9 @@ def profile_all(
         repeats=repeats,
         local_tokenizer_path=local_tokenizer_path,
         fracs=fracs,
+        prefill_url=prefill_url,
+        prefill_bootstrap_host=prefill_bootstrap_host,
+        prefill_bootstrap_port=prefill_bootstrap_port,
     )
     fit_profile(
         out=out,
@@ -375,11 +421,21 @@ def load_round_summaries(*, rounds_path: Path) -> list[dict]:
     ]
 
 
-def summaries_to_cells(*, summaries: list[dict]) -> list[dict]:
+def summaries_to_cells(
+    *, summaries: list[dict], graph_tier_cost: bool = False
+) -> list[dict]:
+    if graph_tier_cost and any(
+        not isinstance(row.get("graph_tokens"), int) or row["graph_tokens"] <= 0
+        for row in summaries
+    ):
+        raise ValueError(
+            "Graph SPS fitting requires one actually replayed graph key "
+            "across all ranks in every steady round. Recollect incompatible runs."
+        )
     return [
         {
             "bs": summary["batch_size_per_rank"],
-            "M": summary["batch_tokens"],
+            "M": summary["graph_tokens" if graph_tier_cost else "batch_tokens"],
             "T": 1.0 / summary["steps_per_sec"],
             "frac": summary.get("frac"),
         }
@@ -388,11 +444,24 @@ def summaries_to_cells(*, summaries: list[dict]) -> list[dict]:
 
 
 def build_table_from_summaries(
-    *, summaries: list[dict], max_batch_tokens: Optional[int], offdiag: bool
+    *,
+    summaries: list[dict],
+    max_batch_tokens: Optional[int],
+    offdiag: bool,
 ):
     if offdiag:
+        capabilities = {row.get("graph_cost_supported", False) for row in summaries}
+        if len(capabilities) > 1:
+            raise ValueError(
+                "Cannot mix graph-aware and legacy SPS calibration rounds."
+            )
+        # Older rounds omit this field and retain the logical-token fit.
+        graph_tier_cost = capabilities == {True}
         return build_additive_table_from_cells(
-            cells=summaries_to_cells(summaries=summaries)
+            cells=summaries_to_cells(
+                summaries=summaries, graph_tier_cost=graph_tier_cost
+            ),
+            graph_tier_cost=graph_tier_cost,
         )
 
     by_batch_tokens: dict[int, list[float]] = {}
@@ -412,10 +481,24 @@ def fetch_server_context(
     base_url: str,
     local_tokenizer_path: Optional[str],
     allowed_modes: tuple[str, ...] = ("static",),
+    prefill_url: Optional[str] = None,
+    prefill_bootstrap_host: Optional[str] = None,
+    prefill_bootstrap_port: Optional[int] = None,
 ) -> ServerContext:
     response = requests.get(base_url + "/server_info", timeout=DEFAULT_TIMEOUT)
     response.raise_for_status()
     info = response.json()
+    pd_target = (
+        fetch_pd_profile_target(
+            base_url=base_url,
+            info=info,
+            prefill_url=prefill_url,
+            bootstrap_host=prefill_bootstrap_host,
+            bootstrap_port=prefill_bootstrap_port,
+        )
+        if prefill_url is not None
+        else None
+    )
 
     speculative_algorithm = info.get("speculative_algorithm")
     if speculative_algorithm != "DSPARK":
@@ -473,6 +556,9 @@ def fetch_server_context(
             "DP ranks disagree on verify_num_draft_tokens: "
             f"{sorted(verify_num_draft_tokens)}."
         )
+    capabilities = {p.get("graph_cost_supported", False) for p in sps_payloads}
+    if len(capabilities) != 1:
+        raise RuntimeError("DP ranks disagree on graph-aware SPS support.")
 
     tokenizer_path = local_tokenizer_path or info.get("tokenizer_path")
     if not tokenizer_path:
@@ -483,6 +569,14 @@ def fetch_server_context(
 
     internal_state = internal_states[0]
     dp_size = int(internal_state.get("dp_size") or 1)
+    if pd_target is not None:
+        # The legacy dp_size can still be 1 for attention-DP engines.
+        dp_size = int(info.get("attn_dp_size") or dp_size)
+        if dp_size != len(internal_states):
+            raise ValueError(
+                f"Decode reports {dp_size} DP ranks but exposes "
+                f"{len(internal_states)} SPS streams."
+            )
     cuda_graph_max_bs = resolve_cuda_graph_max_bs(internal_state=internal_state)
     max_running_per_dp = internal_state.get("effective_max_running_requests_per_dp", -1)
     if max_running_per_dp and max_running_per_dp > 0:
@@ -511,6 +605,52 @@ def fetch_server_context(
         cuda_graph_max_bs=cuda_graph_max_bs,
         skip_max_running_requests_threshold=skip_max_running,
         skip_token_capacity_threshold=skip_token_capacity,
+        graph_cost_supported=capabilities == {True},
+        pd_target=pd_target,
+    )
+
+
+def fetch_pd_profile_target(
+    *,
+    base_url: str,
+    info: dict,
+    prefill_url: str,
+    bootstrap_host: Optional[str],
+    bootstrap_port: Optional[int],
+) -> PdProfileTarget:
+    if info.get("disaggregation_mode") != "decode":
+        raise ValueError("--decode-url must point to a PD Decode engine.")
+    prefill_url = prefill_url.rstrip("/")
+    parsed = urlsplit(prefill_url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("--prefill-url must be an HTTP(S) Prefill URL.")
+    if prefill_url == base_url:
+        raise ValueError("Prefill and Decode URLs must be distinct.")
+    response = requests.get(prefill_url + "/server_info", timeout=DEFAULT_TIMEOUT)
+    response.raise_for_status()
+    prefill = response.json()
+    if prefill.get("disaggregation_mode") != "prefill":
+        raise ValueError("--prefill-url must point to a PD Prefill engine.")
+    backend = info.get("disaggregation_transfer_backend")
+    if backend in (None, "fake") or backend != prefill.get(
+        "disaggregation_transfer_backend"
+    ):
+        raise ValueError(
+            "Prefill and Decode must use the same real KV transfer backend."
+        )
+    host = bootstrap_host if bootstrap_host is not None else parsed.hostname
+    port = (
+        bootstrap_port
+        if bootstrap_port is not None
+        else prefill.get("disaggregation_bootstrap_port")
+    )
+    if not host or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError(
+            "Invalid Prefill bootstrap address; set --prefill-bootstrap-host "
+            "and --prefill-bootstrap-port if discovery is not usable."
+        )
+    return PdProfileTarget(
+        prefill_url=prefill_url, bootstrap_host=host, bootstrap_port=port
     )
 
 
@@ -640,14 +780,19 @@ def run_one_round(
     if frac is not None:
         set_forced_budget_frac(base_url=context.base_url, frac=frac)
 
-    flush_cache(base_url=context.base_url)
+    pd = context.pd_target
+    if pd is None:
+        flush_cache(base_url=context.base_url)
+    else:
+        for endpoint in (pd.prefill_url, context.base_url):
+            flush_pd_cache(base_url=endpoint)
     watermarks = [
         max((row.forward_ct for row in rows), default=-1)
         for rows in fetch_rank_rows(base_url=context.base_url)
     ]
 
     start_time = time.monotonic()
-    load_thread = start_load(
+    load_args = dict(
         base_url=context.base_url,
         num_requests=batch_size,
         input_len=settings.input_len,
@@ -656,16 +801,35 @@ def run_one_round(
         vocab_size=vocab_size,
         rng=rng,
     )
-    reached_target = wait_for_aligned_steps(
-        context=context,
-        watermarks=watermarks,
-        batch_size_per_rank=batch_size_per_rank,
-        min_steady_steps=settings.min_steady_steps,
-        min_steady_seconds=settings.min_steady_seconds,
-        timeout_seconds=settings.round_timeout_seconds,
+    load_thread = (
+        start_load(**load_args)
+        if pd is None
+        else start_pd_load(
+            **load_args,
+            pd=pd,
+            dp_size=context.dp_size,
+            timeout_seconds=settings.round_timeout_seconds + DEFAULT_TIMEOUT,
+        )
     )
-    abort_all_requests(base_url=context.base_url)
-    load_thread.join(timeout=LOAD_JOIN_TIMEOUT_SECONDS)
+    try:
+        reached_target = wait_for_aligned_steps(
+            context=context,
+            watermarks=watermarks,
+            batch_size_per_rank=batch_size_per_rank,
+            min_steady_steps=settings.min_steady_steps,
+            min_steady_seconds=settings.min_steady_seconds,
+            timeout_seconds=settings.round_timeout_seconds,
+            load_thread=load_thread if pd is not None else None,
+        )
+    finally:
+        try:
+            abort_all_requests(base_url=context.base_url)
+        finally:
+            try:
+                if pd is not None:
+                    abort_all_requests(base_url=pd.prefill_url)
+            finally:
+                load_thread.join(timeout=LOAD_JOIN_TIMEOUT_SECONDS)
     if load_thread.is_alive():
         logger.warning(
             "Load batch for bs=%s did not return within %.0fs after abort; "
@@ -706,7 +870,20 @@ def run_one_round(
             reached_target=reached_target,
         ),
         frac=frac,
+        graph_cost_supported=context.graph_cost_supported and frac is not None,
     )
+
+
+def make_profile_input_ids(
+    *, num_requests: int, input_len: int, vocab_size: int, rng: random.Random
+) -> list[list[int]]:
+    token_high = vocab_size - RANDOM_TOKEN_HIGH_MARGIN
+    if token_high <= RANDOM_TOKEN_LOW:
+        raise ValueError(f"vocab_size={vocab_size} too small for random prompts.")
+    return [
+        [rng.randrange(RANDOM_TOKEN_LOW, token_high) for _ in range(input_len)]
+        for _ in range(num_requests)
+    ]
 
 
 def start_load(
@@ -719,13 +896,9 @@ def start_load(
     vocab_size: int,
     rng: random.Random,
 ) -> threading.Thread:
-    token_high = vocab_size - RANDOM_TOKEN_HIGH_MARGIN
-    if token_high <= RANDOM_TOKEN_LOW:
-        raise ValueError(f"vocab_size={vocab_size} too small for random prompts.")
-    input_ids = [
-        [rng.randrange(RANDOM_TOKEN_LOW, token_high) for _ in range(input_len)]
-        for _ in range(num_requests)
-    ]
+    input_ids = make_profile_input_ids(
+        num_requests=num_requests, input_len=input_len, vocab_size=vocab_size, rng=rng
+    )
     payload = {
         "input_ids": input_ids,
         "sampling_params": {
@@ -751,6 +924,95 @@ def start_load(
     return thread
 
 
+def pd_profile_payloads(
+    *,
+    pd: PdProfileTarget,
+    input_ids: list[list[int]],
+    dp_size: int,
+    first_room: int,
+    temperature: float,
+    max_new_tokens: int,
+) -> list[tuple[dict, dict]]:
+    if dp_size < 1 or not input_ids or len(input_ids) % dp_size:
+        raise ValueError(
+            "PD SPS requires an equal non-empty batch on each Decode rank."
+        )
+    bs = len(input_ids) // dp_size
+    pairs = []
+    for rank in range(dp_size):
+        start = rank * bs
+        payload = dict(
+            input_ids=input_ids[start : start + bs],
+            bootstrap_host=[pd.bootstrap_host] * bs,
+            bootstrap_port=[pd.bootstrap_port] * bs,
+            bootstrap_room=list(range(first_room + start, first_room + start + bs)),
+            sampling_params=dict(
+                temperature=temperature, max_new_tokens=max_new_tokens, ignore_eos=True
+            ),
+            stream=False,
+        )
+        pairs.append((payload, dict(payload, routed_dp_rank=rank)))
+    return pairs
+
+
+def start_pd_load(
+    *,
+    base_url: str,
+    num_requests: int,
+    input_len: int,
+    max_new_tokens: int,
+    temperature: float,
+    vocab_size: int,
+    rng: random.Random,
+    pd: PdProfileTarget,
+    dp_size: int,
+    timeout_seconds: float,
+) -> threading.Thread:
+    input_ids = make_profile_input_ids(
+        num_requests=num_requests, input_len=input_len, vocab_size=vocab_size, rng=rng
+    )
+    pairs = pd_profile_payloads(
+        pd=pd,
+        input_ids=input_ids,
+        dp_size=dp_size,
+        first_room=secrets.randbits(62),
+        temperature=temperature,
+        max_new_tokens=max_new_tokens,
+    )
+
+    def post(url: str, payload: dict, role: str, rank: int) -> None:
+        try:
+            res = requests.post(
+                url + "/generate", json=payload, timeout=timeout_seconds
+            )
+            res.raise_for_status()
+        except requests.RequestException as exc:
+            logger.warning(
+                "PD SPS %s load for Decode rank %d ended with %s (may follow abort).",
+                role,
+                rank,
+                type(exc).__name__,
+            )
+
+    def send() -> None:
+        # Never serialize P then D: either request can wait for its peer.
+        with ThreadPoolExecutor(max_workers=2 * len(pairs)) as pool:
+            futures = [
+                pool.submit(post, url, payload, role, rank)
+                for rank, (prefill, decode) in enumerate(pairs)
+                for url, payload, role in (
+                    (pd.prefill_url, prefill, "prefill"),
+                    (base_url, decode, "decode"),
+                )
+            ]
+            for future in futures:
+                future.result()
+
+    thread = threading.Thread(target=send, daemon=True)
+    thread.start()
+    return thread
+
+
 def wait_for_aligned_steps(
     *,
     context: ServerContext,
@@ -759,6 +1021,7 @@ def wait_for_aligned_steps(
     min_steady_steps: int,
     min_steady_seconds: float,
     timeout_seconds: float,
+    load_thread: Optional[threading.Thread] = None,
 ) -> bool:
     deadline = time.monotonic() + timeout_seconds
     steady_start: Optional[float] = None
@@ -794,6 +1057,8 @@ def wait_for_aligned_steps(
         )
         if steady_steps >= min_steady_steps and steady_seconds >= min_steady_seconds:
             return True
+        if load_thread is not None and not load_thread.is_alive():
+            return False
     return False
 
 
@@ -832,6 +1097,43 @@ def flush_cache(*, base_url: str) -> None:
         logger.warning("POST /flush_cache failed; continuing.", exc_info=True)
 
 
+def flush_pd_cache(*, base_url: str) -> None:
+    # A previous round's request may be finishing on either side of the handoff.
+    deadline = time.monotonic() + DEFAULT_TIMEOUT
+    last_error = None
+    while (remaining := deadline - time.monotonic()) > 0:
+        try:
+            response = requests.post(
+                base_url + "/flush_cache",
+                timeout=min(PD_FLUSH_REQUEST_TIMEOUT_SECONDS, remaining),
+                allow_redirects=False,
+            )
+        except requests.exceptions.SSLError:
+            raise
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+        ) as exc:
+            last_error = exc
+        else:
+            if response.status_code == 200:
+                return
+            if response.status_code != 400:
+                response.raise_for_status()
+                raise RuntimeError(
+                    f"Unexpected HTTP {response.status_code} from {base_url}/flush_cache"
+                )
+            last_error = requests.exceptions.HTTPError(
+                "Cache flush was rejected (HTTP 400)", response=response
+            )
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(1.0, remaining))
+    raise TimeoutError(
+        f"Could not confirm PD cache flush at {base_url} before the deadline"
+    ) from last_error
+
+
 def set_forced_budget_frac(*, base_url: str, frac: Optional[float]) -> None:
     response = requests.post(
         base_url + "/set_internal_state",
@@ -867,6 +1169,9 @@ def fetch_rank_rows(*, base_url: str) -> list[list[SpsRow]]:
                     num_running_reqs=int(record["num_running_reqs"]),
                     num_verify_tokens=int(record["num_verify_tokens"]),
                     step_time=float(step_cpu_ms) / 1000.0,
+                    verify_tokens_graph_key=int(
+                        record.get("verify_tokens_graph_key", -1)
+                    ),
                 )
             )
         rank_rows.append(rows)
@@ -882,6 +1187,7 @@ def postprocess_round(
     min_steady_steps: int,
     load_info: LoadInfo,
     frac: Optional[float] = None,
+    graph_cost_supported: bool = False,
 ) -> RoundOutcome:
     offdiag = frac is not None
     batch_size = batch_size_per_rank * dp_size
@@ -971,6 +1277,21 @@ def postprocess_round(
         for by_ct in by_ct_per_rank
     ]
     median_step_time = statistics.median(per_ct_step_times)
+    replayed_keys = {
+        by_ct[ct].verify_tokens_graph_key
+        for ct in steady_cts
+        for by_ct in by_ct_per_rank
+    }
+    graph_tokens = (
+        next(iter(replayed_keys))
+        if len(replayed_keys) == 1 and next(iter(replayed_keys)) > 0
+        else None
+    )
+    if graph_cost_supported and graph_tokens is None:
+        raise RuntimeError(
+            f"Round bs={batch_size} frac={frac}: graph-aware SPS requires one "
+            f"actually replayed graph key; observed {sorted(replayed_keys)}."
+        )
 
     if offdiag:
         if len(aligned_verify_tokens) != 1:
@@ -1000,6 +1321,8 @@ def postprocess_round(
         batch_tokens=batch_tokens,
         steps_per_sec=1.0 / median_step_time,
         num_steady_steps=len(steady_cts),
+        graph_tokens=graph_tokens,
+        graph_cost_supported=graph_cost_supported,
         match_fraction=match_fraction,
         per_rank_median_step_time=per_rank_median_step_time,
         rank_rows=rank_rows,
@@ -1010,6 +1333,8 @@ def postprocess_round(
 
 def fitted_step_time(*, table, bs: int, m: int) -> float:
     if isinstance(table, SpsAdditiveCostTable):
+        if table.m_axis == "graph_tokens":
+            return table.graph_step_time(num_reqs=bs, graph_tokens=m)
         return table.step_time(num_reqs=bs, budget=max(0, m - bs))
     return 1.0 / table.lookup(m)
 
@@ -1109,15 +1434,13 @@ def plot_fit(*, cells: list[dict], table, plot_path: Path) -> None:
             row=1,
             col=3,
         )
-    fig.update_xaxes(
-        title_text="M = num total verify tokens", rangemode="tozero", row=1, col=1
+    x_label = (
+        "M = physical verify graph rows"
+        if isinstance(table, SpsAdditiveCostTable) and table.m_axis == "graph_tokens"
+        else "M = num total verify tokens"
     )
-    fig.update_xaxes(
-        title_text="M = num total verify tokens", rangemode="tozero", row=1, col=2
-    )
-    fig.update_xaxes(
-        title_text="M = num total verify tokens", rangemode="tozero", row=1, col=3
-    )
+    for col in (1, 2, 3):
+        fig.update_xaxes(title_text=x_label, rangemode="tozero", row=1, col=col)
     fig.update_yaxes(title_text="T = step time (ms)", rangemode="tozero", row=1, col=1)
     fig.update_yaxes(
         title_text="throughput (tokens/s)", rangemode="tozero", row=1, col=2
@@ -1142,12 +1465,16 @@ def plot_fit(*, cells: list[dict], table, plot_path: Path) -> None:
     logger.info("Wrote fit plot to %s", plot_path)
 
 
-def build_additive_table_from_cells(*, cells: list[dict]) -> SpsAdditiveCostTable:
+def build_additive_table_from_cells(
+    *, cells: list[dict], graph_tier_cost: bool = False
+) -> SpsAdditiveCostTable:
     if len(cells) < 4:
         raise RuntimeError(
             f"Off-diagonal fit needs at least 4 cells, got {len(cells)}."
         )
-    bias, alpha, theta, _rel, _stats = ols_resid_backfit(cells)
+    bias, alpha, theta, _rel, _stats = ols_resid_backfit(
+        cells, mbin_w=None if graph_tier_cost else 64
+    )
     bs_probes = sorted(alpha)
     m_probes = sorted(theta)
     return SpsAdditiveCostTable(
@@ -1156,12 +1483,13 @@ def build_additive_table_from_cells(*, cells: list[dict]) -> SpsAdditiveCostTabl
         alpha_seconds=[alpha[b] for b in bs_probes],
         m_probes=m_probes,
         theta_seconds=[theta[m] for m in m_probes],
+        m_axis="graph_tokens" if graph_tier_cost else "logical_tokens",
     )
 
 
-def ols_resid_backfit(cells: list, mbin_w: int = 64):
+def ols_resid_backfit(cells: list, mbin_w: Optional[int] = 64):
     def mbin(m):
-        return round(m / mbin_w) * mbin_w
+        return m if mbin_w is None else round(m / mbin_w) * mbin_w
 
     bslist = sorted({c["bs"] for c in cells})
     mbins = sorted({mbin(c["M"]) for c in cells})
@@ -1178,7 +1506,11 @@ def ols_resid_backfit(cells: list, mbin_w: int = 64):
         if mbin(c["M"]) in m_col:
             design[row, 1 + len(bs_col) + m_col[mbin(c["M"])]] = 1.0
 
-    beta, _, _, _ = np.linalg.lstsq(design, target, rcond=None)
+    beta, _, rank, _ = np.linalg.lstsq(design, target, rcond=None)
+    if mbin_w is None and rank != num_cols:
+        raise ValueError(
+            "Graph SPS fit is underdetermined: sweep at least one common graph tier between adjacent batch sizes."
+        )
     bias = float(beta[0])
     alpha = {bslist[0]: 0.0}
     for b in bslist[1:]:
@@ -1218,6 +1550,8 @@ def round_summary_dict(*, outcome: RoundOutcome, repeat: int) -> dict:
         "batch_size_per_rank": outcome.batch_size_per_rank,
         "frac": outcome.frac,
         "batch_tokens": outcome.batch_tokens,
+        "graph_tokens": outcome.graph_tokens,
+        "graph_cost_supported": outcome.graph_cost_supported,
         "steps_per_sec": outcome.steps_per_sec,
         "num_steady_steps": outcome.num_steady_steps,
         "match_fraction": outcome.match_fraction,
@@ -1246,6 +1580,7 @@ def append_round_files(
                             "forward_ct": row.forward_ct,
                             "num_running_reqs": row.num_running_reqs,
                             "num_verify_tokens": row.num_verify_tokens,
+                            "verify_tokens_graph_key": row.verify_tokens_graph_key,
                             "step_time": row.step_time,
                         }
                     )
@@ -1275,6 +1610,7 @@ def write_manifest(
         "dp_size": context.dp_size,
         "verify_num_draft_tokens": context.verify_num_draft_tokens,
         "simulate_acc_len": context.simulate_acc_len,
+        "graph_cost_supported": context.graph_cost_supported,
         "batch_size_per_rank_sweep": batch_sizes,
         "fracs": fracs,
         "settings": msgspec.to_builtins(settings),
@@ -1290,6 +1626,8 @@ def write_manifest(
             round_summary_dict(outcome=outcome, repeat=0) for outcome in rounds
         ],
     }
+    if context.pd_target is not None:
+        manifest["pd_target"] = msgspec.to_builtins(context.pd_target)
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
 
@@ -1335,12 +1673,11 @@ def run_self_check(*, out_path: Path, offdiag: bool) -> None:
 
 def run_additive_self_check(*, table: SpsAdditiveCostTable) -> None:
     for num_reqs in table.bs_probes:
-        for budget in (0, max(table.m_probes) - table.bs_probes[0]):
-            value = table.step_time(num_reqs=num_reqs, budget=max(0, budget))
-            if not value > 0:
+        for m in table.m_probes:
+            value = fitted_step_time(table=table, bs=num_reqs, m=m)
+            if not math.isfinite(value) or value <= 0:
                 raise RuntimeError(
-                    f"Reloaded additive table step_time(num_reqs={num_reqs}, "
-                    f"budget={budget}) is non-positive ({value})."
+                    f"Reloaded additive table step time at bs={num_reqs}, M={m} must be finite and positive ({value})."
                 )
     logger.info(
         "Self-check passed: reloaded additive table (%s bs probes x %s M "
@@ -1369,12 +1706,28 @@ def add_out_arg(parser: argparse.ArgumentParser) -> None:
 
 
 def add_run_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
+    endpoints = parser.add_mutually_exclusive_group(required=True)
+    endpoints.add_argument(
         "--base-url",
-        type=str,
-        default="",
-        help="Base URL of the already-running DSpark server, e.g. "
-        "http://localhost:30000. The profiler never launches a server.",
+        help="Colocate DSpark server URL.",
+    )
+    endpoints.add_argument(
+        "--decode-url",
+        help="PD Decode engine URL. Use together with --prefill-url.",
+    )
+    parser.add_argument(
+        "--prefill-url",
+        help="PD Prefill engine URL. Use dedicated P/D engines: "
+        "profiling flushes both caches and aborts requests between rounds.",
+    )
+    parser.add_argument(
+        "--prefill-bootstrap-host",
+        help="Prefill bootstrap host reachable from Decode. Defaults to the hostname in --prefill-url.",
+    )
+    parser.add_argument(
+        "--prefill-bootstrap-port",
+        type=int,
+        help="Prefill bootstrap port. Defaults to the port advertised by Prefill /server_info.",
     )
     parser.add_argument(
         "--fracs",
@@ -1507,6 +1860,17 @@ def run_batch_sizes(*, args: argparse.Namespace) -> list[int]:
     return build_request_count_sweep(args.max_batch_size)
 
 
+def resolve_profile_url(args: argparse.Namespace) -> str:
+    if (args.prefill_url is None) != (args.decode_url is None):
+        raise ValueError("PD profiling needs both --prefill-url and --decode-url.")
+    if args.prefill_url is None and (
+        args.prefill_bootstrap_host is not None
+        or args.prefill_bootstrap_port is not None
+    ):
+        raise ValueError("Prefill bootstrap overrides require PD profiling.")
+    return args.decode_url or args.base_url
+
+
 def cli_main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -1535,6 +1899,11 @@ def cli_main() -> None:
     add_fit_args(all_parser)
 
     args = parser.parse_args()
+    if args.command in ("run", "all"):
+        try:
+            run_target = resolve_profile_url(args)
+        except ValueError as exc:
+            parser.error(str(exc))
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper()),
         format="%(message)s",
@@ -1542,13 +1911,16 @@ def cli_main() -> None:
 
     if args.command == "run":
         run_profile(
-            base_url=args.base_url,
+            base_url=run_target,
             batch_sizes=run_batch_sizes(args=args),
             settings=run_settings(args=args),
             out=args.out,
             repeats=args.repeats,
             local_tokenizer_path=args.local_tokenizer_path,
             fracs=args.fracs,
+            prefill_url=args.prefill_url,
+            prefill_bootstrap_host=args.prefill_bootstrap_host,
+            prefill_bootstrap_port=args.prefill_bootstrap_port,
         )
     elif args.command == "fit":
         fit_profile(
@@ -1559,7 +1931,7 @@ def cli_main() -> None:
         )
     else:
         profile_all(
-            base_url=args.base_url,
+            base_url=run_target,
             batch_sizes=run_batch_sizes(args=args),
             settings=run_settings(args=args),
             out=args.out,
@@ -1569,6 +1941,9 @@ def cli_main() -> None:
             local_tokenizer_path=args.local_tokenizer_path,
             fracs=args.fracs,
             plot=args.plot,
+            prefill_url=args.prefill_url,
+            prefill_bootstrap_host=args.prefill_bootstrap_host,
+            prefill_bootstrap_port=args.prefill_bootstrap_port,
         )
 
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import math
+from collections.abc import Callable, Sequence
 from typing import Optional, Union
 
 import msgspec
@@ -130,8 +132,10 @@ class DSparkVerifyPlanner:
         self._ragged_verify_mode = read_ragged_verify_mode()
         self._schedule_cfg = DSparkScheduleConfig(gamma=self.gamma)
         self._budget_planner: Optional[HostConfidenceBudgetPlanner] = None
+        self._graph_cost_table: Optional[SpsAdditiveCostTable] = None
         self._dynamic_graph_tier = False
         self._dp_tier_gather_enabled = False
+        self._ppu_megamoe_compact = envs.SGLANG_ENABLE_PPU_DSPARK_MEGAMOE_COMPACT.get()
         self._is_verify_all = True
         self._sync_verify_budget = False
         self._budget_sync_tensor: Optional[torch.Tensor] = None
@@ -184,12 +188,27 @@ class DSparkVerifyPlanner:
                 and is_dp_attention_enabled()
                 and get_parallel().attn_tp_size == 1
                 and get_parallel().attn_cp_size == 1
-                and require_mlp_tp_gather()
+                and (self._ppu_megamoe_compact or require_mlp_tp_gather())
                 and not get_schedule().disable_overlap_schedule
-                and get_disagg().disaggregation_mode == "null"
+                and (
+                    get_disagg().disaggregation_mode == "null"
+                    or (
+                        self._ppu_megamoe_compact
+                        and get_disagg().disaggregation_mode == "decode"
+                    )
+                )
                 and get_parallel().pp_size == 1
                 and not envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
             )
+            if (
+                isinstance(sps_table, SpsAdditiveCostTable)
+                and sps_table.m_axis == "graph_tokens"
+            ):
+                if not self.supports_graph_cost:
+                    raise ValueError(
+                        "Physical-graph DSpark SPS tables require PPU Compact with synchronized DP MegaMoE verify."
+                    )
+                self._graph_cost_table = sps_table
             if tp_rank == 0:
                 sps_table_source = (
                     get_spec().speculative_dspark_sps_table_path or "uninitialized"
@@ -221,6 +240,11 @@ class DSparkVerifyPlanner:
     @property
     def carries_confidence(self) -> bool:
         return self._confidence_head is not None
+
+    @property
+    def supports_graph_cost(self) -> bool:
+        # Report capability even when calibration bootstraps with a legacy table.
+        return self._ppu_megamoe_compact and self._dp_tier_gather_enabled
 
     @property
     def schedules_verify_budget(self) -> bool:
@@ -260,6 +284,12 @@ class DSparkVerifyPlanner:
         draft_input = batch.spec_info
         if self._budget_planner is None:
             return
+        if self._graph_cost_table is not None:
+            self._prepare_shared_graph_budget(batch, future_map)
+            return
+        if self._ppu_megamoe_compact and batch.forward_mode.is_idle():
+            self._maybe_gather_dp_verify_tier(batch=batch, local_tier_num_tokens=0)
+            return
         if draft_input is None:
             local_tier_num_tokens = 0 if batch.batch_size() == 0 else -1
             self._maybe_gather_dp_verify_tier(
@@ -284,21 +314,159 @@ class DSparkVerifyPlanner:
             batch=batch, local_tier_num_tokens=batch.spec_verify_tier_num_tokens
         )
 
+    def _prepare_shared_graph_budget(
+        self, batch: ScheduleBatch, future_map: FutureMap
+    ) -> None:
+        """Agree on a physical graph before choosing per-rank verify lengths."""
+        table, host = self._graph_cost_table, self._budget_planner
+        assert table is not None and host is not None
+        draft_input = batch.spec_info
+        host.note_non_decode_step()
+        batch.spec_verify_tier_num_tokens = -1
+        batch.global_spec_verify_tier_num_tokens = None
+        batch.global_spec_verify_num_reqs = None
+        if draft_input is not None:
+            draft_input.verify_token_budget = None
+        if batch.is_extend_in_batch:
+            # This is a scheduler-agreed flag. No DP verify collective in this step.
+            return
+
+        runner = self.model_runner.decode_cuda_graph_runner
+        grid = tuple(ragged_capture_num_tokens(model_runner=self.model_runner) or ())
+        bs = 0 if batch.forward_mode.is_idle() else batch.batch_size()
+        budgets = [0] * len(grid)
+        expected_tokens = [0.0] * len(grid)
+        forced_budget = None
+        state = 0  # Idle peers participate with no local utility.
+        if bs:
+            state = -1  # No usable confidence/graph: all ranks use uniform verify.
+            resolved = (
+                future_map.resolve_confidence_cpu(batch)
+                if draft_input is not None and batch.forward_mode.is_decode()
+                else None
+            )
+            if resolved is not None:
+                req_pool_indices_cpu = batch.req_pool_indices_cpu
+                survival = host.prepare_survival(
+                    confidence=resolved.confidence,
+                    generation=resolved.generation,
+                    current_generation=self.model_runner.req_to_token_pool.req_generation[
+                        req_pool_indices_cpu.to(torch.int64)
+                    ],
+                    req_pool_indices_cpu=req_pool_indices_cpu,
+                )
+                if host.forced_budget_frac is not None:
+                    state = 2
+                    forced_budget = host.forced_budget(survival)
+                elif (
+                    grid
+                    and runner.attn_backend.supports_ragged_verify_graph
+                    and (not runner.require_mlp_sync or batch.can_run_decode_cuda_graph)
+                ):
+                    state = 1
+                    budgets, expected_tokens = graph_budget_utilities(
+                        survival=survival,
+                        grid=grid,
+                        bs=bs,
+                        cfg=self._schedule_cfg,
+                        verify_num_draft_tokens=self.verify_num_draft_tokens,
+                    )
+
+        forced_tokens = (
+            local_verify_tier_num_tokens(
+                bs=bs,
+                verify_token_budget=forced_budget,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                min_verify_len=self._schedule_cfg.min_verify_len,
+            )
+            if forced_budget is not None
+            else 0
+        )
+        # Same collective and message shape for active, idle, and forced-probe ranks.
+        cpu_group = get_parallel().tp_group.cpu_group
+        local = torch.tensor(
+            [bs, state, forced_tokens, *expected_tokens], dtype=torch.float64
+        )
+        gathered = torch.empty(
+            torch.distributed.get_world_size(group=cpu_group) * local.numel(),
+            dtype=local.dtype,
+        )
+        all_gather_single(gathered, local, group=cpu_group)
+        peers = gathered.view(-1, local.numel()).tolist()
+        max_bs = int(max(peer[0] for peer in peers))
+        if max_bs == 0:
+            return
+        batch.global_spec_verify_num_reqs = max_bs
+        active_states = {peer[1] for peer in peers if peer[0] > 0}
+        if active_states == {2}:
+            # The profiler can still pin a budget and observe the physical graph.
+            batch.global_spec_verify_tier_num_tokens = [int(peer[2]) for peer in peers]
+            if bs:
+                draft_input.verify_token_budget = forced_budget
+                batch.spec_verify_tier_num_tokens = forced_tokens
+                host.last_decision = VerifyBudgetDecision(budget=forced_budget)
+            return
+        if active_states != {1} or not grid or max_bs > runner.max_bs:
+            return
+
+        upper = round_up_grid(
+            min(max_bs * self.verify_num_draft_tokens, grid[-1]), grid
+        )
+        choice = choose_shared_verify_graph(
+            grid=grid,
+            max_graph_tokens=upper,
+            max_bs=max_bs,
+            slots_for_graph=runner._ragged_capture_slots,
+            utilities=[peer[3:] for peer in peers],
+            table=table,
+        )
+        if choice is None:
+            return
+        graph_idx, decision_time, throughput = choice
+        # Pass the actual graph key to both the active and idle replay paths.
+        batch.global_spec_verify_tier_num_tokens = [grid[graph_idx]]
+        if bs:
+            budget = budgets[graph_idx]
+            draft_input.verify_token_budget = budget
+            batch.spec_verify_tier_num_tokens = local_verify_tier_num_tokens(
+                bs=bs,
+                verify_token_budget=budget,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                min_verify_len=self._schedule_cfg.min_verify_len,
+            )
+            host.last_decision = VerifyBudgetDecision(
+                budget=budget,
+                predicted_step_seconds=decision_time,
+                predicted_theta=throughput,
+            )
+
     def _maybe_gather_dp_verify_tier(
         self, *, batch: ScheduleBatch, local_tier_num_tokens: int
     ) -> None:
         if not self._dp_tier_gather_enabled:
             return
+        batch.global_spec_verify_num_reqs = None
         if batch.is_extend_in_batch:
             batch.global_spec_verify_tier_num_tokens = None
             return
         cpu_group = get_parallel().tp_group.cpu_group
-        local_tensor = torch.tensor([local_tier_num_tokens], dtype=torch.int64)
+        counts = [local_tier_num_tokens]
+        if self._ppu_megamoe_compact:
+            # A2A MoE keeps MLP metadata local. Exchange request counts for
+            # verify admission without changing the activation layout.
+            counts.append(batch.batch_size())
+        local_tensor = torch.tensor(counts, dtype=torch.int64)
         gathered = torch.empty(
-            (torch.distributed.get_world_size(group=cpu_group),), dtype=torch.int64
+            (torch.distributed.get_world_size(group=cpu_group) * len(counts),),
+            dtype=torch.int64,
         )
         all_gather_single(gathered, local_tensor, group=cpu_group)
-        batch.global_spec_verify_tier_num_tokens = gathered.tolist()
+        if self._ppu_megamoe_compact:
+            tiers, req_counts = gathered.view(-1, 2).T.tolist()
+            batch.global_spec_verify_tier_num_tokens = tiers
+            batch.global_spec_verify_num_reqs = max(req_counts)
+        else:
+            batch.global_spec_verify_tier_num_tokens = gathered.tolist()
 
     def note_non_decode_step(self) -> None:
         if self._budget_planner is not None:
@@ -897,6 +1065,52 @@ class VerifyBudgetDecision(msgspec.Struct):
     predicted_theta: Optional[float] = None
 
 
+def graph_budget_utilities(
+    *,
+    survival: torch.Tensor,
+    grid: Sequence[int],
+    bs: int,
+    cfg: DSparkScheduleConfig,
+    verify_num_draft_tokens: int,
+) -> tuple[list[int], list[float]]:
+    """Best expected committed-token count that fits each physical graph."""
+    floor = bs * max(cfg.min_verify_len, 1)
+    candidates = survival[:, : cfg.resolved_max_verify_len()].flatten()
+    candidates = candidates[candidates >= cfg.survival_eps].to(torch.float64)
+    prefix = torch.cat(
+        [candidates.new_zeros(1), candidates.sort(descending=True).values.cumsum(0)]
+    )
+    limit = min(prefix.numel() - 1, bs * verify_num_draft_tokens - floor)
+    budgets = [min(max(0, rows - floor), limit) for rows in grid]
+    return budgets, (bs + prefix[budgets]).tolist()
+
+
+def choose_shared_verify_graph(
+    *,
+    grid: Sequence[int],
+    max_graph_tokens: int,
+    max_bs: int,
+    slots_for_graph: Callable[[int], int],
+    utilities: Sequence[Sequence[float]],
+    table: SpsAdditiveCostTable,
+) -> Optional[tuple[int, float, float]]:
+    """Choose by aggregate expected tokens / shared-graph step time."""
+    best = None
+    for i, rows in enumerate(grid):
+        if rows > max_graph_tokens:
+            break
+        if max_bs > slots_for_graph(rows):
+            continue
+        step_time = table.graph_step_time(num_reqs=max_bs, graph_tokens=rows)
+        if not math.isfinite(step_time) or step_time <= 0:
+            continue
+        throughput = math.fsum(local[i] for local in utilities) / step_time
+        # Prefer the smaller graph on a tie.
+        if best is None or throughput > best[2]:
+            best = (i, step_time, throughput)
+    return best
+
+
 def compute_verify_token_budget(
     *,
     history_survival_probs: torch.Tensor,
@@ -915,6 +1129,8 @@ def compute_verify_token_budget(
         [torch.zeros(1, dtype=torch.float64), prefix_sum]
     )
     if isinstance(sps_table, SpsAdditiveCostTable):
+        if sps_table.m_axis != "logical_tokens":
+            raise ValueError("Physical-graph SPS tables require graph-aware planning.")
         step_time = _additive_step_time_tensor(
             table=sps_table,
             num_requests=int(num_requests),
@@ -997,20 +1213,14 @@ class HostConfidenceBudgetPlanner:
         current_generation: torch.Tensor,
         req_pool_indices_cpu: torch.Tensor,
     ) -> int:
-        lagged_confidence, lagged_generation = self._shift_to_lag(
+        survival = self.prepare_survival(
             confidence=confidence,
             generation=generation,
+            current_generation=current_generation,
             req_pool_indices_cpu=req_pool_indices_cpu,
         )
-        survival = self._two_steps_prior_survival(
-            lagged_confidence=lagged_confidence,
-            lagged_generation=lagged_generation,
-            current_generation=current_generation,
-        )
-        forced_frac = self.forced_budget_frac
-        if forced_frac is not None:
-            full_budget = int(survival[:, : self.cfg.resolved_max_verify_len()].numel())
-            forced_budget = max(0, int(float(forced_frac) * full_budget))
+        if self.forced_budget_frac is not None:
+            forced_budget = self.forced_budget(survival)
             self.last_decision = VerifyBudgetDecision(budget=forced_budget)
             return forced_budget
         decision = compute_verify_token_budget(
@@ -1020,6 +1230,30 @@ class HostConfidenceBudgetPlanner:
         )
         self.last_decision = decision
         return decision.budget
+
+    def forced_budget(self, survival: torch.Tensor) -> int:
+        assert self.forced_budget_frac is not None
+        full_budget = survival[:, : self.cfg.resolved_max_verify_len()].numel()
+        return max(0, int(float(self.forced_budget_frac) * full_budget))
+
+    def prepare_survival(
+        self,
+        *,
+        confidence: torch.Tensor,
+        generation: torch.Tensor,
+        current_generation: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
+    ) -> torch.Tensor:
+        lagged_confidence, lagged_generation = self._shift_to_lag(
+            confidence=confidence,
+            generation=generation,
+            req_pool_indices_cpu=req_pool_indices_cpu,
+        )
+        return self._two_steps_prior_survival(
+            lagged_confidence=lagged_confidence,
+            lagged_generation=lagged_generation,
+            current_generation=current_generation,
+        )
 
     def take_last_decision(self) -> Optional[VerifyBudgetDecision]:
         decision = self.last_decision

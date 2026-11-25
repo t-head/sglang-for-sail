@@ -1,6 +1,8 @@
 import functools
 import types
 import unittest
+from contextlib import nullcontext
+from unittest.mock import patch
 
 import torch
 
@@ -11,7 +13,9 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
     HostConfidenceBudgetPlanner,
     VerifyBudgetDecision,
+    choose_shared_verify_graph,
     compute_verify_token_budget,
+    graph_budget_utilities,
     graph_tier_fill_budget,
 )
 from sglang.srt.speculative.dspark_components.dspark_sps import (
@@ -51,6 +55,144 @@ def _additive_table() -> SpsAdditiveCostTable:
         m_probes=[1, 200],
         theta_seconds=[0.0, 0.02],
     )
+
+
+class TestSharedGraphBudget(CustomTestCase):
+    @staticmethod
+    def _table():
+        return SpsAdditiveCostTable(
+            bias_seconds=0.04,
+            bs_probes=[8],
+            alpha_seconds=[0],
+            m_probes=[48, 96],
+            theta_seconds=[0, 0.04],
+            m_axis="graph_tokens",
+        )
+
+    def test_uses_per_graph_capacity_and_joint_utility(self):
+        budgets, tokens = graph_budget_utilities(
+            survival=torch.full((12, 5), 0.5),
+            grid=[48, 96],
+            bs=12,
+            cfg=DSparkScheduleConfig(gamma=5),
+            verify_num_draft_tokens=6,
+        )
+        self.assertEqual(budgets, [36, 60])
+        self.assertEqual(tokens, [30.0, 42.0])
+        args = dict(
+            grid=[48, 96],
+            max_graph_tokens=96,
+            max_bs=8,
+            slots_for_graph=lambda rows: rows,
+            table=self._table(),
+        )
+        self.assertEqual(
+            choose_shared_verify_graph(**args, utilities=[[10, 11], [0, 0]])[0],
+            0,
+        )
+        self.assertEqual(
+            choose_shared_verify_graph(**args, utilities=[[10, 11], [5, 22], [0, 0]])[
+                0
+            ],
+            1,
+        )
+        args["slots_for_graph"] = lambda rows: rows // 12
+        self.assertEqual(
+            choose_shared_verify_graph(**args, utilities=[[10, 11], [0, 0]])[0],
+            1,
+        )
+
+    def test_busy_and_idle_agree_and_new_peer_falls_back(self):
+        from sglang.srt.speculative.dspark_components import dspark_planner as mod
+
+        planner = mod.DSparkVerifyPlanner.__new__(mod.DSparkVerifyPlanner)
+        planner._graph_cost_table = self._table()
+        planner._schedule_cfg = DSparkScheduleConfig(gamma=5)
+        planner.verify_num_draft_tokens = 6
+        runner = _fake_model_runner([48, 96], max_bs=16)
+        graph_runner = runner.decode_cuda_graph_runner
+        graph_runner.attn_backend = types.SimpleNamespace(
+            supports_ragged_verify_graph=True
+        )
+        graph_runner.require_mlp_sync = False
+        graph_runner._ragged_capture_slots = lambda rows: min(rows, 16)
+        runner.req_to_token_pool = types.SimpleNamespace(
+            req_generation=torch.ones(16, dtype=torch.int64)
+        )
+        planner.model_runner = runner
+        host = HostConfidenceBudgetPlanner(
+            sps_table=planner._graph_cost_table,
+            cfg=planner._schedule_cfg,
+            model_runner=runner,
+            relay_lag_steps=1,
+        )
+        planner._budget_planner = host
+        group = object()
+        batch = types.SimpleNamespace(
+            batch_size=lambda: 12,
+            is_extend_in_batch=False,
+            forward_mode=types.SimpleNamespace(
+                is_idle=lambda: False, is_decode=lambda: True
+            ),
+            spec_info=types.SimpleNamespace(verify_token_budget=None),
+            req_pool_indices_cpu=torch.arange(12),
+        )
+        idle = types.SimpleNamespace(
+            batch_size=lambda: 0,
+            is_extend_in_batch=False,
+            spec_info=None,
+            forward_mode=types.SimpleNamespace(is_idle=lambda: True),
+        )
+        resolved = types.SimpleNamespace(
+            confidence=torch.full((12, 5), 0.8),
+            generation=torch.ones(12, dtype=torch.int64),
+        )
+        future_map = types.SimpleNamespace(resolve_confidence_cpu=lambda _: resolved)
+        busy_row = None
+        peer_row = [0.0, 0.0, 0.0, 0.0, 0.0]
+        gather_count = 0
+
+        def gather(output, local, *, group):
+            nonlocal gather_count, busy_row
+            gather_count += 1
+            if local[0]:
+                busy_row = local.clone()
+                peer = local.new_tensor(peer_row)
+                output.copy_(torch.cat([local, peer]))
+            else:
+                output.copy_(torch.cat([busy_row, local]))
+
+        with (
+            patch.object(
+                mod,
+                "get_parallel",
+                return_value=types.SimpleNamespace(
+                    tp_group=types.SimpleNamespace(cpu_group=group)
+                ),
+            ),
+            patch.object(torch.distributed, "get_world_size", return_value=2),
+            patch.object(mod, "all_gather_single", side_effect=gather),
+        ):
+            planner.prepare_verify_budget(batch, future_map)
+            planner.prepare_verify_budget(idle, future_map)
+            self.assertEqual(batch.global_spec_verify_tier_num_tokens, [48])
+            self.assertEqual(idle.global_spec_verify_tier_num_tokens, [48])
+            self.assertEqual(batch.spec_info.verify_token_budget, 36)
+            self.assertEqual(idle.global_spec_verify_num_reqs, 12)
+            peer_row = [8, -1, 0, 0, 0]
+            planner.prepare_verify_budget(batch, future_map)
+            self.assertIsNone(batch.spec_info.verify_token_budget)
+            self.assertIsNone(batch.global_spec_verify_tier_num_tokens)
+            self.assertEqual(batch.global_spec_verify_num_reqs, 12)
+            peer_row = [0, 0, 0, 0, 0]
+            host.forced_budget_frac = 1.0
+            planner.prepare_verify_budget(batch, future_map)
+            self.assertEqual(batch.spec_info.verify_token_budget, 60)
+            self.assertEqual(batch.global_spec_verify_tier_num_tokens, [72, 0])
+            batch.is_extend_in_batch = True
+            planner.prepare_verify_budget(batch, future_map)
+            self.assertIsNone(batch.global_spec_verify_tier_num_tokens)
+            self.assertEqual(gather_count, 4)
 
 
 def _survival_from_confidence(confidence: torch.Tensor) -> torch.Tensor:
@@ -412,6 +554,133 @@ def _fake_model_runner(capture_num_tokens, max_bs):
 
 
 class TestBudgetTierSelection(CustomTestCase):
+    def test_pd_preallocated_row_does_not_publish_confidence_for_reused_slot(self):
+        from sglang.srt.managers import overlap_utils
+
+        pool = types.SimpleNamespace(req_generation=torch.tensor([0, 1, 1]))
+        with patch.object(overlap_utils, "_is_cuda", False):
+            relay = overlap_utils.ConfidenceRelay(torch.device("cpu"), 3, pool)
+            slots = torch.tensor([1, 2])
+            relay.scatter(
+                slots, torch.tensor([[0.125, 0.25], [0.5, 0.5]]), indices_cpu=slots
+            )
+
+        # KV preallocation reuses slot 1. Only the incumbent in slot 2
+        # generates another confidence sample before the newcomer is admitted.
+        pool.req_generation[1] += 1
+        incumbent = torch.tensor([2])
+        relay.scatter(incumbent, torch.tensor([[0.75, 0.5]]), indices_cpu=incumbent)
+        depth = overlap_utils.CONFIDENCE_RELAY_RING_DEPTH
+        relay.conf_ring = torch.empty((depth, 3, 2))
+        relay.gen_ring = torch.zeros((depth, 3), dtype=torch.int64)
+        ready = types.SimpleNamespace(query=lambda: True, record=lambda: None)
+        relay.copy_done = [ready] * depth
+        stream = types.SimpleNamespace(wait_event=lambda event: None)
+        batch = types.SimpleNamespace(
+            spec_info=types.SimpleNamespace(future_indices=slots),
+            req_pool_indices=slots,
+            req_pool_indices_cpu=slots,
+        )
+
+        def snapshot():
+            with patch.object(
+                torch,
+                "get_device_module",
+                return_value=types.SimpleNamespace(stream=lambda _: nullcontext()),
+            ):
+                for _ in range(overlap_utils.CONFIDENCE_RELAY_RING_LAG):
+                    relay.issue_ring_copy(stream=stream, publish_ready=ready)
+            return relay.resolve(batch, stream=stream, publish_ready=ready)
+
+        def survival(resolved):
+            planner = HostConfidenceBudgetPlanner(
+                sps_table=_cliff_table(),
+                cfg=DSparkScheduleConfig(gamma=2),
+                model_runner=None,
+            )
+            return planner._two_steps_prior_survival(
+                lagged_confidence=resolved.confidence,
+                lagged_generation=resolved.generation,
+                current_generation=pool.req_generation[slots],
+            )
+
+        # The pending row gets the no-confidence prior, not its old value.
+        torch.testing.assert_close(
+            survival(snapshot()), torch.tensor([[1.0, 1.0], [0.75, 0.375]])
+        )
+        new_slot = torch.tensor([1])
+        relay.scatter(new_slot, torch.tensor([[0.5, 0.25]]), indices_cpu=new_slot)
+        torch.testing.assert_close(
+            survival(snapshot()), torch.tensor([[0.5, 0.125], [0.75, 0.375]])
+        )
+
+    def test_megamoe_tier_exchange_carries_request_counts_for_idle_rank(self):
+        from sglang.srt.speculative.dspark_components import dspark_planner
+
+        planner = dspark_planner.DSparkVerifyPlanner.__new__(
+            dspark_planner.DSparkVerifyPlanner
+        )
+        planner._dp_tier_gather_enabled = True
+        planner._ppu_megamoe_compact = True
+        batch = types.SimpleNamespace(
+            batch_size=lambda: 0, is_extend_in_batch=False, global_num_tokens=[0]
+        )
+        cpu_group = object()
+        rows = torch.tensor([601, 256, 399, 128], dtype=torch.int64)
+
+        def gather(output, local, *, group):
+            output.copy_(torch.cat([local, rows]))
+
+        with (
+            patch.object(
+                dspark_planner,
+                "get_parallel",
+                return_value=types.SimpleNamespace(
+                    tp_group=types.SimpleNamespace(cpu_group=cpu_group)
+                ),
+            ),
+            patch.object(torch.distributed, "get_world_size", return_value=3),
+            patch.object(dspark_planner, "all_gather_single", side_effect=gather),
+        ):
+            planner._maybe_gather_dp_verify_tier(batch=batch, local_tier_num_tokens=0)
+            self.assertEqual(batch.global_spec_verify_num_reqs, 256)
+            self.assertEqual(batch.global_spec_verify_tier_num_tokens, [0, 601, 399])
+            self.assertEqual(batch.global_num_tokens, [0])
+            tier = dspark_planner.dp_global_verify_tier_num_tokens(
+                global_tier_num_tokens=batch.global_spec_verify_tier_num_tokens
+            )
+            layout = dspark_planner.idle_ragged_layout(
+                tier_num_reqs=batch.global_spec_verify_num_reqs,
+                dp_tier_num_tokens=tier,
+                device=torch.device("cpu"),
+                verify_num_draft_tokens=6,
+                model_runner=_fake_model_runner([384, 768, 1536], max_bs=256),
+            )
+            self.assertEqual(layout.graph_num_tokens, 768)
+
+            # A newly admitted peer without confidence pins the common shape,
+            # even though another active peer can still produce a small budget.
+            rows[0] = -1
+            planner._maybe_gather_dp_verify_tier(batch=batch, local_tier_num_tokens=0)
+            tier = dspark_planner.dp_global_verify_tier_num_tokens(
+                global_tier_num_tokens=batch.global_spec_verify_tier_num_tokens
+            )
+            self.assertIsNone(tier)
+            layout = dspark_planner.idle_ragged_layout(
+                tier_num_reqs=batch.global_spec_verify_num_reqs,
+                dp_tier_num_tokens=tier,
+                device=torch.device("cpu"),
+                verify_num_draft_tokens=6,
+                model_runner=_fake_model_runner([384, 768, 1536], max_bs=256),
+            )
+            self.assertEqual(layout.graph_num_tokens, 1536)
+
+            # A global extend step must not reuse a preceding decode tier.
+            batch.is_extend_in_batch = True
+            planner._maybe_gather_dp_verify_tier(batch=batch, local_tier_num_tokens=0)
+            self.assertIsNone(batch.global_spec_verify_num_reqs)
+            self.assertIsNone(batch.global_spec_verify_tier_num_tokens)
+
     def test_floor_uses_tier_hint_capped_at_uniform_window(self):
         from sglang.srt.speculative.dspark_components.dspark_planner import (
             verify_layout_graph_num_tokens_floor,

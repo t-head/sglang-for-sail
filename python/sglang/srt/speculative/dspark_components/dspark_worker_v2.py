@@ -892,7 +892,11 @@ class DSparkWorkerV2(BaseSpecWorker):
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):
         if batch.global_num_tokens is None or not self._verify_planner.is_compact_mode:
             return None
-        global_bs = max(batch.global_num_tokens)
+        global_bs = (
+            batch.global_spec_verify_num_reqs
+            if batch.global_spec_verify_num_reqs is not None
+            else max(batch.global_num_tokens)
+        )
         if global_bs <= 0:
             return None
         return idle_ragged_layout(
@@ -980,6 +984,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             and batch.global_num_tokens is not None
             else None
         )
+        if batch.global_spec_verify_num_reqs is not None:
+            global_num_reqs = batch.global_spec_verify_num_reqs
         if coordination_plan is not None:
             rank = get_parallel().attn_dp_rank
             target_local_only = len(batch.global_num_tokens) == 1
@@ -1320,6 +1326,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_pool_indices=batch.req_pool_indices,
             verify_tier_num_tokens=int(batch.spec_verify_tier_num_tokens),
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
+            target_graph_replayed=can_run_cuda_graph,
         )
 
         next_draft_input = make_next_draft_input(

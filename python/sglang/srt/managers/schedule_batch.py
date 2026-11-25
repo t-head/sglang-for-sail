@@ -2657,6 +2657,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Full DP token vector retained for Aiter MegaMoE even when the normal MLP
     # TP gather path stores only this rank's token count.
     global_spec_verify_tier_num_tokens: Optional[List[int]] = None
+    global_spec_verify_num_reqs: Optional[int] = None
 
     # Member rows riding one forward; None whenever reqs and rows are 1:1.
     beam_tail: Optional[BeamTail] = None
