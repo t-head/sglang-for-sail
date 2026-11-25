@@ -21,7 +21,13 @@ import json
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from transformers import PreTrainedTokenizerFast
+
+from sglang.srt.hf_transformers import tokenizer as tokenizer_module
 from sglang.srt.hf_transformers.tokenizer import _is_step5_checkpoint
 
 
@@ -77,9 +83,58 @@ def run_unreadable_config_is_not_step5():
         assert _is_step5_checkpoint(tmp, None) is False, "malformed config.json"
 
 
+def run_get_tokenizer_preserves_revision_and_file_options():
+    model = "test/step5-tokenizer"
+    revision = "pinned-revision"
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        subfolder = root / "text"
+        subfolder.mkdir()
+        raw = Tokenizer(WordLevel({"<unk>": 0, "pinned": 1}, unk_token="<unk>"))
+        PreTrainedTokenizerFast(
+            tokenizer_object=raw, unk_token="<unk>"
+        ).save_pretrained(subfolder)
+        _write_config(str(subfolder), json.dumps({"model_type": "step5"}))
+
+        def hub_file(repo_id, filename, *, revision, cache_dir, subfolder, **kwargs):
+            assert repo_id == model and cache_dir == tmp and subfolder == "text"
+            assert kwargs["local_files_only"]
+            if revision != "pinned-revision":
+                raise FileNotFoundError(filename)
+            return str(root / subfolder / filename)
+
+        load_from_local = PreTrainedTokenizerFast.from_pretrained
+
+        def load_pinned(repo_id, **kwargs):
+            assert repo_id == model
+            assert kwargs.pop("revision") == revision
+            assert kwargs.pop("cache_dir") == tmp
+            assert kwargs.pop("subfolder") == "text"
+            assert kwargs.pop("local_files_only")
+            return load_from_local(subfolder, **kwargs)
+
+        with (
+            patch("huggingface_hub.hf_hub_download", side_effect=hub_file),
+            patch.object(
+                tokenizer_module.PreTrainedTokenizerFast,
+                "from_pretrained",
+                side_effect=load_pinned,
+            ),
+        ):
+            loaded = tokenizer_module.get_tokenizer(
+                model,
+                revision=revision,
+                cache_dir=tmp,
+                subfolder="text",
+                local_files_only=True,
+            )
+        assert loaded.encode("pinned", add_special_tokens=False) == [1]
+
+
 def main():
     run_detect_step5_checkpoint()
     run_unreadable_config_is_not_step5()
+    run_get_tokenizer_preserves_revision_and_file_options()
     print("all Step5 tokenizer detection cases passed")
 
 

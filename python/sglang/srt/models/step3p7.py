@@ -82,7 +82,10 @@ class Step3p7ForConditionalGeneration(nn.Module):
         )
         language_model_cls = Step3p5ForCausalLM
         language_kwargs = {}
-        if get_step5_text_config(config) is not None:
+        self.kv_cache_dtype_full_attention_only = (
+            get_step5_text_config(config) is not None
+        )
+        if self.kv_cache_dtype_full_attention_only:
             language_model_cls = Step5ForCausalLM
             language_kwargs["valid_vocab_size"] = valid_vocab_size
         self.language_model = language_model_cls(
