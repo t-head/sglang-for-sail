@@ -417,6 +417,15 @@ def gemm_nt_bf16bf16f32(
         deep_gemm.bf16_gemm_nt(lhs, rhs, out)
 
 
+def gemm_nt_bf16bf16bf16(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    out: torch.Tensor,
+):
+    """Run PPU DeepGEMM with K-major BF16 operands and a BF16 output."""
+    deep_gemm.bf16_gemm_nt(lhs, rhs, out)
+
+
 def tf32_hc_prenorm_gemm(
     x: torch.Tensor,
     fn: torch.Tensor,

@@ -1666,7 +1666,7 @@ class Step5ForCausalLM(nn.Module):
         else:
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(
-            config, valid_vocab_size=valid_vocab_size
+            config, valid_vocab_size=valid_vocab_size, use_sail_deepgemm_lm_head=True
         )
 
     @property

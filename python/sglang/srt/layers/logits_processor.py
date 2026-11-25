@@ -50,6 +50,7 @@ from sglang.srt.layers.logprob_processor import (
     get_token_ids_logprobs_raw,
     get_top_logprobs_raw,
 )
+from sglang.srt.layers.quantization.unquant import try_sail_bf16_linear
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.auxiliary_output import DeviceAuxiliaryOutput
 from sglang.srt.model_executor.forward_batch_info import (
@@ -400,6 +401,8 @@ class LogitsProcessor(nn.Module):
         logit_scale: Optional[float] = None,
         return_full_logits: bool = False,
         valid_vocab_size: Optional[int] = None,
+        *,
+        use_sail_deepgemm_lm_head: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -413,6 +416,7 @@ class LogitsProcessor(nn.Module):
             self.vocab_size if valid_vocab_size is None else valid_vocab_size
         )
         self.logit_scale = logit_scale
+        self.use_sail_deepgemm_lm_head = use_sail_deepgemm_lm_head
         self.use_attn_tp_group = get_parallel().enable_dp_lm_head
         self.use_tp_lm_head_all_to_all = get_parallel().enable_tp_lm_head_all_to_all
         self.use_fp32_lm_head = get_exec().features.enable_fp32_lm_head or getattr(
@@ -1012,9 +1016,12 @@ class LogitsProcessor(nn.Module):
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
             else:
-                logits = torch.matmul(
-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-                )
+                lhs = hidden_states.to(lm_head.weight.dtype)
+                if self.use_sail_deepgemm_lm_head:
+                    logits = try_sail_bf16_linear(lhs, lm_head.weight, embedding_bias)
+                    if logits is not None:
+                        return logits
+                logits = torch.matmul(lhs, lm_head.weight.T)
         else:
             # GGUF models
             # TODO: use weight_packed_linear for GGUF models

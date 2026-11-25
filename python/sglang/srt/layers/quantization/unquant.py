@@ -34,6 +34,7 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import (
+    get_buffer,
     get_exec,
     get_lora,
     get_platform,
@@ -403,6 +404,57 @@ def bf16_gemm_dispatch(
     return _bf16_gemm_dispatch_impl(x, weight, bias)
 
 
+def try_sail_bf16_linear(
+    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None
+) -> Optional[torch.Tensor]:
+    """Run the opt-in SAIL BF16 NT GEMM when the operands are supported."""
+    if not (
+        x.is_cuda
+        and is_sail()
+        and envs.SGLANG_SAIL_DEEPGEMM_DENSE_BF16.get()
+        and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        and not is_batch_invariant_mode_enabled()
+        and not torch.compiler.is_compiling()
+        and bias is None
+        and x.dtype == weight.dtype == torch.bfloat16
+        and x.device == weight.device
+        and x.ndim >= 1
+        and weight.ndim == 2
+        and x.is_contiguous()
+        and weight.is_contiguous()
+    ):
+        return None
+
+    n, k = weight.shape
+    if n == 0 or n % 2 != 0 or k == 0 or k % 16 != 0 or x.shape[-1] != k:
+        return None
+    x_2d = x.view(-1, k)
+    out = x.new_empty((x_2d.shape[0], n))
+    if x_2d.shape[0] == 0:
+        return out.view(*x.shape[:-1], n)
+
+    stats = get_buffer("sail_bf16_dense_stats", lambda: {"hit": 0, "error": 0})
+    try:
+        deep_gemm_wrapper.gemm_nt_bf16bf16bf16(x_2d, weight, out)
+    except (AttributeError, RuntimeError) as exc:
+        stats["error"] += 1
+        if stats["error"] == 1:
+            logger.warning(
+                "DeepGEMM BF16 dense fallback (M=%s N=%s K=%s): %s",
+                x_2d.shape[0],
+                n,
+                k,
+                exc,
+            )
+        return None
+    stats["hit"] += 1
+    if stats["hit"] <= 20 or stats["hit"] % 500 == 0:
+        logger.warning(
+            "SAIL-DG-BF16-HIT n=%s M=%s N=%s K=%s", stats["hit"], x_2d.shape[0], n, k
+        )
+    return out.view(*x.shape[:-1], n)
+
+
 def _can_accumulate_into_addend(
     *,
     weight: torch.Tensor,
@@ -545,7 +597,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 return bf16_gemm_dispatch(x, layer.weight, bias)
             return _bf16_gemm_dispatch_impl(x, layer.weight, bias)
 
-        return F.linear(x, layer.weight, bias)
+        output = try_sail_bf16_linear(x, layer.weight, bias)
+        return F.linear(x, layer.weight, bias) if output is None else output
 
     def apply_with_addend(
         self,

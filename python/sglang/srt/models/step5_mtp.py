@@ -16,6 +16,7 @@ from sglang.srt.configs.step5 import (
 from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import GemmaRMSNorm
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -98,8 +99,12 @@ class Step5DraftModel(nn.Module):
         self.hnorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, weight_dtype=torch.float32
         )
-        self.eh_proj = nn.Linear(
-            config.hidden_size * 2, config.hidden_size, bias=False, dtype=torch.bfloat16
+        self.eh_proj = ReplicatedLinear(
+            config.hidden_size * 2,
+            config.hidden_size,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            prefix=add_prefix("eh_proj", prefix),
         )
         layer_prefix = add_prefix(f"layers.{layer_id}", prefix)
         with layer_stack():
@@ -152,7 +157,9 @@ class Step5DraftModel(nn.Module):
         )
         embedded = self.enorm(embedded.bfloat16())
         normalized_previous = self.hnorm(previous.bfloat16())
-        hidden_states = self.eh_proj(torch.cat((embedded, normalized_previous), dim=-1))
+        hidden_states, _ = self.eh_proj(
+            torch.cat((embedded, normalized_previous), dim=-1)
+        )
         residual_batch.start(forward_batch)
         hidden_states = self.mtp_block(
             positions=positions,
@@ -210,7 +217,7 @@ class Step5MTP(nn.Module):
             use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(
-            config, valid_vocab_size=valid_vocab_size
+            config, valid_vocab_size=valid_vocab_size, use_sail_deepgemm_lm_head=True
         )
 
     @property

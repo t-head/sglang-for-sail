@@ -23,7 +23,10 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     ReplicatedParallelGroup,
 )
-from sglang.srt.layers.quantization.unquant import bf16_gemm_dispatch
+from sglang.srt.layers.quantization.unquant import (
+    bf16_gemm_dispatch,
+    try_sail_bf16_linear,
+)
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.runtime_context import get_exec, get_lora, get_model
 from sglang.srt.utils import add_prefix, is_sail
@@ -286,7 +289,9 @@ class Step5Indexer(nn.Module):
             ):
                 projected = bf16_gemm_dispatch(hidden_states, self.qkz_weight, None)
             else:
-                projected = F.linear(hidden_states, self.qkz_weight)
+                projected = try_sail_bf16_linear(hidden_states, self.qkz_weight)
+                if projected is None:
+                    projected = F.linear(hidden_states, self.qkz_weight)
             index_q, index_key, compression_logits = projected.split(
                 (1024, 256, 256), dim=-1
             )

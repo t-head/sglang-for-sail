@@ -2074,6 +2074,8 @@ class Envs:
     SGLANG_SAIL_USE_ACEXT_CUDA = EnvBool(False)
     SGLANG_SAIL_ACEXT_MOE_DEBUG = EnvBool(False)
     SGLANG_SAIL_DEEPGEMM_DENSE = EnvBool(False)
+    # Route bias-free dense BF16 GEMMs, including the Step5 LM head, to DeepGEMM.
+    SGLANG_SAIL_DEEPGEMM_DENSE_BF16 = EnvBool(False)
     SGLANG_SAIL_DEEPGEMM_MOE = EnvBool(False)
     # Repack MXFP4 MoE weights into the INT4 layout consumed by the PPU
     # DeepGEMM W4A16 kernel. This is distinct from native MXFP4 W4A4.
