@@ -273,17 +273,21 @@ class Step5MTP(nn.Module):
             expected.update(prefix + source for source in (shards or [local]))
         checkpoint_depth = config.num_hidden_layers + config.num_nextn_predict_layers
         seen = set()
+        # Resolve indexed owners using on-disk keys before normalizing VL aliases.
+        checkpoint_names = expected | {
+            "model.language_model." + name.removeprefix("model.") for name in expected
+        }
         weights = Step5ForCausalLM._indexed_duplicate_weights(
             weights,
-            expected,
+            checkpoint_names,
             getattr(self, "checkpoint_path", None),
         )
         for name, loaded_weight in weights:
-            if name.startswith("vision_model.") or name in (
-                "vit_large_projector.weight",
-                "model.norm.weight",
-                "lm_head.weight",
-            ):
+            if name.startswith("model.language_model."):
+                name = "model." + name.removeprefix("model.language_model.")
+            if name.removeprefix("model.").startswith(
+                ("vision_model.", "vit_large_projector.")
+            ) or name in ("model.norm.weight", "lm_head.weight"):
                 continue
             if name.startswith("model.layers."):
                 _, _, index, _ = name.split(".", 3)

@@ -172,7 +172,9 @@ def _resolve_tokenizer_name(tokenizer_name, kwargs):
     return tokenizer_name
 
 
-def _is_step5_checkpoint(tokenizer_name, revision) -> bool:
+def _is_step5_checkpoint(
+    tokenizer_name, revision, *, cache_dir=None, subfolder=""
+) -> bool:
     """Whether the checkpoint is Step-5, whose tokenizer must load directly.
 
     Step-5 ships a byte-level BPE ``tokenizer.json`` but declares the Llama
@@ -181,7 +183,11 @@ def _is_step5_checkpoint(tokenizer_name, revision) -> bool:
     """
     try:
         config_file = _resolve_local_or_cached_file(
-            tokenizer_name, "config.json", revision
+            tokenizer_name,
+            "config.json",
+            revision,
+            cache_dir=cache_dir,
+            subfolder=subfolder,
         )
         with open(config_file) as f:
             config = json.load(f)
@@ -193,13 +199,13 @@ def _is_step5_checkpoint(tokenizer_name, revision) -> bool:
     return model_type.startswith("step5")
 
 
-def _load_step5_tokenizer(tokenizer_name, revision):
+def _load_step5_tokenizer(tokenizer_name, *args, **kwargs):
     """Load Step-5's serialized fast tokenizer, bypassing class selection.
 
     The generic fast loader preserves the ``tokenizer.json`` model,
     pre-tokenizer and decoder, which is what the checkpoint requires.
     """
-    return PreTrainedTokenizerFast.from_pretrained(tokenizer_name, revision=revision)
+    return PreTrainedTokenizerFast.from_pretrained(tokenizer_name, *args, **kwargs)
 
 
 def _auto_tokenizer_from_pretrained(tokenizer_name, *args, **common_kwargs):
@@ -293,7 +299,9 @@ def _resolve_tokenizers_backend(tokenizer_name, *args, **common_kwargs):
 # ---------------------------------------------------------------------------
 
 
-def _fix_v5_tokenizer_components(tokenizer, model_name_or_path, revision=None):
+def _fix_v5_tokenizer_components(
+    tokenizer, model_name_or_path, revision=None, **file_kwargs
+):
     """Fix pre_tokenizer/decoder when a v5 tokenizer class overwrites them.
 
     In transformers v5, some tokenizer classes (e.g. LlamaTokenizer) have a
@@ -313,7 +321,7 @@ def _fix_v5_tokenizer_components(tokenizer, model_name_or_path, revision=None):
         from tokenizers import Tokenizer as RawTokenizer
 
         tok_file = _resolve_local_or_cached_file(
-            model_name_or_path, "tokenizer.json", revision
+            model_name_or_path, "tokenizer.json", revision, **file_kwargs
         )
         raw = RawTokenizer.from_file(tok_file)
     except FileNotFoundError:
@@ -344,7 +352,9 @@ def _fix_v5_tokenizer_components(tokenizer, model_name_or_path, revision=None):
         backend.decoder = raw.decoder
 
 
-def _fix_v5_add_bos_eos_token(tokenizer, model_name_or_path, revision=None):
+def _fix_v5_add_bos_eos_token(
+    tokenizer, model_name_or_path, revision=None, **file_kwargs
+):
     """Restore add_bos_token/add_eos_token stripped by transformers v5.
 
     In transformers v5, _from_pretrained() strips add_bos_token and
@@ -377,7 +387,7 @@ def _fix_v5_add_bos_eos_token(tokenizer, model_name_or_path, revision=None):
 
     try:
         config_file = _resolve_local_or_cached_file(
-            model_name_or_path, "tokenizer_config.json", revision
+            model_name_or_path, "tokenizer_config.json", revision, **file_kwargs
         )
         with open(config_file) as f:
             config = json.load(f)
@@ -453,11 +463,11 @@ def _fix_special_tokens_pattern(tokenizer):
         tokenizer.special_tokens_pattern = "none"
 
 
-def _apply_post_load_fixes(tokenizer, tokenizer_name, revision):
+def _apply_post_load_fixes(tokenizer, tokenizer_name, revision, **file_kwargs):
     """Apply all post-load patches and return the final tokenizer."""
     _install_tokenizer_warnings_filter(tokenizer)
-    _fix_v5_tokenizer_components(tokenizer, tokenizer_name, revision)
-    _fix_v5_add_bos_eos_token(tokenizer, tokenizer_name, revision)
+    _fix_v5_tokenizer_components(tokenizer, tokenizer_name, revision, **file_kwargs)
+    _fix_v5_add_bos_eos_token(tokenizer, tokenizer_name, revision, **file_kwargs)
 
     if not isinstance(tokenizer, PreTrainedTokenizerFast):
         warnings.warn(
@@ -539,6 +549,7 @@ def get_tokenizer(
         return patch_tokenizer(tokenizer)
 
     tokenizer_name = _resolve_tokenizer_name(tokenizer_name, kwargs)
+    revision = kwargs.get("revision") or tokenizer_revision
 
     common_kwargs = dict(
         trust_remote_code=trust_remote_code,
@@ -547,8 +558,19 @@ def get_tokenizer(
         **kwargs,
     )
 
+    file_kwargs = {
+        "cache_dir": kwargs.get("cache_dir"),
+        "subfolder": kwargs.get("subfolder") or "",
+    }
     try:
-        if is_bare_tekken_checkpoint(tokenizer_name, tokenizer_revision):
+        step5_tokenizer = _is_step5_checkpoint(
+            tokenizer_name, revision, **file_kwargs
+        )
+        if step5_tokenizer:
+            step5_kwargs = dict(common_kwargs, revision=revision)
+            step5_kwargs.pop("tokenizer_revision")
+            tokenizer = _load_step5_tokenizer(tokenizer_name, *args, **step5_kwargs)
+        elif is_bare_tekken_checkpoint(tokenizer_name, revision):
             from transformers.tokenization_mistral_common import (
                 MistralCommonTokenizer,
             )
@@ -562,30 +584,25 @@ def get_tokenizer(
             )
 
             tokenizer = MistralCommonTokenizer.from_pretrained(
-                tokenizer_name, revision=tokenizer_revision
+                tokenizer_name, revision=revision
             )
         else:
-            step5_tokenizer = _is_step5_checkpoint(tokenizer_name, tokenizer_revision)
-            if step5_tokenizer:
-                tokenizer = _load_step5_tokenizer(tokenizer_name, tokenizer_revision)
-            else:
-                tokenizer = _auto_tokenizer_from_pretrained(
-                    tokenizer_name, *args, **common_kwargs
-                )
+            tokenizer = _auto_tokenizer_from_pretrained(
+                tokenizer_name, *args, **common_kwargs
+            )
 
-            # With fastokens, the patched TokenizersBackend.from_pretrained already
-            # returned a tokenizer whose backend is a fastokens shim. Re-resolving via
-            # the declared class (e.g. Qwen2Tokenizer) would discard that work.
+            # Re-resolving a fastokens shim through the declared class discards it.
             if (
-                not step5_tokenizer
-                and type(tokenizer).__name__ == _TOKENIZERS_BACKEND
+                type(tokenizer).__name__ == _TOKENIZERS_BACKEND
                 and tokenizer_backend != "fastokens"
             ):
                 tokenizer = _resolve_tokenizers_backend(
                     tokenizer_name, *args, **common_kwargs
                 )
 
-        return _apply_post_load_fixes(tokenizer, tokenizer_name, tokenizer_revision)
+        return _apply_post_load_fixes(
+            tokenizer, tokenizer_name, revision, **file_kwargs
+        )
     except Exception as e:
         if tokenizer_backend == "fastokens":
             raise RuntimeError(

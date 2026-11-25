@@ -366,8 +366,13 @@ def get_processor(
     # (same issue as get_tokenizer). Step-5 is worse: class selection rebuilds
     # its serialized byte-level BPE from the declared Llama class and drops the
     # space prefix, so the processor path must also reload from tokenizer.json.
+    file_kwargs = {
+        key: kwargs[key]
+        for key in ("cache_dir", "subfolder")
+        if key in kwargs and kwargs[key] is not None
+    }
     if type(tokenizer).__name__ == _TOKENIZERS_BACKEND or _is_step5_checkpoint(
-        tokenizer_name, revision
+        tokenizer_name, revision, **file_kwargs
     ):
         logger.warning(
             "Processor tokenizer for %s is %s, reloading via get_tokenizer",
@@ -380,6 +385,12 @@ def get_processor(
             trust_remote_code=trust_remote_code,
             tokenizer_revision=revision,
             tokenizer_backend=tokenizer_backend,
+            **file_kwargs,
+            **{
+                key: kwargs[key]
+                for key in ("local_files_only", "token", "force_download")
+                if key in kwargs
+            },
         )
         if isinstance(processor, PreTrainedTokenizerBase):
             processor = tokenizer
@@ -390,7 +401,7 @@ def get_processor(
     # AutoProcessor may return a model-specific tokenizer whose v5 constructor
     # overwrote the checkpoint's ByteLevel components. Apply the same repair
     # as the text-only loader before this tokenizer encodes any chat history.
-    _fix_v5_tokenizer_components(tokenizer, tokenizer_name, revision)
+    _fix_v5_tokenizer_components(tokenizer, tokenizer_name, revision, **file_kwargs)
 
     if tokenizer.chat_template is None:
         local_path = download_from_hf(
