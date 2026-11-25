@@ -226,6 +226,9 @@ NIGHTLY_SUITES = {
 
 
 OTHER_SUITES = {
+    HWBackend.PPU: [
+        "stage-b-test-1-gpu-ppu",
+    ],
     HWBackend.CPU: [
         "default",
         # `stage="weekly"`, dispatched by weekly-test-cpu.yml.
