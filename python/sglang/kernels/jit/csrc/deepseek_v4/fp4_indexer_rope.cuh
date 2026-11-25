@@ -86,10 +86,10 @@ struct IndexPacked {
   uint32_t exponent[2];  // blocks {0, 1} then {2, 3}, by half of the warp
 };
 
-#if defined(SGL_SAIL_DSV4_INDEX_Q_BUILD) && defined(__HGGCCC__) && SGL_CUDA_ARCH == 890
+#if defined(SGL_SAIL_DSV4_INDEX_Q_BUILD) && defined(__HGGCCC__) && SGL_CUDA_ARCH >= 890
 #define SGL_DSV4_INDEX_Q_PPU_E2M1
 
-/// Pack two FP32 values with the 890 E2M1 conversion instruction.
+/// Pack two FP32 values with the PPU E2M1 conversion instruction.
 SGL_DEVICE uint32_t index_q_pack_e2m1(fp32x2_t x) {
   // The software encoder saturates NaNs to signed 6 via fminf(fabsf(x), 6).
   // Preserve that behavior while passing finite values and infinities through.
@@ -136,7 +136,7 @@ SGL_DEVICE IndexPacked index_rope_quant_pack(fp32x2_t head, fp32x2_t tail, fp32x
     const fp32x2_t pair{data[half * 2], data[half * 2 + 1]};
 #ifdef SGL_DSV4_INDEX_Q_PPU_E2M1
     const auto code = index_q_pack_e2m1({__fmaf_rn(pair.x, inv_scale, 0.0f), __fmaf_rn(pair.y, inv_scale, 0.0f)});
-    // Decode the nibbles in software on 890.
+    // Decode the nibbles in software on PPU.
     const fp32x2_t q{fp4::e2m1_value(code) * scale, fp4::e2m1_value(code >> 4) * scale};
 #else
     const auto q = fp4::fake_quant_x2(pair, scale, inv_scale);
