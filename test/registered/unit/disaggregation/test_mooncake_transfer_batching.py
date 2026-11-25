@@ -139,6 +139,89 @@ class TestMooncakeTransferBatching(unittest.TestCase):
         )
 
 
+class TestMooncakeKVHeadSlicePacking(unittest.TestCase):
+    def setUp(self):
+        self.manager = MooncakeKVManager.__new__(MooncakeKVManager)
+        self.manager.attn_tp_size = 4
+        self.manager.pp_size = 1
+        self.manager.kv_args = SimpleNamespace(
+            engine_rank=0,
+            page_size=4,
+            total_kv_head_num=16,
+            kv_item_lens=[128, 128],
+            kv_data_ptrs=[1000, 2000],
+            kv_data_lens=[512, 512],
+            kv_layer_ids=[],
+        )
+        self.manager.get_mha_kv_ptrs_with_pp = MagicMock(
+            return_value=([1000], [2000], [5000], [6000], 1)
+        )
+        self.manager.engine = MagicMock()
+        self.manager.engine.batch_transfer_sync.return_value = 0
+        self.manager._kv_head_slice_packer = MagicMock()
+        self.manager._kv_head_slice_packer.send.return_value = 0
+        self.src_pages = np.array([1, 3], dtype=np.int32)
+        self.dst_pages = np.array([4, 5], dtype=np.int32)
+
+    def _send(self, dst_rank=3, dst_tp=16, dst_item_len=32):
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            return self.manager.send_kvcache_slice(
+                "session",
+                self.src_pages,
+                [5000, 6000],
+                self.dst_pages,
+                dst_rank,
+                dst_tp,
+                dst_item_len,
+                executor,
+            )
+
+    def test_packs_head_slice_that_fills_the_decode_row(self):
+        self.assertEqual(self._send(), 0)
+
+        args = self.manager._kv_head_slice_packer.send.call_args.args
+        self.assertEqual(args[:2], ("session", [(1000, 5000), (2000, 6000)]))
+        np.testing.assert_array_equal(args[2], self.src_pages)
+        np.testing.assert_array_equal(args[3], self.dst_pages)
+        self.assertEqual(args[4:], (4, 32, 8, 24))
+        self.manager.engine.batch_transfer_sync.assert_not_called()
+
+    def test_keeps_per_token_transfer_for_partial_destination_rows(self):
+        self.manager.attn_tp_size = 16
+        self.manager.kv_args.engine_rank = 1
+        self.manager.kv_args.kv_item_lens = [32, 32]
+
+        self.assertEqual(self._send(dst_rank=0, dst_tp=4, dst_item_len=128), 0)
+
+        self.manager._kv_head_slice_packer.send.assert_not_called()
+        self.manager.engine.batch_transfer_sync.assert_has_calls(
+            [
+                call(
+                    "session",
+                    [1032, 1040, 1048, 1056, 1096, 1104, 1112, 1120],
+                    [5520, 5552, 5584, 5616, 5648, 5680, 5712, 5744],
+                    [8] * 8,
+                ),
+                call(
+                    "session",
+                    [2032, 2040, 2048, 2056, 2096, 2104, 2112, 2120],
+                    [6520, 6552, 6584, 6616, 6648, 6680, 6712, 6744],
+                    [8] * 8,
+                ),
+            ],
+            any_order=True,
+        )
+
+    def test_rejects_out_of_bounds_source_before_packing(self):
+        self.src_pages[1] = 4
+
+        with self.assertRaisesRegex(ValueError, "exceeds its registered source"):
+            self._send()
+
+        self.manager._kv_head_slice_packer.send.assert_not_called()
+        self.manager.engine.batch_transfer_sync.assert_not_called()
+
+
 class TestMiniMaxStateTransfer(CustomTestCase):
     def test_index_truncates_but_dense_rejects_mismatched_page_lists(self):
         """Legacy index transfers copy the common prefix; incomplete dense KV must fail."""

@@ -8,7 +8,7 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -81,6 +81,9 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
+
+if TYPE_CHECKING:
+    from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
 
 logger = logging.getLogger(__name__)
 
@@ -252,6 +255,103 @@ def _uses_flat_entry_layout(
     return mla_backend or force_flat or has_layer_ids or is_single_region_swa
 
 
+_PACK_BUFFER_BYTES = 256 << 20
+# A timed-out transfer may still read the source after the manager tears down.
+_unsettled_buffers: list[StagingBuffer] = []
+
+
+class _KVHeadSlicePacker:
+    """Pack source KV head slices for Mooncake transfers across attention TP sizes.
+
+    When a source slice fills a Decode KV row, pack the slices on Prefill
+    so contiguous destination pages can be written directly.
+    """
+
+    def __init__(self, engine, gpu_id):
+        self.engine = engine
+        self.device = torch.device("cuda", gpu_id)
+        self.lock = threading.Lock()
+        self.buffer = None
+        self.failed = False
+
+    def close(self):
+        with self.lock:
+            if self.buffer is not None:
+                self.engine.deregister(self.buffer.get_ptr())
+                self.buffer = None
+
+    def send(
+        self,
+        session,
+        layer_ptr_pairs,
+        src_pages,
+        dst_pages,
+        page_size,
+        src_width,
+        dst_width,
+        head_offset,
+    ):
+        from sglang.kernels.ops.kvcache.pd_dcp_gather import copy_mla_rows_into_pack
+        from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
+
+        page_bytes = page_size * dst_width
+        pages_per_chunk = _PACK_BUFFER_BYTES // (len(layer_ptr_pairs) * page_bytes)
+        if pages_per_chunk == 0:
+            return None
+        src_ptrs = [src + head_offset for src, _ in layer_ptr_pairs]
+        dst_ptrs = [dst for _, dst in layer_ptr_pairs]
+        row_widths = [dst_width] * len(src_ptrs)
+        row_strides = [src_width] * len(src_ptrs)
+
+        with self.lock, torch.cuda.device(self.device):
+            if self.failed:
+                return None
+            if self.buffer is None:
+                buffer = StagingBuffer(
+                    _PACK_BUFFER_BYTES, self.device, self.device.index
+                )
+                self.engine.register(buffer.get_ptr(), buffer.get_size())
+                self.buffer = buffer
+
+            # transfer_worker has already synchronized the chunk's KV-ready event.
+            stream = self.buffer.get_gather_stream()
+            for start in range(0, src_pages.size, pages_per_chunk):
+                src = src_pages[start : start + pages_per_chunk]
+                dst = dst_pages[start : start + pages_per_chunk]
+                rows = src.astype(np.int64)[:, None] * page_size + np.arange(page_size)
+                with torch.cuda.stream(stream):
+                    gpu_rows = torch.as_tensor(rows.ravel(), device=self.device)
+                    copy_mla_rows_into_pack(
+                        src_ptrs, gpu_rows, self.buffer.buffer, row_widths, row_strides
+                    )
+                stream.synchronize()
+
+                src_runs, dst_runs = group_concurrent_contiguous(
+                    np.arange(dst.size), dst
+                )
+                lengths = [len(run) * page_bytes for run in src_runs]
+                layer_bytes = src.size * page_bytes
+                for layer, dst_ptr in enumerate(dst_ptrs):
+                    src_base = self.buffer.get_ptr() + layer * layer_bytes
+                    sources = [src_base + run[0] * page_bytes for run in src_runs]
+                    targets = [dst_ptr + run[0] * page_bytes for run in dst_runs]
+                    for begin in range(0, len(lengths), 4096):
+                        end = begin + 4096
+                        ret = self.engine.batch_transfer_sync(
+                            session,
+                            sources[begin:end],
+                            targets[begin:end],
+                            lengths[begin:end],
+                        )
+                        if ret != 0:
+                            _unsettled_buffers.append(self.buffer)
+                            self.buffer = None
+                            self.failed = True
+                            logger.warning("Disabling KV packing after a failed send")
+                            return ret
+        return 0
+
+
 class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     sender_trace_module = "mooncake"
 
@@ -280,6 +380,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         )
         self.state_tp_size = get_parallel().tp_size
         self.init_engine()
+        self._kv_head_slice_packer = None
+        if (
+            envs.SGLANG_MOONCAKE_PACK_KV_HEAD_SLICES.get()
+            and disaggregation_mode == DisaggregationMode.PREFILL
+            and torch.device(get_device().device).type == "cuda"
+        ):
+            self._kv_head_slice_packer = _KVHeadSlicePacker(
+                self.engine, self.kv_args.gpu_id
+            )
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.max_transfer_batch_indices = (
@@ -436,6 +545,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.engine.register(ptr, length)
 
     def deregister_buffer_to_engine(self):
+        packer = self._kv_head_slice_packer
+        if packer is not None:
+            packer.close()
         regions = self._registerable_regions()
         if regions:
             ptrs, _ = zip(*regions)
@@ -1934,6 +2046,38 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         tokens_per_page = np.arange(page_size, dtype=np.int64).reshape(1, -1)
         bytes_per_token_on_prefill = src_kv_item_len // page_size
         bytes_per_token_on_decode = dst_kv_item_len // page_size
+
+        packer = self._kv_head_slice_packer
+        # A slice that fills the destination row starts at destination head zero.
+        # Packing merges whole destination pages and reads a constant source stride.
+        if (
+            packer is not None
+            and layer_ptr_pairs
+            and 0 < prefill_kv_indices.size == dst_kv_indices.size
+            and 0 < dst_kv_item_len == heads_bytes_per_token_to_send * page_size
+            and src_kv_item_len % page_size == 0
+            and src_head_slice_offset + heads_bytes_per_token_to_send
+            <= bytes_per_token_on_prefill
+        ):
+            buffer_sizes = dict(zip(src_data_ptrs, self.kv_args.kv_data_lens))
+            required = (int(prefill_kv_indices.max()) + 1) * src_kv_item_len
+            if prefill_kv_indices.min() < 0 or any(
+                required > buffer_sizes[src] for src, _ in layer_ptr_pairs
+            ):
+                raise ValueError("Packed KV slice exceeds its registered source")
+            result = packer.send(
+                mooncake_session_id,
+                layer_ptr_pairs,
+                prefill_kv_indices.ravel(),
+                dst_kv_indices.ravel(),
+                page_size,
+                bytes_per_token_on_prefill,
+                bytes_per_token_on_decode,
+                src_head_slice_offset,
+            )
+            if result is not None:
+                return result
+
         src_token_slot_offsets = (
             tokens_per_page * bytes_per_token_on_prefill + src_head_slice_offset
         )
