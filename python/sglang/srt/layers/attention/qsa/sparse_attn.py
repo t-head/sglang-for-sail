@@ -7,6 +7,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.utils import get_device_sm, is_sail
 
 _H20_CONFIGS = [
     (32, (32, 8, 2)),
@@ -21,12 +22,21 @@ _L20_CONFIGS = [
     (512, (32, 4, 2)),
     (float("inf"), (16, 1, 2)),
 ]
+_SAIL_SM89_CONFIGS = [
+    *_L20_CONFIGS[:-1],
+    (float("inf"), (32, 2, 2)),
+]
 
 
 def _get_best_config(total_q: int):
     if is_batch_invariant_mode_enabled():
         return (32, 4, 2)
-    table = _H20_CONFIGS if "H20" in torch.cuda.get_device_name(0) else _L20_CONFIGS
+    if is_sail() and get_device_sm() == 89:
+        table = _SAIL_SM89_CONFIGS
+    elif "H20" in torch.cuda.get_device_name(0):
+        table = _H20_CONFIGS
+    else:
+        table = _L20_CONFIGS
     return next(cfg for limit, cfg in table if total_q <= limit)
 
 
