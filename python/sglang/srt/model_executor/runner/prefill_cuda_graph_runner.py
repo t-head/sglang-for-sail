@@ -1503,6 +1503,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             and batch_size > self._captured_attn_metadata_max_bs
         ):
             return False
+        if getattr(self, "use_captured_attn_metadata", False):
+            graph_bs_limit = getattr(
+                self.model_runner.attn_backend,
+                "max_breakable_prefill_graph_batch_size",
+                None,
+            )
+            if graph_bs_limit is not None and batch_size > graph_bs_limit:
+                return False
         # LoRA replays need prepare_lora_batch's static metadata. lora_manager
         # keeps LoRA prefill eager on every rank under dp attention, so the
         # schedule-time vote derives this from enable_lora alone.
@@ -1570,14 +1578,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if self._has_inactive_dp_rank(forward_batch):
             return False
 
-        if getattr(self, "use_captured_attn_metadata", False):
-            graph_bs_limit = getattr(
-                self.model_runner.attn_backend,
-                "max_breakable_prefill_graph_batch_size",
-                None,
-            )
-            if graph_bs_limit is not None and forward_batch.batch_size > graph_bs_limit:
-                return False
         # A batch can be too small to activate CP. Its unsharded inputs must
         # not replay a model body captured with CP-local rows.
         if getattr(self, "enable_cp_bcg_capture", False) and not is_cp_active(

@@ -357,6 +357,13 @@ class FlashAttentionBackend(AttentionBackend):
                 "Use a BF16 or fp8_e4m3 KV cache."
             )
         self._init_flash_attention_functions(device_capability)
+        self._supports_swa_head_gate = False
+        if self.fa_impl_ver == 4 and device_capability[0] in (10, 11):
+            from sglang.kernels.ops.attention.flash_attn.cute.interface import (
+                supports_head_gate,
+            )
+
+            self._supports_swa_head_gate = supports_head_gate()
 
         # Store head info for precomputing FA3 scheduler metadata
         self.head_dim = model_runner.model_config.head_dim
@@ -716,13 +723,13 @@ class FlashAttentionBackend(AttentionBackend):
         return self._compute_swa_window_align(cache_seqlens, int(window_left), q_len)
 
     def supports_swa_head_gate(self) -> bool:
-        return self.fa_impl_ver == 4
+        return self._supports_swa_head_gate
 
     def _maybe_head_gate_kwargs(self, head_gate: Optional[torch.Tensor]) -> dict:
         if head_gate is None:
             return {}
         if not self.supports_swa_head_gate():
-            raise RuntimeError("head_gate is only supported by the FA4 backend.")
+            raise RuntimeError("head_gate requires a supported FA4 device.")
         return {"head_gate": head_gate}
 
     @staticmethod
