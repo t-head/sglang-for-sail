@@ -52,21 +52,115 @@ def _safe_subdir(root, parts):
     for part in parts:
         current = current / part
         try:
-            if current.is_symlink() or not current.is_dir():
+            if not stat.S_ISDIR(current.lstat().st_mode):
                 return None
         except OSError:
             return None
     return current
 
 
+def _previous_runs(parent, current_run):
+    try:
+        children = list(parent.iterdir())
+    except OSError:
+        return []
+    previous = []
+    for child in children:
+        if not re.fullmatch(r"[0-9]+-[0-9]+", child.name):
+            continue
+        run_id, attempt = map(int, child.name.split("-"))
+        if run_id != current_run and _safe_subdir(parent, (child.name,)) is not None:
+            previous.append((run_id, attempt, child))
+    return sorted(previous, reverse=True)
+
+
+def _archive_roots(run):
+    yield run
+    try:
+        children = list(run.iterdir())
+    except OSError:
+        return
+    for child in children:
+        if re.fullmatch(r"[0-9a-f]{12}", child.name):
+            scope = _safe_subdir(run, (child.name,))
+            if scope is not None:
+                yield scope
+
+
+def _retained_models(run, models):
+    for scope in _archive_roots(run):
+        for tier in ("fast_sanity", "model_sanity"):
+            tier_dir = _safe_subdir(scope, (tier,))
+            if tier_dir is None:
+                continue
+            for model in models:
+                directory = _safe_subdir(tier_dir, (model,))
+                if directory is None:
+                    continue
+                try:
+                    index_info = (directory / "index.json").lstat()
+                except OSError:
+                    continue
+                if stat.S_ISREG(index_info.st_mode):
+                    yield tier, model, directory
+
+
+def _archive_codes(directory):
+    codes = set()
+    for filename in (
+        "launcher.log",
+        "runtime.log",
+        "pod-status.json",
+        "sglang_serve_fast_full.log",
+        "sglang_serve_fast_2l.log",
+        "sglang_serve_model_sanity.log",
+        "bench-warmup-1.log",
+        "bench-measure-1.log",
+        "bench-warmup-16.log",
+        "bench-measure-16.log",
+        "evalscope.log",
+    ):
+        path = directory / filename
+        try:
+            pre_info = path.lstat()
+        except OSError:
+            continue
+        if not stat.S_ISREG(pre_info.st_mode):
+            continue
+        try:
+            fd = os.open(
+                path,
+                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+            )
+        except OSError:
+            continue
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                os.close(fd)
+                continue
+            stream = os.fdopen(fd, "rb")
+        except OSError:
+            os.close(fd)
+            continue
+        with stream:
+            stream.seek(max(0, info.st_size - 262144))
+            codes.update(diagnostic_codes(stream.read(262144).decode(errors="replace")))
+    return codes
+
+
 def recent_failures(root, current_run, fallback_root=None):
     roots = [root]
     if fallback_root is not None and fallback_root != root:
         roots.append(fallback_root)
-    previous = []
+    models = sorted(
+        policy.stem
+        for policy in MODEL_POLICY_ROOT.glob("*.yaml")
+        if re.fullmatch(r"[a-z0-9][a-z0-9.-]*", policy.stem)
+    )
     for candidate_root in roots:
         try:
-            if candidate_root.is_symlink() or not candidate_root.is_dir():
+            if not stat.S_ISDIR(candidate_root.lstat().st_mode):
                 continue
         except OSError:
             continue
@@ -74,101 +168,26 @@ def recent_failures(root, current_run, fallback_root=None):
             parent = _safe_subdir(candidate_root, parts)
             if parent is None:
                 continue
-            try:
-                runs = list(parent.iterdir())
-            except OSError:
-                continue
-            for run in runs:
-                try:
-                    if run.is_symlink() or not run.is_dir():
-                        continue
-                except OSError:
-                    continue
-                if not re.fullmatch(r"[0-9]+-[0-9]+", run.name):
-                    continue
-                run_id, attempt = map(int, run.name.split("-"))
-                if run_id != current_run:
-                    previous.append((run_id, attempt, run))
-            if previous:
-                break
-        if previous:
-            break
-    if not previous:
-        return []
-    models = sorted(
-        policy.stem
-        for policy in MODEL_POLICY_ROOT.glob("*.yaml")
-        if re.fullmatch(r"[a-z0-9][a-z0-9.-]*", policy.stem)
-    )
-    for run_id, _, run in sorted(previous, reverse=True):
-        records = []
-        for tier in ("fast_sanity", "model_sanity"):
-            for model in models:
-                directory = _safe_subdir(run, (tier, model))
-                if directory is None:
-                    continue
-                index_path = directory / "index.json"
-                try:
-                    index_info = index_path.lstat()
-                except OSError:
-                    continue
-                if not stat.S_ISREG(index_info.st_mode):
-                    continue
-                code = []
-                for filename in (
-                    "launcher.log",
-                    "runtime.log",
-                    "pod-status.json",
-                    "sglang_serve_fast_full.log",
-                    "sglang_serve_fast_2l.log",
-                    "sglang_serve_model_sanity.log",
-                    "bench-warmup-1.log",
-                    "bench-measure-1.log",
-                    "bench-warmup-16.log",
-                    "bench-measure-16.log",
-                    "evalscope.log",
-                ):
-                    path = directory / filename
-                    try:
-                        pre_info = path.lstat()
-                    except OSError:
-                        continue
-                    if not stat.S_ISREG(pre_info.st_mode):
-                        continue
-                    try:
-                        fd = os.open(
-                            path,
-                            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
-                        )
-                    except OSError:
-                        continue
-                    try:
-                        info = os.fstat(fd)
-                        if not stat.S_ISREG(info.st_mode):
-                            os.close(fd)
-                            continue
-                        stream = os.fdopen(fd, "rb")
-                    except OSError:
-                        os.close(fd)
-                        continue
-                    with stream:
-                        stream.seek(max(0, info.st_size - 262144))
-                        code.extend(
-                            diagnostic_codes(
-                                stream.read(262144).decode(errors="replace")
-                            )
-                        )
-                if code:
-                    records.append(
+            found_archive = False
+            for run_id, _, run in _previous_runs(parent, current_run):
+                codes_by_model = {}
+                for tier, model, directory in _retained_models(run, models):
+                    found_archive = True
+                    codes = _archive_codes(directory)
+                    if codes:
+                        codes_by_model.setdefault((tier, model), set()).update(codes)
+                if codes_by_model:
+                    return [
                         {
                             "run_id": run_id,
                             "tier": tier,
                             "model": model,
-                            "codes": sorted(set(code)),
+                            "codes": sorted(codes),
                         }
-                    )
-        if records:
-            return records
+                        for (tier, model), codes in sorted(codes_by_model.items())
+                    ]
+            if found_archive:
+                return []
     return []
 
 
