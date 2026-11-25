@@ -134,6 +134,7 @@ def retain(environ) -> None:
     parent = ensure_retention_base(root)
     for component in (
         f"{index['run_id']}-{index['attempt']}",
+        index["checkout_sha"][:12],
         index["tier"],
     ):
         parent /= component
