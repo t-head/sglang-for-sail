@@ -269,7 +269,7 @@ SGL_DEVICE uint64_t fallback_kth(
 
 // Buffer layout (uint64_t entries): [2 parities][max_rows][kNumRanks * kCandK + kTopK],
 // the candidate block of every rank, then this rank's full local top-k.
-template <int kNumRanks, int kTopK, int kCandK>
+template <int kNumRanks, int kTopK, int kCandK, bool kUseMulticast>
 __global__ void __launch_bounds__(kThreads) merge_kernel(const __grid_constant__ Params p) {
   static_assert(kNumRanks == kWarps, "warp q polls rank q's candidates");
   static_assert(kCandK % 32 == 0 && kTopK % kThreads == 0 && kCandK <= kTopK);
@@ -277,6 +277,7 @@ __global__ void __launch_bounds__(kThreads) merge_kernel(const __grid_constant__
   constexpr int kPerLane = kCandK / 32;         // candidates per lane
   constexpr int64_t kSlot = static_cast<int64_t>(kNumRanks) * kCandK + kTopK;
   __shared__ Smem s;
+  __shared__ uint64_t push_buf[kUseMulticast ? 1 : kCandK];
 
   const int row = blockIdx.x, tid = threadIdx.x, warp = tid / 32;
   const int64_t c = p.counters[row];
@@ -300,12 +301,29 @@ __global__ void __launch_bounds__(kThreads) merge_kernel(const __grid_constant__
   // ---- push the best kCandK to every rank ----
   bool sel[kPerThread];
   select_at_least(own, select_kth(visit_keys(own), min(n_own, kCandK), s), sel);
-  uint64_t* const dst = p.mc_buffer + base + static_cast<int64_t>(p.rank) * kCandK;
-  compact<kCandK>(
-      sel,
-      [&](int e, int i) { device::ptx::multimem_store_relaxed(dst + e, pack_entry(v[i].x, v[i].y, tag)); },
-      [&](int e) { device::ptx::multimem_store_relaxed(dst + e, pack_entry(0, -1, tag)); },
-      s);
+  if constexpr (kUseMulticast) {
+    uint64_t* const dst = p.mc_buffer + base + static_cast<int64_t>(p.rank) * kCandK;
+    compact<kCandK>(
+        sel,
+        [&](int e, int i) { device::ptx::multimem_store_relaxed(dst + e, pack_entry(v[i].x, v[i].y, tag)); },
+        [&](int e) { device::ptx::multimem_store_relaxed(dst + e, pack_entry(0, -1, tag)); },
+        s);
+  } else {
+    compact<kCandK>(
+        sel,
+        [&](int e, int i) { push_buf[e] = pack_entry(v[i].x, v[i].y, tag); },
+        [&](int e) { push_buf[e] = pack_entry(0, -1, tag); },
+        s);
+    __syncthreads();
+    const int dst_rank = (p.rank + warp) % kNumRanks;
+    const uint32_t lane = device::get_lane_id();
+    uint64_t* const dst =
+        reinterpret_cast<uint64_t*>(p.peer_ptrs[dst_rank]) + base + static_cast<int64_t>(p.rank) * kCandK;
+#pragma unroll
+    for (int i = 0; i < kPerLane; ++i) {
+      device::ptx::store_relaxed_sys(dst + lane + 32 * i, push_buf[lane + 32 * i]);
+    }
+  }
 
   // widened slots of the own keys while the pushes travel
   int slot[kPerThread];
@@ -361,9 +379,9 @@ __global__ void __launch_bounds__(kThreads) merge_kernel(const __grid_constant__
 
 }  // namespace dcp_topk_merge
 
-template <int64_t kNumRanks, int64_t kTopK, int64_t kCandK>
+template <int64_t kNumRanks, int64_t kTopK, int64_t kCandK, bool kUseMulticast = true>
 struct DcpTopKMergeKernel {
-  static constexpr auto kernel = dcp_topk_merge::merge_kernel<kNumRanks, kTopK, kCandK>;
+  static constexpr auto kernel = dcp_topk_merge::merge_kernel<kNumRanks, kTopK, kCandK, kUseMulticast>;
 
   /**
    * \brief Merges one batch of decode rows; every rank of the group calls it

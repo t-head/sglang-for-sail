@@ -14,8 +14,10 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_dcp_topk_merge_module(num_ranks: int, topk: int, cand_k: int) -> Module:
-    args = make_cpp_args(num_ranks, topk, cand_k)
+def _jit_dcp_topk_merge_module(
+    num_ranks: int, topk: int, cand_k: int, use_multicast: bool
+) -> Module:
+    args = make_cpp_args(num_ranks, topk, cand_k, use_multicast)
     return load_jit(
         "dcp_topk_merge",
         *args,
@@ -65,7 +67,9 @@ def dcp_topk_merge(
     certificate failed.
     """
     num_ranks = peer_ptrs.shape[0]
-    module = _jit_dcp_topk_merge_module(num_ranks, candidates.shape[1], cand_k)
+    module = _jit_dcp_topk_merge_module(
+        num_ranks, candidates.shape[1], cand_k, multicast_ptr != 0
+    )
     module.dcp_topk_merge(
         candidates,
         buffer,

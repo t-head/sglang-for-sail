@@ -1,17 +1,18 @@
 """Multi-GPU test of the DSA DCP top-k merge (``DcpTopKMerge``).
 
 Every rank holds the token-interleaved shard of the same global score rows,
-runs the v2 candidate epilogue on it and merges through NVLink multicast. Each
-rank's result must be exactly its share of the global top-k (score descending,
-then position ascending) as widened slots, -1 after them, also when a graph
-replays the merge on three alternating inputs until the 8-bit epoch tag wraps,
-so a read of a stale call's entries would return another input's keys. Unlike
-the one-GPU DSA DCP tests it needs 8 real ranks with NVLink multicast.
+runs the v2 candidate epilogue on it and merges through NVLink multicast or
+1-shot P2P unicast push. Each rank's result must be exactly its share of the
+global top-k (score descending, then position ascending) as widened slots, -1
+after them, also when a graph replays the merge on three alternating inputs
+until the 8-bit epoch tag wraps, so a read of a stale call's entries would
+return another input's keys. Unlike the one-GPU DSA DCP tests it needs 8 real
+ranks with NVLink multicast or intra-node P2P peer access.
 
 Usage::
 
     python test/registered/kernels/ops/attention/test_dsa_dcp_topk_merge.py
-    python test/registered/kernels/ops/attention/test_dsa_dcp_topk_merge.py -k periodic
+    python test/registered/kernels/ops/attention/test_dsa_dcp_topk_merge.py -k "p2p and periodic"
 """
 
 from __future__ import annotations
@@ -42,7 +43,7 @@ GRAPH_CHECKS, REPLAYS_PER_CHECK = 5, 20  # 3 * 100 calls per row slot > 255 tags
 
 
 @cache_once
-def _init_once() -> DcpTopKMerge:
+def _init_dist_once() -> None:
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(local_rank)
@@ -54,7 +55,12 @@ def _init_once() -> DcpTopKMerge:
     get_parallel().override_permanently(world_group=ps._WORLD)
     atexit.register(dist.destroy_process_group)
     logging.disable(logging.INFO)
-    return DcpTopKMerge(ps._WORLD, MAX_ROWS, TOPK)
+
+
+@cache_once
+def _init_merge_once(allow_multicast: bool) -> DcpTopKMerge:
+    _init_dist_once()
+    return DcpTopKMerge(ps._WORLD, MAX_ROWS, TOPK, allow_multicast=allow_multicast)
 
 
 def _rows(kind: str, seed: int) -> list[torch.Tensor]:
@@ -182,15 +188,18 @@ class _Case:
         return bad
 
 
+@pytest.mark.parametrize("transport", ["multicast", "p2p"])
 @pytest.mark.parametrize("kind", ["random", "dense_top", "ties", "periodic", "short"])
 @torch.inference_mode()
-def test_dcp_topk_merge(kind: str) -> None:
-    merge = _init_once()
+def test_dcp_topk_merge(transport: str, kind: str) -> None:
+    merge = _init_merge_once(allow_multicast=(transport == "multicast"))
     world, rank = ps._WORLD.world_size, ps._WORLD.rank_in_group
     if world != 8:
         pytest.skip("the merge needs 8 ranks")
-    if merge.buffer is None:
+    if transport == "multicast" and merge.multicast_ptr == 0:
         pytest.skip("multimem multicast unavailable")
+    if merge.buffer is None:
+        pytest.skip(f"{transport} transport unavailable")
     span = PAGE_SIZE * world
     cases = [_Case(kind, seed, rank, world, span) for seed in SEEDS]
 

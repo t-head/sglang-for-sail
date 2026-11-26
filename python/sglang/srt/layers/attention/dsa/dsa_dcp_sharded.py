@@ -175,7 +175,9 @@ class DcpTopKMerge:
     jit/csrc/dsa/dcp_topk_merge.cuh. Needs 8 ranks (one warp each), top-k 2048
     and multicast; ``usable`` is False otherwise."""
 
-    def __init__(self, group, max_rows: int, topk: int):
+    def __init__(
+        self, group, max_rows: int, topk: int, *, allow_multicast: bool = True
+    ):
         import torch.distributed._symmetric_memory as symm_mem
 
         self.rank = group.rank_in_group
@@ -200,11 +202,12 @@ class DcpTopKMerge:
         buffer.zero_()
         torch.cuda.synchronize(group.device)
         handle = symm_mem.rendezvous(buffer, group.device_group.group_name)
-        if handle.multicast_ptr == 0:
-            print_info_once("DSA DCP top-k merge off: no multicast")
+        use_multicast = allow_multicast and handle.multicast_ptr != 0
+        if not use_multicast and not all(handle.buffer_ptrs):
+            print_info_once("DSA DCP top-k merge off: no multicast or peer buffers")
             return
         self.buffer = buffer
-        self.multicast_ptr = handle.multicast_ptr
+        self.multicast_ptr = handle.multicast_ptr if use_multicast else 0
         self.peer_ptrs = torch.tensor(
             handle.buffer_ptrs, dtype=torch.int64, device=group.device
         )
