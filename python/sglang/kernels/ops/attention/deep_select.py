@@ -479,6 +479,43 @@ def _precompile(
     return _CachedModuleDispatch(modules[1:], rows, modules[0])
 
 
+STREAMING_FP32_INPUT_STRIDE_ALIGNMENT = 256  # FP32 elements.
+
+
+def supports_streaming_fp32_topk(device: torch.device) -> bool:
+    return (
+        device.type == "cuda"
+        and torch.version.hip is None
+        and torch.cuda.get_device_capability(device)[0] == 10
+    )
+
+
+@cache_once
+def _jit_streaming_fp32_topk_module() -> Module:
+    root = (KERNEL_PATH / "csrc" / "deep_select").resolve()
+    args = make_cpp_args(512)
+    return load_jit(
+        "deep_select_streaming_fp32",
+        *args,
+        cuda_files=["deep_select/streaming_fp32.cuh"],
+        cuda_wrappers=[("topk", f"DeepSelectTopKFp32Kernel<{args}>::run")],
+        extra_include_paths=[str(root), str(root / "kerutils" / "include")],
+        extra_dependencies=["flashinfer"],
+        extra_cflags=["-DNDEBUG", "-DKERUTILS_IS_BUILD_ON_CUDA"],
+        extra_cuda_cflags=[
+            "-DNDEBUG",
+            "-DKERUTILS_IS_BUILD_ON_CUDA",
+            "-U__CUDA_NO_HALF_OPERATORS__",
+            "-U__CUDA_NO_HALF_CONVERSIONS__",
+            "-U__CUDA_NO_HALF2_OPERATORS__",
+            "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+            "--expt-extended-lambda",
+            "--use_fast_math",
+            "--ftz=false",
+        ],
+    )
+
+
 def topk(
     input: torch.Tensor,
     topk: int,
@@ -495,6 +532,7 @@ def topk(
     value_oob_fill_value: float = float("-inf"),
     return_value: bool = False,
     abort_when_nan_found: bool = False,
+    streaming_fp32: bool = False,
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
     """Select the largest ``topk`` values of every row of ``input``.
 
@@ -502,6 +540,32 @@ def topk(
     False, which skips writing them and is about 10% faster.
     """
     assert hint is None, "hint is not supported"
+    # The streaming implementation retains the short-row shortcut and
+    # TMA staging used by Step5 while sharing this entry point and its contract.
+    if streaming_fp32:
+        if not supports_streaming_fp32_topk(input.device):
+            raise NotImplementedError("Streaming FP32 DeepSelect requires SM10x")
+        if (
+            input.dtype != torch.float32
+            or topk != 512
+            or end is None
+            or output_idx is None
+            or begin is not None
+            or indices_type != torch.int32
+            or sorted
+            or sorted_index
+            or output_idx_offset is not None
+            or idx_oob_fill_value != -1
+            or value_oob_fill_value != float("-inf")
+            or return_value
+            or abort_when_nan_found
+        ):
+            raise ValueError(
+                "Streaming FP32 DeepSelect requires k=512, row ends and an "
+                "int32 output with -1 padding, without sorting or values"
+            )
+        _jit_streaming_fp32_topk_module().topk(input, end, output_idx)
+        return None, output_idx
     if _wheel_available():
         if (
             begin is not None
