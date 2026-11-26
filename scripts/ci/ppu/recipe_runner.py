@@ -445,6 +445,13 @@ def run(policy_path, tier, queue_s):
     assets = RESULTS.parent / "assets.json"
     effective = resolve_recipe(recipe, policy_path=policy_path, tier=tier)
     revision = os.environ.get("PPU_CI_HF_MODEL_REVISION")
+    revision_repo = os.environ.get("PPU_CI_HF_MODEL_REVISION_REPO")
+    if (
+        revision is not None
+        and revision_repo is not None
+        and effective["hf_model_id"] != revision_repo
+    ):
+        revision = None
     uses_cache_ref = revision is None and "PPU_CI_HF_CACHE_ROOT" in os.environ
     if revision is None and not uses_cache_ref:
         model_path = os.environ["PPU_RECIPE_CONTAINER_MODEL"]
