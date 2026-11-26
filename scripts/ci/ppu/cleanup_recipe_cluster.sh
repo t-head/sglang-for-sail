@@ -19,13 +19,13 @@ fi
 
 export PATH="/opt/bin:$PATH"
 infra="${GITHUB_WORKSPACE:-$PWD}/.ppu-infra/cluster-run/scripts"
-[[ -f "$infra/cleanup.sh" ]] || {
+[[ ! -L "${GITHUB_WORKSPACE:-$PWD}/.ppu-infra" && -f "$infra/cleanup.sh" && ! -L "$infra/cleanup.sh" ]] || {
     echo "::error::Cluster cleanup backend missing for failsafe cleanup"
     exit 1
 }
 
 read_state() {
-    python3 -B - "$state_file" "$1" <<'PY'
+    python3 -I -B - "$state_file" "$1" <<'PY'
 import json, re, sys
 data = json.loads(open(sys.argv[1], encoding="utf-8").read())
 key = sys.argv[2]

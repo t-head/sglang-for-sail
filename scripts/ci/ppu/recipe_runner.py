@@ -272,6 +272,7 @@ def warm_pp_stage_shards(
     is_main = threading.current_thread() is threading.main_thread()
     prev_term = signal.signal(signal.SIGTERM, _on_signal) if is_main else None
     prev_int = signal.signal(signal.SIGINT, _on_signal) if is_main else None
+    peer_aborted = False
     try:
         chunk_bytes = 16 * 1024 * 1024
 
@@ -307,6 +308,7 @@ def warm_pp_stage_shards(
                 _peer_failures(barrier_dir, own_rank=node_rank)
                 or (node_rank > 0 and _rank0_done_status(barrier_dir) is not None)
             ):
+                peer_aborted = True
                 phase("worker_exit")
                 raise StartupError("worker_exit")
             raise StartupError("page_cache_warm_cancelled")
@@ -331,6 +333,7 @@ def warm_pp_stage_shards(
                 if _peer_failures(barrier_dir, own_rank=node_rank) or (
                     node_rank > 0 and _rank0_done_status(barrier_dir) is not None
                 ):
+                    peer_aborted = True
                     phase("worker_exit")
                     raise StartupError("worker_exit")
                 if expected.issubset(_barrier_names(barrier_dir)):
@@ -351,11 +354,28 @@ def warm_pp_stage_shards(
         return elapsed_s
     except Exception:
         if barrier_dir is not None:
-            _barrier_write(
-                barrier_dir,
-                f"fail-rank-{node_rank}.json",
-                {"rank": node_rank, "exit_code": 1, "reason": "page_cache_warm"},
-            )
+            if peer_aborted and node_rank > 0:
+                reason = (
+                    "peer_failed"
+                    if _peer_failures(barrier_dir, own_rank=node_rank)
+                    else "rank0_error"
+                )
+                _barrier_write(
+                    barrier_dir,
+                    f"exit-rank-{node_rank}.json",
+                    {
+                        "rank": node_rank,
+                        "exit_code": 1,
+                        "reason": reason,
+                        "propagated": True,
+                    },
+                )
+            elif not peer_aborted:
+                _barrier_write(
+                    barrier_dir,
+                    f"fail-rank-{node_rank}.json",
+                    {"rank": node_rank, "exit_code": 1, "reason": "page_cache_warm"},
+                )
         raise
     finally:
         if is_main:
@@ -1100,9 +1120,18 @@ def _resolve_gang_snapshot(
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         names = _barrier_names(barrier_dir)
-        if _peer_failures(barrier_dir, own_rank=node_rank) or (
-            _rank0_done_status(barrier_dir) is not None
-        ):
+        peers = _peer_failures(barrier_dir, own_rank=node_rank)
+        if peers or (_rank0_done_status(barrier_dir) is not None):
+            _barrier_write(
+                barrier_dir,
+                f"exit-rank-{node_rank}.json",
+                {
+                    "rank": node_rank,
+                    "exit_code": 1,
+                    "reason": "peer_failed" if peers else "rank0_error",
+                    "propagated": True,
+                },
+            )
             raise RuntimeError("rank 0 failed before publishing model snapshot")
         if manifest in names:
             payload = json.loads((barrier_dir / manifest).read_text(encoding="utf-8"))

@@ -247,7 +247,7 @@ if [[ -n "$hca_list_file" ]]; then
         hca_csv=""
         for hca in "${matched_hcas[@]}"; do
             if [[ -n "$hca_csv" ]]; then
-                hca_csv="${hca_csv},=${hca}"
+                hca_csv="${hca_csv},${hca}"
             else
                 hca_csv="=${hca}"
             fi

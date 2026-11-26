@@ -199,6 +199,26 @@ def verify_pod_status(
     expected_digest: str = "",
 ) -> str:
     document = json.loads(pod_status_path.read_text(encoding="utf-8"))
+    spec = document.get("spec")
+    if (
+        isinstance(spec, dict)
+        and env.get("PPU_CI_ALLOW_MULTINODE_HOST_ACCESS") != "true"
+    ):
+        if any(
+            spec.get(flag) is True for flag in ("hostNetwork", "hostIPC", "hostPID")
+        ):
+            raise ValueError("ordinary worker pod has unauthorized host namespace")
+        containers = [
+            *(spec.get("containers") or []),
+            *(spec.get("initContainers") or []),
+        ]
+        if any(
+            isinstance(item, dict)
+            and isinstance(item.get("securityContext"), dict)
+            and item["securityContext"].get("privileged") is True
+            for item in containers
+        ):
+            raise ValueError("ordinary worker pod has unauthorized privileged mode")
     statuses = document.get("status", {}).get("containerStatuses", [])
     worker_ids = [
         item.get("imageID", "")

@@ -193,8 +193,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
-          ref: ${{ needs.check-changes.outputs.source-sha }}
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
           persist-credentials: false
       - name: Fetch pinned Cluster Run backend
         uses: actions/checkout@v4
@@ -204,7 +204,7 @@ jobs:
           path: .ppu-infra
           persist-credentials: false
       - name: Verify the private staging configuration
-        run: python3 -B scripts/ci/ppu/recipe_cluster_config.py --check
+        run: python3 -I -B scripts/ci/ppu/recipe_cluster_config.py --check
 
   ppu-build:
     name: >-
@@ -283,6 +283,8 @@ jobs:
       actions: read
     env:
       TIER: legacy
+      RECIPE_NNODES: '1'
+      PPU_CI_ALLOW_MULTINODE_HOST_ACCESS: 'false'
       PPU_CI_BOARD: ${{ matrix.board }}
       PPU_CI_SOURCE_SHA: ${{ needs.check-changes.outputs.source-sha }}
     steps:
@@ -306,19 +308,33 @@ jobs:
           ref: 96e25147971f5d2a04d828f8ad508cae38a4fa8a
           path: .ppu-infra
           persist-credentials: false
+      - name: Fetch trusted cluster orchestrator
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .ppu-trusted-ci
+          sparse-checkout: |
+            scripts/ci/ppu
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
       - name: Orchestrate PPU Pod with private logs
         id: cluster
         shell: bash
         run: |
           export PPU_PUBLIC_SUMMARY="$GITHUB_STEP_SUMMARY"
-          exec bash scripts/ci/ppu/run_recipe_cluster.sh
+          exec bash .ppu-trusted-ci/scripts/ci/ppu/run_recipe_cluster.sh
+      - name: Guarantee cluster cleanup on cancel or interrupt
+        if: always() && steps.cluster.outcome != 'skipped'
+        shell: bash
+        run: bash .ppu-trusted-ci/scripts/ci/ppu/cleanup_recipe_cluster.sh
       - name: Approve only the checked single-device evidence file
         id: evidence
         if: always() && steps.cluster.outcome != 'skipped'
         shell: bash
         run: |
           if [[ -f ppu-public/legacy.json && ! -L ppu-public/legacy.json ]] &&
-            python3 -B scripts/ci/ppu/recipe_publish.py --verify-only ppu-public/legacy.json >/dev/null 2>&1; then
+            python3 -I -B .ppu-trusted-ci/scripts/ci/ppu/recipe_publish.py --verify-only ppu-public/legacy.json >/dev/null 2>&1; then
             printf 'approved=true\n' >> "$GITHUB_OUTPUT"
           fi
       - name: Upload checked single-device evidence

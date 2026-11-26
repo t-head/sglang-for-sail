@@ -5,6 +5,12 @@ import json
 import os
 import re
 import stat
+import sys
+from pathlib import Path
+
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
 
 from recipe_publish import MODEL_POLICY_ROOT
 from recipe_retention import RETENTION_SUBPATH
@@ -359,8 +365,13 @@ def _archive_outcome(directory):
         if job_outcome in ("pass", "fail"):
             return job_outcome
     phase_val = _read_regular_text(directory / "recipe-phase.txt").strip()
-    if phase_val in ("cleanup", "image_resolution"):
+    if phase_val == "cleanup":
         return "fail"
+    if phase_val == "image_resolution":
+        prov_stream, _ = _open_regular_file(directory / "provenance.json")
+        if prov_stream is None:
+            return "fail"
+        prov_stream.close()
     summary_doc = _read_json_dict(directory / "summary.json")
     if summary_doc is None:
         return None

@@ -143,7 +143,7 @@ jobs:
       - id: check
         env:
           PPU_CI_MODEL_FILTER: ${{ inputs.model_filter || '' }}
-        run: python3 -B scripts/ci/ppu/recipe_cluster_config.py --check
+        run: python3 -I -B scripts/ci/ppu/recipe_cluster_config.py --check
 
   plan:
     needs: [pr-gate, pr-gate-multinode]
@@ -224,8 +224,26 @@ jobs:
                 exit 1
               fi
             elif [[ "$EVENT_NAME" == pull_request_target && "$EVENT_ACTION" == labeled && "$TRIGGER_LABEL" == run-ci-ppu-multinode && -z "$MODEL_FILTER" && "$has_single_node" == true && "$PR_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
-              prior_single_run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/nightly-test-ppu.yml/runs?event=pull_request_target&head_sha=$PR_HEAD&per_page=20" \
-                --jq --arg cur "$GITHUB_RUN_ID" '[.workflow_runs[] | select((.id | tostring) != $cur and .conclusion != "cancelled")] | length' 2>/dev/null || echo 0)
+              job_prefix="Model Sanity ("
+              [[ "$TIER" == fast_sanity ]] && job_prefix="Fast Sanity ("
+              prior_single_run=0
+              if candidate_runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/nightly-test-ppu.yml/runs?event=pull_request_target&head_sha=$PR_HEAD&per_page=20" 2>/dev/null |
+                  jq -r --arg cur "$GITHUB_RUN_ID" '.workflow_runs[] | select((.id | tostring) != $cur and .conclusion != "cancelled" and .conclusion != "skipped") | .id'); then
+                for cand_run in $candidate_runs; do
+                  [[ "$cand_run" =~ ^[0-9]+$ ]] || continue
+                  if scheduled_single=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$cand_run/jobs?per_page=100" 2>/dev/null |
+                      jq -r --arg prefix "$job_prefix" '
+                        [(if type == "array" then .[].jobs[] else .jobs[] end)
+                         | select(.name | startswith($prefix))
+                         | select((.name | test(", [0-9]+x8\\)$")) | not)
+                         | select(.conclusion != "skipped" and .conclusion != "cancelled")] | length'); then
+                    if [[ "$scheduled_single" =~ ^[1-9][0-9]*$ ]]; then
+                      prior_single_run=$scheduled_single
+                      break
+                    fi
+                  fi
+                done
+              fi
               if [[ "$prior_single_run" =~ ^[1-9][0-9]*$ ]]; then
                 echo "::notice::Incremental run-ci-ppu-multinode approval on $PR_HEAD: skipping duplicate single-node matrix already scheduled by another run"
                 models='{"include":[]}'
@@ -452,7 +470,7 @@ jobs:
         run: |
           export PPU_CI_POLICY_ROOT="$GITHUB_WORKSPACE/test/ppu/policy/models"
           if [[ -f ppu-public/recipe.json && ! -L ppu-public/recipe.json ]] &&
-            python3 -B .ppu-trusted-ci/scripts/ci/ppu/recipe_publish.py --verify-only ppu-public/recipe.json >/dev/null 2>&1; then
+            python3 -I -B .ppu-trusted-ci/scripts/ci/ppu/recipe_publish.py --verify-only ppu-public/recipe.json >/dev/null 2>&1; then
             printf 'approved=true\n' >> "$GITHUB_OUTPUT"
           fi
       - name: Upload checked public evidence
@@ -554,7 +572,7 @@ jobs:
         run: |
           export PPU_CI_POLICY_ROOT="$GITHUB_WORKSPACE/test/ppu/policy/models"
           if [[ -f ppu-public/recipe.json && ! -L ppu-public/recipe.json ]] &&
-            python3 -B .ppu-trusted-ci/scripts/ci/ppu/recipe_publish.py --verify-only ppu-public/recipe.json >/dev/null 2>&1; then
+            python3 -I -B .ppu-trusted-ci/scripts/ci/ppu/recipe_publish.py --verify-only ppu-public/recipe.json >/dev/null 2>&1; then
             printf 'approved=true\n' >> "$GITHUB_OUTPUT"
           fi
       - name: Upload checked public evidence

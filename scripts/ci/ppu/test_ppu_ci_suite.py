@@ -369,7 +369,8 @@ class TestPPUCIWorkflow(unittest.TestCase):
             steps["evidence"]["run"],
         )
         self.assertIn(
-            "exec bash scripts/ci/ppu/run_recipe_cluster.sh", steps["cluster"]["run"]
+            "exec bash .ppu-trusted-ci/scripts/ci/ppu/run_recipe_cluster.sh",
+            steps["cluster"]["run"],
         )
 
     def test_legacy_mode_is_explicit_and_separate_from_recipe_ci(self):

@@ -10,6 +10,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
 BACKEND_SHA = "96e25147971f5d2a04d828f8ad508cae38a4fa8a"
 CONFIG_NAME = ".sglang-recipe-ci-v0523"
 SETTINGS = {

@@ -275,6 +275,7 @@ def retain(environ) -> None:
         if ranks_root is not None:
             for pattern in (
                 "rank-*.status",
+                "barrier/rank0.done",
                 "barrier/*.json",
                 "rank-*/runtime.log",
                 "rank-*/worker-phase.txt",

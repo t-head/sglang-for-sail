@@ -45,7 +45,26 @@ write_barrier_fallback() {
             mv -- "$tmp" "$target" || true
         fi
     else
-        if (( code != 0 )); then
+        local propagated=false
+        local exit_reason="pod_trap"
+        if [[ -f "$barrier_dir/fail-rank-0.json" ]]; then
+            propagated=true
+            exit_reason="peer_failed"
+        elif [[ -f "$barrier_dir/rank0.done" ]] &&
+            ! grep -Eq '"status"[[:space:]]*:[[:space:]]*"ok"' "$barrier_dir/rank0.done" 2>/dev/null; then
+            propagated=true
+            exit_reason="rank0_error"
+        else
+            local _peer_fail
+            for _peer_fail in "$barrier_dir"/fail-rank-*.json; do
+                if [[ -f "$_peer_fail" && "$_peer_fail" != "$barrier_dir/fail-rank-${node_rank}.json" ]]; then
+                    propagated=true
+                    exit_reason="peer_failed"
+                    break
+                fi
+            done
+        fi
+        if (( code != 0 )) && [[ "$propagated" != true ]]; then
             target="$barrier_dir/fail-rank-${node_rank}.json"
             if [[ ! -f "$target" ]]; then
                 tmp="${target}.partial.$$"
@@ -56,7 +75,8 @@ write_barrier_fallback() {
         target="$barrier_dir/exit-rank-${node_rank}.json"
         if [[ ! -f "$target" ]]; then
             tmp="${target}.partial.$$"
-            printf '{"rank":%d,"exit_code":%d,"source":"pod_trap"}\n' "$node_rank" "$code" > "$tmp"
+            printf '{"rank":%d,"exit_code":%d,"reason":"%s","source":"pod_trap"}\n' \
+                "$node_rank" "$code" "$exit_reason" > "$tmp"
             mv -- "$tmp" "$target" || true
         fi
     fi
@@ -140,30 +160,84 @@ if (( nnodes > 1 )); then
     if [[ -s "$hca_list_file" ]]; then
         detected_hcas=$(tr -d '\r\n' < "$hca_list_file")
         existing_hcas="${NCCL_IB_HCA:-${PCCL_IB_HCA:-}}"
-        effective_hcas=$(python3 -B - "$detected_hcas" "$existing_hcas" <<'PY'
+        effective_hcas=$(python3 -I -B - "$detected_hcas" "$existing_hcas" <<'PY'
+import os
+from pathlib import Path
+import re
 import sys
 
-detected = [item.lstrip("=") for item in sys.argv[1].split(",") if item.strip()]
+detected = [
+    item.strip().lstrip("=")
+    for item in sys.argv[1].lstrip("=").split(",")
+    if item.strip().lstrip("=")
+]
 existing = sys.argv[2].strip()
 if not existing:
-    print(",".join(f"={name}" for name in detected))
+    print("=" + ",".join(detected))
     raise SystemExit(0)
-exclude = existing.startswith("^")
-tokens = [tok.strip() for tok in existing.lstrip("^").split(",") if tok.strip()]
 
-def matches(dev, tok):
-    if tok.startswith("="):
-        return dev == tok[1:].split(":", 1)[0]
-    return dev.startswith(tok.split(":", 1)[0])
+invert = existing.startswith("^")
+rest = existing[1:] if invert else existing
+exact = rest.startswith("=")
+body = rest[1:] if exact else rest
 
-filtered = [
-    dev
-    for dev in detected
-    if (not any(matches(dev, tok) for tok in tokens) if exclude else any(matches(dev, tok) for tok in tokens))
-]
-if not filtered:
-    raise SystemExit("gid: existing NCCL_IB_HCA/PCCL_IB_HCA excludes all RoCE rails supporting the selected GID index")
-print(",".join(f"={name}" for name in filtered))
+
+def parse_port(raw_port: str) -> int:
+    match = re.match(r"[0-9]+", raw_port)
+    return int(match.group(0)) if match else 0
+
+
+entries: list[tuple[str, int | None]] = []
+for raw_tok in body.split(","):
+    if not raw_tok:
+        continue
+    prefix, sep, port_str = raw_tok.partition(":")
+    if not prefix:
+        continue
+    entries.append((prefix, parse_port(port_str) if sep else None))
+
+
+def dev_matches(dev: str, prefix: str) -> bool:
+    return dev == prefix if exact else dev.startswith(prefix)
+
+
+sysfs = Path(os.environ.get("RECIPE_GID_SYSFS_ROOT", "/sys/class/infiniband"))
+out_tokens: list[str] = []
+for dev in detected:
+    matched = [(prefix, port) for prefix, port in entries if dev_matches(dev, prefix)]
+    if not invert:
+        if not matched:
+            continue
+        if any(port is None for _, port in matched):
+            out_tokens.append(dev)
+        else:
+            seen_ports: list[int] = []
+            for _, port in matched:
+                if port is not None and port not in seen_ports:
+                    seen_ports.append(port)
+                    out_tokens.append(f"{dev}:{port}")
+    else:
+        if any(port is None for _, port in matched):
+            continue
+        if not matched:
+            out_tokens.append(dev)
+            continue
+        excluded_ports = {port for _, port in matched if port is not None}
+        ports_dir = sysfs / dev / "ports"
+        known_ports = (
+            sorted(int(p.name) for p in ports_dir.iterdir() if p.name.isdigit())
+            if ports_dir.is_dir()
+            else [1]
+        )
+        for port in known_ports or [1]:
+            if port not in excluded_ports:
+                out_tokens.append(f"{dev}:{port}")
+
+if not out_tokens:
+    raise SystemExit(
+        "gid: existing NCCL_IB_HCA/PCCL_IB_HCA excludes all RoCE rails supporting the selected GID index"
+    )
+print("=" + ",".join(out_tokens))
 PY
 )
         export NCCL_IB_HCA="$effective_hcas"

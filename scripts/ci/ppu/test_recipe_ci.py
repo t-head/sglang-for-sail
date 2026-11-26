@@ -4607,7 +4607,660 @@ class MultiNodeRecipeTest(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertEqual(proc.stdout.strip(), "3")
-            self.assertEqual(hca_out.read_text().strip(), "=mlx5_bond_0,=mlx5_bond_1")
+            self.assertEqual(hca_out.read_text().strip(), "=mlx5_bond_0,mlx5_bond_1")
+
+            # Verify run_recipe_pod.sh HCA list intersection against NCCL global
+            # prefix & per-entry port semantics.
+            pod_text = (REPO_ROOT / "scripts/ci/ppu/run_recipe_pod.sh").read_text(
+                encoding="utf-8"
+            )
+            hca_block = pod_text[
+                pod_text.index('if [[ -s "$hca_list_file"') : pod_text.index(
+                    "    GLOO_SOCKET_IFNAME="
+                )
+            ]
+
+            def nccl_accepted(value: str) -> list[str]:
+                invert = value.startswith("^")
+                value = value.removeprefix("^")
+                exact = value.startswith("=")
+                value = value.removeprefix("=")
+                tokens = [entry.partition(":") for entry in value.split(",") if entry]
+
+                def selected(dev_name: str, port_num: int) -> bool:
+                    return any(
+                        (dev_name == dev if exact else dev_name.startswith(dev))
+                        and (not suffix or int(suffix) == port_num)
+                        for dev, _, suffix in tokens
+                    )
+
+                return [
+                    f"{dev_name}:{port_num}"
+                    for dev_name in ("mlx5_bond_0", "mlx5_bond_1", "mlx5_bond_2")
+                    for port_num in (1, 2)
+                    if selected(dev_name, port_num) != invert
+                ]
+
+            for existing, expected_export, expected_matches in (
+                (
+                    "",
+                    "=mlx5_bond_0,mlx5_bond_1",
+                    [
+                        "mlx5_bond_0:1",
+                        "mlx5_bond_0:2",
+                        "mlx5_bond_1:1",
+                        "mlx5_bond_1:2",
+                    ],
+                ),
+                ("=mlx5_bond_0:1", "=mlx5_bond_0:1", ["mlx5_bond_0:1"]),
+                (
+                    "mlx5_bond_:1",
+                    "=mlx5_bond_0:1,mlx5_bond_1:1",
+                    ["mlx5_bond_0:1", "mlx5_bond_1:1"],
+                ),
+                (
+                    "^mlx5_bond_1",
+                    "=mlx5_bond_0",
+                    ["mlx5_bond_0:1", "mlx5_bond_0:2"],
+                ),
+            ):
+                res = subprocess.run(
+                    [
+                        "bash",
+                        "-c",
+                        hca_block + '\nprintf "%s" "$NCCL_IB_HCA"',
+                    ],
+                    env={
+                        **os.environ,
+                        "hca_list_file": str(hca_out),
+                        "RECIPE_GID_SYSFS_ROOT": str(sysfs),
+                        "NCCL_IB_HCA": existing,
+                        "PCCL_IB_HCA": "",
+                    },
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertEqual(res.stdout, expected_export)
+                self.assertEqual(nccl_accepted(res.stdout), expected_matches)
+
+    def test_trusted_cluster_entrypoints_and_isolated_python_helpers(self):
+        import re
+
+        import recipe_image
+        import yaml
+
+        pr_wf = yaml.load(
+            (REPO_ROOT / ".github/workflows/pr-test-ppu.yml").read_text(
+                encoding="utf-8"
+            ),
+            Loader=yaml.BaseLoader,
+        )
+        nightly_wf = yaml.load(
+            (REPO_ROOT / ".github/workflows/nightly-test-ppu.yml").read_text(
+                encoding="utf-8"
+            ),
+            Loader=yaml.BaseLoader,
+        )
+        # Ordinary PR cluster preflight must check out the trusted workflow SHA, never candidate SHA.
+        pr_cfg = pr_wf["jobs"]["ppu-cluster-config"]
+        self.assertEqual(
+            pr_cfg["steps"][0]["with"]["repository"], "${{ job.workflow_repository }}"
+        )
+        self.assertEqual(pr_cfg["steps"][0]["with"]["ref"], "${{ job.workflow_sha }}")
+        self.assertIn("python3 -I -B", pr_cfg["steps"][-1]["run"])
+
+        pr_legacy = pr_wf["jobs"]["ppu-legacy-sanity"]
+        self.assertEqual(
+            pr_legacy["env"]["PPU_CI_ALLOW_MULTINODE_HOST_ACCESS"], "false"
+        )
+        legacy_trusted = next(
+            s
+            for s in pr_legacy["steps"]
+            if s.get("with", {}).get("path") == ".ppu-trusted-ci"
+        )
+        self.assertEqual(
+            legacy_trusted["with"]["repository"], "${{ job.workflow_repository }}"
+        )
+        self.assertEqual(legacy_trusted["with"]["ref"], "${{ job.workflow_sha }}")
+        self.assertIn(
+            ".ppu-trusted-ci/scripts/ci/ppu/run_recipe_cluster.sh",
+            next(s["run"] for s in pr_legacy["steps"] if s.get("id") == "cluster"),
+        )
+        self.assertIn(
+            "python3 -I -B",
+            nightly_wf["jobs"]["cluster-preflight"]["steps"][-1]["run"],
+        )
+
+        # Every python3 invocation in host-side shell scripts must run isolated (-I -B).
+        for script_name in ("run_recipe_cluster.sh", "cleanup_recipe_cluster.sh"):
+            text = (REPO_ROOT / "scripts/ci/ppu" / script_name).read_text(
+                encoding="utf-8"
+            )
+            self.assertEqual(re.findall(r"\bpython3\s+(?!-I\s+-B\b)", text), [])
+
+        # Host-side Python helpers must not import poisoned modules from candidate CWD.
+        with tempfile.TemporaryDirectory() as raw_root:
+            poison_cwd = Path(raw_root)
+            (poison_cwd / "sitecustomize.py").write_text(
+                "raise RuntimeError('poisoned sitecustomize')\n", encoding="utf-8"
+            )
+            (poison_cwd / "recipe_diagnostics.py").write_text(
+                "raise RuntimeError('poisoned sibling')\n", encoding="utf-8"
+            )
+            for helper in ("recipe_publish.py", "recipe_image.py", "recipe_bundle.py"):
+                proc = subprocess.run(
+                    [
+                        sys.executable,
+                        "-I",
+                        "-B",
+                        str(REPO_ROOT / "scripts/ci/ppu" / helper),
+                        "--help",
+                    ],
+                    cwd=poison_cwd,
+                    env={**os.environ, "PYTHONPATH": str(poison_cwd)},
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            # Ordinary worker pod verification rejects host namespaces and privileged mode.
+            digest = "sha256:" + "a" * 64
+            env = {
+                "PPU_CI_K8S_RUNTIME_DIGEST": f"registry.internal/team/sglang@{digest}",
+                "PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS": "registry.internal/team/",
+                "PPU_CI_ALLOW_MULTINODE_HOST_ACCESS": "false",
+            }
+            pod_file = poison_cwd / "pod.json"
+            base_status = {
+                "containerStatuses": [
+                    {
+                        "name": "worker",
+                        "imageID": f"docker-pullable://registry.internal/team/sglang@{digest}",
+                    }
+                ]
+            }
+            pod_file.write_text(
+                json.dumps(
+                    {
+                        "spec": {
+                            "hostNetwork": False,
+                            "containers": [
+                                {
+                                    "name": "worker",
+                                    "securityContext": {"privileged": False},
+                                }
+                            ],
+                        },
+                        "status": base_status,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                recipe_image.verify_pod_status(pod_file, env), f"@{digest}"
+            )
+            for bad_spec in (
+                {"hostNetwork": True},
+                {"hostIPC": True},
+                {
+                    "containers": [
+                        {"name": "worker", "securityContext": {"privileged": True}}
+                    ]
+                },
+            ):
+                pod_file.write_text(
+                    json.dumps({"spec": bad_spec, "status": base_status}),
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(ValueError, "ordinary worker pod"):
+                    recipe_image.verify_pod_status(pod_file, env)
+                self.assertEqual(
+                    recipe_image.verify_pod_status(
+                        pod_file,
+                        {**env, "PPU_CI_ALLOW_MULTINODE_HOST_ACCESS": "true"},
+                    ),
+                    f"@{digest}",
+                )
+
+    @unittest.skipUnless(shutil.which("jq"), "jq is required")
+    def test_plan_incremental_multinode_label_dedupes_only_when_single_node_scheduled(
+        self,
+    ):
+        import yaml
+
+        wf = yaml.load(
+            (REPO_ROOT / ".github/workflows/nightly-test-ppu.yml").read_text(
+                encoding="utf-8"
+            ),
+            Loader=yaml.BaseLoader,
+        )
+        plan_step = next(
+            s["run"] for s in wf["jobs"]["plan"]["steps"] if s.get("id") == "plan"
+        )
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True
+        ).strip()
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            runs_json = root / "runs.json"
+            jobs_json = root / "jobs.json"
+            # Mock gh CLI enforcing real gh 2.92.0 positional-arg check (`--jq --arg` fails).
+            (fake_bin / "gh").write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                'if [[ "${1:-}" != "api" ]]; then exit 2; fi\n'
+                "shift\n"
+                "endpoint=''\n"
+                "slurp=0\n"
+                "while (( $# > 0 )); do\n"
+                '  case "$1" in\n'
+                "    --paginate) shift ;;\n"
+                "    --slurp) slurp=1; shift ;;\n"
+                "    --jq) shift 2 ;;\n"
+                "    --*) echo 'unknown or unsupported flag' >&2; exit 1 ;;\n"
+                '    *) if [[ -n "$endpoint" ]]; then echo "accepts 1 arg(s), received extra" >&2; exit 1; fi; endpoint="$1"; shift ;;\n'
+                "  esac\n"
+                "done\n"
+                'if [[ "$endpoint" == *"/workflows/nightly-test-ppu.yml/runs"* ]]; then cat "'
+                + str(runs_json)
+                + '"; exit 0; fi\n'
+                'if [[ "$endpoint" == *"/actions/runs/100/jobs"* ]]; then\n'
+                '  if (( slurp == 1 )); then printf "[%s]\\n" "$(cat "'
+                + str(jobs_json)
+                + '")"; else cat "'
+                + str(jobs_json)
+                + '"; fi\n'
+                "  exit 0\n"
+                "fi\n"
+                "echo '{}' \n",
+                encoding="utf-8",
+            )
+            (fake_bin / "gh").chmod(0o755)
+
+            def run_plan(label: str, multinode_approved: bool) -> list[int]:
+                out = root / f"out-{label}-{multinode_approved}"
+                out.write_text("", encoding="utf-8")
+                env = {
+                    **os.environ,
+                    "PATH": f"{fake_bin}:{os.pathsep.join((str(Path(sys.executable).parent), os.environ['PATH']))}",
+                    "TIER": "model_sanity",
+                    "INPUT_REF": "",
+                    "INPUT_TARGET_REF": "",
+                    "MODEL_FILTER": "",
+                    "IMAGE_TAG": "",
+                    "IMAGE_DIGEST": "",
+                    "APPROVED_SHA": sha,
+                    "PR_HEAD": sha,
+                    "EVENT_NAME": "pull_request_target",
+                    "EVENT_ACTION": "labeled",
+                    "TRIGGER_LABEL": label,
+                    "MULTINODE_APPROVED": str(multinode_approved).lower(),
+                    "MULTINODE_APPROVED_SHA": sha if multinode_approved else "",
+                    "SKIP_BUILD": "true",
+                    "WHEEL_RUN": "",
+                    "WHEEL_ID": "111",
+                    "GITHUB_RUN_ID": "123",
+                    "GITHUB_SHA": sha,
+                    "GITHUB_REPOSITORY": "t-head/sglang-for-sail",
+                    "GITHUB_OUTPUT": str(out),
+                }
+                proc = subprocess.run(
+                    ["bash", "-c", plan_step],
+                    cwd=REPO_ROOT,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                parsed = dict(
+                    line.split("=", 1) for line in out.read_text().splitlines()
+                )
+                return [
+                    len(json.loads(parsed[k])["include"])
+                    for k in ("models", "multinode_models")
+                ]
+
+            # 1) Nightly label schedules 11 single-node + 0 multi-node.
+            runs_json.write_text('{"workflow_runs":[]}\n', encoding="utf-8")
+            jobs_json.write_text('{"jobs":[]}\n', encoding="utf-8")
+            self.assertEqual(run_plan("run-ci-ppu-nightly", False), [11, 0])
+
+            # 2) Prior non-cancelled run whose single-node jobs were skipped must NOT suppress single-node.
+            runs_json.write_text(
+                json.dumps({"workflow_runs": [{"id": 100, "conclusion": "success"}]}),
+                encoding="utf-8",
+            )
+            jobs_json.write_text(
+                json.dumps(
+                    {
+                        "jobs": [
+                            {"name": "Model Sanity (glm-5.3)", "conclusion": "skipped"}
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(run_plan("run-ci-ppu-multinode", True), [11, 1])
+
+            # 3) Prior run with active/completed single-node jobs suppresses duplicate 11 single-node jobs.
+            jobs_json.write_text(
+                json.dumps(
+                    {
+                        "jobs": [
+                            {"name": "Model Sanity (glm-5.3)", "conclusion": None},
+                            {
+                                "name": "Model Sanity (qwen3.8-2.4t-mxfp4, 2x8)",
+                                "conclusion": "skipped",
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(run_plan("run-ci-ppu-multinode", True), [0, 1])
+
+    def test_recent_failures_ignores_passing_image_resolution_archive_and_catches_real_failures(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            store = root / "store"
+            store.mkdir(mode=0o700)
+            model = "glm-5.3"
+            for run_id, worker, overall, phase, msg, has_prov in (
+                (100, "fail", "failure", "cluster_worker", "CUDA out of memory", True),
+                (101, "pass", "success", "cluster_worker", "normal", True),
+                (102, "pass", "success", "image_resolution", "normal", True),
+                (103, "pass", "failure", "cleanup", "Permission denied", True),
+            ):
+                src = root / f"src-{run_id}"
+                (src / "results").mkdir(parents=True)
+                (src / "ranks").mkdir(parents=True)
+                (src / "launcher.log").write_text(msg + "\n", encoding="utf-8")
+                (src / "recipe-phase.txt").write_text(phase + "\n", encoding="utf-8")
+                (src / "results/summary.json").write_text(
+                    json.dumps({"outcome": worker}), encoding="utf-8"
+                )
+                (src / "ranks/rank-1.status").write_text("0\n", encoding="utf-8")
+                if has_prov:
+                    (src / "provenance.json").write_text(
+                        json.dumps(
+                            {
+                                "runtime_image": fast_result()["runtime_image"],
+                                "recipe_tree_sha256": "a" * 64,
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                pub = root / f"pub-{run_id}.json"
+                env = {
+                    "PPU_CI_SOURCE_SHA": "a" * 40,
+                    "TIER": "model_sanity",
+                    "MODEL_KEY": model,
+                    "GITHUB_RUN_ID": str(run_id),
+                    "GITHUB_RUN_ATTEMPT": "1",
+                    "PPU_CI_PRIVATE_RESULTS_ROOT": str(store),
+                    "PPU_CI_ARTIFACT_DIR": str(src),
+                    "RUNNER_TEMP": str(root / "tmp"),
+                    "GITHUB_WORKSPACE": str(root / "ws"),
+                    "RECIPE_OUTCOME": overall,
+                }
+                with (
+                    patch.dict(os.environ, env),
+                    patch.object(sys, "argv", ["recipe_report", str(pub)]),
+                ):
+                    report_recipe()
+                records = recent_failures(store, run_id + 1, model_filter=model)
+                if run_id in (100, 101, 102):
+                    # Passing run 102 at phase=image_resolution must NOT shadow run 100's OOM.
+                    self.assertEqual(len(records), 1)
+                    self.assertEqual(records[0]["run_id"], 100)
+                    self.assertIn("cuda_oom", records[0]["codes"])
+                else:
+                    self.assertEqual(len(records), 1)
+                    self.assertEqual(records[0]["run_id"], 103)
+                    self.assertIn("permission_denied", records[0]["codes"])
+
+    def test_failure_reason_preserves_rank0_initiating_failure_over_propagated_peer_exit(
+        self,
+    ):
+        import recipe_diagnostics
+        import recipe_runner
+
+        pod_text = (REPO_ROOT / "scripts/ci/ppu/run_recipe_pod.sh").read_text(
+            encoding="utf-8"
+        )
+        fallback = pod_text[
+            pod_text.index("write_barrier_fallback()") : pod_text.index(
+                "# The runtime image"
+            )
+        ]
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            barrier = root / "ranks/barrier"
+            rank1 = root / "ranks/rank-1"
+            barrier.mkdir(parents=True)
+            (rank1 / "results").mkdir(parents=True)
+            (root / "recipe-phase.txt").write_text("cluster_worker\n", encoding="utf-8")
+            # Rank 0 fails first at eval_environment and its pod trap records rank0.done=error.
+            (root / "worker-phase.txt").write_text(
+                "eval_environment\n", encoding="utf-8"
+            )
+            r0 = subprocess.run(
+                ["bash", "-c", fallback + '\nwrite_barrier_fallback "1"'],
+                env={
+                    **os.environ,
+                    "node_rank": "0",
+                    "barrier_dir": str(barrier),
+                    "ranks_dir": str(barrier.parent),
+                },
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(r0.returncode, 0, r0.stderr)
+
+            # Rank 1 waiting for snapshot at model_cache_check observes rank 0's error and exits 1.
+            with patch.object(recipe_runner, "RESULTS", rank1 / "results"):
+                recipe_runner.phase("model_cache_check")
+                with self.assertRaisesRegex(
+                    RuntimeError, "rank 0 failed before publishing model snapshot"
+                ):
+                    recipe_runner._resolve_gang_snapshot(
+                        "fixture/model",
+                        None,
+                        nnodes=2,
+                        node_rank=1,
+                        barrier_dir=barrier,
+                        timeout_s=1,
+                    )
+            r1 = subprocess.run(
+                ["bash", "-c", fallback + '\nwrite_barrier_fallback "1"'],
+                env={
+                    **os.environ,
+                    "node_rank": "1",
+                    "barrier_dir": str(barrier),
+                    "ranks_dir": str(barrier.parent),
+                },
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(r1.returncode, 0, r1.stderr)
+            self.assertFalse((barrier / "fail-rank-1.json").exists())
+            self.assertEqual(
+                recipe_diagnostics.failure_reason(root), "eval_environment"
+            )
+
+    @unittest.skipUnless(
+        all(shutil.which(tool) for tool in ("jq", "sha256sum")),
+        "runner tools are required",
+    )
+    def test_cleanup_state_persisted_before_stage_dir_and_retained_on_marker_write_failure(
+        self,
+    ):
+        import signal
+        import time
+
+        cluster = (REPO_ROOT / "scripts/ci/ppu/run_recipe_cluster.sh").read_text(
+            encoding="utf-8"
+        )
+        failsafe = REPO_ROOT / "scripts/ci/ppu/cleanup_recipe_cluster.sh"
+        # State rename MUST precede staging directory allocation.
+        self.assertLess(
+            cluster.index('mv -- "${cleanup_state}.tmp" "$cleanup_state"'),
+            cluster.index('mkdir -m 0700 -- "$stage_dir"'),
+        )
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            stages = root / "stage"
+            runtemp = root / "runner"
+            bins = root / "bin"
+            infra = root / ".ppu-infra/cluster-run/scripts"
+            for folder in (stages, runtemp, bins, infra):
+                folder.mkdir(parents=True)
+            (infra / "cleanup.sh").write_text("#!/usr/bin/env bash\nexit 0\n")
+            (infra / "cleanup.sh").chmod(0o700)
+            (bins / "kubectl").write_text("#!/usr/bin/env bash\nexit 0\n")
+            (bins / "kubectl").chmod(0o700)
+
+            state = runtemp / "ppu-cleanup-state.json"
+            marker = runtemp / "ppu-cleanup-verified.json"
+            probe = root / "entered"
+            env = {
+                **os.environ,
+                "PATH": f"{bins}:{os.environ['PATH']}",
+                "raw": str(root / "scratch"),
+                "stage_root": str(stages),
+                "cleanup_state": str(state),
+                "cleanup_verified_marker": str(marker),
+                "infra": str(infra),
+                "INPUT_NAMESPACE": "ppu-sched",
+                "INPUT_NNODES": "2",
+                "RUNNER_TEMP": str(runtemp),
+                "GITHUB_WORKSPACE": str(root),
+                "PROBE": str(probe),
+            }
+
+            # 1) Hard kill while jq is building state -> zero staging directories allocated.
+            stage_snippet = cluster[
+                cluster.index("job_hash=$(printf") : cluster.index("tar -czf")
+            ]
+            (bins / "jq").write_text(
+                '#!/usr/bin/env bash\ntouch "$PROBE"\nexec sleep 12\n'
+            )
+            (bins / "jq").chmod(0o700)
+            proc = subprocess.Popen(
+                ["bash", "-c", "set -euo pipefail\n" + stage_snippet],
+                env=env,
+                start_new_session=True,
+            )
+            try:
+                for _ in range(200):
+                    if probe.exists():
+                        break
+                    time.sleep(0.01)
+                self.assertTrue(probe.exists())
+            finally:
+                if proc.poll() is None:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+            self.assertEqual(list(stages.iterdir()), [])
+            (bins / "jq").unlink()
+            Path(str(state) + ".tmp").unlink(missing_ok=True)
+
+            # 2) Run full pre-tar allocation, then interrupt before tar -> failsafe cleans empty stage_dir.
+            alloc = subprocess.run(
+                ["bash", "-c", "set -euo pipefail\n" + stage_snippet],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(alloc.returncode, 0, alloc.stderr)
+            self.assertEqual(len(list(stages.iterdir())), 1)
+            self.assertTrue(state.is_file())
+            clean1 = subprocess.run(
+                ["bash", str(failsafe)],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(clean1.returncode, 0, clean1.stdout + clean1.stderr)
+            self.assertTrue(json.loads(clean1.stdout)["cleanup_verified"])
+            self.assertEqual(list(stages.iterdir()), [])
+            marker.unlink()
+
+            # 3) Simulated marker rename failure in finish() retains cleanup_state and sets rc=1.
+            state.write_text(
+                json.dumps(
+                    {
+                        "job_name": "sglang-recipe-deadbeef01234567",
+                        "namespace": "ppu-sched",
+                        "nnodes": 2,
+                        "source_stage_dir": str(
+                            stages
+                            / "sglang-recipe-deadbeef01234567.01234567/source.tar.gz"
+                        ),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            verify_fn = cluster[
+                cluster.index("write_cleanup_verified_marker()") : cluster.index(
+                    "cleanup_staging_fallback()"
+                )
+            ]
+            success_part = cluster[
+                cluster.index("        if (( cleanup_ok == 0 ))") : cluster.index(
+                    "    else\n        if ! write_cleanup_verified_marker no_cluster_resources"
+                )
+            ]
+            (bins / "mv").write_text("#!/usr/bin/env bash\nexit 1\n")
+            (bins / "mv").chmod(0o700)
+            trap_res = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    "set +e\n"
+                    + verify_fn
+                    + "\nverify_cluster_cleanup() { return 0; }\nphase() { :; }\ncleanup_ok=0\nrc=0\n"
+                    + success_part
+                    + '\nprintf "%s" "$rc"',
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            (bins / "mv").unlink()
+            self.assertEqual(trap_res.returncode, 0, trap_res.stderr)
+            self.assertEqual(trap_res.stdout, "1")
+            self.assertTrue(state.is_file())
+            self.assertFalse(marker.exists())
+
+            # Subsequent failsafe recovers cleanly from the retained state.
+            clean2 = subprocess.run(
+                ["bash", str(failsafe)],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(clean2.returncode, 0, clean2.stdout + clean2.stderr)
+            self.assertTrue(json.loads(clean2.stdout)["cleanup_verified"])
+            self.assertFalse(state.exists())
+            self.assertTrue(marker.is_file())
 
 
 if __name__ == "__main__":
