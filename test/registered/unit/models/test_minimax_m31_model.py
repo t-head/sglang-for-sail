@@ -426,6 +426,10 @@ class TestMiniMaxM31Forward(CustomTestCase):
             patch.object(mega_moe, "_is_sail", True),
             patch.object(mega_moe, "_device_sm", 89),
             patch.object(mega_moe, "_mega_moe_max_num_sms", return_value=None),
+            patch.object(torch.cuda, "current_stream", return_value=object()),
+            patch.object(
+                torch.cuda, "is_current_stream_capturing", return_value=False
+            ),
             patch.object(
                 mega_moe.envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK,
                 "get",
@@ -452,7 +456,7 @@ class TestMiniMaxM31Forward(CustomTestCase):
         torch.testing.assert_close(padded_result[:1], result[:1])
         torch.testing.assert_close(padded_result[1:], torch.zeros_like(result[1:]))
         torch.testing.assert_close(empty_result, torch.zeros_like(result))
-        self.assertEqual(completed, [2, 0, 2, 2])
+        self.assertEqual(completed, [2, 1, 2, 2])
 
     def test_capture_includes_final_layer_before_output_norm(self):
         model = object.__new__(MiniMaxM3Model)

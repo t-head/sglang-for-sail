@@ -158,5 +158,5 @@ python3 "$repo/scripts/ci/ppu/prepare_runtime.py"
 cd "$artifacts"
 python3 "$repo/scripts/ci/ppu/run_speculative_sanity.py" \
     2>&1 | tee "$artifacts/sanity.log"
-# Require both sanity files; update this count when extending the suite.
+# Require both selected sanity files; update this count when extending either suite.
 grep -Fxq 'Test Summary: 2/2 passed' "$artifacts/sanity.log"

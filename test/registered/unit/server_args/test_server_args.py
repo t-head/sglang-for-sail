@@ -430,13 +430,14 @@ class TestPrepareServerArgs(CustomTestCase):
             ):
                 validate_mega_moe_token_budget(args, "Qwen3MoeForCausalLM")
 
-    def test_minimax_megamoe_eager_and_prefill_graph_capacity(self):
+    def test_ppu_fp8_megamoe_eager_and_prefill_graph_capacity(self):
         from sglang.srt.arg_groups import mega_moe_hook as hook
         from sglang.srt.environ import envs
 
-        for architecture in (
-            "MiniMaxM3SparseForCausalLM",
-            "MiniMaxM3SparseForConditionalGeneration",
+        for architecture, channelwise_fp8 in (
+            ("MiniMaxM3SparseForCausalLM", False),
+            ("MiniMaxM3SparseForConditionalGeneration", False),
+            ("Glm5NextForConditionalGeneration", True),
         ):
             cfg = SimpleNamespace(
                 moe_a2a_backend="megamoe",
@@ -464,21 +465,280 @@ class TestPrepareServerArgs(CustomTestCase):
                 envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(64),
             ):
                 with self.assertRaisesRegex(ValueError, "max-running-requests"):
-                    hook.validate_mega_moe_token_budget(None, architecture)
+                    hook.validate_mega_moe_token_budget(
+                        None, architecture, ppu_channelwise_fp8=channelwise_fp8
+                    )
                 cfg.max_running_requests = 65
                 with self.assertRaisesRegex(ValueError, "largest decode"):
-                    hook.validate_mega_moe_token_budget(None, architecture)
+                    hook.validate_mega_moe_token_budget(
+                        None, architecture, ppu_channelwise_fp8=channelwise_fp8
+                    )
                 cfg.max_running_requests = 64
-                hook.validate_mega_moe_token_budget(None, architecture)
+                hook.validate_mega_moe_token_budget(
+                    None, architecture, ppu_channelwise_fp8=channelwise_fp8
+                )
                 cfg.max_prefill_tokens = 65
                 with self.assertRaisesRegex(ValueError, "required_per_rank=65"):
-                    hook.validate_mega_moe_token_budget(None, architecture)
+                    hook.validate_mega_moe_token_budget(
+                        None, architecture, ppu_channelwise_fp8=channelwise_fp8
+                    )
                 cfg.max_prefill_tokens = 64
                 cfg.cuda_graph_config.prefill = SimpleNamespace(
                     backend="full", max_bs=32, bs=[32, 65]
                 )
                 with self.assertRaisesRegex(ValueError, "required_per_rank=65"):
-                    hook.validate_mega_moe_token_budget(None, architecture)
+                    hook.validate_mega_moe_token_budget(
+                        None, architecture, ppu_channelwise_fp8=channelwise_fp8
+                    )
+
+    def test_ultra_ep_opt_in_rejects_incompatible_backend_and_encoder_only(self):
+        from sglang.srt.arg_groups import mega_moe_hook as hook
+
+        for cfg, message in (
+            (
+                SimpleNamespace(moe_a2a_backend="deepep", encoder_only=False),
+                "requires --moe-a2a-backend megamoe",
+            ),
+            (
+                SimpleNamespace(moe_a2a_backend="megamoe", encoder_only=True),
+                "encoder-only",
+            ),
+        ):
+            with (
+                self.subTest(message=message),
+                patch.object(hook, "resolving_view", return_value=cfg),
+                envs.SGLANG_OPT_ULTRA_EP_PPU.override(True),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                hook.validate_mega_moe_token_budget_for_model(None)
+
+    def test_ultra_ep_validates_routed_expert_quantization_targets(self):
+        from sglang.srt.arg_groups import mega_moe_hook as hook
+
+        expert_target = r"re:.*mlp\.experts\.\d+\.(gate|up|down)_proj$"
+
+        def fp8_group(target):
+            return {
+                "format": "float-quantized",
+                "targets": [target],
+                "weights": {
+                    "num_bits": 8,
+                    "type": "float",
+                    "symmetric": True,
+                    "strategy": "channel",
+                    "dynamic": False,
+                },
+                "input_activations": {
+                    "num_bits": 8,
+                    "type": "float",
+                    "symmetric": True,
+                    "strategy": "token",
+                    "dynamic": True,
+                },
+            }
+
+        def quant_config(*groups, ignore=()):
+            return {
+                "quant_method": "compressed-tensors",
+                "format": "mixed-precision",
+                "config_groups": {f"group_{i}": g for i, g in enumerate(groups)},
+                "ignore": list(ignore),
+            }
+
+        mxfp4_experts = fp8_group(expert_target)
+        mxfp4_experts.update(format="pack-quantized", input_activations=None)
+        mxfp4_experts["weights"].update(
+            num_bits=4, strategy="group", group_size=32
+        )
+        valid = quant_config(fp8_group(expert_target))
+        invalid_configs = (
+            quant_config(fp8_group(r"re:.*self_attn\..*")),
+            quant_config(fp8_group("Linear"), ignore=[expert_target]),
+            quant_config(
+                fp8_group(r"re:.*self_attn\..*"),
+                mxfp4_experts,
+            ),
+        )
+        cfg = SimpleNamespace(
+            disaggregation_mode="null",
+            tp_size=4,
+            ep_size=4,
+            attn_cp_size=4,
+            nnodes=1,
+            pp_size=1,
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
+            disable_overlap_schedule=True,
+            disable_shared_experts_fusion=True,
+            enforce_shared_experts_fusion=False,
+            enable_eplb=False,
+            enable_eplb_async=False,
+            enable_waterfill=False,
+            ep_num_redundant_experts=0,
+            ep_dispatch_algorithm=None,
+            init_expert_location="trivial",
+            expert_distribution_recorder_mode=None,
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(backend=Backend.DISABLED),
+                decode=SimpleNamespace(backend=Backend.DISABLED),
+            ),
+        )
+        with (
+            envs.SGLANG_OPT_ULTRA_EP_PPU.override(True),
+            envs.SGLANG_OPT_ULTRA_EP_PPU_REDUNDANT_PER_RANK.override(1),
+            override_platform(is_ppu=True, device_sm=89),
+        ):
+            hook._validate_ppu_ultra_ep(
+                cfg, "Glm5NextForConditionalGeneration", valid
+            )
+            for hf_quant_config in invalid_configs:
+                with (
+                    self.subTest(hf_quant_config=hf_quant_config),
+                    self.assertRaisesRegex(ValueError, "channelwise FP8"),
+                ):
+                    hook._validate_ppu_ultra_ep(
+                        cfg, "Glm5NextForConditionalGeneration", hf_quant_config
+                    )
+
+    def test_ultra_ep_startup_modes_and_rejections(self):
+        from sglang.srt.arg_groups import mega_moe_hook as hook
+
+        def config():
+            return SimpleNamespace(
+                disaggregation_mode="null",
+                tp_size=4,
+                ep_size=4,
+                attn_cp_size=4,
+                nnodes=1,
+                pp_size=1,
+                enable_prefill_cp=True,
+                cp_strategy="interleave",
+                disable_overlap_schedule=True,
+                disable_shared_experts_fusion=True,
+                enforce_shared_experts_fusion=False,
+                enable_eplb=False,
+                enable_eplb_async=False,
+                enable_waterfill=False,
+                ep_num_redundant_experts=0,
+                ep_dispatch_algorithm=None,
+                init_expert_location="trivial",
+                expert_distribution_recorder_mode=None,
+                cuda_graph_config=SimpleNamespace(
+                    prefill=SimpleNamespace(backend=Backend.DISABLED),
+                    decode=SimpleNamespace(backend=Backend.DISABLED),
+                ),
+            )
+
+        def validate(cfg, architecture="Glm5NextForConditionalGeneration"):
+            hook._validate_ppu_ultra_ep(
+                cfg,
+                architecture,
+                {"quant_method": "compressed-tensors"},
+                channelwise_fp8=True,
+            )
+
+        with (
+            envs.SGLANG_OPT_ULTRA_EP_PPU.override(True),
+            envs.SGLANG_OPT_ULTRA_EP_PPU_REDUNDANT_PER_RANK.override(1),
+            override_platform(is_ppu=True, device_sm=89),
+        ):
+            # Standalone modes admit eager prefill and decode; PD is prefill-only.
+            for mode, size in (("null", 4), ("null", 8), ("prefill", 8)):
+                with self.subTest(accepted_mode=mode, size=size):
+                    cfg = config()
+                    cfg.disaggregation_mode = mode
+                    cfg.tp_size = cfg.ep_size = cfg.attn_cp_size = size
+                    validate(cfg)
+
+            for overrides, message in (
+                (
+                    {
+                        "disaggregation_mode": "decode",
+                        "tp_size": 8,
+                        "ep_size": 8,
+                        "attn_cp_size": 8,
+                    },
+                    "standalone",
+                ),
+                ({"tp_size": 2}, "standalone"),
+                ({"nnodes": 2}, "single-node"),
+                ({"pp_size": 2}, "single-node"),
+                ({"enable_prefill_cp": False}, "interleave CP"),
+                ({"cp_strategy": "ring"}, "interleave CP"),
+                ({"disable_overlap_schedule": False}, "disable-overlap-schedule"),
+                (
+                    {"disable_shared_experts_fusion": False},
+                    "disable-shared-experts-fusion",
+                ),
+                (
+                    {"enforce_shared_experts_fusion": True},
+                    "disable-shared-experts-fusion",
+                ),
+                ({"enable_eplb": True}, "only expert placement owner"),
+                ({"enable_eplb_async": True}, "only expert placement owner"),
+                ({"enable_waterfill": True}, "only expert placement owner"),
+                ({"ep_num_redundant_experts": 1}, "only expert placement owner"),
+                ({"ep_dispatch_algorithm": "static"}, "only expert placement owner"),
+                ({"init_expert_location": "custom"}, "only expert placement owner"),
+                (
+                    {"expert_distribution_recorder_mode": "record"},
+                    "only expert placement owner",
+                ),
+            ):
+                with self.subTest(rejection=overrides, message=message):
+                    cfg = config()
+                    for name, value in overrides.items():
+                        setattr(cfg, name, value)
+                    with self.assertRaisesRegex(ValueError, message):
+                        validate(cfg)
+
+            with self.assertRaisesRegex(ValueError, "channelwise FP8"):
+                validate(config(), architecture="MiniMaxM3SparseForCausalLM")
+            for phase in ("prefill", "decode"):
+                with self.subTest(graph_phase=phase):
+                    cfg = config()
+                    getattr(cfg.cuda_graph_config, phase).backend = Backend.FULL
+                    with self.assertRaisesRegex(ValueError, "eager execution"):
+                        validate(cfg)
+            cfg = config()
+            cfg.cuda_graph_config = None
+            with self.assertRaisesRegex(ValueError, "eager execution"):
+                validate(cfg)
+            for replicas in (0, -1):
+                with (
+                    self.subTest(replicas=replicas),
+                    envs.SGLANG_OPT_ULTRA_EP_PPU_REDUNDANT_PER_RANK.override(
+                        replicas
+                    ),
+                    self.assertRaisesRegex(ValueError, "must be positive"),
+                ):
+                    validate(config())
+
+        for is_ppu, sm in ((False, 89), (True, 88), (True, 90)):
+            with (
+                self.subTest(is_ppu=is_ppu, sm=sm),
+                envs.SGLANG_OPT_ULTRA_EP_PPU.override(True),
+                override_platform(is_ppu=is_ppu, device_sm=sm),
+                self.assertRaisesRegex(ValueError, "PPU SM89"),
+            ):
+                validate(config())
+
+    def test_ppu_channelwise_fp8_requires_eager_for_glm_and_minimax(self):
+        from sglang.srt.arg_groups import mega_moe_hook as hook
+
+        cfg = SimpleNamespace(
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(backend=Backend.DISABLED),
+                decode=SimpleNamespace(backend=Backend.DISABLED),
+            )
+        )
+        with override_platform(is_ppu=True, device_sm=89):
+            hook._validate_ppu_channelwise_fp8_eager(cfg, True)
+            cfg.cuda_graph_config.decode.backend = Backend.FULL
+            with self.assertRaisesRegex(ValueError, "requires eager execution"):
+                hook._validate_ppu_channelwise_fp8_eager(cfg, True)
+            # GLM MXFP4 and other MegaMoE precisions retain graph support.
+            hook._validate_ppu_channelwise_fp8_eager(cfg, False)
 
     def test_megamoe_token_budget_uses_resolved_dp_chunked_prefill(self):
         from sglang.srt.arg_groups.mega_moe_hook import validate_mega_moe_token_budget
