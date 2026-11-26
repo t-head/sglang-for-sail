@@ -81,6 +81,8 @@ class TestPpuKimiK3Constraints(CustomTestCase):
         ServerArgs.add_cli_args(parser)
         args = parser.parse_args(
             [
+                "--model-path",
+                "dummy",
                 "--mamba-ssm-accum-dtype",
                 "float32",
                 "--linear-attn-decode-backend",
