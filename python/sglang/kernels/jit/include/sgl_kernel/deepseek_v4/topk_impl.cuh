@@ -1177,6 +1177,467 @@ struct TopKCluster : TopKRadixBase<10> {
 
 #endif  // !USE_ROCM
 
+// ---------------------------------------------------------------------------
+// Native BF16 radix top-k (12-bit clamped-exp bf16 histogram, 16B = 8 x bf16)
+// ---------------------------------------------------------------------------
+
+SGL_DEVICE uint16_t bf16_to_bits(bf16_t x) {
+  uint16_t bits;
+  __builtin_memcpy(&bits, &x, sizeof(bits));
+  return bits;
+}
+
+/// Order-preserving 16-bit key for bf16 scores, canonicalizing -0.0 to +0.0
+/// so +/-0 tie-break by index (matching float comparison and stable argsort).
+SGL_DEVICE uint32_t extract_bf16_key_u16(uint32_t bits) {
+  if (bits == 0x8000u) bits = 0u;
+  return (bits & 0x8000u) ? (~bits & 0xFFFFu) : (bits | 0x8000u);
+}
+
+/// 12-bit monotonic coarse bin over raw bf16 bits: 2 adjacent bf16 values per
+/// bin across [2^-15, ~1.3e5], keeping threshold-bin ties small (<= 128) for
+/// normal score distributions without fp16 conversion.
+SGL_DEVICE uint32_t extract_bf16_coarse_bin_u16(uint32_t bits) {
+  if (bits == 0x8000u) bits = 0u;
+  const uint32_t sign = bits >> 15;
+  const uint32_t mag = bits & 0x7FFFu;
+  const uint32_t clamped = mag <= 0x3800u ? 0u : min(mag - 0x3800u, 0x0FFEu);
+  const uint32_t m = clamped >> 1;  // [0, 2047]
+  return sign ? (2047u - m) : (2048u + m);
+}
+
+/// Exact fp32 bounds {v_lo, v_hi} of bf16 coarse bin `bin`:
+/// "above" iff fval >= v_hi, "tie" iff fval >= v_lo && !(fval >= v_hi).
+/// For bin == 4095, v_hi is qNaN so `fval >= v_hi` is always false (even +inf).
+SGL_DEVICE float2 bf16_coarse_bin_bounds(uint32_t bin) {
+  if (bin >= 2048u) {
+    if (bin == 2048u) return {0.0f, __uint_as_float(0x3802u << 16)};
+    if (bin == 4095u) return {__uint_as_float(0x47FEu << 16), padding_value()};
+    const uint32_t m = bin - 2048u;
+    const uint32_t lo = 0x3800u + (m << 1);
+    return {__uint_as_float(lo << 16), __uint_as_float((lo + 2u) << 16)};
+  }
+  if (bin == 2047u) return {__uint_as_float((0x8000u | 0x3801u) << 16), 0.0f};
+  if (bin == 0u) return {-infinity_value(), __uint_as_float((0x8000u | 0x47FDu) << 16)};
+  const uint32_t m = 2047u - bin;
+  const uint32_t mag_hi = 0x3800u + (m << 1) - 1u;
+  const uint32_t mag_lo = mag_hi + 2u;
+  return {__uint_as_float((0x8000u | mag_lo) << 16), __uint_as_float((0x8000u | mag_hi) << 16)};
+}
+
+SGL_DEVICE float bf16_u16_to_float(uint32_t bits) {
+  return __uint_as_float(bits << 16);
+}
+
+SGL_DEVICE float bf16_u16_to_tie_float(uint32_t bits) {
+  return bits == 0x8000u ? 0.0f : __uint_as_float(bits << 16);
+}
+
+struct TopKBF16Base : TopKConfig {
+ public:
+  static constexpr uint32_t kVecSize = 8;  // 16B vectorized load (4 x uint32_t = 8 x bf16)
+  static constexpr uint32_t kHistBits = 12;
+  static constexpr uint32_t kHistSize = 1 << kHistBits;
+  using vec_t = AlignedVector<uint32_t, 4>;
+
+  struct Smem {
+    uint32_t count_eq;
+    uint32_t count_gt;
+    float v_lo;
+    float v_hi;
+    uint32_t exact_key;
+    uint32_t cut_bin;
+    uint32_t warp_sum[kNumWarps];
+    union {
+      alignas(16) uint32_t histogram[kHistSize];
+      struct {
+        union {
+          TieValue tie_values[kMaxNumTie];
+          uint32_t refine_hist[kRefineSize];
+        };
+        TieHandleSmem tie_handle;
+      };
+    };
+  };
+
+ protected:
+  SGL_DEVICE static void init_histogram(uint32_t (&histogram)[kHistSize], uint32_t tx) {
+    constexpr uint32_t kItems = kHistSize / kBlockSize;
+    AlignedVector<uint32_t, kItems> vec;
+    vec.fill(0);
+    vec.store(histogram, tx);
+  }
+
+  template <typename F>
+  SGL_DEVICE static void for_each_bf16_u16(const bf16_t* __restrict__ in, uint32_t seq_len, F&& fn) {
+    const auto tx = threadIdx.x;
+    const auto misalign = static_cast<uint32_t>((reinterpret_cast<uintptr_t>(in) >> 1) & (kVecSize - 1u));
+    const uint32_t head = misalign == 0u ? 0u : min(kVecSize - misalign, seq_len);
+    const uint32_t body_len = seq_len - head;
+    const uint32_t num_full = body_len / kVecSize;
+    const bf16_t* aligned = in + head;
+
+    if (tx < head) fn(bf16_to_bits(in[tx]), tx);
+
+    auto vi = tx;
+    if (vi < num_full) {
+      vec_t next_vec;
+      next_vec.load(aligned, vi);
+#pragma unroll 1
+      do {
+        const auto cur = next_vec;
+        vi += kBlockSize;
+        if (vi < num_full) next_vec.load(aligned, vi);
+        const auto base = head + (vi - kBlockSize) * kVecSize;
+#pragma unroll
+        for (uint32_t p = 0; p < 4; ++p) {
+          const uint32_t w = cur[p];
+          fn(w & 0xFFFFu, base + p * 2u);
+          fn(w >> 16, base + p * 2u + 1u);
+        }
+      } while (vi < num_full);
+    }
+
+    const uint32_t tail_start = head + num_full * kVecSize;
+    const uint32_t tail_len = seq_len - tail_start;
+    if (tx < tail_len) fn(bf16_to_bits(in[tail_start + tx]), tail_start + tx);
+  }
+
+  SGL_DEVICE static void find_threshold(const uint32_t topk, const uint32_t seq_len, Smem* smem) {
+    const auto tx = threadIdx.x;
+    constexpr uint32_t kItems = kHistSize / kBlockSize;
+    uint32_t local_exc_sum[kItems + 1];
+    AlignedVector<uint32_t, kItems> hist_vec;
+    hist_vec.load(smem->histogram, tx);
+
+    local_exc_sum[0] = 0;
+#pragma unroll
+    for (uint32_t i = 0; i < kItems; ++i) {
+      local_exc_sum[i + 1] = hist_vec[i] + local_exc_sum[i];
+    }
+
+    const auto local_sum = local_exc_sum[kItems];
+    const auto lane_id = tx % kWarpSize;
+    const auto warp_id = broadcast(tx / kWarpSize);
+    const auto warp_inc_sum = warp::inclusive_sum(local_sum, lane_id);
+    const auto warp_exc_sum = warp_inc_sum - local_sum;
+    if (lane_id == kWarpSize - 1) smem->warp_sum[warp_id] = warp_inc_sum;
+
+    __syncthreads();
+
+    const auto tmp = smem->warp_sum[lane_id];
+    const auto warp_prefix_sum = warp::reduce_sum(lane_id < warp_id ? tmp : 0);
+    const auto exc_sum = static_cast<int32_t>(warp_prefix_sum + warp_exc_sum);
+    const auto remained = static_cast<int32_t>(seq_len - topk - exc_sum);
+    if (remained >= 0 && remained < static_cast<int32_t>(local_sum)) [[unlikely]] {
+      uint32_t target = 0;
+#pragma unroll
+      for (uint32_t i = 0; i < kItems; ++i) {
+        const auto prev = static_cast<int32_t>(local_exc_sum[i + 0]);
+        const auto next = static_cast<int32_t>(local_exc_sum[i + 1]);
+        if (remained >= prev && remained < next) target = tx * kItems + i;
+      }
+      const auto [v_lo, v_hi] = bf16_coarse_bin_bounds(target);
+      smem->v_lo = v_lo;
+      smem->v_hi = v_hi;
+    }
+
+    __syncthreads();
+  }
+
+  /// Cold path: exact refinement when the coarse threshold bin overflows
+  /// kMaxNumTie. Marked __noinline__ so it adds zero register pressure to the
+  /// hot register/streaming paths.
+  __noinline__ __device__ static void
+  refine_ties_bf16(const bf16_t* __restrict__ in, const TopKProblem& problem, float v_lo, float v_hi, Smem* smem) {
+    const auto tx = threadIdx.x;
+    const auto topk = problem.topk;
+    if (smem->count_gt >= topk) [[unlikely]]
+      return;
+    uint32_t remain = topk - smem->count_gt;
+    auto* const hist = smem->refine_hist;
+
+    const auto in_bin = [v_lo, v_hi](uint32_t bits) -> bool {
+      const float fval = bf16_u16_to_float(bits);
+      return fval >= v_lo && !(fval >= v_hi);
+    };
+
+    // Round 0: MSB 8 bits of ordered 16-bit bf16 key
+    if (tx < 256) hist[tx] = 0;
+    __syncthreads();
+    for_each_bf16_u16(in, problem.seq_len, [&](uint32_t bits, uint32_t) {
+      if (in_bin(bits)) atomicAdd(&hist[extract_bf16_key_u16(bits) >> 8], 1);
+    });
+    __syncthreads();
+    if (tx == 0) {
+      uint32_t above = 0;
+      for (int b = 255; b >= 0; --b) {
+        const uint32_t c = hist[b];
+        if (above < remain && above + c >= remain) {
+          smem->exact_key = static_cast<uint32_t>(b) << 8;
+          smem->cut_bin = remain - above;
+          break;
+        }
+        above += c;
+      }
+    }
+    __syncthreads();
+    const uint32_t msb_prefix = smem->exact_key;
+    remain = smem->cut_bin;
+
+    // Round 1: LSB 8 bits within the chosen MSB bucket
+    if (tx < 256) hist[tx] = 0;
+    __syncthreads();
+    for_each_bf16_u16(in, problem.seq_len, [&](uint32_t bits, uint32_t) {
+      if (!in_bin(bits)) return;
+      const uint32_t key = extract_bf16_key_u16(bits);
+      if ((key & 0xFF00u) == msb_prefix) atomicAdd(&hist[key & 0xFFu], 1);
+    });
+    __syncthreads();
+    if (tx == 0) {
+      uint32_t above = 0;
+      for (int b = 255; b >= 0; --b) {
+        const uint32_t c = hist[b];
+        if (above < remain && above + c >= remain) {
+          smem->exact_key = msb_prefix | static_cast<uint32_t>(b);
+          smem->cut_bin = remain - above;
+          smem->count_eq = c;
+          break;
+        }
+        above += c;
+      }
+    }
+    __syncthreads();
+    const uint32_t exact_key = smem->exact_key;
+    const uint32_t exact_remain = smem->cut_bin;
+    const uint32_t exact_count = smem->count_eq;
+
+    uint32_t idx_shift = 0;
+    uint32_t cut_bin = 0;
+    bool use_idx_cut = false;
+    if constexpr (kStableTies) {
+      if (exact_count > kMaxNumTie) {
+        use_idx_cut = true;
+        const uint32_t hi_bits = (problem.seq_len - 1u) >> kRefineBits;
+        idx_shift = hi_bits == 0u ? 0u : static_cast<uint32_t>(32 - __clz(static_cast<int>(hi_bits)));
+#pragma unroll
+        for (uint32_t i = 0; i < kRefineItems; ++i) {
+          hist[tx * kRefineItems + i] = 0;
+        }
+        __syncthreads();
+        for_each_bf16_u16(in, problem.seq_len, [&](uint32_t bits, uint32_t idx) {
+          if (in_bin(bits) && extract_bf16_key_u16(bits) == exact_key) atomicAdd(&hist[idx >> idx_shift], 1);
+        });
+        __syncthreads();
+        const auto lane_id = tx % kWarpSize;
+        const auto warp_id = broadcast(tx / kWarpSize);
+        uint32_t counts[kRefineItems];
+        uint32_t local_sum = 0;
+#pragma unroll
+        for (uint32_t i = 0; i < kRefineItems; ++i) {
+          counts[i] = hist[tx * kRefineItems + i];
+          local_sum += counts[i];
+        }
+        const auto warp_inc = warp::inclusive_sum(local_sum, lane_id);
+        if (lane_id == kWarpSize - 1) smem->warp_sum[warp_id] = warp_inc;
+        __syncthreads();
+        uint32_t prefix = warp::reduce_sum(lane_id < warp_id ? smem->warp_sum[lane_id] : 0);
+        prefix += warp_inc - local_sum;
+#pragma unroll
+        for (uint32_t i = 0; i < kRefineItems; ++i) {
+          const uint32_t excl = prefix;
+          prefix += counts[i];
+          if (excl < exact_remain && prefix >= exact_remain) {
+            smem->cut_bin = tx * kRefineItems + i;
+          }
+        }
+        __syncthreads();
+        cut_bin = smem->cut_bin;
+      }
+    }
+
+    if (tx == 0) smem->count_eq = 0;
+    __syncthreads();
+    for_each_bf16_u16(in, problem.seq_len, [&](uint32_t bits, uint32_t idx) {
+      if (!in_bin(bits)) return;
+      const uint32_t key = extract_bf16_key_u16(bits);
+      if (key > exact_key) {
+        const auto pos = atomicAdd(&smem->count_gt, 1);
+        if (pos < topk) [[likely]]
+          problem.emit(pos, idx);
+      } else if (key == exact_key) {
+        if (use_idx_cut) {
+          const uint32_t b = idx >> idx_shift;
+          if (b < cut_bin) {
+            const auto pos = atomicAdd(&smem->count_gt, 1);
+            if (pos < topk) [[likely]]
+              problem.emit(pos, idx);
+          } else if (b == cut_bin) {
+            const auto slot = atomicAdd(&smem->count_eq, 1);
+            if (slot < kMaxNumTie) [[likely]]
+              smem->tie_values[slot] = {bf16_u16_to_tie_float(bits), idx};
+          }
+        } else {
+          const auto slot = atomicAdd(&smem->count_eq, 1);
+          if (slot < kMaxNumTie) [[likely]]
+            smem->tie_values[slot] = {bf16_u16_to_tie_float(bits), idx};
+        }
+      }
+    });
+    __syncthreads();
+  }
+
+  SGL_DEVICE static void
+  finish_ties_bf16(const bf16_t* __restrict__ in, const TopKProblem& problem, float v_lo, float v_hi, Smem* smem) {
+    __syncthreads();
+    if (smem->count_eq > kMaxNumTie) [[unlikely]] {
+      refine_ties_bf16(in, problem, v_lo, v_hi, smem);
+    }
+    const auto count_gt = smem->count_gt;
+    const auto count_eq = smem->count_eq;
+    const auto remain_topk = count_gt < problem.topk ? problem.topk - count_gt : 0;
+    const auto tie_count = min(count_eq, kMaxNumTie);
+    handle_tie(smem->tie_values, problem, count_gt, tie_count, remain_topk, &smem->tie_handle);
+  }
+};
+
+template <uint32_t kLocalVecs_>
+struct TopKBF16Register : TopKBF16Base {
+  static constexpr uint32_t kLocalVecs = kLocalVecs_;
+  static constexpr uint32_t kMaxSeqLen = kBlockSize * kVecSize * kLocalVecs;
+
+  template <bool kUsePDL>
+  SGL_DEVICE static void forward(const bf16_t* __restrict__ in, const TopKProblem& problem, Smem* smem) {
+    const auto tx = threadIdx.x;
+    const auto seq_len = problem.seq_len;
+    const auto topk = problem.topk;
+
+    init_histogram(smem->histogram, tx);
+    if (tx == 0) {
+      smem->count_eq = 0;
+      smem->count_gt = 0;
+    }
+    __syncthreads();
+    PDLWaitPrimary<kUsePDL>();
+
+    const auto misalign = static_cast<uint32_t>((reinterpret_cast<uintptr_t>(in) >> 1) & (kVecSize - 1u));
+    const uint32_t head = misalign == 0u ? 0u : min(kVecSize - misalign, seq_len);
+    const uint32_t body_len = seq_len - head;
+    const uint32_t num_full = body_len / kVecSize;
+    const bf16_t* aligned = in + head;
+    const uint32_t tail_start = head + num_full * kVecSize;
+    const uint32_t tail_len = seq_len - tail_start;
+
+    // Phase 1: load into registers + build 12-bit bf16 histogram
+    uint32_t head_bits = 0;
+    uint32_t tail_bits = 0;
+    vec_t local_vecs[kLocalVecs];
+    if (tx < head) head_bits = bf16_to_bits(in[tx]);
+#pragma unroll
+    for (uint32_t i = 0; i < kLocalVecs; ++i) {
+      const auto vi = tx + kBlockSize * i;
+      if (vi < num_full) local_vecs[i].load(aligned, vi);
+    }
+    if (tx < tail_len) tail_bits = bf16_to_bits(in[tail_start + tx]);
+
+    if (tx < head) atomicAdd(&smem->histogram[extract_bf16_coarse_bin_u16(head_bits)], 1);
+#pragma unroll
+    for (uint32_t i = 0; i < kLocalVecs; ++i) {
+      const auto vi = tx + kBlockSize * i;
+      if (vi >= num_full) break;
+#pragma unroll
+      for (uint32_t p = 0; p < 4; ++p) {
+        const uint32_t w = local_vecs[i][p];
+        atomicAdd(&smem->histogram[extract_bf16_coarse_bin_u16(w & 0xFFFFu)], 1);
+        atomicAdd(&smem->histogram[extract_bf16_coarse_bin_u16(w >> 16)], 1);
+      }
+    }
+    if (tx < tail_len) atomicAdd(&smem->histogram[extract_bf16_coarse_bin_u16(tail_bits)], 1);
+    __syncthreads();
+
+    // Phase 2: find threshold bin and its exact fp32 bounds
+    find_threshold(topk, seq_len, smem);
+
+    // Phase 3: collect by two fp32 boundaries directly from registers
+    const float v_lo = smem->v_lo;
+    const float v_hi = smem->v_hi;
+    const auto collect = [&](uint32_t bits, uint32_t idx) {
+      const float fval = bf16_u16_to_float(bits);
+      if (fval >= v_hi) {
+        const auto pos = atomicAdd(&smem->count_gt, 1);
+        if (pos < topk) [[likely]]
+          problem.emit(pos, idx);
+      } else if (fval >= v_lo) {
+        const auto pos = atomicAdd(&smem->count_eq, 1);
+        if (pos < kMaxNumTie) [[likely]]
+          smem->tie_values[pos] = {bf16_u16_to_tie_float(bits), idx};
+      }
+    };
+
+    if (tx < head) collect(head_bits, tx);
+#pragma unroll
+    for (uint32_t i = 0; i < kLocalVecs; ++i) {
+      const auto vi = tx + kBlockSize * i;
+      if (vi >= num_full) break;
+      const uint32_t base = head + vi * kVecSize;
+#pragma unroll
+      for (uint32_t p = 0; p < 4; ++p) {
+        const uint32_t w = local_vecs[i][p];
+        collect(w & 0xFFFFu, base + p * 2u);
+        collect(w >> 16, base + p * 2u + 1u);
+      }
+    }
+    if (tx < tail_len) collect(tail_bits, tail_start + tx);
+
+    // Phase 4: resolve ties
+    finish_ties_bf16(in, problem, v_lo, v_hi, smem);
+  }
+};
+
+struct TopKBF16Streaming : TopKBF16Base {
+  template <bool kUsePDL>
+  SGL_DEVICE static void forward(const bf16_t* __restrict__ in, const TopKProblem& problem, Smem* smem) {
+    const auto tx = threadIdx.x;
+    const auto topk = problem.topk;
+
+    init_histogram(smem->histogram, tx);
+    if (tx == 0) {
+      smem->count_eq = 0;
+      smem->count_gt = 0;
+    }
+    __syncthreads();
+    PDLWaitPrimary<kUsePDL>();
+
+    // Phase 1: build 12-bit bf16 histogram
+    for_each_bf16_u16(in, problem.seq_len, [&](uint32_t bits, uint32_t) {
+      atomicAdd(&smem->histogram[extract_bf16_coarse_bin_u16(bits)], 1);
+    });
+    __syncthreads();
+
+    // Phase 2: find threshold bin and its exact fp32 bounds
+    find_threshold(topk, problem.seq_len, smem);
+
+    // Phase 3: collect by two fp32 boundaries (no bit-twiddle on 2nd pass)
+    const float v_lo = smem->v_lo;
+    const float v_hi = smem->v_hi;
+    for_each_bf16_u16(in, problem.seq_len, [&](uint32_t bits, uint32_t idx) {
+      const float fval = bf16_u16_to_float(bits);
+      if (fval >= v_hi) {
+        const auto pos = atomicAdd(&smem->count_gt, 1);
+        if (pos < topk) [[likely]]
+          problem.emit(pos, idx);
+      } else if (fval >= v_lo) {
+        const auto pos = atomicAdd(&smem->count_eq, 1);
+        if (pos < kMaxNumTie) [[likely]]
+          smem->tie_values[pos] = {bf16_u16_to_tie_float(bits), idx};
+      }
+    });
+
+    // Phase 4: resolve ties
+    finish_ties_bf16(in, problem, v_lo, v_hi, smem);
+  }
+};
+
 }  // namespace device::topk
 
 }  // namespace sglang

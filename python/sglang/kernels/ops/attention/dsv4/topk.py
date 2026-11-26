@@ -301,14 +301,16 @@ def topk_transform_candidates_v2(
 ) -> None:
     """Ragged top-k emitting candidates for a distributed top-k merge.
 
-    Row ``i`` selects the top-k of ``scores[i, ks : ks + seq_lens[i]]`` (``ks
-    = row_starts[i]``, 0 when omitted) exactly as :func:`topk_transform_ragged_v2`
-    does, and writes ``out_candidates[i]`` (``[topk, 2]`` int32) = (fp32 score
-    bits, ``position * world + rank``) per selected position, ``(0, -1)``
-    padded. Local position ``l`` of rank ``rank`` is global position
+    Accepts float32 or bfloat16 ``scores``. Row ``i`` selects the top-k of
+    ``scores[i, ks : ks + seq_lens[i]]`` (``ks = row_starts[i]``, 0 when
+    omitted) exactly as :func:`topk_transform_ragged_v2` does, and writes
+    ``out_candidates[i]`` (``[topk, 2]`` int32) = (fp32 score bits,
+    ``position * world + rank``) per selected position, ``(0, -1)`` padded.
+    Local position ``l`` of rank ``rank`` is global position
     ``l * world + rank`` under decode context parallelism.
 
-    NOTE: ``scores`` is written in place as for the ragged entry point.
+    NOTE: float32 ``scores`` is written in place as for the ragged entry point;
+    bfloat16 ``scores`` is read-only and needs no row-stride padding.
     """
     _topk_v2_module(stable_ties).topk_transform_candidates_dcp(
         scores, seq_lens, row_starts, out_candidates, world, rank
