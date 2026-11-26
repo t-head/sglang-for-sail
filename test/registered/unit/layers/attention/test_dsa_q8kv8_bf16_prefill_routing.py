@@ -12,8 +12,13 @@ from sglang.srt.layers.attention.dsa.dsa_backend_kpool import (
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend,
+    _needs_ppu_eager_draft_cpu_seq_lens,
+    _normalize_inactive_q8_impl_for_role,
+    _scope_dsa_impls_for_role,
     _validate_flashmla_sparse_q8_backend,
+    _validate_ppu_native_q8_geometry,
 )
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -171,6 +176,148 @@ def test_topk_transform_method(prefill_impl, fp8_kv_cache, forward_mode, expecte
     assert backend.get_topk_transform_method(forward_mode) == expected
 
 
+def test_ppu_native_q8_uses_absolute_paged_ids():
+    backend = _make_backend("flashmla_sparse_q8", fp8_kv_cache=False)
+    backend._ppu_native_flat_fp8 = True
+    assert (
+        backend.get_topk_transform_method(ForwardMode.EXTEND)
+        == TopkTransformMethod.PAGED
+    )
+
+
+def test_ppu_native_q8_empty_batch_accepts_none_rope_and_preserves_dtype():
+    backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+    q_nope = torch.empty((0, 2, 512), dtype=torch.float32)
+
+    output = backend._forward_ppu_native_q8(
+        q_nope=q_nope,
+        q_rope=None,
+        kv_cache=None,
+        page_table_1=None,
+        sm_scale=1.0,
+        v_head_dim=512,
+        topk_length=None,
+    )
+
+    assert output.shape == (0, 2, 512)
+    assert output.dtype == q_nope.dtype
+
+
+def test_ppu_native_q8_eager_buffers_are_cached_without_graph_capacity():
+    backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+    backend._ppu_q8_max_num_tokens = 0
+    backend._ppu_q8_buffers = {}
+    backend._ppu_q8_buffers_eager = {}
+
+    first = backend._acquire_ppu_q8_buffer(
+        ("query", 2), (2, 4, 3), torch.float32, torch.device("cpu"), True, fill=0
+    )
+    second = backend._acquire_ppu_q8_buffer(
+        ("query", 2), (1, 4, 3), torch.float32, torch.device("cpu"), True, fill=0
+    )
+
+    assert second.data_ptr() == first.data_ptr()
+    assert backend._ppu_q8_buffers == {}
+    assert torch.equal(second, torch.zeros_like(second))
+
+
+@pytest.mark.parametrize(
+    "mode,expected",
+    [
+        ("prefill", ("flashmla_sparse_q8", None)),
+        ("decode", (None, "flashmla_kv")),
+        ("null", ("flashmla_sparse_q8", "flashmla_kv")),
+    ],
+)
+def test_pd_backend_scope_ignores_the_inactive_role(mode, expected):
+    assert (
+        _scope_dsa_impls_for_role("flashmla_sparse_q8", "flashmla_kv", mode)
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "mode,prefill,decode,expected",
+    [
+        (
+            "prefill",
+            "flashmla_sparse",
+            "flashmla_sparse_q8",
+            ("flashmla_sparse", "flashmla_sparse"),
+        ),
+        (
+            "decode",
+            "flashmla_sparse_q8",
+            "flashmla_sparse",
+            ("flashmla_sparse", "flashmla_sparse"),
+        ),
+        (
+            "prefill",
+            "flashmla_sparse_q8",
+            "flashmla_sparse",
+            ("flashmla_sparse_q8", "flashmla_sparse"),
+        ),
+        (
+            "null",
+            "flashmla_sparse",
+            "flashmla_sparse_q8",
+            ("flashmla_sparse", "flashmla_sparse_q8"),
+        ),
+    ],
+)
+def test_inactive_pd_q8_impl_cannot_reach_local_graph_capture(
+    mode, prefill, decode, expected
+):
+    assert _normalize_inactive_q8_impl_for_role(prefill, decode, mode) == expected
+
+
+@pytest.mark.parametrize(
+    "disable_draft,graph_disabled,expected",
+    [
+        (False, False, False),
+        (True, False, True),
+        (False, True, True),
+    ],
+)
+def test_ppu_eager_draft_cpu_lengths_follow_graph_disable(
+    monkeypatch, disable_draft, graph_disabled, expected
+):
+    runner = SimpleNamespace(
+        is_draft_worker=True,
+        spec_algorithm=SimpleNamespace(is_eagle=lambda: True),
+    )
+    graph_checks = []
+
+    def check_graph_backend(phase, backend):
+        graph_checks.append((phase, backend))
+        return graph_disabled
+
+    monkeypatch.setattr(dsa_backend, "check_cuda_graph_backend", check_graph_backend)
+    with dsa_backend.envs.SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH.override(
+        disable_draft
+    ):
+        assert _needs_ppu_eager_draft_cpu_seq_lens(runner, True) is expected
+        assert _needs_ppu_eager_draft_cpu_seq_lens(runner, False) is False
+    if disable_draft:
+        assert graph_checks == []
+    else:
+        assert graph_checks == [(Phase.DECODE, Backend.DISABLED)]
+
+
+def test_inactive_pd_q8_backend_is_not_locally_validated():
+    prefill_impl, decode_impl = _scope_dsa_impls_for_role(
+        "flashmla_sparse_q8", "flashmla_kv", "decode"
+    )
+    _validate_flashmla_sparse_q8_backend(
+        prefill_impl=prefill_impl,
+        decode_impl=decode_impl,
+        kv_cache_dtype=torch.float16,
+        kv_cache_store_fp8=False,
+        qk_rope_head_dim=64,
+        device_sm_major=8,
+    )
+
+
 @pytest.mark.parametrize("kv_cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_q8_validator_accepts_bf16_and_fp8_kv_on_sm90(kv_cache_dtype):
     _validate_flashmla_sparse_q8_backend(
@@ -244,6 +391,29 @@ def test_q8_validator_rejects_an_unpacked_fp8_pool():
             qk_rope_head_dim=64,
             device_sm_major=9,
         )
+
+
+def test_ppu_native_q8_geometry_accepts_only_raw_e4m3_nope_512():
+    valid = dict(
+        kv_lora_rank=512,
+        qk_rope_head_dim=0,
+        kv_cache_dtype=torch.float8_e4m3fn,
+        pool_dtype=torch.float8_e4m3fn,
+        kv_cache_dim=512,
+        packed_fp8=False,
+    )
+    _validate_ppu_native_q8_geometry(**valid)
+    for field, value in (
+        ("kv_lora_rank", 576),
+        ("qk_rope_head_dim", 64),
+        ("kv_cache_dtype", torch.bfloat16),
+        ("pool_dtype", torch.bfloat16),
+        ("kv_cache_dim", 528),
+        ("packed_fp8", True),
+    ):
+        invalid = valid | {field: value}
+        with pytest.raises(ValueError):
+            _validate_ppu_native_q8_geometry(**invalid)
 
 
 def _make_padder():

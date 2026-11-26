@@ -8,7 +8,7 @@ KV-cache write kernels went to the ``kvcache`` group instead.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
@@ -75,6 +75,16 @@ del _mod, _fn
 
 register_kernel(
     KernelSpec(
+        op="attention.flash_mla_sparse_quantized_fwd",
+        backend=KernelBackend.FLASHMLA,
+        target="sglang.kernels.ops.attention.ppu_flash_mla:flash_mla_sparse_quantized_fwd",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(8, 9), max_sm=(8, 9))}
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
         op="attention.kda_qwen38_qsa_sm121",
         backend=KernelBackend.KDA,
         target=("sglang.kernels.kda_kernels.qwen38_qsa_sm121:qwen38_qsa_sm121"),
@@ -91,6 +101,20 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
     )
 )
+
+
+def flash_mla_sparse_quantized_fwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+    topk_length: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Run native PPU sparse attention over raw E4M3 Q and KV."""
+    return get_kernel(
+        "attention.flash_mla_sparse_quantized_fwd", KernelBackend.FLASHMLA
+    )(q, kv, indices, sm_scale, d_v, topk_length)
 
 
 def can_use_kda_qwen38_qsa_sm121(
@@ -143,7 +167,11 @@ def qwen38_qsa_sm121_varlen(
     )
 
 
-__all__ = ["can_use_kda_qwen38_qsa_sm121", "qwen38_qsa_sm121_varlen"]
+__all__ = [
+    "can_use_kda_qwen38_qsa_sm121",
+    "flash_mla_sparse_quantized_fwd",
+    "qwen38_qsa_sm121_varlen",
+]
 
 
 # Vendored linear-attention (flash-linear-attention port) kernels relocated

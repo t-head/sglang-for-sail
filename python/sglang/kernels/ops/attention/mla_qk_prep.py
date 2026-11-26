@@ -172,7 +172,7 @@ def concat_and_cast_q_fp8_pad_kernel(
     # two strided copy_() it replaces; ~3.7x faster because copy_ into the
     # 64-head-padded buffer is strided (~4.5x off memory-bound).  Strides are passed in,
     # so q_nope/q_rope may be views of a [T, H, NOPE+ROPE] q (head-stride != last-dim).
-    pid = tl.program_id(0)
+    pid = tl.program_id(0).to(tl.int64)
     hr = tl.arange(0, H)
     qpad_head = qpad_ptr + pid * qpad_s0 + hr[:, None] * qpad_s1
     no = tl.arange(0, NOPE)

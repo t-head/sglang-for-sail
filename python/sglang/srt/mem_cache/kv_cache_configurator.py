@@ -110,6 +110,7 @@ from sglang.srt.runtime_context import (
     get_mm,
     get_model,
     get_parallel,
+    get_platform,
     get_schedule,
     get_spec,
     max_speculative_num_draft_tokens,
@@ -3648,21 +3649,29 @@ def calculate_mla_kv_cache_dim(
     if not is_dsa_model:
         return kv_cache_dim
 
-    # TRTLLM uses the raw MLA KV layout. In disaggregated serving only the
-    # backend for the local role determines the local pool layout; the
-    # inactive role may legitimately have a different default backend.
+    # Only the local role's consumer determines its pool layout under PD.
+    raw_kv_layout_backends = {"trtllm"}
+    if (
+        current_platform.is_sail()
+        and get_platform().device_sm == 89
+        and kv_cache_dtype == torch.float8_e4m3fn
+        and kv_lora_rank == 512
+        and qk_rope_head_dim == 0
+    ):
+        raw_kv_layout_backends.add("flashmla_sparse_q8")
+    kernel = get_exec().kernel
     disaggregation_mode = get_disagg().disaggregation_mode
     if disaggregation_mode == "decode":
-        uses_trtllm_kv_layout = get_exec().kernel.dsa_decode_backend == "trtllm"
+        uses_raw_kv_layout = kernel.dsa_decode_backend in raw_kv_layout_backends
     elif disaggregation_mode == "prefill":
-        uses_trtllm_kv_layout = get_exec().kernel.dsa_prefill_backend == "trtllm"
+        uses_raw_kv_layout = kernel.dsa_prefill_backend in raw_kv_layout_backends
     else:
-        uses_trtllm_kv_layout = (
-            get_exec().kernel.dsa_prefill_backend == "trtllm"
-            or get_exec().kernel.dsa_decode_backend == "trtllm"
+        uses_raw_kv_layout = (
+            kernel.dsa_prefill_backend in raw_kv_layout_backends
+            or kernel.dsa_decode_backend in raw_kv_layout_backends
         )
 
-    if uses_trtllm_kv_layout:
+    if uses_raw_kv_layout:
         return kv_cache_dim
 
     # On HIP, TileLang and AITER DSA kernels consume the raw MLA KV layout:

@@ -7,14 +7,15 @@ import sys
 from pathlib import Path
 
 from recipe_diagnostics import failure_reason
-from recipe_publish import LEGACY_CASES, LEGACY_SCHEMA
+from recipe_publish import LEGACY_SCHEMA, legacy_cases_for_board
 from recipe_retention import retain
 
 
 def legacy_result(env, source):
+    legacy_cases = legacy_cases_for_board(env["PPU_CI_BOARD"])
     cases = {
         name: {"status": "not_run", "duration_s": None}
-        for name in LEGACY_CASES.values()
+        for name in legacy_cases.values()
     }
     metrics = source / "suite-metrics.jsonl"
     seen = set()
@@ -25,7 +26,7 @@ def legacy_result(env, source):
     if metrics.is_file():
         for line in metrics.read_text().splitlines():
             row = json.loads(line)
-            name = LEGACY_CASES[row["test_file"]]
+            name = legacy_cases[row["test_file"]]
             if (
                 row["kind"] != "file"
                 or name in seen

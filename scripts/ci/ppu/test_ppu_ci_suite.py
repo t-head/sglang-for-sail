@@ -42,18 +42,37 @@ class TestPPUCISuite(unittest.TestCase):
             list((RUNNER.parent / "registered").rglob("test_ppu_ci_*.py")), []
         )
 
-    def test_ppu_suite_contains_both_speculative_sanity_files(self):
+    def test_ppu_suite_contains_smoke_and_native_q8_files(self):
         registered = RUNNER.parent / "registered"
-        ppu_tests = select_tests(RUNNER.parent.parent)
-        self.assertCountEqual(
-            [
-                Path(test.filename).relative_to(registered).as_posix()
-                for test in ppu_tests
-            ],
-            ["core/test_basic_sanity_eagle3.py", "core/test_basic_sanity_dflash.py"],
-        )
+        for board, expected in (
+            (
+                "ZW-M890P",
+                [
+                    "core/test_basic_sanity_eagle3.py",
+                    "core/test_basic_sanity_dflash.py",
+                    "kernels/ops/attention/test_dsa_native_q8_ppu.py",
+                    "kernels/benchmark/attention/bench_dsa_native_q8_ppu.py",
+                ],
+            ),
+            (
+                "OAM-810E",
+                [
+                    "core/test_basic_sanity_eagle3.py",
+                    "core/test_basic_sanity_dflash.py",
+                ],
+            ),
+        ):
+            with self.subTest(board=board):
+                ppu_tests = select_tests(RUNNER.parent.parent, board=board)
+                self.assertCountEqual(
+                    [
+                        Path(test.filename).relative_to(registered).as_posix()
+                        for test in ppu_tests
+                    ],
+                    expected,
+                )
 
-    def test_runtime_requires_both_sanity_files_to_pass(self):
+    def test_runtime_requires_all_selected_files_to_pass(self):
         source = Path(__file__).with_name("build_and_test.sh").read_text()
         marker = 'cd "$artifacts"\n'
         self.assertIn(marker, source)

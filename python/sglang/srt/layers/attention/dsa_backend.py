@@ -24,6 +24,7 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.runtime_context import (
     get_buffer,
+    get_disagg,
     get_exec,
     get_parallel,
     get_platform,
@@ -123,6 +124,11 @@ from sglang.srt.layers.dcp.layout import (
     get_dcp_lens,
 )
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import (
     is_cuda,
@@ -136,6 +142,10 @@ from sglang.srt.utils import (
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 _IS_GFX95 = is_gfx95_supported()
+_PPU_Q8_INDEX_TOPK = 2048
+_PPU_Q8_MAX_TOPK = 2176
+_PPU_Q8_TOPK_TILE = 64
+_PPU_Q8_SCAN_TILE = 128
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
@@ -515,8 +525,8 @@ def _resolve_dsa_triton_union(*, union: int, deterministic: bool) -> int:
 
 def _validate_flashmla_sparse_q8_backend(
     *,
-    prefill_impl: str,
-    decode_impl: str,
+    prefill_impl: Optional[str],
+    decode_impl: Optional[str],
     kv_cache_dtype: torch.dtype,
     kv_cache_store_fp8: bool,
     qk_rope_head_dim: int,
@@ -584,6 +594,72 @@ def _validate_flashmla_sparse_q8_backend(
         )
 
 
+def _scope_dsa_impls_for_role(
+    prefill_impl: str, decode_impl: str, disaggregation_mode: str
+) -> tuple[Optional[str], Optional[str]]:
+    """Hide the inactive PD role from local pool and backend validation."""
+    if disaggregation_mode == "prefill":
+        return prefill_impl, None
+    if disaggregation_mode == "decode":
+        return None, decode_impl
+    return prefill_impl, decode_impl
+
+
+def _normalize_inactive_q8_impl_for_role(
+    prefill_impl: str, decode_impl: str, disaggregation_mode: str
+) -> tuple[str, str]:
+    """Keep an inactive Q8-only setting out of local PD warmup and capture."""
+    if (
+        disaggregation_mode == "prefill"
+        and prefill_impl != "flashmla_sparse_q8"
+        and decode_impl == "flashmla_sparse_q8"
+    ):
+        decode_impl = prefill_impl
+    elif (
+        disaggregation_mode == "decode"
+        and decode_impl != "flashmla_sparse_q8"
+        and prefill_impl == "flashmla_sparse_q8"
+    ):
+        prefill_impl = decode_impl
+    return prefill_impl, decode_impl
+
+
+def _validate_ppu_native_q8_geometry(
+    *,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    kv_cache_dtype: torch.dtype,
+    pool_dtype: torch.dtype,
+    kv_cache_dim: int,
+    packed_fp8: bool,
+) -> None:
+    if kv_lora_rank != 512 or qk_rope_head_dim != 0:
+        raise ValueError("PPU flashmla_sparse_q8 requires 512-wide NoPE MLA.")
+    if (
+        kv_cache_dtype != torch.float8_e4m3fn
+        or pool_dtype != torch.float8_e4m3fn
+        or kv_cache_dim != 512
+        or packed_fp8
+    ):
+        raise ValueError(
+            "PPU flashmla_sparse_q8 requires --kv-cache-dtype fp8_e4m3 with "
+            f"a raw 512-wide pool; got dtype={kv_cache_dtype}, "
+            f"width={kv_cache_dim}, packed={packed_fp8}."
+        )
+
+
+def _needs_ppu_eager_draft_cpu_seq_lens(model_runner, is_ppu_sm89: bool) -> bool:
+    if not (
+        is_ppu_sm89
+        and model_runner.is_draft_worker
+        and model_runner.spec_algorithm.is_eagle()
+    ):
+        return False
+    return envs.SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH.get() or check_cuda_graph_backend(
+        Phase.DECODE, Backend.DISABLED
+    )
+
+
 class DeepseekSparseAttnBackend(
     DSAMetadataManagementMixin,
     DeepseekSparseAttnBackendKPoolMixin,
@@ -596,14 +672,13 @@ class DeepseekSparseAttnBackend(
     # Extend metadata pads the per-token seqlens to the MLP-sync padded rows
     # (pad_dsa_cache_seqlens), so the queries must keep those rows too.
     plans_padded_extend_rows: bool = True
-    # Decode/verify/draft graph replay rebuilds metadata from static buffers
-    # (page-table width) and never reads seq_lens_cpu / seq_lens_sum; opt out of
-    # the D2H sync. The eager fallback derives lengths from GPU seq_lens, and the
-    # KPool indexer reads the host mirror only for extend, which always has it.
+    # Graph replay uses device/static lengths; eager PPU draft-extend opts in.
     needs_cpu_seq_lens: bool = False
     # init_cuda_graph_state sizes this for every backend, but only the TRT-LLM
     # branch of __init__ allocates one.
     _multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
+    _is_ppu_sm89: bool = False
+    _ppu_native_flat_fp8: bool = False
 
     def __init__(
         self,
@@ -615,6 +690,11 @@ class DeepseekSparseAttnBackend(
         seed_dsa_topk_from_draft_extend: bool = False,
     ):
         super().__init__()
+        self._is_ppu_sm89 = _is_sail and get_platform().device_sm == 89
+        # Eager EAGLE/NEXTN draft-extend needs host lengths before metadata planning.
+        self.needs_cpu_seq_lens = _needs_ppu_eager_draft_cpu_seq_lens(
+            model_runner, self._is_ppu_sm89
+        )
         self.forward_metadata: DSAMetadata
         self.device = model_runner.device
         assert isinstance(model_runner.page_size, int)
@@ -691,6 +771,13 @@ class DeepseekSparseAttnBackend(
         )
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
+        self.dsa_prefill_impl, self.dsa_decode_impl = (
+            _normalize_inactive_q8_impl_for_role(
+                self.dsa_prefill_impl,
+                self.dsa_decode_impl,
+                get_disagg().disaggregation_mode,
+            )
+        )
         if (
             not _is_hip
             and self.token_to_kv_pool.dtype == torch.float8_e4m3fn
@@ -841,18 +928,31 @@ class DeepseekSparseAttnBackend(
             self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
+        self._is_ppu_sm89 = self._is_ppu_sm89 and self.device_capability == (8, 9)
 
         # Unsupported flashmla_sparse_q8 configs must fail at launch, not mid-forward.
-        _validate_flashmla_sparse_q8_backend(
-            prefill_impl=self.dsa_prefill_impl,
-            decode_impl=self.dsa_decode_impl,
-            kv_cache_dtype=self.kv_cache_dtype,
-            kv_cache_store_fp8=self.dsa_kv_cache_store_fp8,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            device_sm_major=self.device_sm_major,
-            hisparse_enabled=self.hisparse_coordinator is not None,
-            mixed_chunk_enabled=get_schedule().enable_mixed_chunk,
+        active_prefill_impl, active_decode_impl = _scope_dsa_impls_for_role(
+            self.dsa_prefill_impl,
+            self.dsa_decode_impl,
+            get_disagg().disaggregation_mode,
         )
+        self._ppu_native_flat_fp8 = self._is_ppu_sm89 and "flashmla_sparse_q8" in (
+            active_prefill_impl,
+            active_decode_impl,
+        )
+        if self._ppu_native_flat_fp8:
+            self._configure_ppu_native_q8()
+        else:
+            _validate_flashmla_sparse_q8_backend(
+                prefill_impl=active_prefill_impl,
+                decode_impl=active_decode_impl,
+                kv_cache_dtype=self.kv_cache_dtype,
+                kv_cache_store_fp8=self.dsa_kv_cache_store_fp8,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                device_sm_major=self.device_sm_major,
+                hisparse_enabled=self.hisparse_coordinator is not None,
+                mixed_chunk_enabled=get_schedule().enable_mixed_chunk,
+            )
 
         if self.dsa_prefill_impl == "triton_sparse_mla":
             _validate_triton_sparse_mla_backend(
@@ -1804,6 +1904,10 @@ class DeepseekSparseAttnBackend(
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
         """
+        if self._ppu_native_flat_fp8:
+            if self._ppu_q8_buffers and max_num_tokens != self._ppu_q8_max_num_tokens:
+                raise RuntimeError("Cannot resize captured PPU q8 buffers.")
+            self._ppu_q8_max_num_tokens = max_num_tokens
         # Whether we can skip the wide [max_num_tokens, max_ctx_len] page_size=1
         # page table in the decode CUDA graph. It is dead weight there only when the
         # decode top-k routes to the fused v2 kernel: attention reads topk_indices
@@ -2602,9 +2706,10 @@ class DeepseekSparseAttnBackend(
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
         )
-        # q8 is only wired on the RAGGED route; PAGED would run the bf16 kernel.
+        # The CUDA Q8KV8 backend is only wired on the RAGGED route.
         if (
             dsa_impl == "flashmla_sparse_q8"
+            and not self._ppu_native_flat_fp8
             and topk_indices is not None
             and topk_transform_method != TopkTransformMethod.RAGGED
         ):
@@ -2669,6 +2774,19 @@ class DeepseekSparseAttnBackend(
                 page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
                     page_table_1
                 ).to(torch.int32)
+
+        if dsa_impl == "flashmla_sparse_q8" and self._ppu_native_flat_fp8:
+            return self._forward_ppu_native_q8(
+                q_nope=q_nope,
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+                topk_length=metadata.dsa_cache_seqlens_int32,
+                reuse_buffers=phase == "decode",
+                first_prefill_chunk=not any(forward_batch.extend_prefix_lens_cpu or ()),
+            )
 
         if dsa_impl == "tilelang":
             if q_rope is not None:
@@ -3033,6 +3151,17 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             )
+        elif dsa_impl == "flashmla_sparse_q8" and self._ppu_native_flat_fp8:
+            return self._forward_ppu_native_q8(
+                q_nope=q_nope,
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+                topk_length=metadata.dsa_cache_seqlens_int32,
+                reuse_buffers=True,
+            )
         elif dsa_impl == "flashmla_kv":
             if q_rope is not None:
                 q_all = self._flashmla_kv_q(q_nope, q_rope)
@@ -3284,7 +3413,7 @@ class DeepseekSparseAttnBackend(
         a real attention kernel (loud NaNs, not silent corruption, but still a
         failed forward).
         """
-        if self.dsa_prefill_impl != "flashmla_sparse_q8":
+        if self.dsa_prefill_impl != "flashmla_sparse_q8" or self._ppu_native_flat_fp8:
             return False
         # RAGGED routing requires exactly EXTEND (excludes decode/idle, MIXED,
         # target-verify and draft-extend, which use dsa_decode_impl anyway).
@@ -3402,6 +3531,212 @@ class DeepseekSparseAttnBackend(
         out = buf[:rows]
         out[:, :width].copy_(topk_indices)
         return out
+
+    def _configure_ppu_native_q8(self) -> None:
+        if not self._is_ppu_sm89 or self.device_capability != (8, 9):
+            raise ValueError("PPU flashmla_sparse_q8 requires PPU0015 (SM89).")
+        mode = get_disagg().disaggregation_mode
+        active_impls = _scope_dsa_impls_for_role(
+            self.dsa_prefill_impl, self.dsa_decode_impl, mode
+        )
+        if "trtllm" in active_impls:
+            raise ValueError("PPU flashmla_sparse_q8 cannot be mixed with trtllm.")
+        if mode in ("prefill", "decode"):
+            local_impl = active_impls[0] if mode == "prefill" else active_impls[1]
+            assert local_impl == "flashmla_sparse_q8"
+            # Warmup and speculative forwards can use the other phase locally.
+            self.dsa_prefill_impl = self.dsa_decode_impl = local_impl
+            self.enable_auto_select_prefill_impl = False
+        elif self.dsa_prefill_impl != self.dsa_decode_impl:
+            raise ValueError(
+                "Standalone PPU raw FP8 KV requires flashmla_sparse_q8 in both phases."
+            )
+
+        _validate_ppu_native_q8_geometry(
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            kv_cache_dtype=self.kv_cache_dtype,
+            pool_dtype=self.token_to_kv_pool.dtype,
+            kv_cache_dim=self.kv_cache_dim,
+            packed_fp8=self.dsa_kv_cache_store_fp8,
+        )
+        if get_parallel().dcp_enabled or self.hisparse_coordinator is not None:
+            raise ValueError("PPU flashmla_sparse_q8 does not support DCP or HiSparse.")
+        if self._kv_shard_pool is not None:
+            raise ValueError("PPU flashmla_sparse_q8 requires the full KV pool.")
+        if self.dsa_index_topk != _PPU_Q8_INDEX_TOPK or self.dsa_index_kpool < 1:
+            raise ValueError(
+                "PPU flashmla_sparse_q8 requires index_topk=2048 and index_kpool >= 1."
+            )
+        logical_topk = self.dsa_index_topk + self.dsa_index_kpool - 1
+        self._ppu_q8_topk_capacity = (
+            (logical_topk + _PPU_Q8_SCAN_TILE - 1) // _PPU_Q8_SCAN_TILE
+        ) * _PPU_Q8_SCAN_TILE
+        if self._ppu_q8_topk_capacity > _PPU_Q8_MAX_TOPK:
+            raise ValueError(
+                "PPU flashmla_sparse_q8 supports at most 2176 top-k columns."
+            )
+        if self.num_q_heads <= 0 or self.flashmla_padding % self.num_q_heads:
+            raise ValueError(
+                f"PPU flashmla_sparse_q8 needs a head count dividing {self.flashmla_padding}; "
+                f"got {self.num_q_heads}."
+            )
+        from sglang.kernels.ops.attention.ppu_flash_mla import (
+            require_sparse_fp8_attention,
+        )
+
+        require_sparse_fp8_attention()
+        self.supports_mha_one_shot = False
+        self._ppu_q8_max_num_tokens = 0
+        self._ppu_q8_buffers: dict[tuple, torch.Tensor] = {}
+        self._ppu_q8_buffers_eager: dict[tuple, torch.Tensor] = {}
+
+    def _acquire_ppu_q8_buffer(self, kind, shape, dtype, device, reuse, fill=None):
+        rows = shape[0]
+        capacity = self._ppu_q8_max_num_tokens
+        if not reuse or (capacity > 0 and rows > capacity):
+            buf = torch.empty(shape, dtype=dtype, device=device)
+            return buf if fill is None else buf.fill_(fill)
+
+        key = (kind, shape[1:], dtype, device)
+        if capacity == 0:
+            # Decode graphs are disabled. Reuse one grow-only eager allocation per
+            # contract instead of allocating Q and padded top-k storage per step;
+            # eager DSA layers run sequentially on one stream.
+            buf = self._ppu_q8_buffers_eager.get(key)
+            if buf is None or buf.shape[0] < rows:
+                buf = torch.empty(shape, dtype=dtype, device=device)
+                if fill is not None:
+                    buf.fill_(fill)
+                self._ppu_q8_buffers_eager[key] = buf
+            return buf[:rows]
+
+        # The captured graph embeds these addresses. Do not grow the buffers
+        # or share them with another stream that could write concurrently.
+        stream = torch.cuda.current_stream(device).cuda_stream
+        key = (*key, stream)
+        if key not in self._ppu_q8_buffers:
+            buf = torch.empty((capacity, *shape[1:]), dtype=dtype, device=device)
+            if fill is not None:
+                buf.fill_(fill)
+            self._ppu_q8_buffers[key] = buf
+        return self._ppu_q8_buffers[key][:rows]
+
+    @staticmethod
+    def _normalize_ppu_q8_topk_lengths(
+        lengths: torch.Tensor, indices: torch.Tensor
+    ) -> torch.Tensor:
+        if (
+            lengths.ndim != 1
+            or lengths.dtype != torch.int32
+            or lengths.device != indices.device
+        ):
+            raise ValueError("PPU q8 topk_length must be 1D int32 on the indices device.")
+        rows = indices.shape[0]
+        if lengths.shape[0] < rows:
+            tail = q8kv8_topk_length_from_indices(indices[lengths.shape[0] :])
+            lengths = torch.cat((lengths, tail))
+        return lengths[:rows].contiguous()
+
+    def _forward_ppu_native_q8(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: Optional[torch.Tensor],
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+        v_head_dim: int,
+        topk_length: Optional[torch.Tensor],
+        *,
+        reuse_buffers: bool = False,
+        first_prefill_chunk: bool = False,
+    ) -> torch.Tensor:
+        rows, heads, dim = q_nope.shape
+        if q_rope is None:
+            q_rope = q_nope.new_empty((rows, heads, 0))
+        if rows == 0:
+            return q_nope.new_empty((0, heads, v_head_dim))
+        if (
+            dim != 512
+            or q_rope.shape[-1] != 0
+            or v_head_dim != 512
+            or kv_cache.dtype != torch.float8_e4m3fn
+            or kv_cache.shape[-1] != 512
+        ):
+            raise ValueError(
+                "PPU flashmla_sparse_q8 expects raw e4m3 KV and 512-wide NoPE Q/V."
+            )
+        if (
+            page_table_1 is None
+            or page_table_1.ndim != 2
+            or page_table_1.dtype != torch.int32
+            or page_table_1.shape[0] != rows
+        ):
+            raise ValueError(
+                "PPU q8 expects a 2D int32 top-k table with one row per query."
+            )
+        width = page_table_1.shape[1]
+        if not 0 < width <= self._ppu_q8_topk_capacity:
+            raise ValueError(f"Invalid PPU q8 top-k width: {width}.")
+        has_kpool = self.dsa_index_kpool > 1
+        scan_lengths = has_kpool and (
+            reuse_buffers or (first_prefill_chunk and rows >= 4096)
+        )
+        needs_length_tail = (
+            not has_kpool
+            and topk_length is not None
+            and topk_length.ndim == 1
+            and topk_length.shape[0] < rows
+        )
+        # Keep the KPool table scan-aligned even when prefill skips the scan.
+        align = _PPU_Q8_SCAN_TILE if has_kpool or needs_length_tail else _PPU_Q8_TOPK_TILE
+        padded_width = (width + align - 1) // align * align
+        indices = page_table_1
+        if padded_width != width or not indices.is_contiguous():
+            indices = self._acquire_ppu_q8_buffer(
+                "indices", (rows, padded_width), torch.int32, indices.device, reuse_buffers
+            )
+            indices[:, :width].copy_(page_table_1)
+            if padded_width > width:
+                indices[:, width:].fill_(-1)
+        if has_kpool:
+            # Tail IDs can follow holes. Scan for the last valid slot, not the
+            # number of valid IDs, and never trim the tail using seq_lens.
+            topk_length = (
+                q8kv8_topk_length_from_indices(indices) if scan_lengths else None
+            )
+        elif topk_length is not None:
+            topk_length = self._normalize_ppu_q8_topk_lengths(topk_length, indices)
+
+        pad_heads = heads if heads % 16 == 0 else self.flashmla_padding
+        q_fp8 = self._acquire_ppu_q8_buffer(
+            ("query", heads),
+            (rows, pad_heads, dim),
+            torch.float8_e4m3fn,
+            q_nope.device,
+            reuse_buffers,
+            fill=0 if heads != pad_heads else None,
+        )
+        # Keep the native kernel's Q-cast grid bounded for long prefills.
+        for start in range(0, rows, 65536):
+            end = min(start + 65536, rows)
+            concat_and_cast_q_fp8_pad(
+                q_fp8[start:end], q_nope[start:end], q_rope[start:end], heads
+            )
+
+        from sglang.kernels.ops.attention import flash_mla_sparse_quantized_fwd
+
+        # On SM89 the native decode entry point requires d_qk=576; 512-wide
+        # NoPE decode uses the same native FP8 kernel as sparse prefill.
+        out = flash_mla_sparse_quantized_fwd(
+            q=q_fp8,
+            kv=kv_cache,
+            indices=indices.unsqueeze(1),
+            sm_scale=sm_scale,
+            d_v=v_head_dim,
+            topk_length=topk_length,
+        )
+        return out[:, :heads]
 
     def _forward_flashmla_sparse_q8kv8(
         self,
@@ -4723,6 +5058,9 @@ class DeepseekSparseAttnBackend(
         SGLANG_DSA_FUSE_TOPK controls whether to fuse the topk transform into the topk kernel.
         This method is used to select the topk transform method which can be fused or unfused.
         """
+        if self._ppu_native_flat_fp8:
+            # Native q8 reads the persistent pool using absolute token IDs.
+            return TopkTransformMethod.PAGED
         if (
             # disable for MTP
             (
