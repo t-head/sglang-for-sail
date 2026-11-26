@@ -143,6 +143,13 @@ ALLOWED_PRESET_SLOTS = frozenset(
         "tp8",
     }
 )
+CANONICAL_PRESET_TOPOLOGY_KIND: dict[str, str] = {
+    "prefill": "single_node",
+    "decode": "single_node",
+    "decode_ep": "multi_node_ep",
+    "pd_prefill": "pd_disagg",
+    "pd_decode": "pd_disagg",
+}
 TOPOLOGY_PLACEHOLDERS: dict[str, tuple[str, Any]] = {
     "master_addr": ("127.0.0.1", "127.0.0.1"),
     "master_port": ("29500", 29500),
@@ -557,7 +564,13 @@ def _extract_placeholders_from_flags_and_env(
         if val is None:
             continue
         if flag in JSON_FLAGS:
-            found.update(_find_placeholders_in_obj(json.loads(val)))
+            try:
+                parsed = json.loads(val)
+            except json.JSONDecodeError as exc:
+                raise ValidationError(
+                    f"JSON flag {flag} has invalid JSON: {exc}"
+                ) from exc
+            found.update(_find_placeholders_in_obj(parsed))
         else:
             found.update(_PLACEHOLDER_RE.findall(val))
     for val in server_env.values():
@@ -628,7 +641,14 @@ def substitute_validation_placeholders(
         if val is None:
             sub_entries.append((flag, None, has_eq))
         elif flag in JSON_FLAGS:
-            parsed = json.loads(val)
+            try:
+                parsed = json.loads(val)
+            except json.JSONDecodeError as exc:
+                raise ValidationError(
+                    f"JSON flag {flag} has invalid JSON: {exc}"
+                ) from exc
+            if not isinstance(parsed, dict):
+                raise ValidationError(f"JSON flag {flag} must decode to a JSON object")
             substituted = _substitute_placeholders_in_json_obj(parsed, table)
             encoded = json.dumps(substituted, separators=(",", ":"), sort_keys=True)
             sub_entries.append((flag, encoded, has_eq))
@@ -710,10 +730,54 @@ def _parse_pos_int_flag(flag_name: str, raw: str | None, *, context: str) -> int
     return val
 
 
+def _validate_multinode_tp_pp_layout(
+    *,
+    tp_val: int,
+    pp_val: int,
+    topo_nodes: int,
+    devices_per_node: int | None,
+    context: str,
+) -> None:
+    """Validate SGLang ``_calculate_rank_ranges`` per-node TP/PP partition."""
+    pp_size_per_node = max(pp_val // topo_nodes, 1)
+    nnodes_per_pp_rank = max(topo_nodes // pp_val, 1)
+    if (
+        (pp_val >= topo_nodes and pp_val % topo_nodes != 0)
+        or (topo_nodes > pp_val and topo_nodes % pp_val != 0)
+        or tp_val % nnodes_per_pp_rank != 0
+    ):
+        raise ValidationError(
+            f"{context}: multi-node SGLang rank assignment incompatible for "
+            f"nodes={topo_nodes}, --tp-size={tp_val}, --pp-size={pp_val}"
+        )
+    tp_size_per_node = tp_val // nnodes_per_pp_rank
+    workers_per_node = pp_size_per_node * tp_size_per_node
+    if devices_per_node is not None and workers_per_node > devices_per_node:
+        raise ValidationError(
+            f"{context}: multi-node SGLang assigns {workers_per_node} workers per node "
+            f"(pp_per_node={pp_size_per_node} * tp_per_node={tp_size_per_node}), "
+            f"exceeding topology.devices_per_node ({devices_per_node})"
+        )
+    seen_ranks: list[tuple[int, int]] = []
+    for node_rank in range(topo_nodes):
+        pp_start = (node_rank // nnodes_per_pp_rank) * pp_size_per_node
+        tp_start = (node_rank % nnodes_per_pp_rank) * tp_size_per_node
+        for pp_r in range(pp_start, pp_start + pp_size_per_node):
+            for tp_r in range(tp_start, tp_start + tp_size_per_node):
+                seen_ranks.append((pp_r, tp_r))
+    expected_ranks = {(p, t) for p in range(pp_val) for t in range(tp_val)}
+    if len(seen_ranks) != len(expected_ranks) or set(seen_ranks) != expected_ranks:
+        raise ValidationError(
+            f"{context}: multi-node SGLang rank ranges do not partition "
+            f"pp_size={pp_val} x tp_size={tp_val} across nodes={topo_nodes}"
+        )
+
+
 def _compute_sglang_parallelism(
     entries: Sequence[tuple[str, str | None, bool]],
     *,
     topo_nodes: int,
+    devices_per_node: int | None = None,
     context: str,
 ) -> tuple[int, int, int, int, int, bool]:
     """Return ``(ppu_count, dp_size, tp_size, pp_size, attn_dp_size, ep_enabled)`` matching SGLang ``ServerArgs``."""
@@ -795,10 +859,18 @@ def _compute_sglang_parallelism(
         )
 
     ppu_count = dp_val * tp_val * pp_val
-    if topo_nodes > 1 and ppu_count % topo_nodes != 0:
-        raise ValidationError(
-            f"{context}: topology.nodes ({topo_nodes}) must evenly divide effective "
-            f"SGLang world size ({ppu_count})"
+    if topo_nodes > 1:
+        if ppu_count % topo_nodes != 0:
+            raise ValidationError(
+                f"{context}: topology.nodes ({topo_nodes}) must evenly divide effective "
+                f"SGLang world size ({ppu_count})"
+            )
+        _validate_multinode_tp_pp_layout(
+            tp_val=tp_val,
+            pp_val=pp_val,
+            topo_nodes=topo_nodes,
+            devices_per_node=devices_per_node,
+            context=context,
         )
 
     moe_a2a = (_flag_value(entries, "--moe-a2a-backend") or "none").strip().lower()
@@ -817,14 +889,31 @@ def _validate_resolved_topology_and_placeholders(
     topo = resolved["topology"]
     topo_kind = topo["kind"]
     topo_nodes = int(topo["nodes"])
-    topo_capacity = topo_nodes * int(topo["devices_per_node"])
+    topo_devices_per_node = int(topo["devices_per_node"])
+    topo_capacity = topo_nodes * topo_devices_per_node
     preset_name = resolved.get("preset")
+
+    expected_topo_kind = (
+        CANONICAL_PRESET_TOPOLOGY_KIND.get(str(preset_name))
+        if preset_name is not None
+        else None
+    )
+    if expected_topo_kind is not None and topo_kind != expected_topo_kind:
+        raise ValidationError(
+            f"{context}: preset {preset_name!r} requires topology.kind={expected_topo_kind!r}, "
+            f"got {topo_kind!r}"
+        )
+    if topo_kind == "pd_disagg" and preset_name not in {"pd_prefill", "pd_decode"}:
+        raise ValidationError(
+            f"{context}: pd_disagg topology must use paired 'pd_prefill' and 'pd_decode' preset slots"
+        )
 
     entries = _parse_flag_entries(flags)
     flag_names = {name for name, _, _ in entries}
     calc_ppu_count, _, _, _, _, ep_enabled = _compute_sglang_parallelism(
         entries,
         topo_nodes=topo_nodes,
+        devices_per_node=topo_devices_per_node,
         context=context,
     )
     ppu_count = max(int(resolved["ppu_count"]), calc_ppu_count)
@@ -839,6 +928,7 @@ def _validate_resolved_topology_and_placeholders(
             f"{context}: topology.nodes ({topo_nodes}) must evenly divide effective "
             f"SGLang world size ({ppu_count})"
         )
+    local_gpu_count = ppu_count // topo_nodes
 
     placeholders = _extract_placeholders_from_flags_and_env(flags, server_env)
     unknown = sorted(placeholders - set(TOPOLOGY_PLACEHOLDERS))
@@ -867,18 +957,32 @@ def _validate_resolved_topology_and_placeholders(
                 raise ValidationError(
                     f"{context}: --disaggregation-ib-device invalid JSON map: {exc}"
                 ) from exc
-            if (
-                isinstance(parsed_ib, dict)
-                and parsed_ib
-                and all(
-                    isinstance(k, str) and v == "{ib_devices}"
+            if isinstance(parsed_ib, dict) and parsed_ib:
+                if not all(
+                    isinstance(k, str)
+                    and k.isdigit()
+                    and str(int(k)) == k
+                    and v == "{ib_devices}"
                     for k, v in parsed_ib.items()
-                )
-            ):
+                ):
+                    raise ValidationError(
+                        f"{context}: per-GPU --disaggregation-ib-device JSON map must map "
+                        f"canonical numeric GPU ID strings to exact '{{ib_devices}}', got {ib_dev!r}"
+                    )
+                expected_gpus = set(range(local_gpu_count))
+                configured_gpus = {int(k) for k in parsed_ib}
+                if configured_gpus != expected_gpus:
+                    missing_gpus = sorted(expected_gpus - configured_gpus)
+                    extra_gpus = sorted(configured_gpus - expected_gpus)
+                    raise ValidationError(
+                        f"{context}: per-GPU --disaggregation-ib-device JSON map must cover "
+                        f"all {local_gpu_count} local GPUs (0..{local_gpu_count - 1}); "
+                        f"missing={missing_gpus}, extra={extra_gpus}"
+                    )
                 return
         raise ValidationError(
             f"{context}: {backend} disaggregation requires --disaggregation-ib-device "
-            f"to be exact '{{ib_devices}}' (or a per-GPU JSON map of '{{ib_devices}}'), got {ib_dev!r}"
+            f"to be exact '{{ib_devices}}' (or a complete per-GPU JSON map of '{{ib_devices}}'), got {ib_dev!r}"
         )
 
     def _require_multinode_wiring() -> None:
@@ -909,7 +1013,13 @@ def _validate_resolved_topology_and_placeholders(
             sub_rank_str = _substitute_placeholders_in_str(
                 node_rank_raw, _build_placeholder_table({"node_rank": probe_rank})
             )
-            if int(sub_rank_str) != probe_rank:
+            try:
+                parsed_rank = int(sub_rank_str)
+            except ValueError as exc:
+                raise ValidationError(
+                    f"{context}: --node-rank must resolve to an integer, got {sub_rank_str!r}"
+                ) from exc
+            if parsed_rank != probe_rank:
                 raise ValidationError(
                     f"{context}: --node-rank must preserve exact identity for rank {probe_rank}"
                 )
@@ -1012,6 +1122,11 @@ def _validate_resolved_topology_and_placeholders(
         if transfer_backend not in SUPPORTED_DISAGG_BACKENDS:
             raise ValidationError(
                 f"{context}: unsupported --disaggregation-transfer-backend {transfer_backend!r}"
+            )
+        if role == "prefill" and transfer_backend == "fake":
+            raise ValidationError(
+                f"{context}: SGLang pd_prefill does not support --disaggregation-transfer-backend "
+                f"'fake' (fake transfer backend is decode-only)"
             )
 
         required_pd_ph = (
@@ -1283,10 +1398,10 @@ def _resolve_recipe_from_doc(
         ordered = _apply_flag_entries(ordered, ["--enable-metrics"])
     if eff_dummy:
         ordered = _apply_flag_entries(ordered, ["--load-format", "dummy"])
-    if eff_layers is not None and eff_layers != "auto":
+    if eff_layers is not None:
         if type(eff_layers) is not int or eff_layers < 1:
             raise ValidationError(
-                f"layer_override must be a positive int, 'auto', or None, got {eff_layers!r}"
+                f"layer_override must be a positive int or None, got {eff_layers!r}"
             )
         ordered = _merge_json_flag(
             ordered,
@@ -1349,6 +1464,7 @@ def _resolve_recipe_from_doc(
     ppu_count, dp_val, _, _, attn_dp_val, _ = _compute_sglang_parallelism(
         ordered,
         topo_nodes=int(eff_topology["nodes"]),
+        devices_per_node=int(eff_topology["devices_per_node"]),
         context=recipe_label,
     )
 
@@ -1366,6 +1482,10 @@ def _resolve_recipe_from_doc(
         "flags": _canonical_flags(ordered),
         "server_env": dict(sorted(server_env.items())),
     }
+    if eff_assets != ppu_blk["assets"]:
+        digest_payload["assets"] = dict(sorted(eff_assets.items()))
+    if resolved_tokenizer != resolved_model:
+        digest_payload["distinct_tokenizer"] = resolved_tokenizer
     if cache_revision is not None:
         digest_payload["cache_revision"] = cache_revision
     config_digest = hashlib.sha256(
@@ -1407,6 +1527,88 @@ def _resolve_recipe_from_doc(
     return result
 
 
+def _validate_pd_disagg_pair(
+    prefill_res: Mapping[str, Any],
+    decode_res: Mapping[str, Any],
+    *,
+    context: str,
+) -> None:
+    """Validate runtime wire compatibility between paired ``pd_prefill`` and ``pd_decode`` roles."""
+    p_entries = _parse_flag_entries(list(prefill_res["flags"]))
+    d_entries = _parse_flag_entries(list(decode_res["flags"]))
+
+    p_backend = (
+        _flag_value(p_entries, "--disaggregation-transfer-backend") or "mooncake"
+    ).strip()
+    d_backend = (
+        _flag_value(d_entries, "--disaggregation-transfer-backend") or "mooncake"
+    ).strip()
+    if p_backend != d_backend:
+        raise ValidationError(
+            f"{context}: pd_prefill and pd_decode must use the same "
+            f"--disaggregation-transfer-backend, got {p_backend!r} vs {d_backend!r}"
+        )
+
+    if p_backend == "mooncake":
+        p_proto = (
+            prefill_res["server_env"].get("MOONCAKE_PROTOCOL", "rdma").strip().lower()
+        )
+        d_proto = (
+            decode_res["server_env"].get("MOONCAKE_PROTOCOL", "rdma").strip().lower()
+        )
+        if p_proto != d_proto:
+            raise ValidationError(
+                f"{context}: pd_prefill and pd_decode must agree on MOONCAKE_PROTOCOL, "
+                f"got {p_proto!r} vs {d_proto!r}"
+            )
+
+    p_page = (
+        _parse_pos_int_flag(
+            "--page-size", _flag_value(p_entries, "--page-size"), context=context
+        )
+        or 1
+    )
+    d_page = (
+        _parse_pos_int_flag(
+            "--page-size", _flag_value(d_entries, "--page-size"), context=context
+        )
+        or 1
+    )
+    if p_page != d_page:
+        raise ValidationError(
+            f"{context}: pd_prefill and pd_decode --page-size mismatch "
+            f"({p_page} vs {d_page}); SGLang disaggregation requires identical KV page sizes"
+        )
+
+    p_kv_dtype = (_flag_value(p_entries, "--kv-cache-dtype") or "auto").strip().lower()
+    d_kv_dtype = (_flag_value(d_entries, "--kv-cache-dtype") or "auto").strip().lower()
+    if p_kv_dtype != d_kv_dtype:
+        raise ValidationError(
+            f"{context}: pd_prefill and pd_decode --kv-cache-dtype mismatch "
+            f"({p_kv_dtype!r} vs {d_kv_dtype!r})"
+        )
+
+    p_dsv4_attn = (
+        (_flag_value(p_entries, "--dsv4-attn-backend") or "auto").strip().lower()
+    )
+    d_dsv4_attn = (
+        (_flag_value(d_entries, "--dsv4-attn-backend") or "auto").strip().lower()
+    )
+    if p_dsv4_attn != d_dsv4_attn:
+        raise ValidationError(
+            f"{context}: pd_prefill and pd_decode --dsv4-attn-backend mismatch "
+            f"({p_dsv4_attn!r} vs {d_dsv4_attn!r})"
+        )
+
+    p_dsv4_layout = prefill_res["server_env"].get("SGLANG_DSV4_KV_LAYOUT", "").strip()
+    d_dsv4_layout = decode_res["server_env"].get("SGLANG_DSV4_KV_LAYOUT", "").strip()
+    if p_dsv4_layout != d_dsv4_layout:
+        raise ValidationError(
+            f"{context}: pd_prefill and pd_decode SGLANG_DSV4_KV_LAYOUT mismatch "
+            f"({p_dsv4_layout!r} vs {d_dsv4_layout!r})"
+        )
+
+
 def resolve_recipe(
     recipe_path: Path,
     *,
@@ -1435,7 +1637,7 @@ def resolve_recipe(
         policy = _load_yaml(policy_path)
         validate_policy_structure(policy, context=str(policy_path), base_dir=REPO_ROOT)
 
-    return _resolve_recipe_from_doc(
+    resolved = _resolve_recipe_from_doc(
         recipe,
         recipe_label=str(recipe_path),
         policy=policy,
@@ -1453,6 +1655,36 @@ def resolve_recipe(
         port=port,
         served_model_name=served_model_name,
     )
+    if resolved["preset"] in {"pd_prefill", "pd_decode"}:
+        peer_preset = (
+            "pd_decode" if resolved["preset"] == "pd_prefill" else "pd_prefill"
+        )
+        peer_resolved = _resolve_recipe_from_doc(
+            recipe,
+            recipe_label=str(recipe_path),
+            variant=resolved["variant"],
+            hardware=resolved["hardware"],
+            preset=peer_preset,
+            cache=cache,
+            dummy_weights=dummy_weights,
+            layer_override=layer_override,
+            assets_map_path=assets_map_path,
+            cache_revision=cache_revision,
+            host=host,
+            port=port,
+            served_model_name=served_model_name,
+        )
+        prefill_res, decode_res = (
+            (resolved, peer_resolved)
+            if resolved["preset"] == "pd_prefill"
+            else (peer_resolved, resolved)
+        )
+        _validate_pd_disagg_pair(
+            prefill_res,
+            decode_res,
+            context=f"{recipe_path}:{resolved['variant']}:{resolved['hardware']}:pd_pair",
+        )
+    return resolved
 
 
 def _scan_text(text: str, *, context: str, allow_loopback: bool = False) -> list[str]:
@@ -1884,6 +2116,7 @@ def validate_serving_recipe_structure(
             if pname == "pd_prefill"
             else ("decode" if pname == "pd_decode" else None)
         )
+        expected_topo_kind = CANONICAL_PRESET_TOPOLOGY_KIND.get(pname)
         if "topology" in pcfg:
             ptopo = _validate_topology_block(
                 pcfg["topology"],
@@ -1891,9 +2124,10 @@ def validate_serving_recipe_structure(
                 allow_role=True,
                 expected_role=expected_role,
             )
-            if pname in {"pd_prefill", "pd_decode"} and ptopo["kind"] != "pd_disagg":
+            if expected_topo_kind is not None and ptopo["kind"] != expected_topo_kind:
                 raise ValidationError(
-                    f"{context}.presets.{pname}.topology.kind must be 'pd_disagg'"
+                    f"{context}.presets.{pname}.topology.kind must be {expected_topo_kind!r}, "
+                    f"got {ptopo['kind']!r}"
                 )
             if ptopo["kind"] == "pd_disagg" and pname not in {
                 "pd_prefill",
@@ -1903,11 +2137,22 @@ def validate_serving_recipe_structure(
                     f"{context}.presets.{pname}: pd_disagg topology must use "
                     f"paired 'pd_prefill' and 'pd_decode' preset slots"
                 )
-        elif pname in {"pd_prefill", "pd_decode"}:
-            if ppu["topology"]["kind"] != "pd_disagg":
-                raise ValidationError(
-                    f"{context}.presets.{pname}: requires topology.kind='pd_disagg'"
+        elif expected_topo_kind is not None:
+            candidate_topos = [
+                vcfg.get("topology") or ppu["topology"]
+                for vname, vcfg in variants_blk.items()
+                if (pcfg.get("variants") is None or vname in pcfg["variants"])
+                and (
+                    pcfg.get("hardware") is None
+                    or pcfg["hardware"] in variant_compat_hw_map[vname]
                 )
+            ] or [ppu["topology"]]
+            for inherited_topo in candidate_topos:
+                if inherited_topo["kind"] != expected_topo_kind:
+                    raise ValidationError(
+                        f"{context}.presets.{pname}: preset {pname!r} requires "
+                        f"topology.kind={expected_topo_kind!r}, got inherited {inherited_topo['kind']!r}"
+                    )
         if "tp" in pcfg and (type(pcfg["tp"]) is not int or pcfg["tp"] <= 0):
             raise ValidationError(f"{context}.presets.{pname}.tp must be positive int")
         if "select" in pcfg:
@@ -1966,11 +2211,28 @@ def validate_serving_recipe_structure(
         if findings:
             raise ValidationError("; ".join(findings))
 
+    if "pd_prefill" in presets_blk and "pd_decode" in presets_blk and variants_blk:
+        all_targets = _iter_variant_preset_targets(recipe, context=context)
+        prefill_targets = {
+            (vname, hw) for vname, pname, hw in all_targets if pname == "pd_prefill"
+        }
+        decode_targets = {
+            (vname, hw) for vname, pname, hw in all_targets if pname == "pd_decode"
+        }
+        if not prefill_targets or prefill_targets != decode_targets:
+            raise ValidationError(
+                f"{context}.presets: pd_prefill and pd_decode must resolve to identical "
+                f"(variant, hardware) targets, got pd_prefill={sorted(prefill_targets)} "
+                f"vs pd_decode={sorted(decode_targets)}"
+            )
+
     if validate_expansions and ppu["framework"] == "sglang":
+        pd_prefill_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+        pd_decode_by_key: dict[tuple[str, str], dict[str, Any]] = {}
         for vname, pname, target_hw in _iter_variant_preset_targets(
             recipe, context=context
         ):
-            _resolve_recipe_from_doc(
+            resolved_exp = _resolve_recipe_from_doc(
                 recipe,
                 recipe_label=context,
                 variant=vname,
@@ -1978,6 +2240,16 @@ def validate_serving_recipe_structure(
                 preset=pname,
                 cache=None,
                 include_runner_flags=False,
+            )
+            if pname == "pd_prefill":
+                pd_prefill_by_key[(vname, target_hw)] = resolved_exp
+            elif pname == "pd_decode":
+                pd_decode_by_key[(vname, target_hw)] = resolved_exp
+        for pair_key in sorted(set(pd_prefill_by_key) | set(pd_decode_by_key)):
+            _validate_pd_disagg_pair(
+                pd_prefill_by_key[pair_key],
+                pd_decode_by_key[pair_key],
+                context=f"{context}:{pair_key[0]}:{pair_key[1]}:pd_pair",
             )
 
 
@@ -2185,7 +2457,6 @@ def validate_policy_structure(
                 or (
                     "layer_override" in fs
                     and lo is not None
-                    and lo != "auto"
                     and (type(lo) is not int or lo <= 0)
                 )
                 or (
@@ -2378,6 +2649,8 @@ def iter_recipe_catalog_entries(
         validate_expansions=False,
     )
     entries: list[dict[str, Any]] = []
+    pd_prefill_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    pd_decode_by_key: dict[tuple[str, str], dict[str, Any]] = {}
     for vname, pname, target_hw in _iter_variant_preset_targets(
         rdoc, context=str(recipe_path)
     ):
@@ -2390,6 +2663,10 @@ def iter_recipe_catalog_entries(
             cache=None,
             include_runner_flags=False,
         )
+        if pname == "pd_prefill":
+            pd_prefill_by_key[(vname, target_hw)] = resolved
+        elif pname == "pd_decode":
+            pd_decode_by_key[(vname, target_hw)] = resolved
         entries.append(
             {
                 "recipe_path": recipe_path,
@@ -2398,6 +2675,12 @@ def iter_recipe_catalog_entries(
                 "hardware": target_hw,
                 "resolved": resolved,
             }
+        )
+    for pair_key in sorted(set(pd_prefill_by_key) | set(pd_decode_by_key)):
+        _validate_pd_disagg_pair(
+            pd_prefill_by_key[pair_key],
+            pd_decode_by_key[pair_key],
+            context=f"{recipe_path}:{pair_key[0]}:{pair_key[1]}:pd_pair",
         )
     return entries
 
@@ -2610,8 +2893,6 @@ def _format_fast_sanity_weights(
         return f"{weight}, full layers"
     fs_cfg = policy_doc.get("tiers", {}).get("fast_sanity", {})
     suffix = " (fallback: full)" if fs_cfg.get("fallback_full_layers") else ""
-    if layer_override == "auto":
-        return f"{weight}, {_md_code('auto')} layers{suffix}"
     return f"{weight}, {layer_override} layers{suffix}"
 
 
@@ -2976,17 +3257,15 @@ def render_ci_matrix_markdown(*, base_dir: Path | None = None) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _parse_layer_override_cli(raw: str) -> int | str | None:
+def _parse_layer_override_cli(raw: str) -> int | None:
     lowered = raw.strip().lower()
-    if lowered == "auto":
-        return "auto"
     if lowered in {"none", "null", "full"}:
         return None
     try:
         parsed = int(raw)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(
-            "layer-override must be a positive int, 'auto', or 'full'"
+            "layer-override must be a positive int or 'full'"
         ) from exc
     if parsed < 1:
         raise argparse.ArgumentTypeError("layer-override must be >= 1")

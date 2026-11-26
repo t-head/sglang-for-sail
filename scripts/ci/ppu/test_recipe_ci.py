@@ -2777,8 +2777,8 @@ class PresetCatalogContractTest(unittest.TestCase):
         )
         self.assertIn("`Qwen3.8-27B.yaml`", catalog_section)
         self.assertIn("`zhenwu_810e` / 2 / `single_node`", catalog_section)
-        self.assertIn("`fp8_channel` (`fp8`)", catalog_section)
-        self.assertIn("`w8a8_int8` (`w8a8_int8`)", catalog_section)
+        self.assertIn("`fp8` (`fp8`)", catalog_section)
+        self.assertIn("`bf16_810e` (`bf16`)", catalog_section)
         self.assertIn("`multi_node_ep` (4x8)", catalog_section)
         self.assertIn("`pd_disagg` (prefill)", catalog_section)
         self.assertIn("`pd_disagg` (decode)", catalog_section)
@@ -2796,14 +2796,14 @@ class PresetCatalogContractTest(unittest.TestCase):
                 ("default", "decode_ep", "zhenwu_m890"),
                 ("default", "pd_prefill", "zhenwu_m890"),
                 ("default", "pd_decode", "zhenwu_m890"),
-                ("fp8_channel", None, "zhenwu_m890"),
-                ("fp8_channel", "prefill", "zhenwu_m890"),
-                ("fp8_channel", "decode", "zhenwu_m890"),
-                ("fp8_channel", "decode_ep", "zhenwu_m890"),
-                ("fp8_channel", "pd_prefill", "zhenwu_m890"),
-                ("fp8_channel", "pd_decode", "zhenwu_m890"),
-                ("w8a8_int8", None, "zhenwu_810e"),
-                ("w8a8_int8", "prefill", "zhenwu_810e"),
+                ("fp8", None, "zhenwu_m890"),
+                ("fp8", "prefill", "zhenwu_m890"),
+                ("fp8", "decode", "zhenwu_m890"),
+                ("fp8", "decode_ep", "zhenwu_m890"),
+                ("fp8", "pd_prefill", "zhenwu_m890"),
+                ("fp8", "pd_decode", "zhenwu_m890"),
+                ("bf16_810e", None, "zhenwu_810e"),
+                ("bf16_810e", "prefill", "zhenwu_810e"),
             ],
         )
         report = validate_paths(
@@ -2814,31 +2814,32 @@ class PresetCatalogContractTest(unittest.TestCase):
         self.assertTrue(report["parser_checked"])
         self.assertEqual(report["checked_combinations"], 14)
 
-        fp8 = resolve_recipe(glm_path, variant="fp8_channel", preset="decode")
+        fp8 = resolve_recipe(glm_path, variant="fp8", preset="decode")
         self.assertEqual(fp8["hardware"], "zhenwu_m890")
         self.assertEqual(fp8["ppu_count"], 8)
         self.assertEqual(
             fp8["hf_model_id"],
-            "T-HEAD/GLM-5.3-Quant-W-FP8-PerChannel-A-FP8-PerChannel",
+            "zai-org/GLM-5.3",
         )
-        self.assertEqual(fp8["golden_model_key"], "glm_5_3_fp8_channel")
-        self.assertEqual(fp8["served_name"], "glm-5.3-fp8-channel")
+        self.assertEqual(fp8["golden_model_key"], "glm_5_3_fp8")
+        self.assertEqual(fp8["served_name"], "glm-5.3-fp8")
         self.assertEqual(
             fp8["enabled_features"], ["tool_calling", "reasoning", "spec_decoding"]
         )
 
-        int8 = resolve_recipe(glm_path, variant="w8a8_int8", preset="prefill")
-        self.assertEqual(int8["hardware"], "zhenwu_810e")
-        self.assertEqual(int8["ppu_count"], 16)
+        bf16_810e = resolve_recipe(glm_path, variant="bf16_810e", preset="prefill")
+        self.assertEqual(bf16_810e["hardware"], "zhenwu_810e")
+        self.assertEqual(bf16_810e["ppu_count"], 16)
         self.assertEqual(
-            int8["hf_model_id"],
-            "T-HEAD/GLM-5.3-Quant-W-INT8-PerChannel-A-INT8-PerToken",
+            bf16_810e["hf_model_id"],
+            "zai-org/GLM-5.3-BF16",
         )
-        self.assertEqual(int8["golden_model_key"], "glm_5_3_w8a8_int8")
+        self.assertEqual(bf16_810e["golden_model_key"], "glm_5_3_bf16_810e")
         self.assertEqual(
-            int8["flags"][int8["flags"].index("--mem-fraction-static") + 1], "0.90"
+            bf16_810e["flags"][bf16_810e["flags"].index("--mem-fraction-static") + 1],
+            "0.90",
         )
-        self.assertNotIn("--speculative-algorithm", int8["flags"])
+        self.assertNotIn("--speculative-algorithm", bf16_810e["flags"])
 
         glm_doc = _load_yaml(glm_path)
         for bad_variants in ({}, None):
@@ -2957,7 +2958,7 @@ class PresetCatalogContractTest(unittest.TestCase):
                 spoof_path.unlink()
 
                 fp8_pol = _load_yaml(root / "test/ppu/policy/models/glm-5.3.yaml")
-                fp8_pol["variant"] = "fp8_channel"
+                fp8_pol["variant"] = "fp8"
                 fp8_pol["tiers"] = {"fast_sanity": fp8_pol["tiers"]["fast_sanity"]}
                 fp8_pol_path = root / "test/ppu/policy/models/glm-5.3-fp8.yaml"
                 fp8_pol_path.write_text(yaml.safe_dump(fp8_pol, sort_keys=False))
@@ -2970,7 +2971,7 @@ class PresetCatalogContractTest(unittest.TestCase):
                 self.assertEqual(fp8_res["model_id"], "zai-org/GLM-5.3")
                 self.assertEqual(
                     fp8_res["hf_model_id"],
-                    "T-HEAD/GLM-5.3-Quant-W-FP8-PerChannel-A-FP8-PerChannel",
+                    "zai-org/GLM-5.3",
                 )
 
                 bad_ms = _load_yaml(
@@ -3262,10 +3263,26 @@ class PresetCatalogContractTest(unittest.TestCase):
 
             glm_rec_path = root / "test/ppu/recipes/zai-org/GLM-5.3.yaml"
             glm_doc = _load_yaml(glm_rec_path)
+            glm_doc["variants"]["w8a8_int8"] = {
+                "precision": "w8a8_int8",
+                "hardware": "zhenwu_810e",
+                "topology": {
+                    "kind": "single_node",
+                    "nodes": 1,
+                    "devices_per_node": 16,
+                },
+                "hf_model_id": "zai-org/GLM-5.3-BF16",
+                "extra_args": ["--tp-size", "16"],
+            }
             glm_doc["presets"]["tp8"] = {
                 "hardware": "zhenwu_m890",
                 "topology": {"kind": "single_node", "nodes": 1, "devices_per_node": 16},
                 "tp": 16,
+            }
+            glm_doc["presets"]["model_sanity"] = {
+                "hardware": "zhenwu_m890",
+                "topology": {"kind": "single_node", "nodes": 1, "devices_per_node": 1},
+                "tp": 1,
             }
             glm_rec_path.write_text(yaml.safe_dump(glm_doc, sort_keys=False))
 
@@ -3278,6 +3295,7 @@ class PresetCatalogContractTest(unittest.TestCase):
                     "preset": "prefill",
                 },
                 "glm-5.3-tp16": {"preset": "tp8"},
+                "glm-5.3-tp1": {"preset": "model_sanity"},
             }
             for slug, overrides in extra_policies.items():
                 pol = copy.deepcopy(base_pol)
@@ -3316,6 +3334,18 @@ class PresetCatalogContractTest(unittest.TestCase):
                     ValueError, "requires 16 devices, exceeding single-node"
                 ):
                     select("fast_sanity", "glm-5.3-tp16")
+                with self.assertRaisesRegex(
+                    ValueError, "unsupported cluster topology for policy glm-5.3-tp1"
+                ):
+                    select("fast_sanity", "glm-5.3-tp1")
+                with self.assertRaisesRegex(
+                    ValueError, "unsupported cluster topology for policy glm-5.3-tp1"
+                ):
+                    cluster_width(
+                        root / "test/ppu/policy/models/glm-5.3-tp1.yaml",
+                        "fast_sanity",
+                        max_devices=8,
+                    )
 
                 admitted = select("fast_sanity", "glm-5.3-tp16", max_devices=16)[
                     "include"
@@ -3327,10 +3357,10 @@ class PresetCatalogContractTest(unittest.TestCase):
         rev_fp8 = "b" * 40
         base_glm = _load_yaml(REPO_ROOT / "test/ppu/recipes/zai-org/GLM-5.3.yaml")
         mxfp4_id = base_glm["ppu"]["hf_model_id"]
-        fp8_id = base_glm["variants"]["fp8_channel"]["hf_model_id"]
+        fp8_id = base_glm["variants"]["fp8"]["hf_model_id"]
         mxfp4_asset = base_glm["ppu"]["assets"]["model"]
-        fp8_asset = base_glm["variants"]["fp8_channel"]["assets"]["model"]
-        fp8_golden = base_glm["variants"]["fp8_channel"]["golden_model_key"]
+        fp8_asset = base_glm["variants"]["fp8"]["assets"]["model"]
+        fp8_golden = base_glm["variants"]["fp8"]["golden_model_key"]
 
         def _make_snapshot(cache_root: Path, repo_id: str, revision: str) -> Path:
             folder = f"models--{repo_id.replace('/', '--')}"
@@ -3365,11 +3395,11 @@ class PresetCatalogContractTest(unittest.TestCase):
                 glm_rec_path = root / "test/ppu/recipes/zai-org/GLM-5.3.yaml"
                 if inherit_assets:
                     glm_doc = _load_yaml(glm_rec_path)
-                    glm_doc["variants"]["fp8_channel"].pop("assets", None)
+                    glm_doc["variants"]["fp8"].pop("assets", None)
                     glm_rec_path.write_text(yaml.safe_dump(glm_doc, sort_keys=False))
 
                 pol = _load_yaml(root / "test/ppu/policy/models/glm-5.3.yaml")
-                pol["variant"] = "fp8_channel"
+                pol["variant"] = "fp8"
                 pol["tiers"] = {"fast_sanity": pol["tiers"]["fast_sanity"]}
                 pol_path = root / "test/ppu/policy/models/glm-5.3-fp8.yaml"
                 pol_path.write_text(yaml.safe_dump(pol, sort_keys=False))
@@ -3435,7 +3465,7 @@ class PresetCatalogContractTest(unittest.TestCase):
                     mock_probes.assert_called_once()
                     self.assertEqual(len(captured_configs), 1)
                     cfg, _, _ = captured_configs[0]
-                    self.assertEqual(cfg["variant"], "fp8_channel")
+                    self.assertEqual(cfg["variant"], "fp8")
                     self.assertEqual(cfg["hf_model_id"], fp8_id)
                     self.assertEqual(cfg["golden_model_key"], fp8_golden)
                     self.assertEqual(cfg["resolved_model"], str(snap_fp8))
@@ -3473,6 +3503,20 @@ class PresetCatalogContractTest(unittest.TestCase):
                     )["config_digest"]
                     self.assertEqual(summary["config_digest"], expected_fp8_digest)
                     self.assertNotEqual(summary["config_digest"], wrong_mxfp4_digest)
+
+                    with patch.dict(
+                        os.environ,
+                        {
+                            "PPU_RECIPE_CONTAINER_MODEL": str(snap_mxfp4),
+                            "RECIPE_PPU_COUNT": "8",
+                        },
+                        clear=True,
+                    ):
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            "container model mount only supports the default recipe checkpoint",
+                        ):
+                            run(pol_path, "fast_sanity", 1.0)
 
     def test_exact_topology_placeholder_identity_and_per_gpu_ib_map(self):
         glm_doc = _load_yaml(REPO_ROOT / "test/ppu/recipes/zai-org/GLM-5.3.yaml")
@@ -3538,7 +3582,12 @@ class PresetCatalogContractTest(unittest.TestCase):
         ):
             validate_serving_recipe_structure(bad_port, context="bad_kv_port")
 
-        for bad_ib in ("nic_{ib_devices}", '{"0":"rdma0","1":"{ib_devices}"}'):
+        for bad_ib in (
+            "nic_{ib_devices}",
+            '{"0":"rdma0","1":"{ib_devices}"}',
+            '{"0":"{ib_devices}","1":"{ib_devices}"}',
+            '{"gpu0":"{ib_devices}"}',
+        ):
             bad_ib_doc = copy.deepcopy(glm_doc)
             ib_args = bad_ib_doc["presets"]["pd_prefill"]["args"]
             ib_args[ib_args.index("--disaggregation-ib-device") + 1] = bad_ib
@@ -3550,8 +3599,9 @@ class PresetCatalogContractTest(unittest.TestCase):
 
         per_gpu_ib = copy.deepcopy(glm_doc)
         ib_args = per_gpu_ib["presets"]["pd_prefill"]["args"]
-        ib_args[ib_args.index("--disaggregation-ib-device") + 1] = (
-            '{"0":"{ib_devices}","1":"{ib_devices}"}'
+        ib_args[ib_args.index("--disaggregation-ib-device") + 1] = json.dumps(
+            {str(gpu_id): "{ib_devices}" for gpu_id in range(8)},
+            separators=(",", ":"),
         )
         validate_serving_recipe_structure(per_gpu_ib, context="per_gpu_ib")
 
@@ -3565,7 +3615,7 @@ class PresetCatalogContractTest(unittest.TestCase):
             REPO_ROOT / "test/ppu/recipes/deepseek-ai/DeepSeek-V4-Flash.yaml"
         )
         mxfp4_id = base_glm["ppu"]["hf_model_id"]
-        fp8_id = base_glm["variants"]["fp8_channel"]["hf_model_id"]
+        fp8_id = base_glm["variants"]["fp8"]["hf_model_id"]
         self.assertEqual(
             PINNED_MODEL_REVISION_SPECS["glm-5.3"],
             ("PPU_CI_GLM53_MODEL_REVISION", mxfp4_id),
@@ -3786,9 +3836,9 @@ class PresetCatalogContractTest(unittest.TestCase):
             self.assertEqual(cfg0["hf_model_id"], mxfp4_id)
             self.assertEqual(cfg0["resolved_model"], expected_mxfp4_snap)
 
-            # Case 1: Quoted "variant": fp8_channel key in block YAML.
+            # Case 1: Quoted "variant": fp8 key in block YAML.
             pol_path.write_text(
-                '"variant": fp8_channel\n' + yaml.safe_dump(orig_pol, sort_keys=False)
+                '"variant": fp8\n' + yaml.safe_dump(orig_pol, sort_keys=False)
             )
             cfg1, _ = _run_worker("quoted_key")
             self.assertEqual(cfg1["hf_model_id"], fp8_id)
@@ -3811,6 +3861,165 @@ class PresetCatalogContractTest(unittest.TestCase):
             cfg3, _ = _run_worker("dual_hf_id")
             self.assertEqual(cfg3["hf_model_id"], fp8_id)
             self.assertEqual(cfg3["resolved_model"], expected_fp8_snap)
+
+    def test_review_regressions_canonical_topology_pd_pairs_rank_ranges_and_digests(
+        self,
+    ):
+        glm_path = REPO_ROOT / "test/ppu/recipes/zai-org/GLM-5.3.yaml"
+        glm_doc = _load_yaml(glm_path)
+
+        bad_decode_ep = copy.deepcopy(glm_doc)
+        bad_decode_ep["presets"]["decode_ep"] = {"hardware": "zhenwu_m890", "tp": 8}
+        with self.assertRaisesRegex(
+            ValidationError, "preset 'decode_ep' requires topology.kind='multi_node_ep'"
+        ):
+            validate_serving_recipe_structure(bad_decode_ep, context="bad_decode_ep")
+
+        for single_slot in ("prefill", "decode"):
+            bad_single_slot = copy.deepcopy(glm_doc)
+            bad_single_slot["presets"][single_slot] = copy.deepcopy(
+                glm_doc["presets"]["decode_ep"]
+            )
+            with self.assertRaisesRegex(ValidationError, "single_node"):
+                validate_serving_recipe_structure(
+                    bad_single_slot, context=f"bad_{single_slot}"
+                )
+
+        disjoint_pd = copy.deepcopy(glm_doc)
+        disjoint_pd["presets"]["pd_prefill"]["variants"] = ["default"]
+        disjoint_pd["presets"]["pd_decode"]["variants"] = ["fp8"]
+        with self.assertRaisesRegex(
+            ValidationError,
+            "pd_prefill and pd_decode must resolve to identical \\(variant, hardware\\) targets",
+        ):
+            validate_serving_recipe_structure(disjoint_pd, context="disjoint_pd")
+
+        bad_page = copy.deepcopy(glm_doc)
+        bad_page["presets"]["pd_decode"]["args"] = [
+            *bad_page["presets"]["pd_decode"]["args"],
+            "--page-size",
+            "128",
+        ]
+        with self.assertRaisesRegex(ValidationError, "--page-size mismatch"):
+            validate_serving_recipe_structure(bad_page, context="bad_pd_page")
+
+        ok_page = copy.deepcopy(bad_page)
+        ok_page["presets"]["pd_prefill"]["args"] = [
+            *ok_page["presets"]["pd_prefill"]["args"],
+            "--page-size",
+            "128",
+        ]
+        validate_serving_recipe_structure(ok_page, context="ok_pd_page")
+
+        bad_kv_dtype = copy.deepcopy(glm_doc)
+        bad_kv_dtype["presets"]["pd_decode"]["args"] = [
+            *bad_kv_dtype["presets"]["pd_decode"]["args"],
+            "--kv-cache-dtype",
+            "fp8_e5m2",
+        ]
+        with self.assertRaisesRegex(ValidationError, "--kv-cache-dtype mismatch"):
+            validate_serving_recipe_structure(bad_kv_dtype, context="bad_pd_kv_dtype")
+
+        bad_backend = copy.deepcopy(glm_doc)
+        d_args = bad_backend["presets"]["pd_decode"]["args"]
+        d_args[d_args.index("--disaggregation-transfer-backend") + 1] = "nixl"
+        with self.assertRaisesRegex(
+            ValidationError, "must use the same --disaggregation-transfer-backend"
+        ):
+            validate_serving_recipe_structure(bad_backend, context="bad_pd_backend")
+
+        fake_prefill = copy.deepcopy(glm_doc)
+        for role in ("pd_prefill", "pd_decode"):
+            r_args = fake_prefill["presets"][role]["args"]
+            r_args[r_args.index("--disaggregation-transfer-backend") + 1] = "fake"
+        with self.assertRaisesRegex(
+            ValidationError, "pd_prefill does not support .* 'fake'"
+        ):
+            validate_serving_recipe_structure(fake_prefill, context="fake_prefill")
+
+        bad_tp12_pp2 = copy.deepcopy(glm_doc)
+        bad_tp12_pp2["presets"]["decode_ep"] = {
+            "hardware": "zhenwu_m890",
+            "topology": {"kind": "multi_node_ep", "nodes": 3, "devices_per_node": 8},
+            "tp": 12,
+            "args": [
+                "--pp-size",
+                "2",
+                "--ep-size",
+                "12",
+                "--nnodes",
+                "3",
+                "--node-rank",
+                "{node_rank}",
+                "--dist-init-addr",
+                "{master_addr}:{master_port}",
+            ],
+        }
+        with self.assertRaisesRegex(
+            ValidationError, "assigns 12 workers per node|rank assignment incompatible"
+        ):
+            validate_serving_recipe_structure(bad_tp12_pp2, context="bad_tp12_pp2")
+
+        ok_tp8_pp3 = copy.deepcopy(bad_tp12_pp2)
+        ok_tp8_pp3["presets"]["decode_ep"]["tp"] = 8
+        ok_tp8_pp3["presets"]["decode_ep"]["args"] = [
+            "--pp-size",
+            "3",
+            "--ep-size",
+            "8",
+            "--nnodes",
+            "3",
+            "--node-rank",
+            "{node_rank}",
+            "--dist-init-addr",
+            "{master_addr}:{master_port}",
+        ]
+        validate_serving_recipe_structure(ok_tp8_pp3, context="ok_tp8_pp3")
+
+        bad_auto_pol = _load_yaml(DEFAULT_POLICY_ROOT / "models/glm-5.3.yaml")
+        bad_auto_pol["tiers"]["fast_sanity"]["layer_override"] = "auto"
+        with self.assertRaisesRegex(
+            ValidationError, "invalid fast sanity weight or layer policy"
+        ):
+            validate_policy_structure(bad_auto_pol, context="bad_auto_pol")
+        with self.assertRaisesRegex(
+            ValidationError, "layer_override must be a positive int or None"
+        ):
+            resolve_recipe(glm_path, layer_override="auto")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            rec_a = copy.deepcopy(glm_doc)
+            rec_b = copy.deepcopy(glm_doc)
+            rec_b["variants"]["fp8"]["assets"]["tokenizer"] = "glm-5.3-custom-tok"
+            rec_a_path = tmp_dir / "rec_a.yaml"
+            rec_b_path = tmp_dir / "rec_b.yaml"
+            rec_a_path.write_text(yaml.safe_dump(rec_a, sort_keys=False))
+            rec_b_path.write_text(yaml.safe_dump(rec_b, sort_keys=False))
+            assets_map = tmp_dir / "assets.yaml"
+            assets_map.write_text(
+                yaml.safe_dump(
+                    {
+                        "glm-5.3-fp8": "/models/glm-fp8",
+                        "glm-5.3-custom-tok": "/models/glm-tok",
+                    }
+                )
+            )
+            res_a = resolve_recipe(
+                rec_a_path, variant="fp8", assets_map_path=assets_map
+            )
+            res_b = resolve_recipe(
+                rec_b_path, variant="fp8", assets_map_path=assets_map
+            )
+            self.assertNotEqual(
+                res_a["resolved_tokenizer"], res_b["resolved_tokenizer"]
+            )
+            self.assertNotEqual(res_a["config_digest"], res_b["config_digest"])
+
+        with self.assertRaisesRegex(ValidationError, "invalid JSON"):
+            substitute_validation_placeholders(
+                ["--json-model-override-args", "{not-json"], {}
+            )
 
 
 if __name__ == "__main__":
