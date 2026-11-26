@@ -5,6 +5,7 @@ import io
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -29,11 +30,12 @@ from ppu_recipe import (
     validate_policy_structure,
 )
 from recipe_bundle import sha256, wheel_inventory
-from recipe_cluster_config import load_settings
-from recipe_cluster_diagnostics import diagnostic_codes
+from recipe_cluster_config import BACKEND_SHA, CONFIG_NAME, load_settings
+from recipe_cluster_diagnostics import diagnostic_codes, recent_failures
 from recipe_publish import publish, validate
 from recipe_report import legacy_result
 from recipe_report import main as report_recipe
+from recipe_retention import retain
 from recipe_runner import (
     cached_model_path,
     metrics_zero,
@@ -1123,6 +1125,620 @@ class ClusterConfigBootstrapTest(unittest.TestCase):
             )
             self.assertEqual(process.returncode, 29)
 
+    def test_cluster_config_resolves_retention_root_and_decouples_scratch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            workspace = root / "workspace"
+            runner_temp = root / "runner-temp"
+            staging_mount = root / "stage-mount"
+            tools = root / "bin"
+            backend = workspace / ".ppu-infra/cluster-run"
+            scripts = workspace / "scripts/ci/ppu"
+            config_dir = staging_mount / CONFIG_NAME
+            retained = config_dir / "output/retained"
+            env_archive = root / "env-archive"
+            cfg_archive = root / "cfg-archive"
+            for folder in (
+                workspace,
+                runner_temp,
+                backend,
+                tools,
+                config_dir,
+                retained,
+                env_archive,
+                cfg_archive,
+            ):
+                folder.mkdir(parents=True, exist_ok=True)
+            config_dir.chmod(0o700)
+            retained.chmod(0o700)
+            env_archive.chmod(0o755)
+            cfg_archive.chmod(0o755)
+            shutil.copytree(REPO_ROOT / "scripts/ci/ppu", scripts)
+            shutil.copytree(DEFAULT_POLICY_ROOT, workspace / "test/ppu/policy")
+            (backend / "action.yml").write_text(
+                f'STAGE_TARBALL="{staging_mount}/${{GITHUB_RUN_ID}}-bundle.tar.gz"\n',
+                encoding="utf-8",
+            )
+            (tools / "git").write_text(
+                f"#!/bin/bash\necho {BACKEND_SHA}\n", encoding="utf-8"
+            )
+            (tools / "git").chmod(0o700)
+            captured_path = root / "captured-env.json"
+            (scripts / "run_recipe_cluster.sh").write_text(
+                "#!/usr/bin/env bash\n"
+                f"{sys.executable} -c 'import json, os, sys; "
+                'open(sys.argv[1], "w").write(json.dumps({k: os.environ.get(k) for k in '
+                '("PPU_CI_K8S_HOST_SCRATCH_ROOT", "PPU_CI_PRIVATE_RESULTS_ROOT", '
+                '"PPU_CI_K8S_PRIVATE_WORKER_ROOT", "PPU_CI_K8S_LOADED_CONFIG_SHA256")}))\' '
+                f'"{captured_path}"\n',
+                encoding="utf-8",
+            )
+            (scripts / "run_recipe_cluster.sh").chmod(0o700)
+
+            def write_config(settings):
+                cfg = config_dir / "config.json"
+                cfg.write_text(json.dumps({"settings": settings}), encoding="utf-8")
+                cfg.chmod(0o600)
+                return sha256(cfg)
+
+            base_env = {
+                **os.environ,
+                "PATH": os.pathsep.join(
+                    (
+                        str(tools),
+                        str(Path(sys.executable).parent),
+                        os.environ["PATH"],
+                    )
+                ),
+                "GITHUB_WORKSPACE": str(workspace),
+                "RUNNER_TEMP": str(runner_temp),
+                "GITHUB_RUN_ID": "777",
+            }
+            base_env.pop("PPU_CI_PRIVATE_RESULTS_ROOT", None)
+
+            # 1. External env overrides config.json and keeps scratch on output/retained.
+            digest_with_cfg = write_config(
+                {
+                    "PPU_CI_K8S_PRIVATE_WORKER_ROOT": "/worker/retained",
+                    "PPU_CI_PRIVATE_RESULTS_ROOT": str(cfg_archive),
+                }
+            )
+            env_case = {
+                **base_env,
+                "PPU_CI_K8S_CONFIG_SHA256": digest_with_cfg,
+                "PPU_CI_PRIVATE_RESULTS_ROOT": str(env_archive),
+            }
+            check_env = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(scripts / "recipe_cluster_config.py"),
+                    "--check",
+                ],
+                cwd=workspace,
+                env=env_case,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(
+                check_env.returncode, 0, check_env.stdout + check_env.stderr
+            )
+            self.assertIn(
+                "PPU cluster private configuration verified", check_env.stdout
+            )
+            status_line = [
+                json.loads(line)["private_retention_check"]
+                for line in check_env.stdout.splitlines()
+                if line.startswith("{")
+            ][0]
+            self.assertEqual(
+                status_line,
+                {
+                    "external_retention_root": True,
+                    "retention_root_valid": True,
+                    "retention_source": "env",
+                    "retention_writable": True,
+                },
+            )
+            for secret in (str(env_archive), str(cfg_archive), str(staging_mount)):
+                self.assertNotIn(secret, check_env.stdout + check_env.stderr)
+            probe_dir = env_archive / "sglang/logs/sglang-for-sail"
+            self.assertTrue(probe_dir.is_dir())
+            self.assertEqual(list(probe_dir.glob(".probe-*")), [])
+
+            exec_env = subprocess.run(
+                [sys.executable, "-B", str(scripts / "recipe_cluster_config.py")],
+                cwd=workspace,
+                env=env_case,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(exec_env.returncode, 0, exec_env.stdout + exec_env.stderr)
+            captured = json.loads(captured_path.read_text(encoding="utf-8"))
+            self.assertEqual(captured["PPU_CI_K8S_HOST_SCRATCH_ROOT"], str(retained))
+            self.assertEqual(captured["PPU_CI_PRIVATE_RESULTS_ROOT"], str(env_archive))
+            self.assertEqual(
+                captured["PPU_CI_K8S_PRIVATE_WORKER_ROOT"], "/worker/retained"
+            )
+
+            # 2. Config value is used when env is unset or empty.
+            cfg_case = {
+                **base_env,
+                "PPU_CI_K8S_CONFIG_SHA256": digest_with_cfg,
+                "PPU_CI_PRIVATE_RESULTS_ROOT": "",
+            }
+            check_cfg = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(scripts / "recipe_cluster_config.py"),
+                    "--check",
+                ],
+                cwd=workspace,
+                env=cfg_case,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(
+                check_cfg.returncode, 0, check_cfg.stdout + check_cfg.stderr
+            )
+            cfg_status = [
+                json.loads(line)["private_retention_check"]
+                for line in check_cfg.stdout.splitlines()
+                if line.startswith("{")
+            ][0]
+            self.assertEqual(cfg_status["retention_source"], "config")
+            self.assertTrue(cfg_status["external_retention_root"])
+            self.assertNotIn(str(cfg_archive), check_cfg.stdout + check_cfg.stderr)
+
+            exec_cfg = subprocess.run(
+                [sys.executable, "-B", str(scripts / "recipe_cluster_config.py")],
+                cwd=workspace,
+                env=cfg_case,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(exec_cfg.returncode, 0, exec_cfg.stdout + exec_cfg.stderr)
+            captured = json.loads(captured_path.read_text(encoding="utf-8"))
+            self.assertEqual(captured["PPU_CI_K8S_HOST_SCRATCH_ROOT"], str(retained))
+            self.assertEqual(captured["PPU_CI_PRIVATE_RESULTS_ROOT"], str(cfg_archive))
+
+            # 3. Fallback to output/retained when neither env nor config sets it.
+            digest_fallback = write_config(
+                {"PPU_CI_K8S_PRIVATE_WORKER_ROOT": "/worker/retained"}
+            )
+            fallback_case = {
+                **base_env,
+                "PPU_CI_K8S_CONFIG_SHA256": digest_fallback,
+            }
+            check_fallback = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(scripts / "recipe_cluster_config.py"),
+                    "--check",
+                ],
+                cwd=workspace,
+                env=fallback_case,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(
+                check_fallback.returncode,
+                0,
+                check_fallback.stdout + check_fallback.stderr,
+            )
+            fb_status = [
+                json.loads(line)["private_retention_check"]
+                for line in check_fallback.stdout.splitlines()
+                if line.startswith("{")
+            ][0]
+            self.assertEqual(
+                fb_status,
+                {
+                    "external_retention_root": False,
+                    "retention_root_valid": True,
+                    "retention_source": "fallback",
+                    "retention_writable": True,
+                },
+            )
+            self.assertNotIn(
+                str(retained), check_fallback.stdout + check_fallback.stderr
+            )
+
+            exec_fallback = subprocess.run(
+                [sys.executable, "-B", str(scripts / "recipe_cluster_config.py")],
+                cwd=workspace,
+                env=fallback_case,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(
+                exec_fallback.returncode, 0, exec_fallback.stdout + exec_fallback.stderr
+            )
+            captured = json.loads(captured_path.read_text(encoding="utf-8"))
+            self.assertEqual(captured["PPU_CI_K8S_HOST_SCRATCH_ROOT"], str(retained))
+            self.assertEqual(captured["PPU_CI_PRIVATE_RESULTS_ROOT"], str(retained))
+
+            # 4. Invalid external roots fail closed without leaking paths.
+            bad_symlink = root / "bad-link"
+            bad_symlink.symlink_to(env_archive)
+            bad_mode = root / "bad-mode"
+            bad_mode.mkdir()
+            bad_mode.chmod(0o777)
+            bad_ephemeral = runner_temp / "nested"
+            bad_ephemeral.mkdir(mode=0o700)
+            for bad_root in (bad_symlink, bad_mode, bad_ephemeral):
+                with self.subTest(bad_root=bad_root.name):
+                    bad_proc = subprocess.run(
+                        [
+                            sys.executable,
+                            "-B",
+                            str(scripts / "recipe_cluster_config.py"),
+                            "--check",
+                        ],
+                        cwd=workspace,
+                        env={
+                            **fallback_case,
+                            "PPU_CI_PRIVATE_RESULTS_ROOT": str(bad_root),
+                        },
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    self.assertEqual(bad_proc.returncode, 2)
+                    self.assertNotIn(str(bad_root), bad_proc.stdout + bad_proc.stderr)
+                    self.assertNotIn(str(root), bad_proc.stdout + bad_proc.stderr)
+                    bad_status = [
+                        json.loads(line)["private_retention_check"]
+                        for line in bad_proc.stdout.splitlines()
+                        if line.startswith("{")
+                    ][0]
+                    self.assertTrue(bad_status["external_retention_root"])
+                    self.assertFalse(bad_status["retention_root_valid"])
+                    self.assertFalse(bad_status["retention_writable"])
+
+            # 5. Normal Recipe exec path fails fast on unwritable external archive,
+            #    while legacy tier bypasses archive probing.
+            ro_archive = root / "ro-archive"
+            ro_base = ro_archive / "sglang/logs/sglang-for-sail"
+            ro_base.mkdir(parents=True)
+            ro_archive.chmod(0o755)
+            (ro_archive / "sglang").chmod(0o755)
+            (ro_archive / "sglang/logs").chmod(0o755)
+            ro_base.chmod(0o500)
+            try:
+                for tier in ("fast_sanity", "model_sanity"):
+                    with self.subTest(fail_fast_tier=tier):
+                        if captured_path.exists():
+                            captured_path.unlink()
+                        blocked = subprocess.run(
+                            [
+                                sys.executable,
+                                "-B",
+                                str(scripts / "recipe_cluster_config.py"),
+                            ],
+                            cwd=workspace,
+                            env={
+                                **fallback_case,
+                                "TIER": tier,
+                                "PPU_CI_PRIVATE_RESULTS_ROOT": str(ro_archive),
+                            },
+                            capture_output=True,
+                            text=True,
+                            timeout=10,
+                        )
+                        self.assertEqual(blocked.returncode, 2)
+                        self.assertFalse(captured_path.exists())
+                        self.assertNotIn(
+                            str(ro_archive), blocked.stdout + blocked.stderr
+                        )
+                        blocked_status = [
+                            json.loads(line)["private_retention_check"]
+                            for line in blocked.stdout.splitlines()
+                            if line.startswith("{")
+                        ][0]
+                        self.assertTrue(blocked_status["external_retention_root"])
+                        self.assertFalse(blocked_status["retention_writable"])
+
+                if captured_path.exists():
+                    captured_path.unlink()
+                legacy_exec = subprocess.run(
+                    [sys.executable, "-B", str(scripts / "recipe_cluster_config.py")],
+                    cwd=workspace,
+                    env={
+                        **fallback_case,
+                        "TIER": "legacy",
+                        "PPU_CI_PRIVATE_RESULTS_ROOT": str(ro_archive),
+                    },
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(
+                    legacy_exec.returncode, 0, legacy_exec.stdout + legacy_exec.stderr
+                )
+                self.assertTrue(captured_path.exists())
+            finally:
+                ro_base.chmod(0o700)
+
+            # 6. Pre-migration diagnostics under retained/sglang-for-sail remain
+            #    visible via --check when switching to a fresh external archive root.
+            fresh_archive = root / "fresh-archive"
+            fresh_archive.mkdir(mode=0o755)
+            fresh_archive.chmod(0o755)
+            (fresh_archive / "sglang/logs/sglang-for-sail/99999-1/results").mkdir(
+                parents=True
+            )
+            old_run = retained / "sglang-for-sail/770-1/fast_sanity/qwen3.8-27b"
+            old_run.mkdir(parents=True)
+            (old_run / "index.json").write_text("{}", encoding="utf-8")
+            (old_run / "launcher.log").write_text(
+                "ImagePullBackOff failed to pull image\n", encoding="utf-8"
+            )
+            migrated_check = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(scripts / "recipe_cluster_config.py"),
+                    "--check",
+                ],
+                cwd=workspace,
+                env={
+                    **fallback_case,
+                    "PPU_CI_PRIVATE_RESULTS_ROOT": str(fresh_archive),
+                },
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(
+                migrated_check.returncode,
+                0,
+                migrated_check.stdout + migrated_check.stderr,
+            )
+            diag_lines = [
+                json.loads(line)["prior_cluster_diagnostics"]
+                for line in migrated_check.stdout.splitlines()
+                if line.startswith('{"prior_cluster_diagnostics"')
+            ]
+            self.assertEqual(
+                diag_lines,
+                [
+                    [
+                        {
+                            "codes": ["image_pull"],
+                            "model": "qwen3.8-27b",
+                            "run_id": 770,
+                            "tier": "fast_sanity",
+                        }
+                    ]
+                ],
+            )
+            self.assertNotIn(
+                str(fresh_archive), migrated_check.stdout + migrated_check.stderr
+            )
+            self.assertNotIn(
+                str(retained), migrated_check.stdout + migrated_check.stderr
+            )
+
+    def test_same_parent_run_retains_both_source_versions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            archive = root / "archive"
+            archive.mkdir(mode=0o700)
+            source = root / "scratch"
+            (source / "results").mkdir(parents=True)
+            (source / "results/summary.json").write_text('{"outcome": "pass"}')
+            (source / "launcher.log").write_text("ok\n")
+            (source / "provenance.json").write_text(
+                json.dumps(
+                    {
+                        "runtime_image": fast_result()["runtime_image"],
+                        "recipe_tree_sha256": "c" * 64,
+                    }
+                )
+            )
+            env = {
+                "TIER": "model_sanity",
+                "MODEL_KEY": "glm-5.3-flash",
+                "GITHUB_RUN_ID": "12345",
+                "GITHUB_RUN_ATTEMPT": "1",
+                "PPU_CI_PRIVATE_RESULTS_ROOT": str(archive),
+                "RUNNER_TEMP": str(root / "runner-temp"),
+                "GITHUB_WORKSPACE": str(root / "workspace"),
+                "PPU_CI_ARTIFACT_DIR": str(source),
+                "RECIPE_OUTCOME": "success",
+            }
+            for attempt, use_report in (("1", False), ("2", True)):
+                run = archive / "sglang/logs/sglang-for-sail" / f"12345-{attempt}"
+                env["GITHUB_RUN_ATTEMPT"] = attempt
+                for checkout_sha in ("a" * 40, "b" * 40):
+                    env["PPU_CI_SOURCE_SHA"] = checkout_sha
+                    with self.subTest(attempt=attempt, sha=checkout_sha):
+                        if use_report:
+                            report = root / f"report-{checkout_sha[:12]}.json"
+                            with (
+                                patch.dict(os.environ, env),
+                                patch.object(
+                                    sys, "argv", ["recipe_report", str(report)]
+                                ),
+                            ):
+                                self.assertEqual(report_recipe(), 0)
+                            result = json.loads(report.read_text())
+                            self.assertEqual(result["outcome"], "pass")
+                            self.assertIs(result["private_retention"], True)
+                            self.assertEqual(result["source_sha"], checkout_sha)
+                        else:
+                            retain(env)
+                        scope = run / checkout_sha[:12]
+                        tier = scope / env["TIER"]
+                        dest = tier / env["MODEL_KEY"]
+                        index_path = dest / "index.json"
+                        self.assertEqual(
+                            json.loads(index_path.read_text()),
+                            {
+                                "checkout_sha": checkout_sha,
+                                "run_id": env["GITHUB_RUN_ID"],
+                                "attempt": attempt,
+                                "tier": env["TIER"],
+                                "model_key": env["MODEL_KEY"],
+                                "files": {
+                                    name: sha256(dest / name)
+                                    for name in (
+                                        "launcher.log",
+                                        "summary.json",
+                                        "provenance.json",
+                                    )
+                                },
+                            },
+                        )
+                        for directory in (run, scope, tier, dest):
+                            self.assertEqual(
+                                stat.S_IMODE(directory.lstat().st_mode), 0o700
+                            )
+                        self.assertEqual(
+                            stat.S_IMODE(index_path.lstat().st_mode), 0o600
+                        )
+                        with self.assertRaisesRegex(
+                            FileExistsError, "retention destination already exists"
+                        ):
+                            retain(env)
+
+    def test_recent_failures_combines_source_scopes_and_legacy_layout(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run = root / "sglang/logs/sglang-for-sail/12345-2"
+            for scope, log in (
+                ("a" * 12, "ImagePullBackOff"),
+                ("b" * 12, "ImagePullBackOff\nInsufficient cpu"),
+                ("", "permission denied"),
+            ):
+                model = run / scope / "model_sanity/glm-5.3-flash"
+                model.mkdir(parents=True)
+                (model / "index.json").write_text("{}")
+                (model / "launcher.log").write_text(log)
+
+            self.assertEqual(
+                recent_failures(root, 12346),
+                [
+                    {
+                        "run_id": 12345,
+                        "tier": "model_sanity",
+                        "model": "glm-5.3-flash",
+                        "codes": ["capacity_cpu", "image_pull", "permission_denied"],
+                    }
+                ],
+            )
+
+    def test_retain_accepts_0755_prefix_dirs_and_rejects_bad_run_dir_or_symlink(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            archive = root / "archive"
+            workspace = root / "workspace"
+            runner_temp = root / "runner-temp"
+            source_dir = root / "scratch"
+            for folder in (archive, workspace, runner_temp, source_dir / "results"):
+                folder.mkdir(parents=True, exist_ok=True)
+            archive.chmod(0o755)
+            (archive / "sglang").mkdir(mode=0o755)
+            (archive / "sglang").chmod(0o755)
+            (archive / "sglang/logs").mkdir(mode=0o755)
+            (archive / "sglang/logs").chmod(0o755)
+            (source_dir / "launcher.log").write_text("ok\n", encoding="utf-8")
+            (source_dir / "results/summary.json").write_text("{}", encoding="utf-8")
+            (source_dir / "provenance.json").write_text("{}", encoding="utf-8")
+
+            env = {
+                "PPU_CI_SOURCE_SHA": "a" * 40,
+                "TIER": "fast_sanity",
+                "MODEL_KEY": "qwen3.8-27b",
+                "GITHUB_RUN_ID": "12345",
+                "GITHUB_RUN_ATTEMPT": "2",
+                "PPU_CI_PRIVATE_RESULTS_ROOT": str(archive),
+                "RUNNER_TEMP": str(runner_temp),
+                "GITHUB_WORKSPACE": str(workspace),
+                "PPU_CI_ARTIFACT_DIR": str(source_dir),
+                "RECIPE_OUTCOME": "success",
+            }
+            retain(env)
+
+            dest = (
+                archive
+                / "sglang/logs/sglang-for-sail/12345-2/aaaaaaaaaaaa/fast_sanity/qwen3.8-27b"
+            )
+            self.assertTrue((dest / "index.json").is_file())
+            self.assertTrue((dest / "launcher.log").is_file())
+            self.assertEqual(
+                stat.S_IMODE((archive / "sglang/logs").lstat().st_mode), 0o755
+            )
+            self.assertEqual(
+                stat.S_IMODE(
+                    (archive / "sglang/logs/sglang-for-sail/12345-2").lstat().st_mode
+                ),
+                0o700,
+            )
+            self.assertEqual(
+                stat.S_IMODE(
+                    (
+                        archive
+                        / "sglang/logs/sglang-for-sail/12345-2/aaaaaaaaaaaa/fast_sanity"
+                    )
+                    .lstat()
+                    .st_mode
+                ),
+                0o700,
+            )
+
+            # Single-run directory must remain strict 0o700.
+            bad_run = archive / "sglang/logs/sglang-for-sail/12346-1"
+            bad_run.mkdir(mode=0o755)
+            bad_run.chmod(0o755)
+            with self.assertRaisesRegex(
+                ValueError, "unexpected retention directory type or mode"
+            ):
+                retain({**env, "GITHUB_RUN_ID": "12346", "GITHUB_RUN_ATTEMPT": "1"})
+
+            bad_scope = archive / "sglang/logs/sglang-for-sail/12345-2" / ("b" * 12)
+            bad_scope.mkdir(mode=0o755)
+            bad_scope.chmod(0o755)
+            bad_scope_env = {**env, "PPU_CI_SOURCE_SHA": "b" * 40}
+            with self.assertRaisesRegex(
+                ValueError, "unexpected retention directory type or mode"
+            ):
+                retain(bad_scope_env)
+            bad_scope.rmdir()
+            bad_scope.symlink_to(bad_scope.with_name("a" * 12))
+            with self.assertRaisesRegex(
+                ValueError, "unexpected retention directory type or mode"
+            ):
+                retain(bad_scope_env)
+
+            # Symlink prefix component must be rejected.
+            sym_archive = root / "sym-archive"
+            sym_archive.mkdir(mode=0o755)
+            sym_archive.chmod(0o755)
+            (sym_archive / "sglang").symlink_to(archive / "sglang")
+            with self.assertRaisesRegex(
+                ValueError, "unexpected retention directory type or mode"
+            ):
+                retain({**env, "PPU_CI_PRIVATE_RESULTS_ROOT": str(sym_archive)})
+
+            # Effective archive base overlapping workspace must be rejected, and
+            # missing RUNNER_TEMP must raise ValueError instead of KeyError.
+            overlap_ws = archive / "sglang"
+            with self.assertRaisesRegex(ValueError, "must not be job-local"):
+                retain({**env, "GITHUB_WORKSPACE": str(overlap_ws)})
+            missing_temp_env = {k: v for k, v in env.items() if k != "RUNNER_TEMP"}
+            with self.assertRaisesRegex(ValueError, "missing runner workspace path"):
+                retain(missing_temp_env)
+
 
 @unittest.skipUnless(
     all(shutil.which(tool) for tool in ("jq", "sha256sum")),
@@ -1294,6 +1910,140 @@ class ClusterTransportTest(unittest.TestCase):
                     )
                 (original_log,) = retained.glob("cluster.*/launcher.log")
                 self.assertIn(injected, original_log.read_text())
+                if not tampered:
+                    archived_index = (
+                        retained
+                        / "sglang/logs/sglang-for-sail/12-1/aaaaaaaaaaaa/fast_sanity"
+                        / model
+                        / "index.json"
+                    )
+                    self.assertTrue(archived_index.is_file())
+
+    def test_cluster_transport_separates_scratch_from_external_archive_root(self):
+        with tempfile.TemporaryDirectory() as temp:
+            result = dict(fast_result(), model="qwen3.8-27b")
+            root = Path(temp).resolve()
+            workspace = root / "checkout"
+            staging = root / "staging"
+            scratch = root / "scratch"
+            archive = root / "external-archive"
+            tools = root / "bin"
+            backend = workspace / ".ppu-infra/cluster-run/scripts"
+            payloads = workspace / "wheels"
+            for folder in (staging, scratch, archive, tools, backend, payloads):
+                folder.mkdir(parents=True)
+            scratch.chmod(0o700)
+            archive.chmod(0o755)
+            (archive / "sglang").mkdir(mode=0o755)
+            (archive / "sglang").chmod(0o755)
+            (archive / "sglang/logs").mkdir(mode=0o755)
+            (archive / "sglang/logs").chmod(0o755)
+            scripts = workspace / "scripts/ci/ppu"
+            shutil.copytree(REPO_ROOT / "scripts/ci/ppu", scripts)
+            shutil.copytree(DEFAULT_POLICY_ROOT, workspace / "test/ppu/policy")
+            (scripts / "recipe_bundle.py").write_text("# Verified separately\n")
+            (payloads / "recipe-manifest.json").write_text(
+                json.dumps({"recipe_tree_sha256": result["recipe_tree_sha256"]})
+            )
+            summary = {
+                "outcome": "pass",
+                "parser_checked": True,
+                "sse_verified": True,
+                "cold_start_s": 3.0,
+                "queue_s": 0,
+                "layer_override": None,
+                "config_digest": result["config_digest"],
+            }
+            (workspace / "fixture.json").write_text(json.dumps(summary))
+            (tools / "git").write_text(
+                f'#!/bin/bash\ncase "$1" in -C) echo {BACKEND_SHA};; '
+                f"*) echo {result['source_sha']};; esac\n"
+            )
+            kube_content = json.dumps(
+                {
+                    "status": {
+                        "containerStatuses": [
+                            {
+                                "name": "worker",
+                                "imageID": "docker-pullable://registry.internal/team/sglang"
+                                + result["runtime_image"],
+                            }
+                        ]
+                    }
+                }
+            )
+            (tools / "kubectl").write_text(
+                f"#!/bin/bash\nif [[ \"$*\" == *'get pod '* ]]; then echo '{kube_content}'; fi\n"
+            )
+            (tools / "timeout").write_text('#!/bin/bash\nshift\nexec "$@"\n')
+            for tool in tools.iterdir():
+                tool.chmod(0o700)
+            (backend / "submit.sh").write_text(
+                'printf "job_status=scheduled\\nstart_time=1\\ndeadline=2\\nqueue_duration_seconds=3\\n" >> "$GITHUB_OUTPUT"\n'
+            )
+            (backend / "monitor.sh").write_text(
+                'mkdir -p "$PPU_CI_WORKER_ARTIFACT_DIR/results"\n'
+                'cp fixture.json "$PPU_CI_WORKER_ARTIFACT_DIR/results/summary.json"\n'
+                'echo job_status=succeeded >> "$GITHUB_OUTPUT"\n'
+            )
+            (backend / "cleanup.sh").write_text(
+                'unlink "$SOURCE_STAGE_DIR"\nrmdir "$(dirname "$SOURCE_STAGE_DIR")"\n'
+            )
+            export_env = {
+                **os.environ,
+                "PATH": os.pathsep.join(
+                    (
+                        str(tools),
+                        str(Path(sys.executable).parent),
+                        os.environ["PATH"],
+                    )
+                ),
+                "TIER": "fast_sanity",
+                "MODEL_KEY": "qwen3.8-27b",
+                "RECIPE_PPU_COUNT": "2",
+                "GITHUB_OUTPUT": str(root / "gha-output"),
+                "PPU_PUBLIC_SUMMARY": str(root / "gha-summary"),
+                "GITHUB_WORKSPACE": str(workspace),
+                "RUNNER_TEMP": str(root / "runner-temp"),
+                "GITHUB_RUN_ID": "42",
+                "GITHUB_RUN_ATTEMPT": "1",
+                "PPU_CI_K8S_CONFIG_SHA256": "",
+                "PPU_CI_K8S_LOADED_CONFIG_SHA256": "",
+                "PPU_CI_K8S_HOST_SCRATCH_ROOT": str(scratch),
+                "PPU_CI_K8S_PRIVATE_WORKER_ROOT": str(scratch),
+                "PPU_CI_PRIVATE_RESULTS_ROOT": str(archive),
+                "PPU_CI_K8S_STAGE_ROOT": str(staging),
+                "PPU_CI_SOURCE_SHA": result["source_sha"],
+                "PPU_CI_JIT_ROOT": str(root / "jit"),
+                "PPU_CI_HF_CACHE_ROOT": str(root / "cache"),
+                "PPU_CI_K8S_RUNTIME_DIGEST": "registry.internal/team/sglang"
+                + result["runtime_image"],
+            }
+            process = subprocess.run(
+                ["bash", str(scripts / "run_recipe_cluster.sh")],
+                cwd=workspace,
+                env=export_env,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+            self.assertEqual(len(list(scratch.glob("cluster.*/launcher.log"))), 1)
+            self.assertEqual(list(archive.glob("cluster.*")), [])
+            archived_dir = (
+                archive
+                / "sglang/logs/sglang-for-sail/42-1/aaaaaaaaaaaa/fast_sanity/qwen3.8-27b"
+            )
+            self.assertTrue((archived_dir / "index.json").is_file())
+            self.assertTrue((archived_dir / "launcher.log").is_file())
+            public_text = (
+                (workspace / "ppu-public/recipe.json").read_text()
+                + (root / "gha-summary").read_text()
+                + process.stdout
+                + process.stderr
+            )
+            self.assertNotIn(str(archive), public_text)
+            self.assertNotIn(str(scratch), public_text)
 
     def test_cluster_diagnostics_classifies_server_logs_and_startup_phases(self):
         import recipe_cluster_diagnostics
@@ -1305,13 +2055,18 @@ class ClusterTransportTest(unittest.TestCase):
             self.assertIn(phase, recipe_diagnostics.PHASES)
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
-            fast_dir = root / "sglang-for-sail/45014946019-1/fast_sanity/qwen3.8-27b"
+            fast_dir = (
+                root
+                / "sglang/logs/sglang-for-sail/45014946019-1/fast_sanity/qwen3.8-27b"
+            )
             fast_dir.mkdir(parents=True)
             (fast_dir / "index.json").write_text("{}")
             (fast_dir / "sglang_serve_fast_full.log").write_text(
                 "ModuleNotFoundError: No module named 'blake3'\n"
             )
-            nightly_dir = root / "sglang-for-sail/45055310116-1/model_sanity/glm-5.3"
+            nightly_dir = (
+                root / "sglang/logs/sglang-for-sail/45055310116-1/model_sanity/glm-5.3"
+            )
             nightly_dir.mkdir(parents=True)
             (nightly_dir / "index.json").write_text("{}")
             (nightly_dir / "bench-warmup-1.log").write_text(
@@ -1330,6 +2085,127 @@ class ClusterTransportTest(unittest.TestCase):
                         "tier": "model_sanity",
                         "model": "glm-5.3",
                         "codes": ["missing_triton_kernels", "python_import"],
+                    }
+                ],
+            )
+
+        with tempfile.TemporaryDirectory() as legacy_root:
+            root = Path(legacy_root)
+            (root / "sglang/logs/sglang-for-sail").mkdir(parents=True)
+            legacy_dir = root / "sglang-for-sail/45014946019-1/fast_sanity/qwen3.8-27b"
+            legacy_dir.mkdir(parents=True)
+            (legacy_dir / "index.json").write_text("{}")
+            (legacy_dir / "launcher.log").write_text(
+                "ImagePullBackOff failed to pull image\n"
+            )
+            records = recipe_cluster_diagnostics.recent_failures(root, 45055310117)
+            self.assertEqual(
+                records,
+                [
+                    {
+                        "run_id": 45014946019,
+                        "tier": "fast_sanity",
+                        "model": "qwen3.8-27b",
+                        "codes": ["image_pull"],
+                    }
+                ],
+            )
+
+        for layout in ("sglang/logs/sglang-for-sail", "sglang-for-sail"):
+            for link_level in ("tier", "model", "index", "log"):
+                with (
+                    self.subTest(layout=layout, link_level=link_level),
+                    tempfile.TemporaryDirectory() as outer_tmp,
+                ):
+                    outer = Path(outer_tmp)
+                    root = outer / "archive"
+                    outside = outer / "outside"
+                    outside_model = outside / "qwen3.8-27b"
+                    outside_model.mkdir(parents=True)
+                    (outside_model / "index.json").write_text("{}")
+                    (outside_model / "launcher.log").write_text(
+                        "ImagePullBackOff failed to pull image\n"
+                    )
+                    run_dir = root / layout / "775-1"
+                    if link_level == "tier":
+                        run_dir.mkdir(parents=True)
+                        (run_dir / "fast_sanity").symlink_to(outside)
+                    elif link_level == "model":
+                        (run_dir / "fast_sanity").mkdir(parents=True)
+                        (run_dir / "fast_sanity/qwen3.8-27b").symlink_to(outside_model)
+                    elif link_level == "index":
+                        model_dir = run_dir / "fast_sanity/qwen3.8-27b"
+                        model_dir.mkdir(parents=True)
+                        (model_dir / "index.json").symlink_to(
+                            outside_model / "index.json"
+                        )
+                        (model_dir / "launcher.log").write_text(
+                            "ImagePullBackOff failed to pull image\n"
+                        )
+                    else:
+                        model_dir = run_dir / "fast_sanity/qwen3.8-27b"
+                        model_dir.mkdir(parents=True)
+                        (model_dir / "index.json").write_text("{}")
+                        (model_dir / "launcher.log").symlink_to(
+                            outside_model / "launcher.log"
+                        )
+                    self.assertEqual(
+                        recipe_cluster_diagnostics.recent_failures(root, 776), []
+                    )
+
+        for layout in ("sglang/logs/sglang-for-sail", "sglang-for-sail"):
+            for non_regular in ("dir", "fifo"):
+                if non_regular == "fifo" and not hasattr(os, "mkfifo"):
+                    continue
+                with (
+                    self.subTest(layout=layout, non_regular=non_regular),
+                    tempfile.TemporaryDirectory() as outer_tmp,
+                ):
+                    root = Path(outer_tmp) / "archive"
+                    model_dir = root / layout / "775-1/fast_sanity/qwen3.8-27b"
+                    model_dir.mkdir(parents=True)
+                    (model_dir / "index.json").write_text("{}")
+                    log_path = model_dir / "launcher.log"
+                    if non_regular == "dir":
+                        log_path.mkdir()
+                    else:
+                        os.mkfifo(log_path)
+                    self.assertEqual(
+                        recipe_cluster_diagnostics.recent_failures(root, 776), []
+                    )
+
+        # Transient OSError while listing a candidate parent falls back cleanly.
+        with tempfile.TemporaryDirectory() as outer_tmp:
+            outer = Path(outer_tmp)
+            primary = outer / "external"
+            fallback = outer / "retained"
+            blocked_parent = primary / "sglang/logs/sglang-for-sail"
+            blocked_parent.mkdir(parents=True)
+            legacy_dir = fallback / "sglang-for-sail/774-1/fast_sanity/qwen3.8-27b"
+            legacy_dir.mkdir(parents=True)
+            (legacy_dir / "index.json").write_text("{}")
+            (legacy_dir / "launcher.log").write_text("ImagePullBackOff failed\n")
+            real_iterdir = Path.iterdir
+
+            def flaky_iterdir(self_path):
+                if self_path == blocked_parent:
+                    raise PermissionError("transient nfs error")
+                return real_iterdir(self_path)
+
+            with patch.object(
+                Path, "iterdir", autospec=True, side_effect=flaky_iterdir
+            ):
+                records = recipe_cluster_diagnostics.recent_failures(
+                    primary, 776, fallback_root=fallback
+                )
+            self.assertEqual(
+                records,
+                [
+                    {
+                        "run_id": 774,
+                        "tier": "fast_sanity",
+                        "model": "qwen3.8-27b",
+                        "codes": ["image_pull"],
                     }
                 ],
             )

@@ -87,6 +87,21 @@ struct IndexPacked {
   uint32_t exponent[2];  // blocks {0, 1} then {2, 3}, by half of the warp
 };
 
+#if defined(SGL_SAIL_DSV4_INDEX_Q_BUILD) && defined(__HGGCCC__) && SGL_CUDA_ARCH >= 890
+#define SGL_DSV4_INDEX_Q_PPU_E2M1
+
+/// Pack two FP32 values with the PPU E2M1 conversion instruction.
+SGL_DEVICE uint32_t index_q_pack_e2m1(fp32x2_t x) {
+  // The software encoder saturates NaNs to signed 6 via fminf(fabsf(x), 6).
+  // Preserve that behavior while passing finite values and infinities through.
+  x.x = isnan(x.x) ? copysignf(6.0f, x.x) : x.x;
+  x.y = isnan(x.y) ? copysignf(6.0f, x.y) : x.y;
+  uint32_t packed;
+  asm("{ .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %2, %1; cvt.u32.u8 %0, t; }" : "=r"(packed) : "f"(x.x), "f"(x.y));
+  return packed;
+}
+#endif
+
 /// \brief The whole shared body of both directions: RoPE tail, both fp4 stages,
 ///        and the indexer's pack.
 ///
@@ -107,10 +122,17 @@ SGL_DEVICE IndexPacked index_rope_quant_pack(fp32x2_t head, fp32x2_t tail, fp32x
   float data[4];
   data[0] = head.x;
   data[1] = head.y;
-  // The contraction is spelled out so `index_q_block_kernel` matches it bit for bit;
   // `rope_tail` ends in `.to(x.dtype)`, so the rotated pair is rounded again.
+#ifdef __HGGCCC__
+  // Match SAIL's original split-chain contraction before the BF16 round trip.
+  // Forcing the CUDA FMA order can move a midpoint and change a packed FP4 byte.
+  const auto rotated =
+      cast<fp32x2_t>(cast<bf16x2_t>(fp32x2_t{tail.x * freq.x - tail.y * freq.y, tail.x * freq.y + tail.y * freq.x}));
+#else
+  // Spell out CUDA's contraction so `index_q_block_kernel` matches bit for bit.
   const auto rotated = cast<fp32x2_t>(cast<bf16x2_t>(fp32x2_t{
       __fmaf_rn(tail.x, freq.x, -__fmul_rn(tail.y, freq.y)), __fmaf_rn(tail.x, freq.y, __fmul_rn(tail.y, freq.x))}));
+#endif
   data[2] = rotated.x;
   data[3] = rotated.y;
 
@@ -120,7 +142,14 @@ SGL_DEVICE IndexPacked index_rope_quant_pack(fp32x2_t head, fp32x2_t tail, fp32x
   for (uint32_t half = 0; half < 2; ++half) {
     const auto amax = warp::reduce_max<kHalfLanes>(fmaxf(fabsf(data[half * 2]), fabsf(data[half * 2 + 1])));
     const auto [scale, inv_scale] = fp4::block_scale(amax);
-    const auto q = fp4::fake_quant_x2({data[half * 2], data[half * 2 + 1]}, scale, inv_scale);
+    const fp32x2_t pair{data[half * 2], data[half * 2 + 1]};
+#ifdef SGL_DSV4_INDEX_Q_PPU_E2M1
+    const auto code = index_q_pack_e2m1({__fmaf_rn(pair.x, inv_scale, 0.0f), __fmaf_rn(pair.y, inv_scale, 0.0f)});
+    // Decode the nibbles in software on PPU.
+    const fp32x2_t q{fp4::e2m1_value(code) * scale, fp4::e2m1_value(code >> 4) * scale};
+#else
+    const auto q = fp4::fake_quant_x2(pair, scale, inv_scale);
+#endif
     data[half * 2 + 0] = q.x;
     data[half * 2 + 1] = q.y;
   }
@@ -135,16 +164,20 @@ SGL_DEVICE IndexPacked index_rope_quant_pack(fp32x2_t head, fp32x2_t tail, fp32x
     // `inv_scale_ue8m0` instead of the reference's division: the scale is a
     // power of two, so both are exact except at the unreachable exponent 254.
     const auto inv_scale = deepseek_v4::fp8::inv_scale_ue8m0(static_cast<int32_t>(out.exponent[half]));
-#ifndef SGL_SOFTWARE_E2M1
-    const auto code = __nv_cvt_float2_to_fp4x2(
-        fp32x2_t{data[half * 2] * inv_scale, data[half * 2 + 1] * inv_scale}, __NV_E2M1, cudaRoundNearest);
+    const fp32x2_t scaled{data[half * 2] * inv_scale, data[half * 2 + 1] * inv_scale};
+#if defined(SGL_DSV4_INDEX_Q_PPU_E2M1)
+    const auto code = index_q_pack_e2m1(scaled);
+#elif defined(SGL_SOFTWARE_E2M1)
+    const auto code = fp4::e2m1x2_code(scaled);
 #else
-    const auto code = fp4::e2m1x2_code(fp32x2_t{data[half * 2] * inv_scale, data[half * 2 + 1] * inv_scale});
+    const auto code = __nv_cvt_float2_to_fp4x2(scaled, __NV_E2M1, cudaRoundNearest);
 #endif
     out.payload[half] = clear_negative_zero(static_cast<uint32_t>(code));
   }
   return out;
 }
+
+#undef SGL_DSV4_INDEX_Q_PPU_E2M1
 
 /// \brief The row's four block exponents, packed little-endian into one word.
 ///
@@ -295,7 +328,9 @@ __global__ __launch_bounds__(kFp4RopeWarpsPerCTA* device::kWarpThreads) void ind
   }
 }
 
-#ifndef USE_ROCM
+// This SM100 block specialization uses NVIDIA FP4 intrinsics. HGCC keeps the
+// warp kernel, with the Q-only PPU packing path selected below its own guard.
+#if !defined(USE_ROCM) && !defined(__HGGCCC__)
 /// Threads per CTA of `index_q_block_kernel`: 64 (token, head) rows.
 constexpr uint32_t kIndexQBlockThreads = 256;
 
@@ -434,7 +469,7 @@ __global__ __launch_bounds__(kIndexQBlockThreads) void index_q_block_kernel(cons
     }
   }
 }
-#endif  // USE_ROCM
+#endif  // !USE_ROCM && !__HGGCCC__
 
 /// \brief Host side of `index_k_kernel`.
 template <int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, uint32_t kRatio, bool kUsePDL>
@@ -503,7 +538,7 @@ struct IndexQKernel {
 
   template <typename PosT, bool kWeights>
   static constexpr auto kernel = index_q_kernel<kUsePDL, kHeadDim, kRopeDim, PosT, kWeights>;
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && !defined(__HGGCCC__)
   template <typename PosT, bool kWeights>
   static constexpr auto block_kernel = index_q_block_kernel<kUsePDL, kHeadDim, kRopeDim, PosT, kWeights>;
   /// (token, head) rows from which SM100-family GPUs take `index_q_block_kernel`:
@@ -593,7 +628,7 @@ struct IndexQKernel {
         .heads = static_cast<uint32_t>(H.unwrap()),
     };
     const auto i32 = pos_dtype.is_type<int32_t>();
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && !defined(__HGGCCC__)
     if (num_rows >= kBlockKernelMinRows && runtime::get_cc_major(device_.unwrap().device_id) == 10) {
       // The block kernel moves input and freqs_cis rows in 32-byte vectors and payload
       // rows in 16-byte vectors; a misaligned view fails here instead of faulting.

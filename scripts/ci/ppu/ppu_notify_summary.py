@@ -21,6 +21,7 @@ import time
 from datetime import datetime
 from http.client import HTTPException
 from pathlib import Path
+from typing import NamedTuple
 from urllib.error import HTTPError
 from urllib.parse import parse_qsl, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -29,9 +30,12 @@ from zoneinfo import ZoneInfo
 URL = "PPU_CI_NOTIFY_WEBHOOK_URL"
 SECRET = "PPU_CI_NOTIFY_SIGNING_SECRET"
 ROSTER = "PPU_CI_NOTIFY_ROSTER_JSON"
+TARGETS = "PPU_CI_NOTIFY_TARGETS_JSON"
+TARGETS_LIMIT = 64 * 1024
 MODEL = re.compile(r"[a-z0-9][a-z0-9_.-]{0,79}")
 REPOSITORY = re.compile(r"[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+")
 REF = re.compile(r"[a-zA-Z0-9_./-]{1,128}")
+VERSION = re.compile(r"(?:main|v[0-9]+(?:\.[0-9]+){1,2}(?:-[a-z0-9._-]+)?)")
 SHA = re.compile(r"[0-9a-f]{40}")
 PHASES = (
     "approval",
@@ -76,16 +80,152 @@ def score(value):
     return value if type(value) in (int, float) and 0 <= value <= 1 else None
 
 
-def signed_url(url, secret, timestamp_ms):
+class NotificationTarget(NamedTuple):
+    webhook_url: str
+    signing_secret: str
+
+
+def validate_webhook_url(url):
+    if not isinstance(url, str) or not url:
+        raise ValueError("Expected an HTTPS webhook URL")
     parts = urlsplit(url)
+    try:
+        port = parts.port
+    except ValueError:
+        raise ValueError("Expected an HTTPS webhook URL") from None
+    host_port = parts.netloc.rsplit("]", 1)[-1]
     if (
         parts.scheme != "https"
         or not parts.hostname
         or parts.username is not None
+        or parts.password is not None
         or parts.fragment
         or any(character.isspace() for character in url)
+        or (port is not None and port < 1)
+        or (":" in host_port and port is None)
     ):
         raise ValueError("Expected an HTTPS webhook URL")
+    return url
+
+
+def _validate_target(entry):
+    if not isinstance(entry, dict):
+        raise ValueError("Invalid notification target")
+    if not set(entry).issubset({"webhook_url", "signing_secret"}):
+        raise ValueError("Unknown notification target field")
+    webhook_url = validate_webhook_url(entry.get("webhook_url"))
+    signing_secret = entry.get("signing_secret", "")
+    if not isinstance(signing_secret, str):
+        raise ValueError("Invalid notification signing secret")
+    return NotificationTarget(webhook_url, signing_secret)
+
+
+def _load_json_unique_keys(raw):
+    def reject_duplicate_keys(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("Duplicate JSON key")
+            result[key] = value
+        return result
+
+    return json.loads(raw, object_pairs_hook=reject_duplicate_keys)
+
+
+def parse_targets(raw):
+    if not isinstance(raw, str) or len(raw.encode("utf-8")) > TARGETS_LIMIT:
+        raise ValueError("Invalid notification targets configuration")
+    try:
+        config = _load_json_unique_keys(raw)
+    except ValueError:
+        raise ValueError("Invalid notification targets configuration") from None
+    if not isinstance(config, dict):
+        raise ValueError("Expected a JSON object")
+    if not set(config).issubset({"default", "routes"}):
+        raise ValueError("Unknown notification targets field")
+    default_target = (
+        _validate_target(config["default"]) if "default" in config else None
+    )
+    routes = {}
+    if "routes" in config:
+        raw_routes = config["routes"]
+        if not isinstance(raw_routes, dict):
+            raise ValueError("Invalid notification routes mapping")
+        for key, value in raw_routes.items():
+            if not isinstance(key, str) or len(key) > 64 or not VERSION.fullmatch(key):
+                raise ValueError("Invalid notification route version")
+            routes[key] = _validate_target(value)
+    if default_target is None and not routes:
+        raise ValueError("Empty notification targets")
+    return default_target, routes
+
+
+def resolve_target(version="", environ=None):
+    env = os.environ if environ is None else environ
+    raw_targets = env.get(TARGETS, "")
+    fallback_url = env.get(URL, "").strip()
+    fallback_secret = env.get(SECRET, "")
+    if raw_targets:
+        default_target, routes = parse_targets(raw_targets)
+        if version and version in routes:
+            return routes[version]
+        if default_target is not None:
+            return default_target
+        if fallback_url:
+            return NotificationTarget(fallback_url, fallback_secret)
+        return None
+    if fallback_url:
+        return NotificationTarget(fallback_url, fallback_secret)
+    return None
+
+
+def _extract_version(raw, *, allow_bare_version=True):
+    if not isinstance(raw, str):
+        return ""
+    candidate = raw.strip()
+    if not candidate:
+        return ""
+    if candidate.startswith("refs/heads/"):
+        branch = candidate[len("refs/heads/") :]
+        if branch == "main":
+            return "main"
+        for prefix in ("releases/", "release/", "yuhe/"):
+            if branch.startswith(prefix):
+                version = branch[len(prefix) :]
+                if (
+                    version != "main"
+                    and len(version) <= 64
+                    and VERSION.fullmatch(version)
+                ):
+                    return version
+        return ""
+    if candidate == "main":
+        return "main"
+    for prefix in ("releases/", "release/", "yuhe/"):
+        if candidate.startswith(prefix):
+            version = candidate[len(prefix) :]
+            if version != "main" and len(version) <= 64 and VERSION.fullmatch(version):
+                return version
+            return ""
+    if allow_bare_version and len(candidate) <= 64 and VERSION.fullmatch(candidate):
+        return candidate
+    return ""
+
+
+def normalize_version(explicit_version="", notify_ref="", fallback_version=""):
+    if explicit_version not in (None, ""):
+        if not isinstance(explicit_version, str):
+            return ""
+        if explicit_version.strip():
+            return _extract_version(explicit_version, allow_bare_version=True)
+    return _extract_version(notify_ref, allow_bare_version=False) or _extract_version(
+        fallback_version, allow_bare_version=True
+    )
+
+
+def signed_url(url, secret, timestamp_ms):
+    validate_webhook_url(url)
+    parts = urlsplit(url)
     if not secret:
         return url
     timestamp = str(timestamp_ms)
@@ -182,6 +322,28 @@ def public_context():
     return repo, ref, event, run_id
 
 
+def job_duration(started_at, completed_at):
+    try:
+        started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        completed = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+        if (
+            started.tzinfo is not None
+            and completed.tzinfo is not None
+            and completed >= started
+        ):
+            return int((completed - started).total_seconds())
+    except (AttributeError, ValueError, OverflowError):
+        pass
+    return None
+
+
+class JobExecution(NamedTuple):
+    conclusion: str | None
+    attempt: int
+    job_id: int | None
+    elapsed_s: int | None
+
+
 def run_jobs(expected):
     """Resolve each expected job to the attempt that actually executed it."""
     repo, _, _, run_id = public_context()
@@ -198,7 +360,7 @@ def run_jobs(expected):
                 env={
                     key: value
                     for key, value in os.environ.items()
-                    if key not in (URL, SECRET, ROSTER)
+                    if key not in (URL, SECRET, ROSTER, TARGETS)
                 },
                 stderr=subprocess.DEVNULL,
                 timeout=20,
@@ -226,12 +388,15 @@ def run_jobs(expected):
                     # Partial reruns can copy prior jobs with new IDs and attempt
                     # numbers. Their original execution timestamps are retained.
                     timestamps = job["started_at"], job["completed_at"]
-                    if executions.get(name) != timestamps:
-                        executions[name] = timestamps
-                        executed_in = number
-                    else:
-                        executed_in = jobs[name][1]
-                    jobs[name] = job["conclusion"], executed_in
+                    if executions.get(name) == timestamps:
+                        continue
+                    executions[name] = timestamps
+                    jobs[name] = JobExecution(
+                        job["conclusion"],
+                        number,
+                        job.get("id"),
+                        job_duration(*timestamps),
+                    )
     except (OSError, KeyError, TypeError, ValueError, subprocess.SubprocessError):
         # A later snapshot could contain a failure that supersedes an old pass.
         jobs.clear()
@@ -241,28 +406,71 @@ def run_jobs(expected):
 
 def model_result(model, job, read_evidence):
     """Only a successful job with matching public evidence counts as a pass."""
-    conclusion, attempt = job or (None, None)
-    result = {"model": model, "status": "fail", "phase": "missing evidence"}
-    if attempt is not None and conclusion in ("success", "failure", "timed_out"):
+    result = {
+        "model": model,
+        "status": "fail",
+        "phase": "missing evidence",
+        "score": None,
+        "golden_score": None,
+        "job_id": job.job_id if job else None,
+        "job_elapsed_s": job.elapsed_s if job else None,
+    }
+    if job and job.conclusion in ("success", "failure", "timed_out"):
         try:
-            status, phase, actual, golden = read_evidence(attempt)
+            status, phase, actual, golden = read_evidence(job.attempt)
         except (OSError, KeyError, TypeError, ValueError, RecursionError):
             return result
-        if conclusion == "success" and status == "pass":
+        result.update(score=score(actual), golden_score=score(golden))
+        if job.conclusion == "success" and status == "pass":
             result["status"] = "pass"
-        elif status == "fail":
-            result.update(phase=phase, score=actual, golden_score=golden)
         else:
-            result["phase"] = "unknown"
+            result["phase"] = phase if status == "fail" else "unknown"
     return result
 
 
-def make_payload(report, roster, weekday):
-    repo, ref, event, run_id = public_context()
+def compact_duration(elapsed):
+    if type(elapsed) is not int or elapsed < 0:
+        return "—"
+    hours, remainder = divmod(elapsed, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    return f"{minutes}m" if minutes else f"{seconds}s"
+
+
+def passing_rows(passes):
+    model_width = max(len("Model"), max(len(row["model"]) for row in passes))
+    score_width = len("100.00% (100.00%)")
+    table = [
+        "```text",
+        f"{'Model':<{model_width}}  {'GSM8K (Golden)':<{score_width}}  Time",
+    ]
+    for row in passes:
+        actual, golden = score(row.get("score")), score(row.get("golden_score"))
+        reference = f"{golden:.2%}" if golden is not None else "—"
+        accuracy = f"{actual:.2%} ({reference})" if actual is not None else "—"
+        duration = compact_duration(row.get("job_elapsed_s"))
+        table.append(
+            f"{row['model']:<{model_width}}  {accuracy:<{score_width}}  {duration}"
+        )
+    return "\n".join([*table, "```"])
+
+
+def make_payload(report, roster, weekday, *, version=None):
+    repo, _, _, run_id = public_context()
+    raw_version = os.environ.get("NOTIFY_VERSION", "") if version is None else version
+    resolved_version = (
+        raw_version
+        if isinstance(raw_version, str)
+        and len(raw_version) <= 64
+        and VERSION.fullmatch(raw_version)
+        else ""
+    )
+    label = f"[sglang | {resolved_version}]" if resolved_version else f"[{repo}]"
     rows = report["results"]
     if not isinstance(rows, list) or not rows:
         raise ValueError("Expected one or more result rows")
-    failures = []
+    failures, passes = [], []
     for row in rows:
         if (
             not isinstance(row, dict)
@@ -271,16 +479,9 @@ def make_payload(report, roster, weekday):
             or row.get("status") not in ("pass", "fail")
         ):
             raise ValueError("Invalid result row")
-        if row["status"] == "fail":
-            failures.append(row)
+        (failures if row["status"] == "fail" else passes).append(row)
 
-    passed = len(rows) - len(failures)
-    headline = (
-        f"[❌ {len(failures)} 项失败 · 待认领]"
-        if failures
-        else f"[✅ 全绿 {passed}/{len(rows)}]"
-    )
-    title = f"{headline} {repo} / {ref} · {event}"
+    title = f"{label} PPU Nightly 晨报"
     elapsed = report.get("elapsed_s")
     duration = "未知"
     if type(elapsed) is int and elapsed >= 0:
@@ -289,9 +490,13 @@ def make_payload(report, roster, weekday):
         duration = f"{hours}h {minutes:02d}m {seconds:02d}s"
     link = f"https://github.com/{repo}/actions/runs/{run_id}"
     text = [
-        f"### {headline} `{repo} / {ref}` · {event}",
-        f"通过 **{passed}/{len(rows)}** · 总耗时 {duration} · [Run]({link})",
+        f"### {title}",
+        f"通过 **{len(passes)}/{len(rows)}** · 失败 **{len(failures)}** · "
+        f"总耗时 {duration} · [整轮 Run]({link})",
     ]
+    if failures:
+        text.append(f"#### 🔴 失败用例 ({len(failures)})")
+    failures_text = []
     for row in failures:
         phase = row.get("phase", "unknown")
         phase = phase if phase in PHASES else "unknown"
@@ -303,7 +508,17 @@ def make_payload(report, roster, weekday):
         sha = row.get("first_failing_sha")
         if isinstance(sha, str) and SHA.fullmatch(sha):
             details.append(f"first_failing_sha `{sha}`")
-        text.append(f"- `{row['model']}` · {' · '.join(details)} · [Run]({link})")
+        details.append(f"耗时 {compact_duration(row.get('job_elapsed_s'))}")
+        job_id = row.get("job_id")
+        if type(job_id) is int and job_id > 0:
+            details.append(f"[直达 Job]({link}/job/{job_id})")
+        else:
+            details.append(f"[整轮 Run]({link})")
+        failures_text.append(f"- `{row['model']}` · {' · '.join(details)}")
+    if failures_text:
+        text.append("\n".join(failures_text))
+    if passes:
+        text += [f"#### 🟢 通过用例 ({len(passes)})", passing_rows(passes)]
     mobiles, users = (
         recipients(roster, [row["model"] for row in failures], weekday)
         if failures
@@ -326,20 +541,36 @@ def main(argv=None):
     mode.add_argument("--nightly", type=Path, metavar="ARTIFACT_DIR")
     mode.add_argument("--report", type=Path, metavar="FILE")
     mode.add_argument("--smoke-test", action="store_true")
+    parser.add_argument("--version", default=None, metavar="VERSION")
     args = parser.parse_args(argv)
-    url = os.environ.get(URL, "").strip()
-    if not url:
+    if args.version is not None:
+        version = normalize_version(args.version, "")
+        if not version:
+            warn("Invalid notification version.")
+            return int(args.smoke_test)
+    else:
+        env_version = os.environ.get("NOTIFY_VERSION") or os.environ.get(
+            "NOTIFY_NIGHTLY_VERSION", ""
+        )
+        version = normalize_version("", os.environ.get("NOTIFY_REF", ""), env_version)
+    try:
+        target = resolve_target(version)
+    except (ValueError, RecursionError):
+        warn("Invalid notification targets configuration.")
+        return int(args.smoke_test)
+    if target is None:
         if args.smoke_test:
             warn("Markdown webhook URL is not configured.")
             return 1
         return 0
     try:
         if args.smoke_test:
+            prefix = f"[sglang | {version}] " if version else ""
             payload = {
                 "msgtype": "markdown",
                 "markdown": {
-                    "title": "PPU CI",
-                    "text": "### PPU CI webhook connectivity test",
+                    "title": f"{prefix}PPU CI",
+                    "text": f"### {prefix}PPU CI webhook connectivity test",
                 },
             }
         else:
@@ -350,11 +581,13 @@ def main(argv=None):
             else:
                 report = json_file(args.report)
             weekday = WEEKDAYS[datetime.now(SHANGHAI).weekday()]
-            payload = make_payload(report, os.environ.get(ROSTER, ""), weekday)
+            payload = make_payload(
+                report, os.environ.get(ROSTER, ""), weekday, version=version
+            )
     except (OSError, KeyError, TypeError, ValueError, RecursionError):
         warn("Could not assemble the public CI notification.")
         return 0
-    delivered = deliver(url, os.environ.get(SECRET, ""), payload)
+    delivered = deliver(target.webhook_url, target.signing_secret, payload)
     if args.smoke_test and delivered:
         print("Markdown webhook accepted the connectivity test.")
     return int(args.smoke_test and not delivered)

@@ -1,12 +1,19 @@
+import sys
 import unittest
 from contextlib import contextmanager
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch, sentinel
 
 import torch
-
+from sglang.kernels.ops.attention.fla.fused_recurrent import (
+    fused_recurrent_gated_delta_rule_packed_decode,
+)
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+from sglang.srt.layers.attention import hybrid_linear_attn_backend
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    Mamba2AttnBackend,
+    MambaAttnBackendBase,
+)
 from sglang.srt.layers.attention.linear import gdn_backend
 from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNAttnBackend,
@@ -15,11 +22,13 @@ from sglang.srt.layers.attention.linear.gdn_backend import (
     flashinfer_gdn_prefill_default,
     validate_gdn_mis_backend,
 )
+from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
     FlashInferGDNKernel,
     maybe_build_flashinfer_checkpoint_plan,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
+from sglang.srt.layers.attention.linear.short_conv_backend import ShortConvAttnBackend
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     resolve_linear_attn_backends,
@@ -147,6 +156,14 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
             ):
                 self.assertEqual(backend.supports_prefill_graph_extend(), captured)
 
+    def test_explicit_static_gdn_graph_keeps_priority_over_pla(self):
+        with (
+            envs.SGLANG_SAIL_PLA_CUDA.override(True),
+            envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.override(True),
+            self._setup() as backend,
+        ):
+            self.assertTrue(backend.supports_prefill_graph_extend())
+
     def test_another_extend_kernel_is_captured_only_where_an_external_body_asks(self):
         for body_seqs, captured in (("no body", False), (None, False), (8, True)):
             with (
@@ -163,6 +180,105 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
 
 
 class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
+    def test_sail_packed_decode_uses_physical_rows_without_offsets(self):
+        state = torch.zeros(4, 16, 128, 128, dtype=torch.float32)
+        indices = torch.tensor([2, -1, 1], dtype=torch.int32)
+        qkv = torch.empty(3, 3072, dtype=torch.bfloat16)
+        a = torch.empty(3, 16, dtype=torch.bfloat16)
+        b = torch.empty_like(a)
+        a_log = torch.zeros(16)
+        dt_bias = torch.zeros(16, dtype=torch.bfloat16)
+        out = torch.empty(3, 1, 16, 128, dtype=torch.bfloat16)
+        decode = ModuleType("pla.decode")
+        decode.fused_sigmoid_gating_delta_rule_forward_k_last_packed = MagicMock(
+            return_value=out
+        )
+        with (
+            envs.SGLANG_SAIL_PLA_CUDA.override(True),
+            patch(
+                "sglang.kernels.ops.attention.fla.fused_recurrent.is_sail",
+                return_value=True,
+            ),
+            patch.dict(sys.modules, {"pla.decode": decode}),
+        ):
+            result, result_state = fused_recurrent_gated_delta_rule_packed_decode(
+                qkv,
+                a,
+                b,
+                a_log,
+                dt_bias,
+                128**-0.5,
+                state,
+                out,
+                indices,
+                use_qk_l2norm_in_kernel=False,
+            )
+
+        decode.fused_sigmoid_gating_delta_rule_forward_k_last_packed.assert_called_once()
+        args = (
+            decode.fused_sigmoid_gating_delta_rule_forward_k_last_packed.call_args.args
+        )
+        self.assertIs(args[8], state)
+        self.assertIs(args[9], indices)
+        self.assertIs(args[11], False)
+        self.assertIsNone(args[12])
+        self.assertIs(result, out)
+        self.assertIs(result_state, state)
+
+    def test_sail_prefill_metadata_reuses_prefix_mask_without_building_pla_offsets(
+        self,
+    ):
+        for backend_cls, is_sail, lengths, reuse_mask in (
+            (GDNAttnBackend, True, [2, 3], True),
+            (KDAAttnBackend, True, [2, 3], True),
+            (KDAAttnBackend, True, [2, 0], True),
+            (GDNAttnBackend, False, [2, 3], False),
+            (Mamba2AttnBackend, True, [2, 3], False),
+            (ShortConvAttnBackend, True, [2, 3], False),
+        ):
+            with self.subTest(
+                backend=backend_cls.__name__, is_sail=is_sail, lengths=lengths
+            ):
+                backend = object.__new__(backend_cls)
+                backend.device = torch.device("cpu")
+                backend.req_to_token_pool = SimpleNamespace(
+                    get_mamba_indices=lambda indices: indices,
+                )
+                backend._state_ids = SimpleNamespace(ids=lambda indices: indices)
+                backend.state_pool = None
+                prefix_lens = torch.tensor([0, 4])
+                batch = SimpleNamespace(
+                    batch_size=2,
+                    forward_mode=ForwardMode.EXTEND,
+                    logical_forward_mode=ForwardMode.EXTEND,
+                    req_pool_indices=torch.tensor([1, 2 if lengths[1] else 0]),
+                    mamba_track_indices=None,
+                    mamba_track_mask=None,
+                    mamba_prefill_track_mask_cpu=None,
+                    mamba_track_seqlens_cpu=None,
+                    extend_prefix_lens=prefix_lens,
+                    extend_prefix_lens_cpu=[0, 4],
+                    extend_start_loc=torch.tensor([0, lengths[0]]),
+                    extend_seq_lens=torch.tensor(lengths),
+                    extend_seq_lens_cpu=lengths,
+                    tbo_parent_token_range=None,
+                )
+                with patch.object(
+                    hybrid_linear_attn_backend, "is_sail", return_value=is_sail
+                ):
+                    MambaAttnBackendBase.init_forward_metadata(backend, batch)
+
+                metadata = backend.forward_metadata
+                self.assertIsNone(metadata.pla_prefill_host_offsets)
+                self.assertEqual(metadata.logical_num_tokens, sum(lengths))
+                mask = backend._prefill_has_initial_state(batch)
+                torch.testing.assert_close(mask, torch.tensor([False, True]))
+                if reuse_mask:
+                    self.assertIs(mask, metadata.prefill_has_initial_state)
+                    self.assertIs(backend._prefill_has_initial_state(batch), mask)
+                else:
+                    self.assertIsNone(metadata.prefill_has_initial_state)
+
     def test_prefill_conv_table_covers_only_nonempty_chunks(self):
         backend = object.__new__(GDNAttnBackend)
         backend.device = "cpu"

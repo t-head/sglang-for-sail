@@ -12,10 +12,43 @@ The PR workflow finish job requires Linux infrastructure selftests, the native b
 
 ```bash
 gh workflow run pr-test-ppu.yml --repo t-head/sglang-for-sail \
-  --ref release/v0.5.23 -f run_legacy_sanity=true
+  --ref yuhe/v1.0.0 -f run_legacy_sanity=true
 ```
 
 The reusable workflow accepts the same boolean input and a candidate `ref`.
+
+## Trigger Quick Reference
+
+Check [`test/ppu/README.md`](../../../test/ppu/README.md) for the exact policy slugs available in each tier. `model_filter` accepts comma-separated slugs that declare the requested tier; avoid leaving it blank during routine branch validation because an empty filter schedules every model in that tier and can saturate the shared 8-card PPU pool.
+
+| Scenario | How to trigger | What runs |
+| --- | --- | --- |
+| Routine PR validation | Apply `run-ci` + `run-ci-ppu` on the PR | Dummy-weight Fast Sanity across all `fast_sanity` policies |
+| Full real-weight PR gate | Apply `run-ci` + `run-ci-ppu-nightly` on the PR | Real-weight GSM8K + microbench across all `model_sanity` policies |
+| Branch / framework upgrade smoke (no PR) | Dispatch `pr-test-ppu.yml` with `run_model_sanity=true` and `model_filter` | Real-weight GSM8K + microbench on 1–2 sampled `model_sanity` models |
+| On-demand Nightly spot check | Dispatch `nightly-test-ppu.yml` with `model_filter` | Real-weight GSM8K + microbench on selected `model_sanity` models (optional wheel reuse) |
+
+Dispatch `pr-test-ppu.yml` on a same-repository maintainer branch to sample 1–2 representative real-weight GSM8K models (for example, 2-card `glm-5.3-flash` and 8-card `deepseek-v4-flash`) without opening a PR:
+
+```bash
+gh workflow run pr-test-ppu.yml --repo t-head/sglang-for-sail \
+  --ref <branch> -f run_model_sanity=true \
+  -f model_filter=glm-5.3-flash,deepseek-v4-flash
+```
+
+To run dummy-weight Fast Sanity on a subset of models (including `fast_sanity`-only slugs such as `qwen3.8-27b`), omit `-f run_model_sanity=true`:
+
+```bash
+gh workflow run pr-test-ppu.yml --repo t-head/sglang-for-sail \
+  --ref <branch> -f model_filter=qwen3.8-27b,deepseek-v4-flash
+```
+
+To trigger `nightly-test-ppu.yml` on demand with `model_filter` (optionally reusing a prior wheel build via `skip_wheel_build=true` and `wheel_artifact_run_id=<run_id>`):
+
+```bash
+gh workflow run nightly-test-ppu.yml --repo t-head/sglang-for-sail \
+  --ref yuhe/v1.0.0 -f model_filter=glm-5.3-flash,deepseek-v4-flash
+```
 
 ## Provision the cluster runner
 
@@ -33,8 +66,8 @@ The runner uses the pinned T-Head Cluster Run backend. Each Recipe job requests 
 | `PPU_CI_GSM8K_PATH` | Offline EvalScope GSM8K dataset directory |
 | `PPU_CI_JIT_ROOT` | Node-local persistent JIT cache root |
 | `PPU_CI_K8S_STAGE_ROOT` | Cluster Run's shared source staging directory in the CPU runner view |
-| `PPU_CI_PRIVATE_RESULTS_ROOT` | Private shared results directory in the CPU runner view |
-| `PPU_CI_K8S_PRIVATE_WORKER_ROOT` | The same results directory in the worker view |
+| `PPU_CI_PRIVATE_RESULTS_ROOT` | Private results archive root in the CPU runner view; Recipe runs are archived under `sglang/logs/sglang-for-sail/<run_id>-<attempt>/<source_sha_12>/<tier>/<model_key>` |
+| `PPU_CI_K8S_PRIVATE_WORKER_ROOT` | Worker view of the task-scoped private scratch directory (`PPU_CI_K8S_HOST_SCRATCH_ROOT`) |
 | `PPU_CI_K8S_RUNTIME_DIGEST` | Optional manifest reference for the designated release runtime tag |
 | `PPU_CI_RUNTIME_IMAGE` | Existing single-device test image |
 | `PPU_CI_TARGET_MODEL_PATH`, `PPU_CI_EAGLE3_MODEL_PATH`, `PPU_CI_DFLASH_MODEL_PATH`, `PPU_CI_EVAL_CACHE` | Existing single-device assets in the worker view |

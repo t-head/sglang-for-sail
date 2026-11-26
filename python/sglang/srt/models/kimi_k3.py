@@ -2525,7 +2525,7 @@ class KimiK3DeltaAttention(nn.Module):
         heads = layer.num_v_heads if is_sail() else self.local_num_heads
         seg = heads * 128
         allowed_heads = (
-            kda_fused_decode.SAIL_SUPPORTED_HEADS
+            kda_fused_decode.sail_supported_heads()
             if is_sail()
             else kda_fused_decode.SUPPORTED_HEADS
         )

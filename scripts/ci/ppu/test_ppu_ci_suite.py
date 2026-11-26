@@ -42,6 +42,24 @@ class TestPPUCISuite(unittest.TestCase):
             list((RUNNER.parent / "registered").rglob("test_ppu_ci_*.py")), []
         )
 
+    def test_gdn_registrations_use_current_suites(self):
+        registered = RUNNER.parent / "registered"
+        paths = [
+            "unit/layers/attention/test_gdn_pla_prefill.py",
+            "unit/layers/attention/test_mamba_track_state_dtype.py",
+            "kernels/ops/attention/test_gdn_pla_prefill.py",
+        ]
+        tests = registry.collect_tests([str(registered / path) for path in paths])
+        self.assertEqual(len(tests), 3)
+        self.assertCountEqual(
+            [(test.backend, test.effective_suite) for test in tests],
+            [
+                (registry.HWBackend.CPU, "base-a-test-cpu"),
+                (registry.HWBackend.CPU, "base-a-test-cpu"),
+                (registry.HWBackend.PPU, "extra-test-1-gpu-ppu"),
+            ],
+        )
+
     def test_ppu_suite_contains_model_and_kernel_regressions(self):
         registered = RUNNER.parent / "registered"
         files = [
@@ -70,6 +88,9 @@ class TestPPUCISuite(unittest.TestCase):
                 "radix_cache/test_radix_attention.py",
                 "ppu/test_sail_attention_backends.py",
                 "kernels/ops/attention/test_dsa_tilelang_sparse_layout.py",
+                "kernels/ops/attention/test_gdn_pla_prefill.py",
+                "kernels/ops/attention/dsv4/test_index_q_rope_pack_weights.py",
+                "unit/layers/attention/test_dsa_k_only_ppu.py",
                 "kernels/ops/attention/test_minimax_m3_msa_ppu_page_table_tail.py",
                 "kernels/ops/activation/test_silu_and_mul_masked_post_per_token_quant_fp8.py",
                 "kernels/ops/communication/test_engram_gather_peer.py",
@@ -128,11 +149,13 @@ class TestPPUCISuite(unittest.TestCase):
                 (
                     "test",
                     (
-                        ("Test Summary: 10/10 passed", 0, 0),
+                        ("Test Summary: 13/13 passed", 0, 0),
+                        ("Test Summary: 12/12 passed", 0, 1),
+                        ("Test Summary: 11/11 passed", 0, 1),
                         ("Test Summary: 9/9 passed", 0, 1),
                         ("Test Summary: 9/10 passed", 0, 1),
-                        ("Test Summary: 10/10 passed", 7, 7),
-                        ("Test Summary: 10/10 passed (incomplete)", 0, 1),
+                        ("Test Summary: 13/13 passed", 7, 7),
+                        ("Test Summary: 13/13 passed (incomplete)", 0, 1),
                         ("", 0, 1),
                     ),
                 ),

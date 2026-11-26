@@ -36,7 +36,9 @@ from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_hip, is_sail, is_sm100_supported
+from sglang.srt.utils.common import ceil_div
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -60,6 +62,7 @@ def _use_amd_flydsl_mega_moe() -> bool:
 def _ppu_mega_moe_mma_type(mma_type: str) -> str:
     """Translate per-layer precision labels to the PPU DeepGEMM API."""
     return {
+        "fp8xfp8_channelwise": "fp8xfp8",
         "mxf4xmxf4": "fp4xfp4",
         "fp8xmxfp4": "fp8xfp4",
         "bf16xmxfp4": "bf16xfp4",
@@ -130,6 +133,9 @@ def check_mega_moe_shapes(hidden: int, intermediate: int, mma_type: str) -> None
     scale_group = 16 if mma_type == "nvfp4xnvfp4" else 32
     align = 128 if mma_type in ("fp8xfp4", "fp8xfp8", "mxf4xmxf4") else 16 * scale_group
     hidden_align = 16 * scale_group
+    if mma_type == "fp8xfp8_channelwise":
+        # PPU channelwise FP8 uses one FP32 scale per token.
+        hidden_align, align = 256, 128
     if hidden % hidden_align != 0 or intermediate % align != 0:
         raise ValueError(
             f"DeepGEMM MegaMoE ({mma_type}) needs hidden_size to be a multiple "
@@ -154,6 +160,7 @@ def _get_mega_moe_symm_buffer(
 ) -> SymmBuffer:
     import deep_gemm
 
+    channelwise = _is_sail and mma_type == "fp8xfp8_channelwise"
     if _is_sail:
         mma_type = _ppu_mega_moe_mma_type(mma_type)
 
@@ -166,12 +173,15 @@ def _get_mega_moe_symm_buffer(
             hidden,
             intermediate_hidden,
             mma_type,
+            channelwise,
             activation,
             num_shared_experts,
             deep_gemm.get_num_sms(),
         )
         buf = _MEGA_MOE_SYMM_BUFFER.get(key)
         if buf is None:
+            # DeepGEMM shares the MMA name, but the scale layouts need distinct buffers.
+            buffer_kwargs = {"quantization": "channelwise"} if channelwise else {}
             buf = deep_gemm.get_symm_buffer_for_mega_moe(
                 group,
                 num_experts,
@@ -182,6 +192,7 @@ def _get_mega_moe_symm_buffer(
                 num_shared_experts=num_shared_experts,
                 mma_type=mma_type,
                 activation=activation,
+                **buffer_kwargs,
             )
             _MEGA_MOE_SYMM_BUFFER[key] = buf
             # Only the SM100 kernels read the SM locality map.
@@ -220,7 +231,10 @@ def is_mega_moe_experts_ready(experts) -> bool:
     if not experts._mega_moe_weights_built:
         return False
     if _is_sail:
-        return _device_sm >= 89 and _mega_moe_mma_type(experts) == "mxf4xmxf4"
+        return _device_sm >= 89 and _mega_moe_mma_type(experts) in (
+            "mxf4xmxf4",
+            "fp8xfp8_channelwise",
+        )
     if _device_sm == 90:
         return is_sm90_fp8_mega_moe_available(experts)
     # The SM100 mega kernels exist for compute capability 10.x only.
@@ -274,6 +288,12 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     global_num_tokens = get_dp_global_num_tokens()
     if global_num_tokens and not is_dsa_enable_prefill_cp():
         max_tokens_per_rank = max(global_num_tokens)
+        if len(global_num_tokens) > 1:
+            parallel = get_parallel()
+            if parallel.attn_dp_size > 1 and parallel.attn_cp_size == 1:
+                max_tokens_per_rank = ceil_div(
+                    max_tokens_per_rank, parallel.attn_tp_size
+                )
     else:
         max_tokens_per_rank = hidden_states.shape[0]
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
@@ -586,6 +606,7 @@ def run_mega_routed_experts(
     activation_clamp: Optional[float] = None,
     routed_scaling_factor: float = 1.0,
     activation: str = "swiglu",
+    activation_alpha: Optional[float] = None,
     num_shared_experts: int = 0,
     shared_l1_weights=None,
     shared_l2_weights=None,
@@ -609,6 +630,8 @@ def run_mega_routed_experts(
     )
 
     mma_type = _mega_moe_mma_type(experts)
+    if _is_sail and activation == "swigluoai":
+        activation = "swiglu_oai"
     if buf is None:
         buf = _get_mega_moe_symm_buffer(
             get_parallel().moe_ep_group.device_group,
@@ -666,7 +689,7 @@ def run_mega_routed_experts(
             buf.topk_idx,
             buf.topk_weights,
             num_tokens=num_tokens,
-            group_size=32,
+            group_size=0 if mma_type == "fp8xfp8_channelwise" else 32,
             mma_type=_ppu_mega_moe_mma_type(mma_type),
         )
         if mma_type != "mxf4xmxf4":
@@ -765,17 +788,21 @@ def run_mega_routed_experts(
         "fast_math": True,
         **mega_kwargs,
     }
+    if _is_sail and activation_alpha is not None:
+        kernel_kwargs["activation_alpha"] = activation_alpha
     if not _is_sail:
         # PPU's fp4_fp4_mega_moe takes the shared experts outside the kernel.
         kernel_kwargs["shared_l1_weights"] = shared_l1_weights
         kernel_kwargs["shared_l2_weights"] = shared_l2_weights
     with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
         if _is_sail:
-            mega_moe_kernel = {
-                "mxf4xmxf4": deep_gemm.fp4_fp4_mega_moe,
-                "fp8xmxfp4": deep_gemm.fp8_fp4_mega_moe,
-                "bf16xmxfp4": deep_gemm.bf16_fp4_mega_moe,
+            kernel_name = {
+                "mxf4xmxf4": "fp4_fp4_mega_moe",
+                "fp8xmxfp4": "fp8_fp4_mega_moe",
+                "bf16xmxfp4": "bf16_fp4_mega_moe",
+                "fp8xfp8_channelwise": "fp8_fp8_mega_moe",
             }[mma_type]
+            mega_moe_kernel = getattr(deep_gemm, kernel_name)
         else:
             mega_moe_kernel = deep_gemm.fp8_fp4_mega_moe
         mega_moe_kernel(

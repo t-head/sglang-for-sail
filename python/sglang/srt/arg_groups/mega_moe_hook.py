@@ -11,7 +11,7 @@ from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
-from sglang.srt.utils.common import ceil_align, parse_connector_type
+from sglang.srt.utils.common import ceil_align, ceil_div, parse_connector_type
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +85,8 @@ MEGA_MOE_NO_FALLBACK_ARCHS = frozenset(
         "Glm5NextForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "MellumForCausalLM",
+        "MiniMaxM3SparseForCausalLM",
+        "MiniMaxM3SparseForConditionalGeneration",
         "Qwen2MoeForCausalLM",
         "Qwen3MoeForCausalLM",
         "Qwen3NextForCausalLM",
@@ -199,13 +201,19 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
     max_tokens_per_rank = (
         envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
     )
+    minimax = model_label in (
+        "MiniMaxM3SparseForCausalLM",
+        "MiniMaxM3SparseForConditionalGeneration",
+    )
     if cfg.disaggregation_mode != "prefill":
         decode_tokens = mega_moe_decode_tokens_per_rank(cfg)
+        if minimax and cfg.max_running_requests is None:
+            raise ValueError(
+                f"{model_label} MegaMoE needs --max-running-requests to bound eager decode / verify rows."
+            )
         if (
-            model_label == "KimiK31ForConditionalGeneration"
-            and cfg.max_running_requests is not None
-        ):
-            # Kimi repacks its experts at load and has no oversized eager fallback.
+            minimax or model_label == "KimiK31ForConditionalGeneration"
+        ) and cfg.max_running_requests is not None:
             eager_requests = ceil_align(
                 cfg.max_running_requests // cfg.attn_dp_size,
                 cfg.tp_size // cfg.attn_dp_size,
@@ -246,13 +254,14 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
     from sglang.srt.configs.model_config import KIMI_K3_ARCHS
 
     kimi = model_label in KIMI_K3_ARCHS
-    if kimi:
+    if kimi or minimax:
         prefill_tokens = max(prefill_tokens, getattr(cfg, "max_prefill_tokens", 0) or 0)
         graph = cfg.cuda_graph_config.prefill if cfg.cuda_graph_config else None
         if graph is not None and graph.backend != "disabled":
             prefill_tokens = max(
                 prefill_tokens, graph.max_bs or 0, max(graph.bs or [0])
             )
+    if kimi:
         # Kimi repacks its experts at load and has no non-mega fallback, so the
         # whole prefill forward must fit the MegaMoE workspace of the EP group.
         ep_capacity = max_tokens_per_rank * (cfg.ep_size or 1)
@@ -282,6 +291,18 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
             1,
         )
         local_chunked_prefill_size = cfg.chunked_prefill_size
+        # CP has its own padding and layout; keep its existing budget.
+        if cfg.attn_cp_size == 1 and token_alignment > 1:
+            graph = cfg.cuda_graph_config.prefill if cfg.cuda_graph_config else None
+            if graph is not None and graph.backend != "disabled" and graph.bs:
+                local_chunked_prefill_size = max(
+                    local_chunked_prefill_size, max(graph.bs)
+                )
+            token_partition_size, token_alignment = token_alignment, 1
+            token_partition_name = "attn_tp_size (after attention DP)"
+            local_chunked_prefill_size = ceil_div(
+                local_chunked_prefill_size, token_partition_size
+            )
     elif kimi and cfg.tp_size // cfg.attn_cp_size > 1:
         token_partition_size = cfg.tp_size // cfg.attn_cp_size
         token_partition_name = "attn_tp_size (SP-MoE rows)"
