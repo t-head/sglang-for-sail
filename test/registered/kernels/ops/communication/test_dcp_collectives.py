@@ -1,5 +1,6 @@
 """Run with python on eight GPUs; validate peer exchange and graph replay."""
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -12,7 +13,9 @@ from sglang.kernels.ops.attention.dcp_kernels import (
     DcpDirectAllToAll,
     dcp_lse_combine_triton,
 )
-from sglang.srt.layers.dcp import comm
+from sglang.srt.layers.dcp import comm, layout
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.models.deepseek_common.attention_forward_methods import forward_mla
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
@@ -240,6 +243,137 @@ def test_candidate_merge_scratch_and_graph_replay():
                     actual.sort(dim=-1).values, expected.sort(dim=-1).values
                 ), (actual.shape[0], length)
                 assert workspace.merge_buffer.data_ptr() == scratch_ptr
+
+
+@torch.inference_mode()
+def test_small_batch_a2a_v_preprojection_replay():
+    """Check BF16 V preprojection against postprojection and an FP32 oracle."""
+    fixture._init_world()
+    group = ps._WORLD
+    rank, world = group.rank_in_group, group.world_size
+    batch, local_heads, latent_dim, value_dim = 5, 12, 512, 128
+    heads = world * local_heads
+    owned = slice(rank * local_heads, (rank + 1) * local_heads)
+    rng = torch.Generator(device="cuda").manual_seed(101 + rank)
+    dtype = torch.bfloat16
+    output = torch.empty(batch, heads, latent_dim, dtype=dtype, device="cuda")
+    lse = torch.empty(batch, heads, device="cuda")
+    local_weight = torch.randn(
+        local_heads,
+        latent_dim,
+        value_dim,
+        dtype=dtype,
+        device="cuda",
+        generator=rng,
+    ).mul_(latent_dim**-0.5)
+    parts = [torch.empty_like(output) for _ in range(world)]
+    stats = [torch.empty_like(lse) for _ in range(world)]
+
+    class Attention(forward_mla.DeepseekMLAForwardMixin):
+        current_attention_backend = "dsa"
+        use_dsa = True
+        use_deep_gemm_bmm = False
+        next_skip_topk = None
+        dcp_size = world
+        num_local_heads = local_heads
+        kv_lora_rank = latent_dim
+        v_head_dim = value_dim
+        w_vc = local_weight
+
+        def attn_mqa_for_dcp_decode(self, *args, **kwargs):
+            return output, lse
+
+        def o_proj(self, projected):
+            return projected, None
+
+    def update():
+        output.normal_(generator=rng)
+        lse.normal_(generator=rng)
+        if rank == 0:
+            lse[0].fill_(-torch.inf)  # One empty shard with nonzero stored partials.
+        output[1].fill_(1 if rank % 2 == 0 else -1)
+        if rank == 0:
+            output[1, :, 0].add_(0.125)  # A small residual after cancellation.
+        lse[1].zero_()
+        lse[2].fill_(-torch.inf)  # All shards empty.
+        dist.all_gather(parts, output, group=group.device_group)
+        dist.all_gather(stats, lse, group=group.device_group)
+        probs = torch.stack(stats)[:, :, owned].softmax(dim=0).nan_to_num()
+        merged = (torch.stack(parts)[:, :, owned].float() * probs[..., None]).sum(0)
+        return (
+            torch.bmm(merged.transpose(0, 1), local_weight.float())
+            .transpose(0, 1)
+            .flatten(1, 2)
+        )
+
+    module = Attention()
+    forward_batch = SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY)
+
+    def run(preproject):
+        module.dcp_v_preproject = preproject
+        return module.forward_absorb_core(
+            None, None, None, None, forward_batch, None, None, None, None
+        )
+
+    with (
+        published_topology(
+            tp_size=world,
+            dcp_size=world,
+            dcp_comm_backend="a2a",
+            dsa_decode_backend="flashmla_kv",
+        ),
+        get_parallel().override(dcp_group=group),
+        patch.object(layout, "_dsa_shards_index_k", True),
+        patch.object(forward_mla, "_is_sail", True),
+        patch.object(
+            group, "all_to_all_single", wraps=group.all_to_all_single
+        ) as exchange,
+    ):
+        update()
+        run(False)
+        run(True)
+        # BF16 partials carry two additional BF16 columns of FP32 LSE.
+        assert [call.args[1].numel() for call in exchange.call_args_list] == [
+            2 * batch * heads * (dim + 2) for dim in (latent_dim, value_dim)
+        ]
+        exchange.reset_mock()
+        torch.cuda.synchronize()
+        dist.barrier(group=group.cpu_group)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            projected = run(True)
+        assert exchange.call_args.args[1].numel() == 2 * batch * heads * (value_dim + 2)
+        # Two BF16 rounding stages with unit-scale partials and normalized V
+        # weights. Absolute tolerance also covers near-zero cancellation.
+        tol = 2 * torch.finfo(dtype).eps
+        for _ in range(2):
+            reference = update()
+            baseline = run(False)
+            graph.replay()
+            projected_fp32, baseline_fp32 = projected.float(), baseline.float()
+            comparisons = (
+                (projected_fp32, reference),
+                (baseline_fp32, reference),
+                (projected_fp32, baseline_fp32),
+            )
+            passed = (
+                torch.stack(
+                    [
+                        torch.isclose(got, want, atol=tol, rtol=tol).all()
+                        for got, want in comparisons
+                    ]
+                )
+                .all()
+                .to(torch.int32)
+            )
+            passed *= ((projected[2] == 0) & (baseline[2] == 0)).all().int()
+            # All ranks stop together if any rank fails the check.
+            dist.all_reduce(passed, op=dist.ReduceOp.MIN, group=group.device_group)
+            if not passed.item():
+                for got, want in comparisons:
+                    torch.testing.assert_close(got, want, atol=tol, rtol=tol)
+                assert ((projected[2] == 0) & (baseline[2] == 0)).all()
+                pytest.fail("V projection comparison failed on another rank")
 
 
 if __name__ == "__main__":

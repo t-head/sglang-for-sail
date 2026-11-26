@@ -14,6 +14,7 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -25,7 +26,9 @@ from sglang.kernels.ops.attention.dsa.paged_mqa_logits import (
     deepgemm_paged_mqa_logits_native,
 )
 from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
+from sglang.srt.layers.attention.dsa import dsa_dcp_sharded
 from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import (
+    _local_candidates,
     _scatter_candidates_kernel,
     dcp_all_visible,
     dcp_global_topk,
@@ -918,6 +921,35 @@ class TestDSADCPAttention(CustomTestCase):
 
 
 class TestDCPCandidatePrefix(CustomTestCase):
+    def test_ppu_bf16_logits_candidate_graph_replay(self):
+        """PPU BF16 paged logits must reach the FP32-only candidate kernel aligned."""
+        rows, width, world, rank = 2, 2051, 8, 3
+        logits = torch.empty(rows, 2064, device="cuda", dtype=torch.bfloat16)[:, :width]
+        lengths = torch.tensor([width, 0], device="cuda", dtype=torch.int32)
+        rng = torch.Generator(device="cuda").manual_seed(23)
+        # Exercise PPU dispatch with the real FP32 kernel and graph on CUDA CI.
+        with (
+            patch.object(dsa_dcp_sharded, "is_sail", return_value=True),
+            published_topology(tp_size=world, dcp_size=world),
+            get_parallel().override(attn_dcp_rank=rank),
+        ):
+            logits.normal_(generator=rng)
+            _local_candidates(logits, lengths, TOPK)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                candidates = _local_candidates(logits, lengths, TOPK)
+            for _ in range(2):
+                logits.normal_(generator=rng)
+                order = torch.argsort(logits[0], descending=True, stable=True)[:TOPK]
+                graph.replay()
+                sorted_positions, permutation = candidates[0, :, 1].sort()
+                expected = order.sort().values
+                self.assertTrue(torch.equal(sorted_positions, expected * world + rank))
+                scores = candidates[0, permutation, 0].view(torch.float32)
+                self.assertTrue(torch.equal(scores, logits[0, expected].float()))
+                self.assertTrue((candidates[1, :, 1] == -1).all())
+
     def test_scatter_ignores_stale_padding_on_replay(self):
         rows, width = 5, 32768
         lens = torch.full((rows,), 8199, device="cuda", dtype=torch.int32)

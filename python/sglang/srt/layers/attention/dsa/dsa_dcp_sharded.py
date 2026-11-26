@@ -44,9 +44,10 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     topk_transform_packed_v2,
     topk_transform_paged_v2,
 )
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import _sail_topk_fp32
 from sglang.srt.layers.dcp.comm import all_gather_kv_cache_for_dcp
 from sglang.srt.runtime_context import get_parallel, get_platform
-from sglang.srt.utils import print_info_once
+from sglang.srt.utils import is_sail, print_info_once
 
 _ZEROS: dict[torch.device, torch.Tensor] = {}
 _SIDE_STREAMS: dict[torch.device, torch.cuda.Stream] = {}
@@ -383,6 +384,8 @@ def _local_candidates(
     if logits.shape[1] == 0:
         out[..., 1] = -1
         return out
+    if logits.dtype == torch.bfloat16 and is_sail():
+        logits = _sail_topk_fp32(logits)
     # v2 ragged top-k with the candidate epilogue: local positions ascend
     # with global ones, so its tie order matches the merge's
     topk_transform_candidates_v2(
