@@ -24,9 +24,15 @@ struct DeepSelectTopKFp32Kernel {
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
 
-    TensorMatcher({B, N}).with_strides({S, 1}).with_dtype<fp32_t>().with_device(device).verify(scores);
+    TensorMatcher({B, N}).with_strides({S, 1}).with_dtype<fp32_t>().with_device(device).ensure_alignment(16).verify(
+        scores);
     TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(ends);
-    TensorMatcher({B, kTopK}).with_strides({O, 1}).with_dtype<int32_t>().with_device(device).verify(indices);
+    TensorMatcher({B, kTopK})
+        .with_strides({O, 1})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .ensure_alignment(OUTPUT_STRIDE_ALIGNMENT_REQUIREMENT)
+        .verify(indices);
 
     const auto stride = static_cast<uint64_t>(S.unwrap());
     const auto out_stride = static_cast<uint64_t>(O.unwrap());

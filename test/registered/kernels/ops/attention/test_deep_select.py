@@ -118,6 +118,43 @@ def test_variable_row_end():
     _check_topk(input, k, indices, end=end, values=values, idx_fill=-1, value_fill=-5.0)
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="Step 5 DeepSelect requires SM10x",
+)
+def test_step5_fp32_shortcut_and_streaming():
+    k, width = 512, 32768
+    scores = _make_input(5, width, torch.float32)
+    ends = torch.tensor([0, k - 1, k, k + 1, width], dtype=torch.int32, device="cuda")
+    indices = torch.empty((len(ends), k), dtype=torch.int32, device="cuda")
+    _, result = topk(
+        scores,
+        k,
+        end=ends,
+        output_idx=indices,
+        idx_oob_fill_value=-1,
+        return_value=False,
+        abort_when_nan_found=False,
+        streaming_fp32=True,
+    )
+    assert result is indices
+    _check_topk(scores, k, indices, end=ends, idx_fill=-1)
+
+    # A sliced view can have aligned row strides and an unaligned base address.
+    backing = torch.empty((len(ends), k + 8), dtype=torch.int32, device="cuda")
+    with pytest.raises(RuntimeError, match="Tensor data pointer is not aligned"):
+        topk(
+            scores,
+            k,
+            end=ends,
+            output_idx=backing[:, 1 : k + 1],
+            idx_oob_fill_value=-1,
+            return_value=False,
+            abort_when_nan_found=False,
+            streaming_fp32=True,
+        )
+
+
 def test_caller_output_and_index_offset():
     rows, k, width = 5, 512, 8192
     input = _make_input(rows, width, torch.bfloat16)
