@@ -104,7 +104,6 @@ class BaseReasoningFormatDetector:
 
         # Subclasses can opt into stricter boundary handling without changing
         # the established behavior of detectors that share this base class.
-        self._prefer_tool_start_boundary = False
 
         self.continue_final_message = continue_final_message
         if self.continue_final_message:
@@ -473,7 +472,6 @@ class Step5Detector(DeepSeekR1Detector):
             force_nonempty_content=force_nonempty_content,
         )
         self.tool_start_token = "<tool_call>"
-        self._prefer_tool_start_boundary = True
 
 
 class Qwen3Detector(BaseReasoningFormatDetector):

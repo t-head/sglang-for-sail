@@ -9,4 +9,6 @@ pub(super) const THINK: TagConfig = TagConfig {
     tool_start: Some("<tool_call>"),
     reasoning_default: ReasoningDefault::on_unless("enable_thinking"),
     tool_start_at_line_start: false,
+    force_reasoning_by_default: false,
+    prefer_tool_start_boundary: false,
 };
