@@ -469,6 +469,17 @@ def run(policy_path, tier, queue_s):
         revision = None
     uses_cache_ref = revision is None and "PPU_CI_HF_CACHE_ROOT" in os.environ
     if revision is None and not uses_cache_ref:
+        recipe_doc = _load_yaml(recipe)
+        default_hf_id = recipe_doc.get("ppu", {}).get("hf_model_id") or recipe_doc.get(
+            "model", {}
+        ).get("model_id")
+        if (
+            effective["variant"] != "default"
+            or effective["hf_model_id"] != default_hf_id
+        ):
+            raise ValueError(
+                "container model mount only supports the default recipe checkpoint"
+            )
         model_path = os.environ["PPU_RECIPE_CONTAINER_MODEL"]
     else:
         phase("model_cache_check")

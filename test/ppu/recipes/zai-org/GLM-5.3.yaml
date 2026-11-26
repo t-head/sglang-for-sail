@@ -69,7 +69,7 @@ variants:
     served_name: glm-5.3-mxfp4
     extra_args: []
     extra_env: {}
-  fp8_channel:
+  fp8:
     precision: fp8
     hardware: zhenwu_m890
     topology:
@@ -77,28 +77,28 @@ variants:
       nodes: 1
       devices_per_node: 8
     assets:
-      model: glm-5.3-fp8-channel
-      tokenizer: glm-5.3-fp8-channel
-    hf_model_id: T-HEAD/GLM-5.3-Quant-W-FP8-PerChannel-A-FP8-PerChannel
-    golden_model_key: glm_5_3_fp8_channel
-    served_name: glm-5.3-fp8-channel
+      model: glm-5.3-fp8
+      tokenizer: glm-5.3-fp8
+    hf_model_id: zai-org/GLM-5.3
+    golden_model_key: glm_5_3_fp8
+    served_name: glm-5.3-fp8
     extra_args:
       - --tp-size
       - "8"
     extra_env: {}
-  w8a8_int8:
-    precision: w8a8_int8
+  bf16_810e:
+    precision: bf16
     hardware: zhenwu_810e
     topology:
       kind: single_node
       nodes: 1
       devices_per_node: 16
     assets:
-      model: glm-5.3-w8a8-int8
-      tokenizer: glm-5.3-w8a8-int8
-    hf_model_id: T-HEAD/GLM-5.3-Quant-W-INT8-PerChannel-A-INT8-PerToken
-    golden_model_key: glm_5_3_w8a8_int8
-    served_name: glm-5.3-w8a8-int8
+      model: glm-5.3-bf16
+      tokenizer: glm-5.3-bf16
+    hf_model_id: zai-org/GLM-5.3-BF16
+    golden_model_key: glm_5_3_bf16_810e
+    served_name: glm-5.3-bf16
     extra_args:
       - --tp-size
       - "16"
@@ -237,8 +237,9 @@ presets:
       SGLANG_SAIL_DEEPEP_RECV_HOOK: "0"
 notes: >-
   Reference #0 full-scenario serving recipe for zai-org/GLM-5.3 across Zhenwu
-  M890 (default mxfp4 and fp8_channel) and Zhenwu 810E (w8a8_int8) variants,
-  covering prefill (TP8/TP16 without NEXTN), single-node decode (TP8 with
-  NEXTN), 4-node TP32+AttnDP32+DeepEP decode_ep, and paired Mooncake
-  pd_prefill/pd_decode disaggregation presets. Baseline default resolution
-  remains unchanged for online PR fast_sanity and Nightly model_sanity gates.
+  M890 (default mxfp4 and public fp8 zai-org/GLM-5.3) and Zhenwu 810E (public
+  bf16_810e zai-org/GLM-5.3-BF16) variants, covering prefill (TP8/TP16 without
+  NEXTN), single-node decode (TP8 with NEXTN), 4-node TP32+AttnDP32+DeepEP
+  decode_ep, and paired Mooncake pd_prefill/pd_decode disaggregation presets.
+  Baseline default resolution remains unchanged for online PR fast_sanity and
+  Nightly model_sanity gates.
