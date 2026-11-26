@@ -389,6 +389,14 @@ del _mod, _fn
 
 register_kernel(
     KernelSpec(
+        op="attention.dequantize_k_cache_paged_fast_dsa",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsa.dequant_k_cache:dequantize_k_cache_paged_fast_dsa",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
         op="attention.fused_rope_wo_a_bf16",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.attention.dsv4.wo_a:fused_rope_wo_a_bf16",
