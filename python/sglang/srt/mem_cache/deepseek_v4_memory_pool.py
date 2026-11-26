@@ -868,6 +868,19 @@ class DeepSeekV4IndexerPool(KVCache):
         scales = buf[page, scale_cols].contiguous().view(torch.int32).squeeze(-1)
         return payload, scales
 
+    def get_index_k_int8(
+        self, layer_id: int, slots: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """INT8 rows at `slots`: (payload int8 [n, 128], fp32 scales [n]),
+        from the page layout [page_size * 128 payload | page_size * 4 scale]."""
+        from sglang.kernels.ops.attention.dsv4.int8_indexer import gather_int8_index_k
+
+        assert not self.use_fp4_indexer, (
+            "int8 readback only applies to the non-fp4 132-byte layout"
+        )
+        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        return gather_int8_index_k(buf, slots, self.page_size)
+
     def get_index_k_dequant(
         self, layer_id: int, slots: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
@@ -2284,6 +2297,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.wait_layer_transfer(layer_id)
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         return self._indexer_pool(compress_ratio).get_index_k_fp4(
+            compress_layer_id, slots
+        )
+
+    def get_low_ratio_index_k_int8(
+        self, layer_id: int, slots: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """INT8 index-K rows at `slots`: (payload int8 [n, 128], fp32 scales [n])."""
+        self.wait_layer_transfer(layer_id)
+        compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
+        return self._indexer_pool(compress_ratio).get_index_k_int8(
             compress_layer_id, slots
         )
 
