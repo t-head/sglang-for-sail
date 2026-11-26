@@ -9,6 +9,7 @@ import ast
 import functools
 import logging
 import runpy
+import subprocess
 import sys
 import unittest
 from contextlib import contextmanager, nullcontext
@@ -69,6 +70,7 @@ BASE_NS = load_definitions(
     SRC / "test/test_utils.py",
     ["CustomTestCase"],
     {
+        "subprocess": subprocess,
         "unittest": unittest,
         "envs": ENV_NS["envs"],
         "is_in_ci": lambda: False,
@@ -180,15 +182,18 @@ class MegaMHCFixture:
 
 
 class TestMegaMHCDispatch(MegaMHCFixture, CustomTestCase):
-    def test_sail_sm89_and_newer_and_nvidia_sm10x(self):
+    def test_sail_sm80_and_newer_and_nvidia_sm10x(self):
         with self.env.override(True):
             for sail, sm, expected in [
-                (True, 80, False),
-                (True, 88, False),
+                (True, 75, False),
+                (True, 79, False),
+                (True, 80, True),
+                (True, 88, True),
                 (True, 89, True),
                 (True, 90, True),
                 (True, 100, True),
                 (True, 120, True),
+                (False, 80, False),
                 (False, 89, False),
                 (False, 90, False),
                 (False, 100, True),

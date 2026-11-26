@@ -3,7 +3,7 @@
 Credit: DeepSeek's DeepGEMM project provides the fused MegaMHC kernel.
 https://github.com/deepseek-ai/DeepGEMM
 
-SAIL SM89+ needs a compatible vendor DeepGEMM build; the upstream SM10x kernel
+SAIL SM80+ needs a compatible vendor DeepGEMM build; the upstream SM10x kernel
 alone does not support SAIL. Unsupported inputs/APIs leave the existing path intact.
 """
 
@@ -60,7 +60,7 @@ def _mega_mhc_supported() -> bool:
     if not ENABLE_JIT_DEEPGEMM:
         return False
     sm = get_device_sm()
-    if not (sm >= 89 if _is_sail else is_cuda() and 100 <= sm < 110):
+    if not (sm >= 80 if _is_sail else is_cuda() and 100 <= sm < 110):
         return False
     from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 
