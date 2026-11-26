@@ -1077,7 +1077,7 @@ class TestPPUPDEnvironment(unittest.TestCase):
         }
         self.assertEqual(
             hashlib.sha256(json.dumps(deployment, sort_keys=True).encode()).hexdigest(),
-            "593aed8a9bd4f088a7754e6ae803447cb9707bb48e630015f09a43add3caf0a6",
+            "5c3fc010f4ff70f1d5fb2981ef9fd7f412f544592ffd7b4c2cff22aa38095ad1",
         )
 
     def test_runtime_provenance_native_imports_router_and_metadata(self):

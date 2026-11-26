@@ -308,7 +308,7 @@ def resolve_recipe(
     port: int = 9985,
     served_model_name: str | None = None,
 ) -> dict[str, Any]:
-    """Resolve a serving recipe or the current local PD deployment and test policy."""
+    """Resolve recipe + optional policy tier into effective SGLang argv, env, and digest."""
     recipe = _load_yaml(recipe_path)
     if recipe.get("schema_version") == PD_SCHEMA:
         return _resolve_pd_recipe(
@@ -1474,7 +1474,10 @@ def validate_paths(
                 for label, flag_set in _collect_all_recipe_flag_sets(rpath, rdoc):
                     validate_flags_with_parser(active_parser, flag_set, context=label)
                     checked_flag_sets += 1
-            parser_checked = checked_flag_sets > 0
+                if rdoc.get("schema_version") == PD_SCHEMA:
+                    parser_checked = True
+                else:
+                    parser_checked = checked_flag_sets > 0
 
     return {
         "validated_files": validated,

@@ -9,8 +9,6 @@ import re
 import sys
 from pathlib import Path
 
-import yaml
-
 from recipe_diagnostics import PHASES
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -64,6 +62,8 @@ ACCURACY = {
 
 
 def load_policy(model):
+    import yaml
+
     try:
         policy = yaml.safe_load((MODEL_POLICY_ROOT / f"{model}.yaml").read_text())
     except yaml.YAMLError as exc:
@@ -74,6 +74,8 @@ def load_policy(model):
 
 
 def accuracy_recipe(policy):
+    import yaml
+
     reference = policy.get("recipe")
     if type(reference) is not str:
         raise ValueError("accuracy-only policy lacks recipe")
@@ -118,6 +120,8 @@ def accuracy_recipe(policy):
 
 
 def validate_accuracy_baseline(payload, recipe, stage):
+    import yaml
+
     ppu = recipe.get("ppu")
     if type(ppu) is not dict or type(ppu.get("golden_model_key")) is not str:
         raise ValueError("accuracy-only recipe lacks golden identity")
@@ -221,7 +225,11 @@ def validate(payload):
     }
     tier = payload.get("tier")
     tier_fields = {"fast_sanity": FAST, "model_sanity": NIGHTLY}.get(tier)
-    if tier_fields is None:
+    accuracy_only = payload.get("model") == "deepseek-v41-flash-pd"
+    base_fields = ACCURACY_BASE if accuracy_only else BASE
+    if accuracy_only and tier == "model_sanity":
+        tier_fields = ACCURACY
+    if tier_fields is None or set(payload) - (meta | base_fields | tier_fields):
         raise ValueError("unexpected result field")
     if (
         payload["schema"] != "ppu-sanity/v1"
@@ -233,20 +241,17 @@ def validate(payload):
         or type(payload["private_retention"]) is not bool
     ):
         raise ValueError("invalid run identity")
-    policy = load_policy(payload["model"])
-    accuracy_only = policy.get("measurement") == "accuracy_only"
-    base_fields = ACCURACY_BASE if accuracy_only else BASE
+    recipe = stage = None
     if accuracy_only:
         if tier != "model_sanity":
             raise ValueError("accuracy-only policy requires model_sanity")
-        tier_fields = ACCURACY
-    recipe = stage = None
-    if "measurement" in payload:
-        if not accuracy_only or payload["measurement"] != "accuracy_only":
+        policy = load_policy(payload["model"])
+        if policy.get("measurement") != "accuracy_only":
             raise ValueError("measurement profile does not match model policy")
-        recipe, stage = accuracy_recipe(policy)
-    if set(payload) - (meta | base_fields | tier_fields):
-        raise ValueError("unexpected result field")
+        if "measurement" in payload:
+            if payload["measurement"] != "accuracy_only":
+                raise ValueError("measurement profile does not match model policy")
+            recipe, stage = accuracy_recipe(policy)
     for key in ("recipe_tree_sha256", "config_digest"):
         if key in payload and not re.fullmatch(r"[0-9a-f]{64}", payload[key]):
             raise ValueError("invalid digest")

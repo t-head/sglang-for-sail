@@ -1,4 +1,4 @@
-"""Validate the PPU runner environment, with opt-in PD runtime checks."""
+"""Validate the PPU runner environment without importing SGLang."""
 
 import argparse
 import hashlib
@@ -291,6 +291,7 @@ def check_pd_runtime():
 
 
 def main() -> int:
+    """Run every check and return a process-compatible status code."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--pd-case", choices=("deepseek-v41-flash-1p1d",))
     parser.add_argument("--pd-config", type=Path)

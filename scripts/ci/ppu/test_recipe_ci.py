@@ -841,6 +841,54 @@ class RecipeContractTest(unittest.TestCase):
             resolve_recipe(recipe, policy_path=policy, tier="fast_sanity"), resolved
         )
 
+    def test_available_parser_does_not_claim_unchecked_recipe_flags(self):
+        recipe = _load_yaml(
+            REPO_ROOT / "test/ppu/recipes/deepseek-ai/DeepSeek-V4.1-Flash.yaml"
+        )
+        recipe["ppu"]["framework"] = "vllm"
+        parser = argparse.ArgumentParser(allow_abbrev=False)
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "recipe.yaml"
+            path.write_text(yaml.safe_dump(recipe))
+            report = validate_paths(
+                [path], sglang_parser_mode="required", parser=parser
+            )
+        self.assertEqual(report["validated_files"], [str(path)])
+        self.assertFalse(report["parser_checked"])
+        self.assertEqual(report["checked_flag_sets"], 0)
+
+    def test_pd_parser_evidence_requires_both_role_checks(self):
+        parser = argparse.ArgumentParser(allow_abbrev=False)
+        parser.add_argument("--model-path")
+        for _, flags in _collect_all_recipe_flag_sets(
+            PD_CONFIG_PATH, load_pd_config()
+        ):
+            for flag, value, _ in _parse_flag_entries(flags):
+                if flag not in parser._option_string_actions:
+                    if value is None:
+                        parser.add_argument(flag, action="store_true")
+                    else:
+                        parser.add_argument(flag)
+        report = validate_paths(
+            [PD_CONFIG_PATH], sglang_parser_mode="required", parser=parser
+        )
+        self.assertTrue(report["parser_checked"])
+        self.assertEqual(report["checked_flag_sets"], 2)
+        mode_action = parser._option_string_actions["--disaggregation-mode"]
+        for rejected_role in ("prefill", "decode"):
+            with self.subTest(rejected_role=rejected_role):
+                mode_action.choices = [
+                    role for role in ("prefill", "decode") if role != rejected_role
+                ]
+                with self.assertRaisesRegex(
+                    ValidationError, f":{rejected_role}: parser rejected args"
+                ):
+                    validate_paths(
+                        [PD_CONFIG_PATH],
+                        sglang_parser_mode="required",
+                        parser=parser,
+                    )
+
     def test_pd_only_validation_requires_parser_and_does_not_claim_skipped_checks(self):
         with patch("ppu_recipe._build_sglang_serve_parser", side_effect=ImportError) as build:
             with self.assertRaisesRegex(ValidationError, "parser check required"):
@@ -1060,10 +1108,37 @@ class RecipeContractTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "golden evaluation contract"):
                     evaluate(stage, {**forwarded, "hf_model_id": "wrong/model"})
 
+    def test_old_model_eval_worker_keeps_existing_endpoint_and_payload(self):
+        path = DEFAULT_POLICY_ROOT / "models/deepseek-v4-flash.yaml"
+        config = resolve_recipe(
+            REPO_ROOT / _load_yaml(path)["recipe"], policy_path=path, tier="model_sanity"
+        )
+        stage = next(
+            stage for stage in _load_yaml(path)["tiers"]["model_sanity"]["stages"]
+            if stage["kind"] == "evalscope"
+        )
+        config["api_url"] = "http://127.0.0.1:8008"
+        expected = {key: config[key] for key in ("golden_model_key", "hf_model_id", "ppu_count")}
+        with tempfile.TemporaryDirectory() as temp, patch("recipe_runner.RESULTS", Path(temp)):
+            (Path(temp) / "gsm8k-result.json").write_text("{}")
+            with patch.dict(os.environ, {"PPU_CI_EVAL_SITE": "/eval-site"}), patch(
+                "recipe_runner.subprocess.run"
+            ) as worker:
+                run_evaluation(stage, config)
+                self.assertEqual(json.loads(worker.call_args.kwargs["input"]), [stage, expected])
+            task_config = Mock(side_effect=lambda **kwargs: SimpleNamespace(**kwargs))
+            task = Mock(return_value={"gsm8k": SimpleNamespace(score=1253 / 1319, num=1319)})
+            with patch.dict(sys.modules, {"evalscope": SimpleNamespace(TaskConfig=task_config, run_task=task)}), patch(
+                "recipe_runner.read_eval_reviews", return_value=({"fixture": True}, 1253)
+            ):
+                evaluate(stage, config)
+            self.assertEqual(task_config.call_args.kwargs["api_url"], "http://127.0.0.1:9985/v1")
+
     def test_old_model_cannot_opt_out_of_full_model_sanity(self):
         policy = _load_yaml(DEFAULT_POLICY_ROOT / "models/deepseek-v4-flash.yaml")
+        validate_policy_structure(policy, context="fixture")
         policy["measurement"] = "accuracy_only"
-        with self.assertRaisesRegex(ValidationError, "requires a PD recipe"):
+        with self.assertRaisesRegex(ValidationError, "accuracy_only requires a PD recipe"):
             validate_policy_structure(policy, context="fixture")
         del policy["measurement"]
         policy["tiers"]["model_sanity"]["stages"] = policy["tiers"]["model_sanity"]["stages"][1:2]
@@ -1120,6 +1195,25 @@ class RunEvidenceTest(unittest.TestCase):
             baseline_established=True,
         )
         return result
+
+    def test_non_pd_publication_keeps_original_dependencies_and_rejection_order(self):
+        result = fast_result()
+        with patch("recipe_publish.load_policy", side_effect=AssertionError("PD-only")), patch(
+            "recipe_publish.Path.read_text", side_effect=AssertionError("no policy parsing")
+        ):
+            validate(result)
+        with self.assertRaisesRegex(ValueError, "unexpected result field"):
+            validate({"tier": "fast_sanity", "unexpected": True})
+        launcher = (
+            "import sys, json; sys.path.insert(0, sys.argv[1]); "
+            "from recipe_publish import validate; validate(json.loads(sys.argv[2]))"
+        )
+        isolated = subprocess.run(
+            [sys.executable, "-I", "-S", "-B", "-c", launcher,
+             str(REPO_ROOT / "scripts/ci/ppu"), json.dumps(result)],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(isolated.returncode, 0, isolated.stderr)
 
     def test_accuracy_only_pass_publishes_without_fabricated_bench_fields(self):
         result = self.accuracy_result()

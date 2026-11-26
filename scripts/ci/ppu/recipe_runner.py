@@ -411,7 +411,9 @@ def evaluate(stage, config):
     report = run_task(
         task_cfg=TaskConfig(
             model=MODEL,
-            api_url=config.get("api_url", HOST) + "/v1",
+            api_url=(
+                config["api_url"] if config.get("deployment_kind") == "pd_disagg" else HOST
+            ) + "/v1",
             api_key="EMPTY",
             eval_type="openai_api",
             datasets=["gsm8k"],
@@ -514,11 +516,10 @@ def run_evaluation(stage, config):
         return evaluate(stage, config)
     args = [
         stage,
-        {
-            **{key: config[key] for key in ("golden_model_key", "hf_model_id", "ppu_count")},
-            "api_url": config.get("api_url", HOST),
-        },
+        {key: config[key] for key in ("golden_model_key", "hf_model_id", "ppu_count")},
     ]
+    if config.get("deployment_kind") == "pd_disagg":
+        args[1].update(deployment_kind="pd_disagg", api_url=config["api_url"])
     launcher = (
         "import runpy, sys; sys.path[:0] = sys.argv[1:3]; del sys.argv[1:3]; "
         "runpy.run_module('recipe_runner', run_name='__main__')"

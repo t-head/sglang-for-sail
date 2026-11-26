@@ -21,20 +21,21 @@ def cluster_width(policy_path, tier):
     width = resolved["ppu_count"]
     if topology["kind"] == "pd_disagg":
         # Only the current local eight-device case is executable by this selector.
-        supported = (
-            resolved.get("deployment_kind") == "pd_disagg"
-            and tier == "model_sanity"
-            and topology["nodes"] == 1
-            and topology["devices_per_node"] == width == 8
-        )
-    else:
-        supported = (
-            topology["kind"] == "single_node"
-            and topology["nodes"] == 1
-            and topology["devices_per_node"] == width
-            and width in {2, 4, 8}
-        )
-    if not supported:
+        if (
+            resolved.get("deployment_kind") != "pd_disagg"
+            or tier != "model_sanity"
+            or topology["nodes"] != 1
+            or topology["devices_per_node"] != width
+            or width != 8
+        ):
+            raise ValueError(f"unsupported cluster topology for policy {policy_path.stem}")
+        return width
+    if (
+        topology["kind"] != "single_node"
+        or topology["nodes"] != 1
+        or topology["devices_per_node"] != width
+        or width not in {2, 4, 8}
+    ):
         raise ValueError(f"unsupported cluster topology for policy {policy_path.stem}")
     return width
 
