@@ -11,7 +11,8 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.utils import is_xpu
+from sglang.srt.environ import envs
+from sglang.srt.utils import is_sail, is_xpu
 
 from .candidate_table import CANDIDATE_BLOCK_SIZE
 from .utils import make_name
@@ -37,6 +38,12 @@ def _jit_topk_v2_module(stable_ties: bool = False):
 
     args = make_cpp_args(is_arch_support_pdl(), stable_ties)
     extra_cuda_cflags = [f"-DSGL_TOPK_STABLE_TIES={int(stable_ties)}"]
+    # Cache key args; a no-SIMT build must not collide with the default module
+    # (the JIT cache key does not include compile flags).
+    module_args = list(args)
+    if envs.SGLANG_DSA_TOPK_NO_SIMT.get() and is_sail():
+        module_args.append("nosimt")
+        extra_cuda_cflags.append("--no-simt")
     # Enable each cluster path only when its occupancy probe reports capacity.
     if is_arch_support_pdl():  # set the persistent cluster size after hopper
         for cluster_size, occupancy in ((8, 2), (16, 1)):
@@ -62,7 +69,7 @@ def _jit_topk_v2_module(stable_ties: bool = False):
     ]
     return load_jit(
         make_name("topk_v2"),
-        *args,
+        *module_args,
         extra_cuda_cflags=extra_cuda_cflags,
         cuda_files=["deepseek_v4/topk_v2.cuh"],
         cuda_wrappers=wrappers,
@@ -125,14 +132,19 @@ def _jit_topk_prefill_module(topk: int):
 
 @cache_once
 def _jit_topk_prefill_bf16_module(topk: int):
+    module_args = [make_name("topk_prefill_bf16"), str(topk)]
+    extra_cuda_cflags = [f"-DSGL_TOPK={topk}"]
+    if envs.SGLANG_DSA_TOPK_NO_SIMT.get() and is_sail():
+        # Keep this build separate from the default JIT module.
+        module_args.append("nosimt")
+        extra_cuda_cflags.append("--no-simt")
     return load_jit(
-        make_name("topk_prefill_bf16"),
-        str(topk),
+        *module_args,
         cuda_files=["deepseek_v4/topk_prefill_bf16.cuh"],
         cuda_wrappers=[
             ("top_k_per_row_prefill_bf16", "TopKPrefillBF16Kernel::transform"),
         ],
-        extra_cuda_cflags=[f"-DSGL_TOPK={topk}"],
+        extra_cuda_cflags=extra_cuda_cflags,
     )
 
 

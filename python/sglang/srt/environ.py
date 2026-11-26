@@ -2049,6 +2049,8 @@ class Envs:
     # DSA backend (GLM 5 and DeepSeek V3.2)
     # ===================================================================
     SGLANG_DSA_FUSE_TOPK = EnvBool(True)
+    # Opt into the PPU-only compiler mode for BF16 prefill TopK.
+    SGLANG_DSA_TOPK_NO_SIMT = EnvBool(False)
     # Enabled for supported CUDA KPool geometry; set to 0 to use ordinary metadata.
     SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION = EnvBool(True)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
