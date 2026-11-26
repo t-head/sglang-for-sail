@@ -945,6 +945,63 @@ class RecipeContractTest(unittest.TestCase):
                     self.assertIn(str(path), str(error.exception))
                     self.assertIsInstance(error.exception.__cause__, cause)
 
+    def test_pd_recipe_scans_public_strings_except_declared_local_addresses(self):
+        config = load_pd_config()
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "pd.yaml"
+            path.write_text(yaml.safe_dump(config))
+            report = validate_paths([path], sglang_parser_mode="skip")
+            self.assertEqual(report["validated_files"], [str(path)])
+            self.assertEqual(resolve_recipe(path)["pd_config"], config)
+
+            for keys, value, finding in (
+                (("common_env", "QODER_PAT"), "fixture", "credential"),
+                (
+                    ("roles", "prefill", "env", "MC_TEST_VALUE"),
+                    "fixture.alibaba-inc.com",
+                    "internal_domain",
+                ),
+                (
+                    ("roles", "decode", "env", "MC_TEST_VALUE"),
+                    "127.0.0.1",
+                    "ipv4_literal",
+                ),
+                (("router", "metrics_host"), "192.0.2.5", "ipv4_literal"),
+            ):
+                with self.subTest(keys=keys):
+                    invalid = deepcopy(config)
+                    target = invalid
+                    for key in keys[:-1]:
+                        target = target[key]
+                    target[keys[-1]] = value
+                    path.write_text(yaml.safe_dump(invalid))
+                    message = f"matched {finding}"
+                    with self.assertRaisesRegex(ValidationError, message) as error:
+                        validate_paths([path], sglang_parser_mode="skip")
+                    self.assertNotIn("QODER_PAT", str(error.exception))
+                    with self.assertRaisesRegex(ValidationError, message):
+                        resolve_recipe(path)
+
+    def test_pd_recipe_rejects_text_model_layer_overrides(self):
+        config = load_pd_config()
+        flag = "--json-model-override-args"
+        index = config["common_args"].index(flag) + 1
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "pd.yaml"
+            for override, message in (
+                ({"num_hidden_layers": 2}, "does not support layer overrides"),
+                ({"text_config": {"num_hidden_layers": 2}}, "does not support layer overrides"),
+                ({"text_config": []}, "text_config must be an object"),
+            ):
+                with self.subTest(override=override):
+                    candidate = deepcopy(config)
+                    candidate["common_args"][index] = json.dumps(override)
+                    path.write_text(yaml.safe_dump(candidate))
+                    with self.assertRaisesRegex(ValidationError, message):
+                        validate_paths([path], sglang_parser_mode="skip")
+                    with self.assertRaisesRegex(ValidationError, message):
+                        resolve_recipe(path)
+
     def test_pd_runner_executes_only_accuracy_and_keeps_real_weights(self):
         policy = DEFAULT_POLICY_ROOT / "models/deepseek-v41-flash-pd.yaml"
         accuracy = {
@@ -992,7 +1049,10 @@ class RecipeContractTest(unittest.TestCase):
     def test_pd_lifecycle_orders_readiness_and_cleans_partial_startup(self):
         policy = DEFAULT_POLICY_ROOT / "models/deepseek-v41-flash-pd.yaml"
         config = resolve_recipe(PD_CONFIG_PATH, policy_path=policy, tier="model_sanity")
-        for failure in (None, "spawn", "health", "exit", "eval", "signal", "preflight", "parser", "timeout", "ports", "cleanup_timeout"):
+        for failure in (
+            None, "spawn", "health", "exit", "eval", "signal", "preflight", "parser",
+            "timeout", "ports", "cleanup_timeout", "cleanup_signal",
+        ):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp:
                 results = Path(temp) / "results"
                 results.mkdir()
@@ -1014,8 +1074,17 @@ class RecipeContractTest(unittest.TestCase):
                     events.append("start:" + name)
                     process = Mock(pid=100 + len(children))
                     process.poll.return_value = 1 if failure == "exit" else None
-                    if failure == "cleanup_timeout":
-                        process.wait.side_effect = [subprocess.TimeoutExpired("fixture", 15), 0]
+
+                    def wait(*, timeout):
+                        for sig, handler in previous.items():
+                            self.assertIsNot(signal.getsignal(sig), handler)
+                        if timeout == 15 and failure in ("signal", "cleanup_signal"):
+                            signal.getsignal(signal.SIGINT)(signal.SIGINT, None)
+                        if timeout == 15 and failure == "cleanup_timeout":
+                            raise subprocess.TimeoutExpired("fixture", timeout)
+                        return 0
+
+                    process.wait.side_effect = wait
                     children.append(process)
                     return process
 
@@ -1073,6 +1142,10 @@ class RecipeContractTest(unittest.TestCase):
                             self.assertTrue(call.kwargs["start_new_session"])
                         self.assertEqual(check.call_args.kwargs["env"]["PD_TEST_CODE_SOURCE"], "installed")
                         self.assertTrue((results / "pd-runtime.json").is_file())
+                    elif failure in ("signal", "cleanup_signal"):
+                        expected = signal.SIGTERM if failure == "signal" else signal.SIGINT
+                        with self.assertRaisesRegex(InterruptedError, f"interrupted by signal {expected}"):
+                            execute()
                     else:
                         with self.assertRaises((RuntimeError, OSError, ValueError, InterruptedError, subprocess.CalledProcessError)):
                             execute()

@@ -546,9 +546,35 @@ def _load_pd_recipe(recipe_path: Path) -> dict[str, Any]:
     from ppu_pd import load_pd_config
 
     try:
-        return load_pd_config(recipe_path)
+        config = load_pd_config(recipe_path)
     except (KeyError, TypeError, ValueError, NotImplementedError) as exc:
         raise ValidationError(f"{recipe_path}: invalid PD recipe: {exc}") from exc
+
+    def mask_local_addresses(section, allowed):
+        return {
+            key: "" if key in allowed and value == allowed[key] else value
+            for key, value in section.items()
+        }
+
+    scan_config = {
+        **config,
+        "nodes": {
+            name: mask_local_addresses(node, {"host": "127.0.0.1"})
+            for name, node in config["nodes"].items()
+        },
+        "roles": {
+            name: mask_local_addresses(role, {"host": "0.0.0.0"})
+            for name, role in config["roles"].items()
+        },
+        "router": mask_local_addresses(
+            config["router"], {"host": "127.0.0.1", "metrics_host": "127.0.0.1"}
+        ),
+    }
+    for _, text in _walk_strings(scan_config):
+        findings = _scan_text(text, context=str(recipe_path))
+        if findings:
+            raise ValidationError("; ".join(findings))
+    return config
 
 
 def _pd_role_flag_sets(config: dict[str, Any]) -> list[tuple[str, list[str]]]:
@@ -569,8 +595,12 @@ def _pd_role_flag_sets(config: dict[str, Any]) -> list[tuple[str, list[str]]]:
                     raise ValidationError(f"PD {name}: invalid JSON flag {flag}") from exc
                 if not isinstance(obj, dict):
                     raise ValidationError(f"PD {name}: JSON flag {flag} must be an object")
-                if flag == "--json-model-override-args" and "num_hidden_layers" in obj:
-                    raise ValidationError("PD does not support layer overrides")
+                if flag == "--json-model-override-args":
+                    text_config = obj.get("text_config")
+                    if text_config is not None and not isinstance(text_config, dict):
+                        raise ValidationError(f"PD {name}: text_config must be an object")
+                    if "num_hidden_layers" in obj or "num_hidden_layers" in (text_config or {}):
+                        raise ValidationError("PD does not support layer overrides")
         sets.append((name, flags))
     return sets
 

@@ -172,6 +172,9 @@ def pd_server(config, timings):
         "--request-timeout-secs", str(pd["request_timeout_s"]),
     ]
     processes = []
+    handlers = {}
+    cleaning_up = False
+    cleanup_signal = None
 
     def stop(process):
         try:
@@ -189,7 +192,15 @@ def pd_server(config, timings):
         process.wait(timeout=5)
 
     def interrupted(signum, frame):
+        nonlocal cleanup_signal
+        if cleaning_up:
+            cleanup_signal = signum
+            return
         raise InterruptedError(f"PD interrupted by signal {signum}")
+
+    def restore_handlers():
+        for sig, handler in handlers.items():
+            signal.signal(sig, handler)
 
     def start_process(stack, name, process_env):
         log = stack.enter_context((RESULTS / f"pd-{name}.log").open("wb"))
@@ -218,10 +229,11 @@ def pd_server(config, timings):
         raise StartupError("readiness_timeout")
 
     with contextlib.ExitStack() as stack:
-        handlers = {}
+        stack.callback(restore_handlers)
         try:
             for sig in (signal.SIGTERM, signal.SIGINT):
-                handlers[sig] = signal.signal(sig, interrupted)
+                handlers[sig] = signal.getsignal(sig)
+                signal.signal(sig, interrupted)
             phase("server_startup")
             start = time.monotonic()
             deadline = start + pd["ready_timeout_s"]
@@ -240,8 +252,9 @@ def pd_server(config, timings):
             yield
             check_processes()
         finally:
-            for sig, handler in handlers.items():
-                signal.signal(sig, handler)
+            cleaning_up = True
+    if cleanup_signal is not None:
+        raise InterruptedError(f"PD interrupted by signal {cleanup_signal}")
 
 
 def probes(cfg, *, fast):
