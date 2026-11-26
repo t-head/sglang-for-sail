@@ -177,6 +177,9 @@ jobs:
           APPROVED_SHA: ${{ needs.pr-gate.outputs.sha }}
           MULTINODE_APPROVED: ${{ needs.pr-gate-multinode.outputs.approved }}
           MULTINODE_APPROVED_SHA: ${{ needs.pr-gate-multinode.outputs.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action || '' }}
+          TRIGGER_LABEL: ${{ github.event.label.name || '' }}
           INPUT_REF: ${{ inputs.ref || '' }}
           INPUT_TARGET_REF: ${{ inputs.target_ref || '' }}
           MODEL_FILTER: ${{ inputs.model_filter || '' }}
@@ -217,6 +220,15 @@ jobs:
               else
                 echo "::error::Multi-node models require the run-ci-ppu-multinode approval label for revision $source" >&2
                 exit 1
+              fi
+            elif [[ "$EVENT_NAME" == pull_request_target && "$EVENT_ACTION" == labeled && "$TRIGGER_LABEL" == run-ci-ppu-multinode && -z "$MODEL_FILTER" && "$has_single_node" == true && "$PR_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
+              prior_single_run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/nightly-test-ppu.yml/runs?event=pull_request_target&head_sha=$PR_HEAD&per_page=20" \
+                --jq --arg cur "$GITHUB_RUN_ID" '[.workflow_runs[] | select((.id | tostring) != $cur and .conclusion != "cancelled")] | length' 2>/dev/null || echo 0)
+              if [[ "$prior_single_run" =~ ^[1-9][0-9]*$ ]]; then
+                echo "::notice::Incremental run-ci-ppu-multinode approval on $PR_HEAD: skipping duplicate single-node matrix already scheduled by another run"
+                models='{"include":[]}'
+                has_single_node=false
+                all_models="$multinode_models"
               fi
             fi
           fi
@@ -411,26 +423,34 @@ jobs:
           ref: 96e25147971f5d2a04d828f8ad508cae38a4fa8a
           path: .ppu-infra
           persist-credentials: false
+      - name: Fetch trusted cluster orchestrator
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .ppu-trusted-ci
+          sparse-checkout: |
+            scripts/ci/ppu
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
       - name: Orchestrate PPU Pod with private logs
         id: cluster
         shell: bash
         run: |
           export PPU_PUBLIC_SUMMARY="$GITHUB_STEP_SUMMARY"
-          exec bash scripts/ci/ppu/run_recipe_cluster.sh
+          exec bash .ppu-trusted-ci/scripts/ci/ppu/run_recipe_cluster.sh
       - name: Guarantee cluster cleanup on cancel or interrupt
         if: always() && steps.cluster.outcome != 'skipped'
         shell: bash
-        run: |
-          if [[ -f scripts/ci/ppu/cleanup_recipe_cluster.sh ]]; then
-            bash scripts/ci/ppu/cleanup_recipe_cluster.sh
-          fi
+        run: bash .ppu-trusted-ci/scripts/ci/ppu/cleanup_recipe_cluster.sh
       - name: Approve only the checked public evidence file
         id: evidence
         if: always() && steps.cluster.outcome != 'skipped'
         shell: bash
         run: |
+          export PPU_CI_POLICY_ROOT="$GITHUB_WORKSPACE/test/ppu/policy/models"
           if [[ -f ppu-public/recipe.json && ! -L ppu-public/recipe.json ]] &&
-            python3 -B scripts/ci/ppu/recipe_publish.py --verify-only ppu-public/recipe.json >/dev/null 2>&1; then
+            python3 -B .ppu-trusted-ci/scripts/ci/ppu/recipe_publish.py --verify-only ppu-public/recipe.json >/dev/null 2>&1; then
             printf 'approved=true\n' >> "$GITHUB_OUTPUT"
           fi
       - name: Upload checked public evidence
@@ -505,23 +525,34 @@ jobs:
           ref: 96e25147971f5d2a04d828f8ad508cae38a4fa8a
           path: .ppu-infra
           persist-credentials: false
+      - name: Fetch trusted cluster orchestrator
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .ppu-trusted-ci
+          sparse-checkout: |
+            scripts/ci/ppu
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
       - name: Orchestrate multi-node PPU Pods with private logs
         id: cluster
         shell: bash
         run: |
           export PPU_PUBLIC_SUMMARY="$GITHUB_STEP_SUMMARY"
-          exec bash scripts/ci/ppu/run_recipe_cluster.sh
+          exec bash .ppu-trusted-ci/scripts/ci/ppu/run_recipe_cluster.sh
       - name: Guarantee cluster cleanup on cancel or interrupt
         if: always() && steps.cluster.outcome != 'skipped'
         shell: bash
-        run: bash scripts/ci/ppu/cleanup_recipe_cluster.sh
+        run: bash .ppu-trusted-ci/scripts/ci/ppu/cleanup_recipe_cluster.sh
       - name: Approve only the checked public evidence file
         id: evidence
         if: always() && steps.cluster.outcome != 'skipped'
         shell: bash
         run: |
+          export PPU_CI_POLICY_ROOT="$GITHUB_WORKSPACE/test/ppu/policy/models"
           if [[ -f ppu-public/recipe.json && ! -L ppu-public/recipe.json ]] &&
-            python3 -B scripts/ci/ppu/recipe_publish.py --verify-only ppu-public/recipe.json >/dev/null 2>&1; then
+            python3 -B .ppu-trusted-ci/scripts/ci/ppu/recipe_publish.py --verify-only ppu-public/recipe.json >/dev/null 2>&1; then
             printf 'approved=true\n' >> "$GITHUB_OUTPUT"
           fi
       - name: Upload checked public evidence

@@ -61,13 +61,11 @@ def select(tier, model_filter, *, topology="all"):
         sorted(DEFAULT_POLICY_ROOT.rglob("*.yaml")), sglang_parser_mode="skip"
     )
     models = {}
-    topologies = {}
     for path in sorted((DEFAULT_POLICY_ROOT / "models").glob("*.yaml")):
         if tier in _load_yaml(path).get("tiers", {}):
             if not re.fullmatch(r"[a-z0-9][a-z0-9.-]*", path.stem):
                 raise ValueError("invalid policy model key")
             models[path.stem] = path
-            topologies[path.stem] = cluster_topology(path, tier)
 
     if model_filter:
         requested = [key.strip() for key in model_filter.split(",")]
@@ -79,7 +77,11 @@ def select(tier, model_filter, *, topology="all"):
             raise ValueError(
                 "model filter must contain distinct policy model keys for this tier"
             )
+        # Resolve topologies only for explicitly requested models so an
+        # unrelated schema-valid policy (e.g. pd_disagg) never blocks selection.
+        topologies = {key: cluster_topology(models[key], tier) for key in requested}
     else:
+        topologies = {key: cluster_topology(path, tier) for key, path in models.items()}
         # Capacity isolation: multi-node flagships never enter the default PR
         # fast_sanity matrix; they run only via explicit model_filter or the
         # dedicated serial multi-node Nightly slot.

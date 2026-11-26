@@ -79,6 +79,16 @@ def _peer_failures(barrier_dir: Path | None, *, own_rank: int) -> list[str]:
     )
 
 
+def _rank0_done_status(barrier_dir: Path | None) -> str | None:
+    if barrier_dir is None or "rank0.done" not in _barrier_names(barrier_dir):
+        return None
+    try:
+        done_doc = json.loads((barrier_dir / "rank0.done").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "error"
+    return "ok" if done_doc.get("status") == "ok" else "error"
+
+
 def _kill_process_group_members(pgid: int, *, grace_s: float = 1.0) -> None:
     """Terminate any surviving members of a process group after leader exit."""
     try:
@@ -269,8 +279,12 @@ def warm_pp_stage_shards(
             read_total = 0
             with path.open("rb") as stream:
                 while not cancel.is_set():
-                    if barrier_dir is not None and _peer_failures(
-                        barrier_dir, own_rank=node_rank
+                    if barrier_dir is not None and (
+                        _peer_failures(barrier_dir, own_rank=node_rank)
+                        or (
+                            node_rank > 0
+                            and _rank0_done_status(barrier_dir) is not None
+                        )
                     ):
                         cancel.set()
                         break
@@ -289,6 +303,12 @@ def warm_pp_stage_shards(
                 total_bytes += fut.result()
 
         if cancel.is_set():
+            if barrier_dir is not None and (
+                _peer_failures(barrier_dir, own_rank=node_rank)
+                or (node_rank > 0 and _rank0_done_status(barrier_dir) is not None)
+            ):
+                phase("worker_exit")
+                raise StartupError("worker_exit")
             raise StartupError("page_cache_warm_cancelled")
 
         warm_only_s = time.monotonic() - start
@@ -308,7 +328,9 @@ def warm_pp_stage_shards(
             while time.monotonic() < deadline:
                 if cancel.is_set():
                     raise StartupError("page_cache_warm_cancelled")
-                if _peer_failures(barrier_dir, own_rank=node_rank):
+                if _peer_failures(barrier_dir, own_rank=node_rank) or (
+                    node_rank > 0 and _rank0_done_status(barrier_dir) is not None
+                ):
                     phase("worker_exit")
                     raise StartupError("worker_exit")
                 if expected.issubset(_barrier_names(barrier_dir)):
@@ -467,7 +489,20 @@ def run_worker_node(
                         raise StartupError("server_exit")
                     names = _barrier_names(barrier_dir)
                     if "rank0.done" in names:
+                        done_status = _rank0_done_status(barrier_dir)
                         signal_sent, stop_rc = _stop_process_group(process)
+                        if done_status != "ok":
+                            phase("worker_exit")
+                            _barrier_write(
+                                barrier_dir,
+                                f"exit-rank-{node_rank}.json",
+                                {
+                                    "rank": node_rank,
+                                    "exit_code": 1,
+                                    "reason": "rank0_error",
+                                },
+                            )
+                            return {"outcome": "fail", "node_rank": node_rank}
                         expected_signal_rcs = {
                             0,
                             -signal.SIGTERM,
@@ -566,8 +601,9 @@ def run_worker_node(
                         return {"outcome": "fail", "node_rank": node_rank}
                     time.sleep(poll_s)
             finally:
-                if process.poll() is None:
-                    _stop_process_group(process)
+                # Always reap any surviving members of the launcher's process
+                # group even when the group leader already exited early.
+                _stop_process_group(process)
     finally:
         if is_main:
             signal.signal(signal.SIGTERM, prev_term)
@@ -631,21 +667,23 @@ def server(
             status["ok"] = True
         finally:
             wait_error = None
-            if barrier_dir is not None and signal_done_on_exit:
-                # Publish rank0.done BEFORE stopping rank 0's server, and on the
-                # normal path wait for live workers to stop cleanly while rank 0
-                # is still up so workers never see a premature disconnect.
-                _barrier_write(
-                    barrier_dir,
-                    "rank0.done",
-                    {"status": "ok" if status["ok"] else "error"},
-                )
-                if status["ok"] and nnodes > 1:
-                    try:
-                        _wait_workers_exit(barrier_dir, nnodes)
-                    except Exception as exc:
-                        wait_error = exc
-            _stop_process_group(process)
+            try:
+                if barrier_dir is not None and signal_done_on_exit:
+                    # Publish rank0.done BEFORE stopping rank 0's server, and on the
+                    # normal path wait for live workers to stop cleanly while rank 0
+                    # is still up so workers never see a premature disconnect.
+                    _barrier_write(
+                        barrier_dir,
+                        "rank0.done",
+                        {"status": "ok" if status["ok"] else "error"},
+                    )
+                    if status["ok"] and nnodes > 1:
+                        try:
+                            _wait_workers_exit(barrier_dir, nnodes)
+                        except Exception as exc:
+                            wait_error = exc
+            finally:
+                _stop_process_group(process)
             if wait_error is not None:
                 raise wait_error
 
@@ -1036,7 +1074,7 @@ def _resolve_gang_snapshot(
     nnodes: int,
     node_rank: int,
     barrier_dir: Path | None,
-    timeout_s: float = 300.0,
+    timeout_s: float = 1800.0,
     poll_s: float = 0.5,
 ) -> tuple[str, str]:
     """Ensure every node in a multi-node gang resolves the exact same snapshot."""
@@ -1062,7 +1100,9 @@ def _resolve_gang_snapshot(
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         names = _barrier_names(barrier_dir)
-        if _peer_failures(barrier_dir, own_rank=node_rank) or "rank0.done" in names:
+        if _peer_failures(barrier_dir, own_rank=node_rank) or (
+            _rank0_done_status(barrier_dir) is not None
+        ):
             raise RuntimeError("rank 0 failed before publishing model snapshot")
         if manifest in names:
             payload = json.loads((barrier_dir / manifest).read_text(encoding="utf-8"))
@@ -1103,6 +1143,11 @@ def run(policy_path, tier, queue_s):
 
     revision = os.environ.get("PPU_CI_HF_MODEL_REVISION")
     uses_cache_ref = revision is None and "PPU_CI_HF_CACHE_ROOT" in os.environ
+    snapshot_wait_timeout = (
+        MODEL_SANITY_READY_TIMEOUTS.get(policy["model_id"], 2400)
+        if tier == "model_sanity"
+        else 1800
+    )
     if revision is None and not uses_cache_ref:
         model_path = os.environ["PPU_RECIPE_CONTAINER_MODEL"]
     else:
@@ -1113,6 +1158,7 @@ def run(policy_path, tier, queue_s):
             nnodes=expected_nnodes,
             node_rank=node_rank,
             barrier_dir=barrier_dir,
+            timeout_s=float(snapshot_wait_timeout),
         )
     assets.write_text(
         json.dumps({name: model_path for name in recipe_ppu["assets"].values()})

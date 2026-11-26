@@ -3,9 +3,15 @@
 set -euo pipefail
 umask 077
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
 if [[ -n "${PPU_CI_K8S_CONFIG_SHA256:-}" &&
     "${PPU_CI_K8S_LOADED_CONFIG_SHA256:-}" != "$PPU_CI_K8S_CONFIG_SHA256" ]]; then
-    exec python3 -B scripts/ci/ppu/recipe_cluster_config.py
+    exec python3 -B "$SCRIPT_DIR/recipe_cluster_config.py"
+fi
+
+if [[ -z "${PPU_CI_POLICY_ROOT:-}" && -d "${GITHUB_WORKSPACE:-$PWD}/test/ppu/policy/models" && ! -L "${GITHUB_WORKSPACE:-$PWD}/test/ppu/policy/models" ]]; then
+    export PPU_CI_POLICY_ROOT="${GITHUB_WORKSPACE:-$PWD}/test/ppu/policy/models"
 fi
 
 mode=${TIER:?}
@@ -64,7 +70,7 @@ record_runtime_image() {
         files+=("$raw/pod-status-worker-$i.json")
     done
     local public_digest
-    public_digest=$(python3 -B scripts/ci/ppu/recipe_image.py verify-pods "${files[@]}" \
+    public_digest=$(python3 -B "$SCRIPT_DIR/recipe_image.py" verify-pods "${files[@]}" \
         --expected-repo "$EXPECTED_IMAGE_REPO" \
         --expected-digest "$EXPECTED_IMAGE_DIGEST") || return 1
     if [[ "$SKIP_WHEEL_INSTALL" == true ]]; then
@@ -80,7 +86,7 @@ record_runtime_image() {
 }
 
 verify_cluster_cleanup() {
-    local remaining remaining_svc remaining_pg
+    local remaining remaining_svc remaining_pg stage_parent
     remaining=$(timeout 15s kubectl -n "$INPUT_NAMESPACE" get pods -l "ppu-job=$JOB_NAME" -o name) || return 1
     [[ -z "$remaining" ]] || return 1
     if (( INPUT_NNODES > 0 )); then
@@ -88,7 +94,12 @@ verify_cluster_cleanup() {
         remaining_pg=$(timeout 15s kubectl -n "$INPUT_NAMESPACE" get podgroups.scheduling.x-k8s.io "$JOB_NAME" --ignore-not-found -o name) || return 1
         [[ -z "$remaining_svc" && -z "$remaining_pg" ]] || return 1
     fi
-    [[ ! -e "$SOURCE_STAGE_DIR" ]]
+    [[ ! -e "$SOURCE_STAGE_DIR" ]] || return 1
+    stage_parent=$(dirname -- "$SOURCE_STAGE_DIR")
+    if [[ "$(basename -- "$SOURCE_STAGE_DIR")" == "source.tar.gz" &&
+        "$(basename -- "$stage_parent")" == "${JOB_NAME}."* ]]; then
+        [[ ! -e "$stage_parent" ]] || return 1
+    fi
 }
 
 export JOB_NAME="" SOURCE_STAGE_DIR="" INPUT_JOB_STATUS=failed INPUT_WORKFLOW_STATUS=failure
@@ -161,8 +172,8 @@ finish() {
         (( rc == 0 )) && export RECIPE_OUTCOME=success
         local candidate
         if ! candidate=$(mktemp 2>/dev/null) ||
-            ! python3 -B scripts/ci/ppu/recipe_report.py "$candidate" 2>/dev/null ||
-            ! python3 -B scripts/ci/ppu/recipe_publish.py "$candidate" \
+            ! python3 -B "$SCRIPT_DIR/recipe_report.py" "$candidate" 2>/dev/null ||
+            ! python3 -B "$SCRIPT_DIR/recipe_publish.py" "$candidate" \
                 ppu-public/legacy.json "$public_summary" >&3 2>/dev/null; then
             echo "::error::Single-device evidence could not be published" >&3
             rc=1
@@ -177,9 +188,9 @@ finish() {
     fi
     export RECIPE_OUTCOME=failure
     (( rc == 0 )) && export RECIPE_OUTCOME=success
-    python3 -B scripts/ci/ppu/recipe_report.py "$raw/public-candidate.json" || rc=1
+    python3 -B "$SCRIPT_DIR/recipe_report.py" "$raw/public-candidate.json" || rc=1
     if [[ ! -f "$raw/public-candidate.json" ]] ||
-        ! python3 -B scripts/ci/ppu/recipe_publish.py "$raw/public-candidate.json" \
+        ! python3 -B "$SCRIPT_DIR/recipe_publish.py" "$raw/public-candidate.json" \
             ppu-public/recipe.json "$public_summary" >&3; then
         echo "::error::PPU cluster result could not be published" >&3
         rc=1
@@ -231,7 +242,7 @@ case "$mode" in
             [[ "$mode" != fast_sanity ]] || INPUT_TIMEOUT_MINUTES=30
         fi
         INPUT_NPROC_PER_NODE=$RECIPE_PPU_COUNT
-        resolved_image_json=$(python3 -B scripts/ci/ppu/recipe_image.py resolve \
+        resolved_image_json=$(python3 -B "$SCRIPT_DIR/recipe_image.py" resolve \
             --image-tag "${PPU_CI_RUNTIME_IMAGE_TAG:-}" \
             --image-digest "${PPU_CI_RUNTIME_IMAGE_DIGEST:-}")
         INPUT_IMAGE=$(jq -er '.pull_ref' <<< "$resolved_image_json")
@@ -247,12 +258,12 @@ case "$mode" in
         if [[ "$SKIP_WHEEL_INSTALL" == true ]]; then
             [[ -n "${PPU_CI_RUNTIME_IMAGE_TAG:-}${PPU_CI_RUNTIME_IMAGE_DIGEST:-}" ]]
             [[ ! -e wheels ]]
-            RECIPE_TREE_SHA256=$(python3 -B scripts/ci/ppu/recipe_bundle.py checkout-digest "$PPU_CI_SOURCE_SHA")
+            RECIPE_TREE_SHA256=$(python3 -B "$SCRIPT_DIR/recipe_bundle.py" checkout-digest "$PPU_CI_SOURCE_SHA")
             [[ "$RECIPE_TREE_SHA256" =~ ^[0-9a-f]{64}$ ]]
             export PPU_CI_RECIPE_TREE_SHA256="$RECIPE_TREE_SHA256"
         else
             [[ -d wheels && ! -L wheels ]]
-            python3 -B scripts/ci/ppu/recipe_bundle.py check wheels "$PPU_CI_SOURCE_SHA"
+            python3 -B "$SCRIPT_DIR/recipe_bundle.py" check wheels "$PPU_CI_SOURCE_SHA"
         fi
         export PPU_CI_SKIP_WHEEL_INSTALL="$SKIP_WHEEL_INSTALL"
         if [[ "$mode" == model_sanity ]]; then
@@ -350,7 +361,8 @@ jq -n \
     > "${cleanup_state}.tmp"
 mv -- "${cleanup_state}.tmp" "$cleanup_state"
 [[ -s "$cleanup_state" ]]
-tar -czf "$SOURCE_STAGE_DIR" --exclude='./.ppu-infra' --exclude='./.git/config' \
+tar -czf "$SOURCE_STAGE_DIR" --exclude='./.ppu-infra' --exclude='./.ppu-trusted-ci' \
+    --exclude='./.git/config' \
     --exclude='./.git/config.worktree' --exclude='./.git/hooks' \
     --exclude='./.git/modules' --exclude='./.git/worktrees' -C "$GITHUB_WORKSPACE" .
 run_backend "$infra/submit.sh"

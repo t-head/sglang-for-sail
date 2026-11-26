@@ -12,6 +12,21 @@
 # Fails closed if no routable RoCE v2 GID consensus exists.
 set -euo pipefail
 
+hca_list_file=""
+while (( $# > 0 )); do
+    case "$1" in
+        --hca-list-file)
+            [[ $# -ge 2 ]] || { echo "gid: --hca-list-file requires a path" >&2; exit 2; }
+            hca_list_file="$2"
+            shift 2
+            ;;
+        *)
+            echo "gid: unknown argument: $1" >&2
+            exit 2
+            ;;
+    esac
+done
+
 sysfs="${RECIPE_GID_SYSFS_ROOT:-/sys/class/infiniband}"
 
 if [[ ! -d "$sysfs" ]]; then
@@ -220,5 +235,28 @@ if [[ -z "$chosen" ]]; then
     exit 1
 fi
 
-echo "gid: selected RoCE v2 index $chosen across ${#selected_names[@]} RDMA devices" >&2
+matched_hcas=()
+for (( i = 0; i < ${#selected_sets[@]}; i++ )); do
+    case " ${selected_sets[$i]} " in
+        *" ${chosen} "*) matched_hcas+=("${selected_names[$i]}") ;;
+    esac
+done
+
+if [[ -n "$hca_list_file" ]]; then
+    if (( ${#matched_hcas[@]} < ${#active_devices[@]} )); then
+        hca_csv=""
+        for hca in "${matched_hcas[@]}"; do
+            if [[ -n "$hca_csv" ]]; then
+                hca_csv="${hca_csv},=${hca}"
+            else
+                hca_csv="=${hca}"
+            fi
+        done
+        printf '%s\n' "$hca_csv" > "$hca_list_file"
+    else
+        : > "$hca_list_file"
+    fi
+fi
+
+echo "gid: selected RoCE v2 index $chosen across ${#matched_hcas[@]}/${#active_devices[@]} RDMA devices" >&2
 printf '%s\n' "$chosen"

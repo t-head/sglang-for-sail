@@ -1105,9 +1105,14 @@ class ClusterConfigBootstrapTest(unittest.TestCase):
             root = Path(temp)
             scripts = root / "scripts/ci/ppu"
             scripts.mkdir(parents=True)
+            launcher = scripts / "run_recipe_cluster.sh"
+            launcher.write_bytes(
+                (REPO_ROOT / "scripts/ci/ppu/run_recipe_cluster.sh").read_bytes()
+            )
+            launcher.chmod(0o755)
             (scripts / "recipe_cluster_config.py").write_text("raise SystemExit(29)\n")
             process = subprocess.run(
-                ["bash", str(REPO_ROOT / "scripts/ci/ppu/run_recipe_cluster.sh")],
+                ["bash", str(launcher)],
                 cwd=root,
                 env={
                     **os.environ,
@@ -3499,14 +3504,31 @@ class MultiNodeRecipeTest(unittest.TestCase):
         plan_run = next(s["run"] for s in plan_job["steps"] if s.get("id") == "plan")
         self.assertNotIn("--topology", plan_run)
         self.assertIn("run-ci-ppu-multinode", plan_run)
-        single_cleanup_run = next(
-            s["run"]
-            for s in single["steps"]
-            if "cleanup_recipe_cluster.sh" in s.get("run", "")
-        )
-        self.assertIn(
-            "[[ -f scripts/ci/ppu/cleanup_recipe_cluster.sh ]]", single_cleanup_run
-        )
+        self.assertIn("prior_single_run", plan_run)
+        for job_obj in (single, workflow["jobs"]["recipe-sanity-multinode"]):
+            trusted_checkout = next(
+                s
+                for s in job_obj["steps"]
+                if s.get("with", {}).get("path") == ".ppu-trusted-ci"
+            )
+            self.assertEqual(
+                trusted_checkout["with"]["repository"], "${{ job.workflow_repository }}"
+            )
+            self.assertEqual(trusted_checkout["with"]["ref"], "${{ job.workflow_sha }}")
+            cluster_run = next(
+                s["run"] for s in job_obj["steps"] if s.get("id") == "cluster"
+            )
+            self.assertIn(
+                ".ppu-trusted-ci/scripts/ci/ppu/run_recipe_cluster.sh", cluster_run
+            )
+            cleanup_run = next(
+                s["run"]
+                for s in job_obj["steps"]
+                if "cleanup_recipe_cluster.sh" in s.get("run", "")
+            )
+            self.assertIn(
+                ".ppu-trusted-ci/scripts/ci/ppu/cleanup_recipe_cluster.sh", cleanup_run
+            )
         multi = workflow["jobs"]["recipe-sanity-multinode"]
         self.assertEqual(multi["runs-on"], "k8s-runner-group-cpu-thead")
         self.assertEqual(str(multi["strategy"]["max-parallel"]), "1")
@@ -3543,8 +3565,10 @@ class MultiNodeRecipeTest(unittest.TestCase):
         for expected in (
             'export MASTER_ADDR="${PPU_CI_DIST_INIT_ADDR%:*}"',
             'export MASTER_PORT="${PPU_CI_DIST_INIT_ADDR##*:}"',
-            'export NCCL_SOCKET_IFNAME="$GLOO_SOCKET_IFNAME"',
-            'export PCCL_SOCKET_IFNAME="$GLOO_SOCKET_IFNAME"',
+            'export NCCL_SOCKET_IFNAME="=${GLOO_SOCKET_IFNAME}"',
+            'export PCCL_SOCKET_IFNAME="=${GLOO_SOCKET_IFNAME}"',
+            'export NCCL_IB_HCA="$effective_hcas"',
+            'export PCCL_IB_HCA="$effective_hcas"',
             'export PCCL_IB_GID_INDEX="$NCCL_IB_GID_INDEX"',
             "export PCCL_MNNVL_ENABLE=0",
             "export NCCL_MNNVL_ENABLE=0",
@@ -4235,6 +4259,355 @@ class MultiNodeRecipeTest(unittest.TestCase):
                     }
                 ],
             )
+
+    def test_recent_failures_reports_cleanup_failed_run_even_when_worker_summary_passed(
+        self,
+    ):
+        import recipe_retention
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            archive_root = root / "archive"
+            archive_root.mkdir(mode=0o700)
+            base = archive_root / "sglang/logs/sglang-for-sail"
+            # Run 100: older OOM.
+            r100 = base / "100-1" / ("a" * 12) / "model_sanity/qwen3.8-2.4t-mxfp4"
+            r100.mkdir(parents=True)
+            (r100 / "index.json").write_text(
+                json.dumps({"job_outcome": "fail"}), encoding="utf-8"
+            )
+            (r100 / "runtime.log").write_text("CUDA out of memory\n", encoding="utf-8")
+
+            # Run 102: worker summary passed, but later cluster cleanup failed
+            # (RECIPE_OUTCOME=failure) so index.json records job_outcome=fail.
+            src = root / "scratch-102"
+            (src / "results").mkdir(parents=True)
+            (src / "launcher.log").write_text(
+                "Command failed during cleanup\n", encoding="utf-8"
+            )
+            (src / "recipe-phase.txt").write_text("cleanup\n", encoding="utf-8")
+            (src / "results/summary.json").write_text(
+                json.dumps({"outcome": "pass"}), encoding="utf-8"
+            )
+            recipe_retention.retain(
+                {
+                    "PPU_CI_SOURCE_SHA": "c" * 40,
+                    "TIER": "model_sanity",
+                    "MODEL_KEY": "qwen3.8-2.4t-mxfp4",
+                    "GITHUB_RUN_ID": "102",
+                    "GITHUB_RUN_ATTEMPT": "1",
+                    "PPU_CI_PRIVATE_RESULTS_ROOT": str(archive_root),
+                    "PPU_CI_ARTIFACT_DIR": str(src),
+                    "RUNNER_TEMP": str(root / "runner-temp"),
+                    "GITHUB_WORKSPACE": str(root / "workspace"),
+                    "RECIPE_OUTCOME": "failure",
+                }
+            )
+            records = recent_failures(
+                archive_root, 103, model_filter="qwen3.8-2.4t-mxfp4"
+            )
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["run_id"], 102)
+            self.assertIn("worker_exit", records[0]["codes"])
+
+    def test_failsafe_cleanup_cleans_empty_stage_dir_and_is_idempotent_on_retry(self):
+        script = REPO_ROOT / "scripts/ci/ppu/cleanup_recipe_cluster.sh"
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            runner_temp = root / "runner-temp"
+            runner_temp.mkdir()
+            ws = root / "ws"
+            infra = ws / ".ppu-infra/cluster-run/scripts"
+            infra.mkdir(parents=True)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            (infra / "cleanup.sh").write_text("#!/usr/bin/env bash\nexit 0\n")
+            (infra / "cleanup.sh").chmod(0o755)
+            (fake_bin / "kubectl").write_text("#!/usr/bin/env bash\nexit 0\n")
+            (fake_bin / "kubectl").chmod(0o755)
+
+            job_name = "sglang-recipe-deadbeef01234567"
+            empty_stage_dir = root / f"{job_name}.abcdef12"
+            empty_stage_dir.mkdir()
+            state = runner_temp / "ppu-cleanup-state.json"
+            state.write_text(
+                json.dumps(
+                    {
+                        "job_name": job_name,
+                        "namespace": "ppu-sched",
+                        "nnodes": 2,
+                        "source_stage_dir": str(empty_stage_dir / "source.tar.gz"),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            env = {
+                **os.environ,
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "RUNNER_TEMP": str(runner_temp),
+                "GITHUB_WORKSPACE": str(ws),
+            }
+            first = subprocess.run(
+                ["bash", str(script)],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            self.assertTrue(json.loads(first.stdout)["cleanup_verified"])
+            self.assertFalse(empty_stage_dir.exists())
+            self.assertFalse(state.exists())
+
+            # Immediate retry must succeed via the persisted verified marker.
+            second = subprocess.run(
+                ["bash", str(script)],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+            self.assertTrue(json.loads(second.stdout)["cleanup_verified"])
+
+    def test_select_explicit_filter_ignores_unrelated_unsupported_topology(self):
+        from unittest import mock
+
+        import recipe_select
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            policy_root = Path(raw_root) / "policy"
+            models_dir = policy_root / "models"
+            models_dir.mkdir(parents=True)
+            glm_policy = DEFAULT_POLICY_ROOT / "models/glm-5.3.yaml"
+            (models_dir / "glm-5.3.yaml").write_text(
+                glm_policy.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+            (models_dir / "disagg-demo.yaml").write_text(
+                glm_policy.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+            orig_topo = recipe_select.cluster_topology
+
+            def fake_topo(path, tier):
+                if path.stem == "disagg-demo":
+                    raise ValueError(
+                        "unsupported cluster topology for policy disagg-demo"
+                    )
+                return orig_topo(path, tier)
+
+            with (
+                mock.patch.object(recipe_select, "DEFAULT_POLICY_ROOT", policy_root),
+                mock.patch.object(recipe_select, "validate_paths"),
+                mock.patch.object(
+                    recipe_select, "cluster_topology", side_effect=fake_topo
+                ),
+            ):
+                selected = recipe_select.select("model_sanity", "glm-5.3")
+                self.assertEqual(
+                    selected, {"include": [{"model": "glm-5.3", "ppu_count": 8}]}
+                )
+                with self.assertRaises(ValueError):
+                    recipe_select.select("model_sanity", "disagg-demo")
+
+    def test_run_worker_node_reaps_child_on_early_exit_and_propagates_rank0_error(self):
+        import signal
+        import time
+        from unittest import mock
+
+        import recipe_runner
+
+        # 1) Leader SIGKILLed early -> run_worker_node must still reap child.
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            results_dir = root / "art/results"
+            results_dir.mkdir(parents=True)
+            barrier = root / "barrier"
+            barrier.mkdir()
+            pid_file = root / "child.pid"
+            launcher_cmd = [
+                sys.executable,
+                "-c",
+                (
+                    "import os, signal, subprocess, sys, time; "
+                    "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+                    f"open({str(pid_file)!r}, 'w').write(str(c.pid)); "
+                    "os.kill(os.getpid(), signal.SIGKILL)"
+                ),
+            ]
+            with mock.patch.object(recipe_runner, "RESULTS", results_dir):
+                with self.assertRaises(recipe_runner.StartupError):
+                    recipe_runner.run_worker_node(
+                        {"argv": launcher_cmd, "server_env": {}},
+                        "fast_full",
+                        nnodes=2,
+                        node_rank=1,
+                        dist_init_addr="127.0.0.1:29500",
+                        barrier_dir=barrier,
+                        poll_s=0.05,
+                    )
+            child_pid = int(pid_file.read_text().strip())
+            exit_doc = json.loads((barrier / "exit-rank-1.json").read_text())
+            self.assertEqual(exit_doc["exit_code"], -signal.SIGKILL)
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.05)
+            else:
+                os.kill(child_pid, signal.SIGKILL)
+                self.fail("rank-1 child survived run_worker_node early exit")
+
+        # 2) rank0.done with status=error -> live rank-1 returns fail (not pass).
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            results_dir = root / "art/results"
+            results_dir.mkdir(parents=True)
+            barrier = root / "barrier"
+            barrier.mkdir()
+            (barrier / "rank0.done").write_text(
+                json.dumps({"status": "error"}), encoding="utf-8"
+            )
+            with mock.patch.object(recipe_runner, "RESULTS", results_dir):
+                outcome = recipe_runner.run_worker_node(
+                    {
+                        "argv": [sys.executable, "-c", "import time; time.sleep(60)"],
+                        "server_env": {},
+                    },
+                    "fast_full",
+                    nnodes=2,
+                    node_rank=1,
+                    dist_init_addr="127.0.0.1:29500",
+                    barrier_dir=barrier,
+                    poll_s=0.05,
+                )
+            self.assertEqual(outcome["outcome"], "fail")
+            exit_doc = json.loads((barrier / "exit-rank-1.json").read_text())
+            self.assertEqual(exit_doc["exit_code"], 1)
+            self.assertEqual(exit_doc["reason"], "rank0_error")
+
+    def test_server_tears_down_local_process_when_rank0_barrier_write_fails(self):
+        import errno
+        import time
+        from unittest import mock
+
+        import recipe_runner
+
+        spawned = {}
+        real_popen = subprocess.Popen
+
+        def tracking_popen(*args, **kwargs):
+            proc = real_popen(*args, **kwargs)
+            spawned["proc"] = proc
+            return proc
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            results_dir = root / "art/results"
+            results_dir.mkdir(parents=True)
+            barrier = root / "barrier"
+            barrier.mkdir()
+
+            class FakeResp:
+                status = 200
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return False
+
+            with (
+                mock.patch.object(recipe_runner, "RESULTS", results_dir),
+                mock.patch.object(recipe_runner, "request", return_value=FakeResp()),
+                mock.patch.object(
+                    recipe_runner.subprocess, "Popen", side_effect=tracking_popen
+                ),
+                mock.patch.object(
+                    recipe_runner,
+                    "_barrier_write",
+                    side_effect=OSError(errno.ENOSPC, "No space left on device"),
+                ),
+            ):
+                with self.assertRaises(OSError):
+                    with recipe_runner.server(
+                        {
+                            "argv": [
+                                sys.executable,
+                                "-c",
+                                "import time; time.sleep(60)",
+                            ],
+                            "server_env": {},
+                        },
+                        "fast_full",
+                        {},
+                        10,
+                        nnodes=2,
+                        node_rank=0,
+                        dist_init_addr="127.0.0.1:29500",
+                        barrier_dir=barrier,
+                        signal_done_on_exit=True,
+                    ):
+                        pass
+            proc = spawned["proc"]
+            deadline = time.monotonic() + 3.0
+            while proc.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertIsNotNone(proc.poll())
+
+    def test_failure_reason_attributes_failed_peer_rank_over_rank0_startup(self):
+        import recipe_diagnostics
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            src = Path(raw_root)
+            (src / "worker-phase.txt").write_text("server_startup\n", encoding="utf-8")
+            (src / "ranks/barrier").mkdir(parents=True)
+            (src / "ranks/rank-1").mkdir(parents=True)
+            (src / "ranks/rank-1.status").write_text("1\n", encoding="utf-8")
+            (src / "ranks/barrier/fail-rank-1.json").write_text(
+                json.dumps({"rank": 1, "exit_code": 1}), encoding="utf-8"
+            )
+            (src / "ranks/rank-1/worker-phase.txt").write_text(
+                "multinode_network\n", encoding="utf-8"
+            )
+            self.assertEqual(
+                recipe_diagnostics.failure_reason(src), "multinode_network"
+            )
+            # Cleanup precedence remains highest.
+            (src / "recipe-phase.txt").write_text("cleanup\n", encoding="utf-8")
+            self.assertEqual(recipe_diagnostics.failure_reason(src), "cleanup")
+
+    def test_gid_selector_emits_matched_hca_list_when_majority_excludes_outlier(self):
+        script = REPO_ROOT / "scripts/ci/ppu/recipe_multinode_gid_index.sh"
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            sysfs = root / "infiniband"
+            for name, slot in (
+                ("mlx5_bond_0", 3),
+                ("mlx5_bond_1", 3),
+                ("mlx5_bond_2", 5),
+            ):
+                gids = sysfs / name / "ports/1/gids"
+                types = sysfs / name / "ports/1/gid_attrs/types"
+                gids.mkdir(parents=True)
+                types.mkdir(parents=True)
+                (sysfs / name / "ports/1/state").write_text("4: ACTIVE\n")
+                (gids / str(slot)).write_text(
+                    "fd03:0000:0000:0000:0000:0000:0000:0001\n"
+                )
+                (types / str(slot)).write_text("RoCE v2\n")
+            hca_out = root / "hca.txt"
+            proc = subprocess.run(
+                ["bash", str(script), "--hca-list-file", str(hca_out)],
+                env={**os.environ, "RECIPE_GID_SYSFS_ROOT": str(sysfs)},
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip(), "3")
+            self.assertEqual(hca_out.read_text().strip(), "=mlx5_bond_0,=mlx5_bond_1")
 
 
 if __name__ == "__main__":

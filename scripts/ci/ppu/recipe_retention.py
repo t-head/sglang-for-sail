@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm-project/vllm-sail@0163924 (Apache-2.0).
 
+import errno
 import hashlib
 import json
 import os
@@ -79,46 +80,72 @@ def _is_safe_relative_regular_file(root: Path, path: Path) -> bool:
         return False
 
 
-def _open_safe_relative_regular_file(root: Path, relative_path: str):
+def _open_safe_relative_regular_file(root_fd: int, relative_path: str):
     parts = Path(relative_path).parts
-    if not parts or Path(relative_path).is_absolute() or ".." in parts:
+    if (
+        not parts
+        or Path(relative_path).is_absolute()
+        or any(part in ("", ".", "..") for part in parts)
+    ):
         raise ValueError("expected a relative recipe output")
-    parent = root
-    if len(parts) > 1:
-        parent = _safe_subdir(root, parts[:-1])
-        if parent is None:
-            # Missing intermediate directory is treated like a missing optional
-            # file unless a symlink/non-directory is present at that component.
-            current = root
-            for part in parts[:-1]:
-                current = current / part
-                try:
-                    mode = current.lstat().st_mode
-                except FileNotFoundError:
-                    raise
-                if not stat.S_ISDIR(mode):
-                    raise ValueError("expected a regular recipe output directory")
-            raise FileNotFoundError(relative_path)
-    target = parent / parts[-1]
-    mode = target.lstat().st_mode
-    if not stat.S_ISREG(mode):
-        raise ValueError("expected a regular recipe output")
-    fd = os.open(
-        target,
-        os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
-    )
+    opened_dirs: list[int] = []
+    cur_fd = root_fd
     try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            os.close(fd)
-            raise ValueError("expected a regular recipe output")
-        return os.fdopen(fd, "rb")
-    except Exception:
+        for part in parts[:-1]:
+            try:
+                next_fd = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=cur_fd,
+                )
+            except FileNotFoundError:
+                raise
+            except OSError as exc:
+                # ELOOP / ENOTDIR indicate a symlink or non-directory component.
+                raise ValueError("expected a regular recipe output directory") from exc
+            try:
+                if not stat.S_ISDIR(os.fstat(next_fd).st_mode):
+                    os.close(next_fd)
+                    raise ValueError("expected a regular recipe output directory")
+            except Exception:
+                try:
+                    os.close(next_fd)
+                except OSError:
+                    pass
+                raise
+            opened_dirs.append(next_fd)
+            cur_fd = next_fd
+
         try:
-            os.close(fd)
-        except OSError:
-            pass
-        raise
+            fd = os.open(
+                parts[-1],
+                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=cur_fd,
+            )
+        except FileNotFoundError:
+            raise
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.EISDIR, errno.ENOTDIR):
+                raise ValueError("expected a regular recipe output") from exc
+            raise
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                os.close(fd)
+                raise ValueError("expected a regular recipe output")
+            return os.fdopen(fd, "rb")
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+    finally:
+        for dir_fd in reversed(opened_dirs):
+            try:
+                os.close(dir_fd)
+            except OSError:
+                pass
 
 
 def _check_dir_mode(directory: Path, *allowed_modes: int) -> None:
@@ -222,85 +249,95 @@ def retain(environ) -> None:
 
     source_dir = Path(environ["PPU_CI_ARTIFACT_DIR"])
     partial = environ.get("RECIPE_OUTCOME") in ("failure", "cancelled")
+    if partial:
+        index["job_outcome"] = "fail"
+    root_fd = os.open(source_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        if not stat.S_ISDIR((source_dir / "results").lstat().st_mode):
-            raise ValueError("expected a recipe results directory")
-    except FileNotFoundError:
+        if not stat.S_ISDIR(os.fstat(root_fd).st_mode):
+            raise ValueError("expected a recipe artifact directory")
+        try:
+            if not stat.S_ISDIR(
+                os.stat("results", dir_fd=root_fd, follow_symlinks=False).st_mode
+            ):
+                raise ValueError("expected a recipe results directory")
+        except FileNotFoundError:
+            if not partial:
+                raise
+        required = {"launcher.log"}
         if not partial:
-            raise
-    required = {"launcher.log"}
-    if not partial:
-        required.update(RESULT_FILES)
-    entries = ["launcher.log", *RESULT_FILES, *OPTIONAL_FILES]
-    for path in sorted(source_dir.glob("pod-status-worker-*.json")):
-        if _is_safe_relative_regular_file(source_dir, path):
-            entries.append(path.relative_to(source_dir).as_posix())
-    ranks_root = _safe_subdir(source_dir, ("ranks",))
-    ranks_optional: set[str] = set()
-    if ranks_root is not None:
-        for pattern in (
-            "rank-*.status",
-            "barrier/*.json",
-            "rank-*/runtime.log",
-            "rank-*/worker-phase.txt",
-            "rank-*/results/page-cache-warm.log",
-            "rank-*/results/sglang_serve_*.log",
-        ):
-            try:
-                matches = sorted(ranks_root.glob(pattern))
-            except OSError:
-                continue
-            for path in matches:
+            required.update(RESULT_FILES)
+        entries = ["launcher.log", *RESULT_FILES, *OPTIONAL_FILES]
+        for path in sorted(source_dir.glob("pod-status-worker-*.json")):
+            if _is_safe_relative_regular_file(source_dir, path):
+                entries.append(path.relative_to(source_dir).as_posix())
+        ranks_root = _safe_subdir(source_dir, ("ranks",))
+        ranks_optional: set[str] = set()
+        if ranks_root is not None:
+            for pattern in (
+                "rank-*.status",
+                "barrier/*.json",
+                "rank-*/runtime.log",
+                "rank-*/worker-phase.txt",
+                "rank-*/results/page-cache-warm.log",
+                "rank-*/results/sglang_serve_*.log",
+            ):
                 try:
-                    if _is_safe_relative_regular_file(source_dir, path):
-                        rel = path.relative_to(source_dir).as_posix()
-                        entries.append(rel)
-                        ranks_optional.add(rel)
+                    matches = sorted(ranks_root.glob(pattern))
                 except OSError:
                     continue
-    review_root = _safe_subdir(source_dir, ("results", "evalscope"))
-    if review_root is not None:
-        entries.extend(
-            path.relative_to(source_dir).as_posix()
-            for path in sorted(review_root.rglob("*"))
-            if path.suffix in (".json", ".jsonl", ".log")
-            and _is_safe_relative_regular_file(source_dir, path)
-        )
-    with tempfile.TemporaryDirectory(prefix=".staging-", dir=parent) as staging_dir:
-        staging = Path(staging_dir)
-        published = staging / index["model_key"]
-        published.mkdir(mode=0o700)
-        files = {}
-        for relative_path in entries:
-            source = source_dir / relative_path
-            name = (
-                relative_path
-                if relative_path.startswith(("results/evalscope/", "ranks/"))
-                else source.name
+                for path in matches:
+                    try:
+                        if _is_safe_relative_regular_file(source_dir, path):
+                            rel = path.relative_to(source_dir).as_posix()
+                            entries.append(rel)
+                            ranks_optional.add(rel)
+                    except OSError:
+                        continue
+        review_root = _safe_subdir(source_dir, ("results", "evalscope"))
+        if review_root is not None:
+            entries.extend(
+                path.relative_to(source_dir).as_posix()
+                for path in sorted(review_root.rglob("*"))
+                if path.suffix in (".json", ".jsonl", ".log")
+                and _is_safe_relative_regular_file(source_dir, path)
             )
-            try:
-                stream = _open_safe_relative_regular_file(source_dir, relative_path)
-            except FileNotFoundError:
-                if relative_path not in required:
-                    continue
-                raise
-            except PermissionError:
-                if relative_path in ranks_optional:
-                    continue
-                raise
-            copied = published / name
-            copied.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            digest = hashlib.sha256()
-            with stream, copied.open("wb") as out:
-                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                    out.write(chunk)
-                    digest.update(chunk)
-            copied.chmod(0o600)
-            files[name] = digest.hexdigest()
-        index_path = published / "index.json"
-        index_path.write_text(
-            json.dumps({**index, "files": files}, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        index_path.chmod(0o600)
-        published.rename(destination)
+        with tempfile.TemporaryDirectory(prefix=".staging-", dir=parent) as staging_dir:
+            staging = Path(staging_dir)
+            published = staging / index["model_key"]
+            published.mkdir(mode=0o700)
+            files = {}
+            for relative_path in entries:
+                source = source_dir / relative_path
+                name = (
+                    relative_path
+                    if relative_path.startswith(("results/evalscope/", "ranks/"))
+                    else source.name
+                )
+                try:
+                    stream = _open_safe_relative_regular_file(root_fd, relative_path)
+                except FileNotFoundError:
+                    if relative_path not in required:
+                        continue
+                    raise
+                except PermissionError:
+                    if relative_path in ranks_optional:
+                        continue
+                    raise
+                copied = published / name
+                copied.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                digest = hashlib.sha256()
+                with stream, copied.open("wb") as out:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        out.write(chunk)
+                        digest.update(chunk)
+                copied.chmod(0o600)
+                files[name] = digest.hexdigest()
+            index_path = published / "index.json"
+            index_path.write_text(
+                json.dumps({**index, "files": files}, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            index_path.chmod(0o600)
+            published.rename(destination)
+    finally:
+        os.close(root_fd)

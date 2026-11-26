@@ -337,21 +337,34 @@ def _iter_safe_rank_logs(ranks_dir):
                     yield item, is_rank1
 
 
-def _archive_outcome(directory):
-    stream, size = _open_regular_file(directory / "summary.json")
+def _read_json_dict(path, limit=65536):
+    stream, size = _open_regular_file(path)
     if stream is None:
         return None
-    if size > 65536:
+    if size > limit:
         stream.close()
         return None
     with stream:
         try:
-            payload = json.loads(stream.read(65536).decode(errors="replace"))
+            payload = json.loads(stream.read(limit).decode(errors="replace"))
         except (ValueError, OSError):
             return None
-    if not isinstance(payload, dict):
+    return payload if isinstance(payload, dict) else None
+
+
+def _archive_outcome(directory):
+    index_doc = _read_json_dict(directory / "index.json", limit=262144)
+    if index_doc is not None:
+        job_outcome = index_doc.get("job_outcome")
+        if job_outcome in ("pass", "fail"):
+            return job_outcome
+    phase_val = _read_regular_text(directory / "recipe-phase.txt").strip()
+    if phase_val in ("cleanup", "image_resolution"):
+        return "fail"
+    summary_doc = _read_json_dict(directory / "summary.json")
+    if summary_doc is None:
         return None
-    outcome = payload.get("outcome")
+    outcome = summary_doc.get("outcome")
     return outcome if isinstance(outcome, str) else None
 
 

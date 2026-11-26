@@ -90,22 +90,31 @@ if (( INPUT_NNODES > 0 )); then
 fi
 
 leftover_staging=0
-if [[ -n "$SOURCE_STAGE_DIR" && -e "$SOURCE_STAGE_DIR" ]]; then
+stage_parent=""
+stage_parent_is_job_dir=false
+if [[ -n "$SOURCE_STAGE_DIR" ]]; then
     stage_parent=$(dirname -- "$SOURCE_STAGE_DIR")
     if [[ "$(basename -- "$SOURCE_STAGE_DIR")" == "source.tar.gz" &&
         "$(basename -- "$stage_parent")" == "${JOB_NAME}."* ]]; then
+        stage_parent_is_job_dir=true
         rm -f -- "$SOURCE_STAGE_DIR" || true
         rmdir -- "$stage_parent" 2>/dev/null || true
     fi
-fi
-if [[ -n "$SOURCE_STAGE_DIR" && -e "$SOURCE_STAGE_DIR" ]]; then
-    leftover_staging=1
+    if [[ -e "$SOURCE_STAGE_DIR" ]] || [[ "$stage_parent_is_job_dir" == true && -e "$stage_parent" ]]; then
+        leftover_staging=1
+    fi
 fi
 
 verified=false
 if (( cleanup_rc == 0 && leftover_pods == 0 && leftover_services == 0 && leftover_podgroups == 0 && leftover_staging == 0 )); then
-    verified=true
-    rm -f -- "$state_file"
+    marker_tmp="${verified_marker}.tmp.$$"
+    if printf '{"cleanup_verified": true, "leftover_podgroups": 0, "leftover_pods": 0, "leftover_services": 0, "leftover_staging": 0, "nnodes": %d, "schema": "ppu-cleanup/v1", "source": "always_failsafe"}\n' \
+        "$INPUT_NNODES" > "$marker_tmp" && mv -- "$marker_tmp" "$verified_marker"; then
+        verified=true
+        rm -f -- "$state_file"
+    else
+        rm -f -- "$marker_tmp" 2>/dev/null || true
+    fi
 fi
 
 printf '{"cleanup_verified": %s, "leftover_podgroups": %d, "leftover_pods": %d, "leftover_services": %d, "leftover_staging": %d, "nnodes": %d, "schema": "ppu-cleanup/v1", "source": "always_failsafe"}\n' \

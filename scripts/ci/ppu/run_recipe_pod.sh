@@ -134,20 +134,54 @@ if (( nnodes > 1 )); then
     printf '%s\n' multinode_network > "$PPU_CI_ARTIFACT_DIR/worker-phase.txt"
     PPU_CI_DIST_INIT_ADDR=$(bash scripts/ci/ppu/recipe_multinode_rendezvous.sh "$ranks_dir")
     export PPU_CI_DIST_INIT_ADDR
-    NCCL_IB_GID_INDEX=$(bash scripts/ci/ppu/recipe_multinode_gid_index.sh)
+    hca_list_file="$PPU_CI_ARTIFACT_DIR/roce-hca-list.txt"
+    NCCL_IB_GID_INDEX=$(bash scripts/ci/ppu/recipe_multinode_gid_index.sh --hca-list-file "$hca_list_file")
     export NCCL_IB_GID_INDEX
+    if [[ -s "$hca_list_file" ]]; then
+        detected_hcas=$(tr -d '\r\n' < "$hca_list_file")
+        existing_hcas="${NCCL_IB_HCA:-${PCCL_IB_HCA:-}}"
+        effective_hcas=$(python3 -B - "$detected_hcas" "$existing_hcas" <<'PY'
+import sys
+
+detected = [item.lstrip("=") for item in sys.argv[1].split(",") if item.strip()]
+existing = sys.argv[2].strip()
+if not existing:
+    print(",".join(f"={name}" for name in detected))
+    raise SystemExit(0)
+exclude = existing.startswith("^")
+tokens = [tok.strip() for tok in existing.lstrip("^").split(",") if tok.strip()]
+
+def matches(dev, tok):
+    if tok.startswith("="):
+        return dev == tok[1:].split(":", 1)[0]
+    return dev.startswith(tok.split(":", 1)[0])
+
+filtered = [
+    dev
+    for dev in detected
+    if (not any(matches(dev, tok) for tok in tokens) if exclude else any(matches(dev, tok) for tok in tokens))
+]
+if not filtered:
+    raise SystemExit("gid: existing NCCL_IB_HCA/PCCL_IB_HCA excludes all RoCE rails supporting the selected GID index")
+print(",".join(f"={name}" for name in filtered))
+PY
+)
+        export NCCL_IB_HCA="$effective_hcas"
+        export PCCL_IB_HCA="$effective_hcas"
+    fi
     GLOO_SOCKET_IFNAME=$(bash scripts/ci/ppu/recipe_multinode_gloo_iface.sh "$PPU_CI_DIST_INIT_ADDR")
     export GLOO_SOCKET_IFNAME
     # Align MASTER_ADDR/MASTER_PORT with the resolved rendezvous IP so nothing
     # in the runtime or PCCL stack tries to resolve the cluster-internal
     # *.svc.cluster.local hostname injected under hostNetwork, and bind NCCL
-    # out-of-band bootstrap to the same peer-facing interface as Gloo.
+    # out-of-band bootstrap to the exact peer-facing interface (`=iface` avoids
+    # NCCL prefix matching VLAN subinterfaces such as bond0.100).
     export MASTER_ADDR="${PPU_CI_DIST_INIT_ADDR%:*}"
     export MASTER_PORT="${PPU_CI_DIST_INIT_ADDR##*:}"
     export NNODES="$nnodes"
     export RANK="$node_rank"
-    export NCCL_SOCKET_IFNAME="$GLOO_SOCKET_IFNAME"
-    export PCCL_SOCKET_IFNAME="$GLOO_SOCKET_IFNAME"
+    export NCCL_SOCKET_IFNAME="=${GLOO_SOCKET_IFNAME}"
+    export PCCL_SOCKET_IFNAME="=${GLOO_SOCKET_IFNAME}"
     export PCCL_IB_GID_INDEX="$NCCL_IB_GID_INDEX"
     # Disable MNNVL and cuMem cross-node fabric auto-enablement (engine.py sets
     # NCCL_MNNVL_ENABLE=1 and NCCL_CUMEM_ENABLE=1 when nnodes>1 on SAIL, while

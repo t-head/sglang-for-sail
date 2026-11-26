@@ -148,9 +148,10 @@ def main():
         return
     if os.environ.get("TIER") != "legacy":
         _verify_retention_root(retention_root_raw, retention_source, os.environ)
+    launcher = str(Path(__file__).resolve().with_name("run_recipe_cluster.sh"))
     os.execvpe(
         "bash",
-        ["bash", "scripts/ci/ppu/run_recipe_cluster.sh"],
+        ["bash", launcher],
         {
             **os.environ,
             **values,

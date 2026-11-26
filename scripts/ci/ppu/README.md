@@ -23,9 +23,10 @@ Check [`test/ppu/README.md`](../../../test/ppu/README.md) for the exact policy s
 
 | Scenario | How to trigger | What runs |
 | --- | --- | --- |
-| Routine PR validation | Apply `run-ci` + `run-ci-ppu` on the PR | Dummy-weight Fast Sanity across all single-node `fast_sanity` policies |
+| Routine PR validation | Apply `run-ci` + `run-ci-ppu` on the PR | Dummy-weight Fast Sanity across all single-node `fast_sanity` policies (PR Fast has no `model_filter` and stays single-node) |
 | Full single-node real-weight PR gate | Apply `run-ci` + `run-ci-ppu-nightly` on the PR | Real-weight GSM8K + microbench across all single-node `model_sanity` policies |
-| Multi-node flagship PR gate | Add `run-ci-ppu-multinode` alongside `run-ci-ppu` / `run-ci-ppu-nightly` | Enables serial multi-node (`nnodes >= 2`) flagship jobs in addition to single-node policies |
+| Multi-node flagship PR gate (Model Sanity) | Add `run-ci-ppu-multinode` alongside `run-ci` + `run-ci-ppu-nightly` | Enables serial multi-node (`nnodes >= 2`) real-weight Model Sanity (incremental label skips duplicating already-scheduled single-node matrix) |
+| Multi-node flagship dummy smoke (Fast Sanity) | Dispatch `pr-test-ppu.yml` or `nightly-test-ppu.yml` (`tier=fast_sanity`) with `model_filter=qwen3.8-2.4t-mxfp4` | Dummy-weight 2x8 Fast Sanity on the explicitly requested multi-node flagship |
 | Branch / framework upgrade smoke (no PR) | Dispatch `pr-test-ppu.yml` with `run_model_sanity=true` and `model_filter` | Real-weight GSM8K + microbench on 1–2 sampled `model_sanity` models |
 | On-demand Nightly spot check | Dispatch `nightly-test-ppu.yml` with `model_filter` | Real-weight GSM8K + microbench on selected `model_sanity` models (optional wheel reuse) |
 
