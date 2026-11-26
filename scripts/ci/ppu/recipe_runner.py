@@ -469,6 +469,11 @@ def check_one_batch_results(output, case, *, engine="one_batch"):
         for length in shape["input_len"]
     }
     threshold = case["threshold"]
+    floor = threshold["min_tokens_per_s"]
+    floors = (
+        floor if isinstance(floor, dict) else dict.fromkeys(shape["input_len"], floor)
+    )
+    throughput_ratio = 1 - threshold.get("allowed_drop_ratio", 0)
     rows = [json.loads(line) for line in output.read_text().splitlines()]
     measured = set()
     measurements = []
@@ -494,7 +499,7 @@ def check_one_batch_results(output, case, *, engine="one_batch"):
                     "tokens_per_s": value,
                 }
             )
-        passed &= valid_throughput and value >= threshold["min_tokens_per_s"]
+        passed &= valid_throughput and value >= floors[key[1]] * throughput_ratio
     if measured != expected:
         raise ValueError(
             f"{case['id']}: missing one_batch results for {sorted(expected - measured)}"

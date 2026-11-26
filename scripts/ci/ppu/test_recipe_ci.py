@@ -82,6 +82,8 @@ class TestLightPerf(unittest.TestCase):
     def test_server_decode_requires_full_generation(self):
         policy = _load_yaml(DEFAULT_POLICY_ROOT / "models/qwen3.8-flash-next-tp4.yaml")
         case = policy["tiers"]["light_perf"]["cases"][1]
+        threshold = case["threshold"]
+        floor = threshold["min_tokens_per_s"] * (1 - threshold["allowed_drop_ratio"])
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "result.jsonl"
             row = {
@@ -89,7 +91,7 @@ class TestLightPerf(unittest.TestCase):
                 "batch_size": 64,
                 "input_len": 4096,
                 "output_len": 1536,
-                "output_throughput": 10,
+                "output_throughput": floor,
                 "total_output_tokens": 64 * 1536,
             }
             output.write_text(json.dumps(row) + "\n")
@@ -104,7 +106,7 @@ class TestLightPerf(unittest.TestCase):
                         "batch_size": 64,
                         "input_len": 4096,
                         "output_len": 1536,
-                        "tokens_per_s": 10,
+                        "tokens_per_s": floor,
                     }
                 ],
             )
@@ -282,7 +284,7 @@ class TestLightPerf(unittest.TestCase):
             root = Path(directory)
             assets = root / "assets.json"
             assets.write_text(json.dumps({"qwen3.8-27b": directory}))
-            for throughput, outcome in [(100, "pass"), (0.5, "fail")]:
+            for throughput, outcome in [(9500, "pass"), (9000, "fail")]:
                 results = root / outcome
                 results.mkdir()
 
@@ -345,6 +347,10 @@ class TestLightPerf(unittest.TestCase):
                 self.assertEqual(launch.call_count, 2)
                 self.assertEqual(summary["outcome"], outcome)
                 self.assertEqual(
+                    [result["passed"] for result in summary["cases"].values()],
+                    [outcome == "pass", True],
+                )
+                self.assertEqual(
                     [
                         (result["throughput"]["metric"], len(result["throughput"]["rows"]))
                         for result in summary["cases"].values()
@@ -375,6 +381,14 @@ class TestLightPerf(unittest.TestCase):
             output.touch()
             with self.assertRaisesRegex(ValueError, "missing one_batch results"):
                 check_one_batch_results(output, case)
+
+    def test_prefill_thresholds_must_cover_every_input_length(self):
+        path = DEFAULT_POLICY_ROOT / "models/qwen3.8-27b.yaml"
+        policy = _load_yaml(path)
+        case = policy["tiers"]["light_perf"]["cases"][0]
+        case["threshold"]["min_tokens_per_s"].pop(4096)
+        with self.assertRaisesRegex(ValidationError, "must cover every input length"):
+            validate_policy_structure(policy, context=str(path))
 
 
 def fast_result():

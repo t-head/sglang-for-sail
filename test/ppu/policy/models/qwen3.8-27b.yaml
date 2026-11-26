@@ -15,13 +15,19 @@ tiers:
     hardware: zhenwu_m890
     variant: default
     dummy_weights: true
-    # Smoke floors for the pilot. Calibrate regression thresholds on 890P.
     cases:
       - id: qwen3_8_27b_bf16_tp2_prefill
         preset: one_batch_prefill
         input: {batch_size: 1, input_len: [4096, 16384, 65536, 102400], output_len: 1}
-        threshold: {metric: prefill_throughput, min_tokens_per_s: 1}
+        threshold:
+          metric: prefill_throughput
+          allowed_drop_ratio: 0.10
+          min_tokens_per_s:
+            4096: 10228.349988024047
+            16384: 8104.290739679701
+            65536: 8809.585611002887
+            102400: 7789.545812878436
       - id: qwen3_8_27b_bf16_tp2_decode
         preset: one_batch_decode
         input: {batch_size: 16, input_len: [4096], output_len: 1536}
-        threshold: {metric: median_decode_throughput, min_tokens_per_s: 1}
+        threshold: {metric: median_decode_throughput, min_tokens_per_s: 723.4784336602493, allowed_drop_ratio: 0.10}

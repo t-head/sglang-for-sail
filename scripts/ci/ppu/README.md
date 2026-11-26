@@ -56,7 +56,16 @@ Light Perf runs prefill and decode with full-layer dummy weights. Each policy
 selects serving recipe presets and declares the benchmark engine, input shapes,
 and minimum throughput. Cases retain their original `one_batch` or
 `one_batch_server` engine. The server benchmark uses synthetic `random-ids`
-prompts. The initial minimum of 1 token/s on every shape checks completion.
+prompts. Each shape uses the lowest throughput measured for that shape in the
+three reference CI runs as its baseline
+([run 1](https://github.com/t-head/sglang-for-sail/actions/runs/45749088627),
+[run 2](https://github.com/t-head/sglang-for-sail/actions/runs/45781044140),
+[run 3](https://github.com/t-head/sglang-for-sail/actions/runs/45781086154)).
+Policies store the original measurements in token/s.
+`threshold.min_tokens_per_s` accepts a single baseline for the entire case
+or a mapping from every declared `input_len` to its own baseline.
+The effective floor is `baseline * (1 - allowed_drop_ratio)`. The current
+cases allow a 10% drop. An omitted `allowed_drop_ratio` defaults to zero.
 
 | `model_filter` | Board | Allocation |
 | --- | --- | --- |

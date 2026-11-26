@@ -1058,10 +1058,25 @@ def _validate_light_perf(tier, recipe_path: Path | None, *, context: str) -> Non
             raise ValidationError(f"{location}: expected positive, distinct shapes")
         keys = {"metric", "min_tokens_per_s"}
         threshold = _check_keys(
-            case["threshold"], allowed=keys, required=keys, context=location
+            case["threshold"],
+            allowed=keys | {"allowed_drop_ratio"},
+            required=keys,
+            context=location,
         )
         metric = threshold["metric"]
         floor = threshold["min_tokens_per_s"]
+        allowed_drop = threshold.get("allowed_drop_ratio", 0)
+        if isinstance(floor, dict):
+            if (
+                any(type(length) is not int for length in floor)
+                or set(floor) != set(lengths)
+            ):
+                raise ValidationError(
+                    f"{location}: throughput thresholds must cover every input length"
+                )
+            floors = floor.values()
+        else:
+            floors = (floor,)
         if (
             not isinstance(metric, str)
             or metric not in LIGHT_PERF_METRICS[engine]
@@ -1069,8 +1084,12 @@ def _validate_light_perf(tier, recipe_path: Path | None, *, context: str) -> Non
                 metric in ("median_decode_throughput", "output_throughput")
                 and shape["output_len"] <= 1
             )
-            or type(floor) not in (int, float)
-            or not 0 < floor < math.inf
+            or type(allowed_drop) not in (int, float)
+            or not 0 <= allowed_drop < 1
+            or any(
+                type(value) not in (int, float) or not 0 < value < math.inf
+                for value in floors
+            )
         ):
             raise ValidationError(f"{location}: invalid throughput threshold")
 
