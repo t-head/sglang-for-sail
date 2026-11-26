@@ -146,3 +146,162 @@ test("workflow planner script treats 404 branch lookup as absent and rethrows ot
     /Service Unavailable/,
   );
 });
+
+function extractJobSecrets(workflowText, jobName) {
+  const lines = workflowText.split(/\r?\n/);
+  const meaningful = line => {
+    const trimmed = line.trim();
+    return trimmed !== "" && !trimmed.startsWith("#");
+  };
+  const indentOf = line => line.match(/^ */)[0].length;
+
+  let jobsLine = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (!meaningful(lines[i])) continue;
+    if (indentOf(lines[i]) === 0 && /^jobs:\s*(?:#.*)?$/.test(lines[i])) {
+      assert.equal(jobsLine, -1, "Duplicate top-level jobs section");
+      jobsLine = i;
+    }
+  }
+  assert.notEqual(jobsLine, -1, "Missing top-level jobs section");
+
+  let jobIndent = null;
+  let targetStart = -1;
+  let targetEnd = lines.length;
+  for (let i = jobsLine + 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (!meaningful(line)) continue;
+    const spaces = indentOf(line);
+    if (spaces === 0) break;
+    jobIndent ??= spaces;
+    if (spaces === jobIndent) {
+      if (targetStart !== -1) {
+        targetEnd = i;
+        break;
+      }
+      if (new RegExp(`^\\s*${jobName}:\\s*(?:#.*)?$`).test(line)) {
+        targetStart = i;
+      }
+    }
+  }
+  assert.notEqual(targetStart, -1, `Missing job ${jobName}`);
+  for (let i = targetEnd + 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (!meaningful(line)) continue;
+    const spaces = indentOf(line);
+    if (spaces === 0) break;
+    if (spaces === jobIndent && new RegExp(`^\\s*${jobName}:\\s*(?:#.*)?$`).test(line)) {
+      assert.fail(`Duplicate job ${jobName}`);
+    }
+  }
+
+  let propIndent = null;
+  let secretsStart = -1;
+  let secretsEnd = targetEnd;
+  for (let i = targetStart + 1; i < targetEnd; i++) {
+    const line = lines[i];
+    if (!meaningful(line)) continue;
+    const spaces = indentOf(line);
+    if (spaces <= jobIndent) break;
+    propIndent ??= spaces;
+    if (spaces === propIndent) {
+      if (secretsStart !== -1 && secretsEnd === targetEnd) {
+        secretsEnd = i;
+      }
+      if (/^\s*secrets:\s*(?:#.*)?$/.test(line)) {
+        assert.equal(secretsStart, -1, `Duplicate secrets section in job ${jobName}`);
+        secretsStart = i;
+        secretsEnd = targetEnd;
+      }
+    }
+  }
+  if (secretsStart === -1) return Object.create(null);
+
+  const secrets = Object.create(null);
+  let entryIndent = null;
+  for (let i = secretsStart + 1; i < secretsEnd; i++) {
+    const line = lines[i];
+    if (!meaningful(line)) continue;
+    const spaces = indentOf(line);
+    if (spaces <= propIndent) break;
+    entryIndent ??= spaces;
+    assert.equal(spaces, entryIndent, `Unexpected indentation in ${jobName}.secrets: ${line}`);
+    const match = /^\s*([A-Za-z0-9_]+):\s*(.+?)\s*(?:#.*)?$/.exec(line);
+    assert.ok(match, `Malformed secret entry in ${jobName}.secrets: ${line}`);
+    const [, key, value] = match;
+    assert.equal(Object.hasOwn(secrets, key), false, `Duplicate secret ${key} in ${jobName}`);
+    secrets[key] = value;
+  }
+  return secrets;
+}
+
+test("nightly-dispatch-ppu forwards PPU_CI_NOTIFY_TARGETS_JSON on each named release job", () => {
+  const workflow = readFileSync(
+    resolve(__dirname, "../../../.github/workflows/nightly-dispatch-ppu.yml"),
+    "utf8",
+  );
+  for (const jobName of ["release-v0523", "release-v100"]) {
+    const secrets = extractJobSecrets(workflow, jobName);
+    assert.equal(
+      secrets.PPU_CI_NOTIFY_TARGETS_JSON,
+      "${{ secrets.PPU_CI_NOTIFY_TARGETS_JSON }}",
+      `${jobName} must forward PPU_CI_NOTIFY_TARGETS_JSON`,
+    );
+    assert.equal(
+      secrets.PPU_CI_NOTIFY_WEBHOOK_URL,
+      "${{ secrets.PPU_CI_NOTIFY_WEBHOOK_URL }}",
+      `${jobName} must forward PPU_CI_NOTIFY_WEBHOOK_URL`,
+    );
+    assert.equal(
+      secrets.PPU_CI_NOTIFY_SIGNING_SECRET,
+      "${{ secrets.PPU_CI_NOTIFY_SIGNING_SECRET }}",
+      `${jobName} must forward PPU_CI_NOTIFY_SIGNING_SECRET`,
+    );
+    assert.equal(
+      secrets.PPU_CI_NOTIFY_ROSTER_JSON,
+      "${{ secrets.PPU_CI_NOTIFY_ROSTER_JSON }}",
+      `${jobName} must forward PPU_CI_NOTIFY_ROSTER_JSON`,
+    );
+  }
+});
+
+test("extractJobSecrets detects missing binding moved to another job or plan.env", () => {
+  const workflow = readFileSync(
+    resolve(__dirname, "../../../.github/workflows/nightly-dispatch-ppu.yml"),
+    "utf8",
+  );
+  const v1Section = workflow.slice(workflow.indexOf("  release-v100:"));
+  const removedFromV1 =
+    workflow.slice(0, workflow.indexOf("  release-v100:")) +
+    v1Section.replace(
+      /^\s+PPU_CI_NOTIFY_TARGETS_JSON:\s+\$\{\{\s*secrets\.PPU_CI_NOTIFY_TARGETS_JSON\s*\}\}\r?\n/m,
+      "",
+    );
+
+  const movedToDisabledJob =
+    removedFromV1.trimEnd() +
+    "\n\n  release-disabled:\n    if: false\n    uses: t-head/sglang-for-sail/.github/workflows/nightly-test-ppu.yml@main\n    secrets:\n      PPU_CI_NOTIFY_TARGETS_JSON: ${{ secrets.PPU_CI_NOTIFY_TARGETS_JSON }}\n";
+  assert.equal(
+    extractJobSecrets(movedToDisabledJob, "release-v0523").PPU_CI_NOTIFY_TARGETS_JSON,
+    "${{ secrets.PPU_CI_NOTIFY_TARGETS_JSON }}",
+  );
+  assert.equal(
+    extractJobSecrets(movedToDisabledJob, "release-v100").PPU_CI_NOTIFY_TARGETS_JSON,
+    undefined,
+  );
+
+  const movedToPlanEnv = removedFromV1.replace(
+    "        env:\n",
+    "        env:\n          PPU_CI_NOTIFY_TARGETS_JSON: ${{ secrets.PPU_CI_NOTIFY_TARGETS_JSON }}\n",
+  );
+  assert.equal(
+    extractJobSecrets(movedToPlanEnv, "release-v100").PPU_CI_NOTIFY_TARGETS_JSON,
+    undefined,
+  );
+
+  const duplicatedInJob = workflow.replace(
+    "      PPU_CI_NOTIFY_TARGETS_JSON: ${{ secrets.PPU_CI_NOTIFY_TARGETS_JSON }}\n",
+    "      PPU_CI_NOTIFY_TARGETS_JSON: ${{ secrets.PPU_CI_NOTIFY_TARGETS_JSON }}\n      PPU_CI_NOTIFY_TARGETS_JSON: ${{ secrets.PPU_CI_NOTIFY_TARGETS_JSON }}\n",
+  );
+  assert.throws(() => extractJobSecrets(duplicatedInJob, "release-v0523"), /Duplicate secret/);
+});
