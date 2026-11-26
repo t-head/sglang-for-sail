@@ -22,9 +22,10 @@
 //
 // Arrival is lamport-style: a slot reads +0.0 until its producer has written it
 // (a producer rewrites +0.0 words to -0.0), and the consumer restores +0.0
-// after reading, so the plane needs no barrier. Slot (dst, src) holds rows
-// R = b * (H / N) + j for dst's local head j: R * 256 B of payload (D = 128 bf16)
-// then, at `lse_offset`, one 16 B word [lse, -0, -0, -0] per row.
+// after reading, so the plane needs no barrier. Slot (dst, src) reserves
+// `max_rows * 256` B for payload (D = 128 bf16) followed by `max_rows * 16` B
+// for LSE words [lse, -0, -0, -0] at the fixed capacity-derived `lse_offset`,
+// so blocks at different phases across changing batch sizes never collide.
 //
 // A warp owns a row at a time, on the same (block, warp) on every rank, so the
 // producer and the consumer of a row share a block and its phase counter; the
@@ -213,6 +214,13 @@ __global__ __launch_bounds__(kBlockSize, 1) void push_combine_kernel(const __gri
 
 template <uint32_t kWorldSize, bool kUsePDL>
 struct DcpPushCombineKernel {
+  static int64_t max_active_blocks(int64_t device_id) {
+    using namespace dcp_push_combine;
+    const auto bpsm = host::runtime::get_blocks_per_sm(push_combine_kernel<kWorldSize, kUsePDL>, kBlockSize);
+    const auto num_sm = host::runtime::get_sm_count(static_cast<int>(device_id));
+    return static_cast<int64_t>(bpsm) * static_cast<int64_t>(num_sm);
+  }
+
   static void
   run(CommunicatorRef ref,
       tvm::ffi::TensorView v,
@@ -237,9 +245,10 @@ struct DcpPushCombineKernel {
     const int64_t batch = B.unwrap();
     if (batch == 0) return;
     const int64_t num_rows = batch * hpr;
+    const int64_t max_rows = push.slot_bytes / (kRowBytes + 16);
     const int64_t need = num_rows * (kRowBytes + 16);
-    CHECK_HOST(need <= push.slot_bytes) << "DCP push-combine needs " << need << " B per slot, plane has "
-                                        << push.slot_bytes;
+    CHECK_HOST(num_rows <= max_rows) << "DCP push-combine needs " << need << " B per slot, plane has "
+                                     << push.slot_bytes;
     CHECK_HOST(reinterpret_cast<uintptr_t>(v.data_ptr()) % 16 == 0 && v.stride(0) % 8 == 0 && v.stride(1) % 8 == 0);
     Params<kWorldSize> p{};
     p.v = static_cast<const uint8_t*>(v.data_ptr());
@@ -254,7 +263,7 @@ struct DcpPushCombineKernel {
     }
     p.counter = push.counter;
     p.slot_bytes = static_cast<uint32_t>(push.slot_bytes);
-    p.lse_offset = static_cast<uint32_t>(num_rows * kRowBytes);
+    p.lse_offset = static_cast<uint32_t>(max_rows * kRowBytes);
     p.rank = push.rank;
     p.num_rows = static_cast<uint32_t>(num_rows);
     p.heads_per_rank = static_cast<uint32_t>(hpr);

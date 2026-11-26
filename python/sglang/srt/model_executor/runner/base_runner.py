@@ -57,6 +57,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.spec_info import create_dummy_verify_input
 from sglang.srt.utils import (
     empty_context,
+    is_sail,
     log_info_on_rank0,
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -266,6 +267,7 @@ class BaseRunner(ABC):
 
         self._pre_initialize_flashinfer_allreduce_workspace()
         self._pre_initialize_fi_a2a_workspace()
+        self._pre_initialize_icn_a2a_workspace()
         self._pre_initialize_pcie_ipc_workspace()
 
         # Model-owned communication resources may depend on the resolved
@@ -351,6 +353,30 @@ class BaseRunner(ABC):
                 get_parallel().dcp_group,
                 self.model_runner.model_config.num_attention_heads,
             )
+
+    def _pre_initialize_icn_a2a_workspace(self):
+        """Allocate the ICN P2P push-combine workspace for the a2a DCP comm
+        backend on SAIL/PPU; must run before CG capture (syncs streams +
+        barriers cross-rank, uncapturable).
+        """
+        if (
+            not is_sail()
+            or not get_parallel().dcp_enabled
+            or get_parallel().dcp_comm_backend != "a2a"
+        ):
+            return
+        if not any(
+            getattr(module, "dcp_v_preproject", False)
+            for module in self.model_runner.model.modules()
+        ):
+            return
+
+        from sglang.srt.layers.dcp import init_dcp_push_combine
+
+        init_dcp_push_combine(
+            get_parallel().dcp_group,
+            self.model_runner.model_config.num_attention_heads,
+        )
 
     def _pre_initialize_pcie_ipc_workspace(self):
         """Build the PCIe-IPC all-reduce workspace before graph capture.

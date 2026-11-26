@@ -990,7 +990,7 @@ class DeepseekMLAForwardMixin:
                     # reduction. Exchange the narrower projected partials.
                     if (
                         getattr(self, "dcp_v_preproject", False)
-                        and self.use_dsa
+                        and (self.use_dsa or _is_sail)
                         and (
                             attn_output.shape[0] >= 512
                             # the push-combine reduce wins at any batch size
