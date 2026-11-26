@@ -6,7 +6,7 @@ The release branch owns the SGLang serving recipes, test policies and 890P accur
 - **Model Sanity** runs real weights once per model. It runs GSM8K main (1,319 questions), reconciles each scored sample with the reference band, verifies the KV gauge after a cache flush, and runs the native microbench at concurrency 1 and 16. The same-server performance measurements are diagnostic.
 - **Legacy single-device sanity** runs EAGLE3 and DFlash on both board types when explicitly requested. Each test reports its original result and the runner retains the raw output privately.
 
-For release PRs, a maintainer with write access must apply `run-ci` and `run-ci-ppu` for Fast Sanity or `run-ci-ppu-nightly` for Model Sanity. The labels may arrive in either order. A rerun rechecks the PR timeline. After a new push, remove and reapply the workload label to approve the current head. Apply the same labels to fork PRs after reviewing the exact revision. Nightly dispatch and reusable inputs also allow an exact model filter and reuse of a candidate build with `skip_wheel_build` and `wheel_artifact_run_id`.
+For release PRs, a maintainer with write access must apply `run-ci` and `run-ci-ppu` for Fast Sanity or `run-ci-ppu-nightly` for single-node Model Sanity. Multi-node flagships (`nnodes >= 2`, which require privileged host-network Pods) are excluded from default PR Fast Sanity and require the additional `run-ci-ppu-multinode` label on PRs (unfiltered PR Model Sanity skips multi-node models unless `run-ci-ppu-multinode` is also present, while explicit multi-node `model_filter` fails fast in `plan` without it). The labels may arrive in either order. A rerun rechecks the PR timeline. After a new push, remove and reapply the workload label to approve the current head. Apply the same labels to fork PRs after reviewing the exact revision. Nightly dispatch and reusable inputs also allow an exact model filter and reuse of a candidate build with `skip_wheel_build` and `wheel_artifact_run_id`.
 
 The PR workflow finish job requires Linux infrastructure selftests, the native build, runner preflight and Recipe Fast Sanity for changes in PPU scope. PR-triggered workflows use the protected base branch's workflow and the approved head SHA as the test source. To run the separate single-device workflow on the release branch after it lands, dispatch the same workflow in legacy-only mode.
 
@@ -23,8 +23,9 @@ Check [`test/ppu/README.md`](../../../test/ppu/README.md) for the exact policy s
 
 | Scenario | How to trigger | What runs |
 | --- | --- | --- |
-| Routine PR validation | Apply `run-ci` + `run-ci-ppu` on the PR | Dummy-weight Fast Sanity across all `fast_sanity` policies |
-| Full real-weight PR gate | Apply `run-ci` + `run-ci-ppu-nightly` on the PR | Real-weight GSM8K + microbench across all `model_sanity` policies |
+| Routine PR validation | Apply `run-ci` + `run-ci-ppu` on the PR | Dummy-weight Fast Sanity across all single-node `fast_sanity` policies |
+| Full single-node real-weight PR gate | Apply `run-ci` + `run-ci-ppu-nightly` on the PR | Real-weight GSM8K + microbench across all single-node `model_sanity` policies |
+| Multi-node flagship PR gate | Add `run-ci-ppu-multinode` alongside `run-ci-ppu` / `run-ci-ppu-nightly` | Enables serial multi-node (`nnodes >= 2`) flagship jobs in addition to single-node policies |
 | Branch / framework upgrade smoke (no PR) | Dispatch `pr-test-ppu.yml` with `run_model_sanity=true` and `model_filter` | Real-weight GSM8K + microbench on 1–2 sampled `model_sanity` models |
 | On-demand Nightly spot check | Dispatch `nightly-test-ppu.yml` with `model_filter` | Real-weight GSM8K + microbench on selected `model_sanity` models (optional wheel reuse) |
 

@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import stat
 import tempfile
 from pathlib import Path
@@ -40,6 +39,7 @@ OPTIONAL_FILES = (
     "results/evalscope.log",
     "results/gsm8k-result.json",
     "results/gsm8k_per_question.jsonl",
+    "results/page-cache-warm.log",
     "results/sglang_serve_fast_2l.log",
     "results/sglang_serve_fast_full.log",
     "results/sglang_serve_model_sanity.log",
@@ -47,6 +47,78 @@ OPTIONAL_FILES = (
 
 
 RETENTION_SUBPATH = ("sglang", "logs", "sglang-for-sail")
+
+
+def _safe_subdir(root: Path, parts: tuple[str, ...]) -> Path | None:
+    current = root
+    for part in parts:
+        if not part or part in (".", ".."):
+            return None
+        current = current / part
+        try:
+            if not stat.S_ISDIR(current.lstat().st_mode):
+                return None
+        except OSError:
+            return None
+    return current
+
+
+def _is_safe_relative_regular_file(root: Path, path: Path) -> bool:
+    try:
+        rel = path.relative_to(root)
+    except ValueError:
+        return False
+    parts = rel.parts
+    if not parts or any(part in ("", ".", "..") for part in parts):
+        return False
+    if len(parts) > 1 and _safe_subdir(root, parts[:-1]) is None:
+        return False
+    try:
+        return stat.S_ISREG((root / rel).lstat().st_mode)
+    except OSError:
+        return False
+
+
+def _open_safe_relative_regular_file(root: Path, relative_path: str):
+    parts = Path(relative_path).parts
+    if not parts or Path(relative_path).is_absolute() or ".." in parts:
+        raise ValueError("expected a relative recipe output")
+    parent = root
+    if len(parts) > 1:
+        parent = _safe_subdir(root, parts[:-1])
+        if parent is None:
+            # Missing intermediate directory is treated like a missing optional
+            # file unless a symlink/non-directory is present at that component.
+            current = root
+            for part in parts[:-1]:
+                current = current / part
+                try:
+                    mode = current.lstat().st_mode
+                except FileNotFoundError:
+                    raise
+                if not stat.S_ISDIR(mode):
+                    raise ValueError("expected a regular recipe output directory")
+            raise FileNotFoundError(relative_path)
+    target = parent / parts[-1]
+    mode = target.lstat().st_mode
+    if not stat.S_ISREG(mode):
+        raise ValueError("expected a regular recipe output")
+    fd = os.open(
+        target,
+        os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+    )
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            os.close(fd)
+            raise ValueError("expected a regular recipe output")
+        return os.fdopen(fd, "rb")
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
 
 
 def _check_dir_mode(directory: Path, *allowed_modes: int) -> None:
@@ -161,16 +233,17 @@ def retain(environ) -> None:
         required.update(RESULT_FILES)
     entries = ["launcher.log", *RESULT_FILES, *OPTIONAL_FILES]
     for path in sorted(source_dir.glob("pod-status-worker-*.json")):
-        if path.is_file() and not path.is_symlink():
+        if _is_safe_relative_regular_file(source_dir, path):
             entries.append(path.relative_to(source_dir).as_posix())
-    ranks_root = source_dir / "ranks"
+    ranks_root = _safe_subdir(source_dir, ("ranks",))
     ranks_optional: set[str] = set()
-    if ranks_root.is_dir() and not ranks_root.is_symlink():
+    if ranks_root is not None:
         for pattern in (
             "rank-*.status",
             "barrier/*.json",
             "rank-*/runtime.log",
             "rank-*/worker-phase.txt",
+            "rank-*/results/page-cache-warm.log",
             "rank-*/results/sglang_serve_*.log",
         ):
             try:
@@ -179,18 +252,19 @@ def retain(environ) -> None:
                 continue
             for path in matches:
                 try:
-                    if path.is_file() and not path.is_symlink():
+                    if _is_safe_relative_regular_file(source_dir, path):
                         rel = path.relative_to(source_dir).as_posix()
                         entries.append(rel)
                         ranks_optional.add(rel)
                 except OSError:
                     continue
-    review_root = source_dir / "results/evalscope"
-    if review_root.is_dir() and not review_root.is_symlink():
+    review_root = _safe_subdir(source_dir, ("results", "evalscope"))
+    if review_root is not None:
         entries.extend(
             path.relative_to(source_dir).as_posix()
             for path in sorted(review_root.rglob("*"))
-            if path.is_file() and path.suffix in (".json", ".jsonl", ".log")
+            if path.suffix in (".json", ".jsonl", ".log")
+            and _is_safe_relative_regular_file(source_dir, path)
         )
     with tempfile.TemporaryDirectory(prefix=".staging-", dir=parent) as staging_dir:
         staging = Path(staging_dir)
@@ -205,26 +279,23 @@ def retain(environ) -> None:
                 else source.name
             )
             try:
-                mode = source.lstat().st_mode
+                stream = _open_safe_relative_regular_file(source_dir, relative_path)
             except FileNotFoundError:
                 if relative_path not in required:
                     continue
                 raise
-            if not stat.S_ISREG(mode):
-                raise ValueError("expected a regular recipe output")
-            copied = published / name
-            copied.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            try:
-                shutil.copyfile(source, copied)
             except PermissionError:
                 if relative_path in ranks_optional:
                     continue
                 raise
-            copied.chmod(0o600)
+            copied = published / name
+            copied.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             digest = hashlib.sha256()
-            with copied.open("rb") as stream:
+            with stream, copied.open("wb") as out:
                 for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    out.write(chunk)
                     digest.update(chunk)
+            copied.chmod(0o600)
             files[name] = digest.hexdigest()
         index_path = published / "index.json"
         index_path.write_text(

@@ -144,7 +144,7 @@ jobs:
         run: python3 -B scripts/ci/ppu/recipe_cluster_config.py --check
 
   plan:
-    needs: pr-gate
+    needs: [pr-gate, pr-gate-multinode]
     if: inputs.tier != 'cluster_preflight' && needs.pr-gate.outputs.approved == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -175,6 +175,8 @@ jobs:
         id: plan
         env:
           APPROVED_SHA: ${{ needs.pr-gate.outputs.sha }}
+          MULTINODE_APPROVED: ${{ needs.pr-gate-multinode.outputs.approved }}
+          MULTINODE_APPROVED_SHA: ${{ needs.pr-gate-multinode.outputs.sha }}
           INPUT_REF: ${{ inputs.ref || '' }}
           INPUT_TARGET_REF: ${{ inputs.target_ref || '' }}
           MODEL_FILTER: ${{ inputs.model_filter || '' }}
@@ -195,11 +197,29 @@ jobs:
           fi
           python3 -B scripts/ci/ppu/recipe_image.py validate-inputs \
             --image-tag "$IMAGE_TAG" --image-digest "$IMAGE_DIGEST"
-          all_models=$(python3 -B scripts/ci/ppu/recipe_select.py "$TIER" --model-filter "$MODEL_FILTER" --topology all)
-          models=$(python3 -B scripts/ci/ppu/recipe_select.py "$TIER" --model-filter "$MODEL_FILTER" --topology single_node)
-          multinode_models=$(python3 -B scripts/ci/ppu/recipe_select.py "$TIER" --model-filter "$MODEL_FILTER" --topology multi_node)
+          # Call the existing selector interface once so older PR heads remain compatible.
+          all_models=$(python3 -B scripts/ci/ppu/recipe_select.py "$TIER" --model-filter "$MODEL_FILTER")
+          models=$(jq -c '{include: [.include[] | select((.nnodes // 1) == 1)]}' <<< "$all_models")
+          multinode_models=$(jq -c '{include: [.include[] | select((.nnodes // 1) > 1)]}' <<< "$all_models")
           has_single_node=$(jq -r 'if (.include | length) > 0 then "true" else "false" end' <<< "$models")
           has_multi_node=$(jq -r 'if (.include | length) > 0 then "true" else "false" end' <<< "$multinode_models")
+          if [[ "$has_multi_node" == true ]]; then
+            multinode_ok=false
+            if [[ "${MULTINODE_APPROVED:-}" == true && "${MULTINODE_APPROVED_SHA:-}" == "$source" ]]; then
+              multinode_ok=true
+            fi
+            if [[ "$multinode_ok" != true ]]; then
+              if [[ -n "$PR_HEAD" && -z "$MODEL_FILTER" && "$has_single_node" == true ]]; then
+                echo "::notice::Skipping multi-node models on PR because label run-ci-ppu-multinode is not approved for this revision"
+                multinode_models='{"include":[]}'
+                has_multi_node=false
+                all_models="$models"
+              else
+                echo "::error::Multi-node models require the run-ci-ppu-multinode approval label for revision $source" >&2
+                exit 1
+              fi
+            fi
+          fi
           if [[ "$has_single_node" != true && "$has_multi_node" != true ]]; then
             echo "::error::No models selected for tier $TIER" >&2
             exit 1
@@ -400,7 +420,10 @@ jobs:
       - name: Guarantee cluster cleanup on cancel or interrupt
         if: always() && steps.cluster.outcome != 'skipped'
         shell: bash
-        run: bash scripts/ci/ppu/cleanup_recipe_cluster.sh
+        run: |
+          if [[ -f scripts/ci/ppu/cleanup_recipe_cluster.sh ]]; then
+            bash scripts/ci/ppu/cleanup_recipe_cluster.sh
+          fi
       - name: Approve only the checked public evidence file
         id: evidence
         if: always() && steps.cluster.outcome != 'skipped'
@@ -424,11 +447,11 @@ jobs:
     name: ${{ inputs.tier == 'fast_sanity' && 'Fast Sanity' || 'Model Sanity' }} (${{ matrix.model }}, ${{ matrix.nnodes }}x8)
     needs: [pr-gate-multinode, plan, ppu-build, evalscope-wheels, recipe-sanity]
     if: >-
-      !cancelled() && needs.plan.result == 'success' &&
+      always() && !cancelled() && needs.plan.result == 'success' &&
       needs.plan.outputs.has-multi-node == 'true' &&
       needs.pr-gate-multinode.outputs.approved == 'true' &&
       needs.pr-gate-multinode.outputs.sha == needs.plan.outputs.source-sha &&
-      (needs.recipe-sanity.result == 'success' || needs.recipe-sanity.result == 'skipped') &&
+      needs.recipe-sanity.result != 'cancelled' &&
       (inputs.tier == 'fast_sanity' || needs.evalscope-wheels.result == 'success') &&
       (needs.ppu-build.result == 'success' ||
        ((needs.plan.outputs.input-artifact-id != '' || needs.plan.outputs.skip-wheel-install == 'true') &&

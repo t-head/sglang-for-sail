@@ -6,9 +6,15 @@ set -euo pipefail
 umask 077
 
 state_file="${RUNNER_TEMP:-/tmp}/ppu-cleanup-state.json"
+verified_marker="${RUNNER_TEMP:-/tmp}/ppu-cleanup-verified.json"
 if [[ ! -f "$state_file" ]]; then
-    printf '{"cleanup_verified": true, "schema": "ppu-cleanup/v1", "source": "orchestrator_trap"}\n'
-    exit 0
+    if [[ -f "$verified_marker" && ! -L "$verified_marker" ]]; then
+        cat -- "$verified_marker"
+        exit 0
+    fi
+    printf '{"cleanup_verified": false, "schema": "ppu-cleanup/v1", "source": "missing_state"}\n'
+    echo "::error::Cluster cleanup state is missing and no verified cleanup marker was recorded"
+    exit 1
 fi
 
 export PATH="/opt/bin:$PATH"
@@ -84,6 +90,14 @@ if (( INPUT_NNODES > 0 )); then
 fi
 
 leftover_staging=0
+if [[ -n "$SOURCE_STAGE_DIR" && -e "$SOURCE_STAGE_DIR" ]]; then
+    stage_parent=$(dirname -- "$SOURCE_STAGE_DIR")
+    if [[ "$(basename -- "$SOURCE_STAGE_DIR")" == "source.tar.gz" &&
+        "$(basename -- "$stage_parent")" == "${JOB_NAME}."* ]]; then
+        rm -f -- "$SOURCE_STAGE_DIR" || true
+        rmdir -- "$stage_parent" 2>/dev/null || true
+    fi
+fi
 if [[ -n "$SOURCE_STAGE_DIR" && -e "$SOURCE_STAGE_DIR" ]]; then
     leftover_staging=1
 fi

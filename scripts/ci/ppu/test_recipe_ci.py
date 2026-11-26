@@ -3494,11 +3494,27 @@ class MultiNodeRecipeTest(unittest.TestCase):
         single = workflow["jobs"]["recipe-sanity"]
         self.assertEqual(single["env"]["RECIPE_NNODES"], "1")
         self.assertEqual(single["env"]["PPU_CI_ALLOW_MULTINODE_HOST_ACCESS"], "false")
+        plan_job = workflow["jobs"]["plan"]
+        self.assertIn("pr-gate-multinode", plan_job["needs"])
+        plan_run = next(s["run"] for s in plan_job["steps"] if s.get("id") == "plan")
+        self.assertNotIn("--topology", plan_run)
+        self.assertIn("run-ci-ppu-multinode", plan_run)
+        single_cleanup_run = next(
+            s["run"]
+            for s in single["steps"]
+            if "cleanup_recipe_cluster.sh" in s.get("run", "")
+        )
+        self.assertIn(
+            "[[ -f scripts/ci/ppu/cleanup_recipe_cluster.sh ]]", single_cleanup_run
+        )
         multi = workflow["jobs"]["recipe-sanity-multinode"]
         self.assertEqual(multi["runs-on"], "k8s-runner-group-cpu-thead")
         self.assertEqual(str(multi["strategy"]["max-parallel"]), "1")
         self.assertIn("pr-gate-multinode", multi["needs"])
+        self.assertIn("always() && !cancelled()", multi["if"])
         self.assertIn("needs.pr-gate-multinode.outputs.approved == 'true'", multi["if"])
+        self.assertIn("needs.recipe-sanity.result != 'cancelled'", multi["if"])
+        self.assertNotIn("needs.recipe-sanity.result == 'success'", multi["if"])
         self.assertEqual(multi["env"]["RECIPE_NNODES"], "${{ matrix.nnodes || 2 }}")
         self.assertEqual(
             multi["env"]["RECIPE_PPU_COUNT"], "${{ matrix.ppu_count || 8 }}"
@@ -3569,7 +3585,29 @@ class MultiNodeRecipeTest(unittest.TestCase):
             stage_file.parent.mkdir()
             stage_file.write_text("tarball", encoding="utf-8")
 
-            # Case 1: no state file -> orchestrator already verified cleanup.
+            # Case 1a: neither state file nor verified marker -> fail-closed missing_state.
+            missing = subprocess.run(
+                ["bash", str(script)],
+                env={
+                    **os.environ,
+                    "RUNNER_TEMP": str(runner_temp),
+                    "GITHUB_WORKSPACE": str(ws),
+                },
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertNotEqual(missing.returncode, 0)
+            missing_payload = json.loads(missing.stdout.splitlines()[0])
+            self.assertFalse(missing_payload["cleanup_verified"])
+            self.assertEqual(missing_payload["source"], "missing_state")
+
+            # Case 1b: no state file, but orchestrator wrote verified marker -> pass.
+            marker = runner_temp / "ppu-cleanup-verified.json"
+            marker.write_text(
+                '{"cleanup_verified": true, "schema": "ppu-cleanup/v1", "source": "orchestrator_trap"}\n',
+                encoding="utf-8",
+            )
             noop = subprocess.run(
                 ["bash", str(script)],
                 env={
@@ -3582,7 +3620,9 @@ class MultiNodeRecipeTest(unittest.TestCase):
                 timeout=10,
             )
             self.assertEqual(noop.returncode, 0, noop.stderr)
+            self.assertTrue(json.loads(noop.stdout)["cleanup_verified"])
             self.assertEqual(json.loads(noop.stdout)["source"], "orchestrator_trap")
+            marker.unlink()
 
             # Case 2: state file present (orchestrator killed mid-cancel) -> failsafe cleans up.
             (infra / "cleanup.sh").write_text(
@@ -3868,6 +3908,333 @@ class MultiNodeRecipeTest(unittest.TestCase):
         self.assertEqual(golden["tolerance"], {"mode": "band", "abs": 0.02})
         self.assertEqual(golden["score"], 0.9757)
         self.assertEqual(golden["score_num"], 1287)
+
+    def test_orchestrator_aborts_before_submit_on_cleanup_state_write_failure(self):
+        script = (REPO_ROOT / "scripts/ci/ppu/run_recipe_cluster.sh").read_text(
+            encoding="utf-8"
+        )
+        # Durable cleanup_state write must happen BEFORE tar and MUST NOT use
+        # a single `&&` chain that suppresses left-hand write failures.
+        self.assertLess(
+            script.index('> "${cleanup_state}.tmp"'),
+            script.index('tar -czf "$SOURCE_STAGE_DIR"'),
+        )
+        self.assertNotIn('> "${cleanup_state}.tmp" &&', script)
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            workspace = root / "ws"
+            scripts_dir = workspace / "scripts/ci/ppu"
+            scripts_dir.mkdir(parents=True)
+            for name in (
+                "run_recipe_cluster.sh",
+                "recipe_image.py",
+                "recipe_bundle.py",
+                "recipe_report.py",
+                "recipe_publish.py",
+                "recipe_retention.py",
+                "recipe_diagnostics.py",
+                "ppu_recipe.py",
+            ):
+                src = REPO_ROOT / "scripts/ci/ppu" / name
+                dst = scripts_dir / name
+                dst.write_bytes(src.read_bytes())
+                if src.stat().st_mode & 0o111:
+                    dst.chmod(0o755)
+            (workspace / "test/ppu/policy/models").mkdir(parents=True)
+            (workspace / "test/ppu/policy/models/qwen3.8-2.4t-mxfp4.yaml").write_text(
+                (
+                    REPO_ROOT / "test/ppu/policy/models/qwen3.8-2.4t-mxfp4.yaml"
+                ).read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "ci@example.com"],
+                cwd=workspace,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "CI"], cwd=workspace, check=True
+            )
+            subprocess.run(["git", "add", "."], cwd=workspace, check=True)
+            subprocess.run(
+                ["git", "commit", "-q", "-m", "init"], cwd=workspace, check=True
+            )
+            source_sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=workspace, text=True
+            ).strip()
+
+            infra = workspace / ".ppu-infra/cluster-run/scripts"
+            infra.mkdir(parents=True)
+            submit_marker = root / "submit-called"
+            (infra / "submit.sh").write_text(
+                f'#!/usr/bin/env bash\ntouch "{submit_marker}"\nexit 0\n',
+                encoding="utf-8",
+            )
+            (infra / "submit.sh").chmod(0o755)
+            (infra / "cleanup.sh").write_text("#!/usr/bin/env bash\nexit 0\n")
+            (infra / "cleanup.sh").chmod(0o755)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            (fake_bin / "kubectl").write_text("#!/usr/bin/env bash\nexit 0\n")
+            (fake_bin / "kubectl").chmod(0o755)
+            (fake_bin / "git").write_text(
+                "#!/usr/bin/env bash\n"
+                'if [[ "$1" == "-C" && "$3" == "rev-parse" ]]; then echo 96e25147971f5d2a04d828f8ad508cae38a4fa8a; exit 0; fi\n'
+                'exec /usr/bin/git "$@"\n'
+            )
+            (fake_bin / "git").chmod(0o755)
+
+            retained = root / "retained"
+            retained.mkdir(mode=0o700)
+            staging = root / "staging"
+            staging.mkdir(mode=0o700)
+            ro_temp = root / "ro-temp"
+            ro_temp.mkdir(mode=0o500)
+            digest_ok = "sha256:" + "a" * 64
+            try:
+                proc = subprocess.run(
+                    ["bash", str(scripts_dir / "run_recipe_cluster.sh")],
+                    cwd=workspace,
+                    env={
+                        **os.environ,
+                        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                        "TIER": "fast_sanity",
+                        "MODEL_KEY": "qwen3.8-2.4t-mxfp4",
+                        "RECIPE_PPU_COUNT": "8",
+                        "RECIPE_NNODES": "2",
+                        "PPU_CI_ALLOW_MULTINODE_HOST_ACCESS": "true",
+                        "PPU_CI_SKIP_WHEEL_INSTALL": "true",
+                        "PPU_CI_RUNTIME_IMAGE_DIGEST": digest_ok,
+                        "PPU_CI_K8S_RUNTIME_DIGEST": f"registry.internal/team/sglang@{digest_ok}",
+                        "PPU_CI_RECIPE_IMAGE_REPO": "registry.internal/team/sglang",
+                        "PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS": "registry.internal/team/",
+                        "PPU_PUBLIC_SUMMARY": str(root / "summary.md"),
+                        "GITHUB_WORKSPACE": str(workspace),
+                        "RUNNER_TEMP": str(ro_temp),
+                        "GITHUB_RUN_ID": "99",
+                        "GITHUB_RUN_ATTEMPT": "1",
+                        "PPU_CI_K8S_CONFIG_SHA256": "",
+                        "PPU_CI_K8S_LOADED_CONFIG_SHA256": "",
+                        "PPU_CI_PRIVATE_RESULTS_ROOT": str(retained),
+                        "PPU_CI_K8S_PRIVATE_WORKER_ROOT": str(retained),
+                        "PPU_CI_K8S_STAGE_ROOT": str(staging),
+                        "PPU_CI_SOURCE_SHA": source_sha,
+                        "PPU_CI_JIT_ROOT": str(root / "jit"),
+                        "PPU_CI_HF_CACHE_ROOT": str(root / "cache"),
+                    },
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+            finally:
+                ro_temp.chmod(0o700)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertFalse(submit_marker.exists())
+            self.assertEqual(list(staging.glob("**/source.tar.gz")), [])
+
+    def test_retain_rejects_intermediate_rank_symlinks_and_archives_warmup_logs(self):
+        import recipe_retention
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            outside = root / "outside"
+            outside.mkdir()
+            secret = outside / "runtime.log"
+            secret.write_text("SECRET_OUTSIDE_JOB\n", encoding="utf-8")
+
+            src = root / "scratch"
+            (src / "results").mkdir(parents=True)
+            (src / "launcher.log").write_text("launcher\n", encoding="utf-8")
+            (src / "provenance.json").write_text("{}\n", encoding="utf-8")
+            (src / "results/summary.json").write_text(
+                json.dumps({"outcome": "pass"}), encoding="utf-8"
+            )
+            (src / "results/page-cache-warm.log").write_text(
+                "pp_warm_done rank=0/2 shards=106/213\n", encoding="utf-8"
+            )
+            # Legitimate rank-1 warm log + symlinked rank-2 directory pointing outside.
+            (src / "ranks/rank-1/results").mkdir(parents=True)
+            (src / "ranks/rank-1/results/page-cache-warm.log").write_text(
+                "pp_warm_done rank=1/2 shards=107/213\n", encoding="utf-8"
+            )
+            (src / "ranks/rank-2").symlink_to(outside)
+
+            archive_root = root / "archive"
+            archive_root.mkdir(mode=0o700)
+            sha = "a" * 40
+            recipe_retention.retain(
+                {
+                    "PPU_CI_SOURCE_SHA": sha,
+                    "TIER": "model_sanity",
+                    "MODEL_KEY": "qwen3.8-2.4t-mxfp4",
+                    "GITHUB_RUN_ID": "88",
+                    "GITHUB_RUN_ATTEMPT": "1",
+                    "PPU_CI_PRIVATE_RESULTS_ROOT": str(archive_root),
+                    "PPU_CI_ARTIFACT_DIR": str(src),
+                    "RUNNER_TEMP": str(root / "runner-temp"),
+                    "GITHUB_WORKSPACE": str(root / "workspace"),
+                    "RECIPE_OUTCOME": "success",
+                }
+            )
+            dest = (
+                archive_root
+                / "sglang/logs/sglang-for-sail/88-1"
+                / sha[:12]
+                / "model_sanity/qwen3.8-2.4t-mxfp4"
+            )
+            index = json.loads((dest / "index.json").read_text(encoding="utf-8"))
+            self.assertIn("page-cache-warm.log", index["files"])
+            self.assertIn("ranks/rank-1/results/page-cache-warm.log", index["files"])
+            self.assertNotIn("ranks/rank-2/runtime.log", index["files"])
+            self.assertFalse((dest / "ranks/rank-2/runtime.log").exists())
+
+    def test_gang_snapshot_resolution_locks_single_revision_across_ranks(self):
+        import concurrent.futures
+        from unittest import mock
+
+        import recipe_runner
+
+        rev_a = "a" * 40
+        rev_b = "b" * 40
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            barrier = root / "barrier"
+            state = {"current": rev_a}
+
+            def fake_cached(repo_id, revision):
+                resolved = state["current"] if revision is None else revision
+                return f"/cache/snapshots/{resolved}", resolved
+
+            with mock.patch.object(
+                recipe_runner, "cached_model_path", side_effect=fake_cached
+            ):
+                p0, r0 = recipe_runner._resolve_gang_snapshot(
+                    "T-HEAD/Qwen3.8-2.4T-A95B-FP8-mxfp4-fp8-030",
+                    None,
+                    nnodes=2,
+                    node_rank=0,
+                    barrier_dir=barrier,
+                    poll_s=0.02,
+                )
+                # Mutate refs/main between rank 0 and rank 1 resolution.
+                state["current"] = rev_b
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    p1, r1 = pool.submit(
+                        recipe_runner._resolve_gang_snapshot,
+                        "T-HEAD/Qwen3.8-2.4T-A95B-FP8-mxfp4-fp8-030",
+                        None,
+                        nnodes=2,
+                        node_rank=1,
+                        barrier_dir=barrier,
+                        poll_s=0.02,
+                    ).result(timeout=5)
+            self.assertEqual((p0, r0), (p1, r1))
+            self.assertEqual(r1, rev_a)
+
+    def test_stop_process_group_reaps_surviving_children_after_leader_sigkill(self):
+        import signal
+        import time
+
+        import recipe_runner
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            pid_file = Path(raw_root) / "child.pid"
+            # Leader spawns a child in the same process group and waits.
+            proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os, subprocess, sys, time; "
+                        f"c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+                        f"open({str(pid_file)!r}, 'w').write(str(c.pid)); "
+                        "time.sleep(60)"
+                    ),
+                ],
+                start_new_session=True,
+            )
+            deadline = time.monotonic() + 5.0
+            while not pid_file.exists() or not pid_file.read_text().strip():
+                if time.monotonic() > deadline:
+                    proc.kill()
+                    self.fail("child pid file not created")
+                time.sleep(0.05)
+            child_pid = int(pid_file.read_text().strip())
+            # Kill ONLY the group leader, leaving its child alive in the group.
+            os.kill(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=5)
+            os.kill(child_pid, 0)  # Child is still alive before cleanup.
+
+            sent, rc = recipe_runner._stop_process_group(proc)
+            self.assertFalse(sent)
+            self.assertEqual(rc, -signal.SIGKILL)
+            # Child must be dead after _stop_process_group.
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.05)
+            else:
+                os.kill(child_pid, signal.SIGKILL)
+                self.fail("child process survived after _stop_process_group")
+
+    def test_pp_layer_indices_match_sglang_runtime_remainder_and_partition_override(
+        self,
+    ):
+        import recipe_runner
+
+        # 5 layers across PP2 -> runtime puts remainder on later stages: [0, 2) and [2, 5).
+        self.assertEqual(
+            recipe_runner._pp_layer_indices(5, pp_size=2, pp_rank=0), (0, 2)
+        )
+        self.assertEqual(
+            recipe_runner._pp_layer_indices(5, pp_size=2, pp_rank=1), (2, 5)
+        )
+        # Custom SGLANG_PP_LAYER_PARTITION override is honored.
+        env = {"SGLANG_PP_LAYER_PARTITION": "1,4"}
+        self.assertEqual(
+            recipe_runner._pp_layer_indices(5, pp_size=2, pp_rank=0, server_env=env),
+            (0, 1),
+        )
+        self.assertEqual(
+            recipe_runner._pp_layer_indices(5, pp_size=2, pp_rank=1, server_env=env),
+            (1, 5),
+        )
+
+    def test_recent_failures_ignores_healthy_multinode_run_and_surfaces_prior_oom(self):
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            base = root / "sglang/logs/sglang-for-sail"
+            # Run 100: failed with OOM.
+            r100 = base / "100-1" / ("a" * 12) / "model_sanity/qwen3.8-2.4t-mxfp4"
+            r100.mkdir(parents=True)
+            (r100 / "index.json").write_text("{}")
+            (r100 / "runtime.log").write_text("CUDA out of memory\n", encoding="utf-8")
+            # Run 101: later healthy run with outcome=pass and rank-1.status=0.
+            r101 = base / "101-1" / ("b" * 12) / "model_sanity/qwen3.8-2.4t-mxfp4"
+            (r101 / "ranks").mkdir(parents=True)
+            (r101 / "index.json").write_text("{}")
+            (r101 / "summary.json").write_text(
+                json.dumps({"outcome": "pass"}), encoding="utf-8"
+            )
+            (r101 / "ranks/rank-1.status").write_text("0\n", encoding="utf-8")
+
+            records = recent_failures(root, 102, model_filter="qwen3.8-2.4t-mxfp4")
+            self.assertEqual(
+                records,
+                [
+                    {
+                        "run_id": 100,
+                        "tier": "model_sanity",
+                        "model": "qwen3.8-2.4t-mxfp4",
+                        "codes": ["cuda_oom", "worker_oom"],
+                    }
+                ],
+            )
 
 
 if __name__ == "__main__":

@@ -337,7 +337,28 @@ def _iter_safe_rank_logs(ranks_dir):
                     yield item, is_rank1
 
 
+def _archive_outcome(directory):
+    stream, size = _open_regular_file(directory / "summary.json")
+    if stream is None:
+        return None
+    if size > 65536:
+        stream.close()
+        return None
+    with stream:
+        try:
+            payload = json.loads(stream.read(65536).decode(errors="replace"))
+        except (ValueError, OSError):
+            return None
+    if not isinstance(payload, dict):
+        return None
+    outcome = payload.get("outcome")
+    return outcome if isinstance(outcome, str) else None
+
+
 def _archive_codes(directory):
+    outcome = _archive_outcome(directory)
+    if outcome == "pass":
+        return set()
     codes = set()
     for filename in (
         "launcher.log",
@@ -356,15 +377,18 @@ def _archive_codes(directory):
         codes.update(_scan_file_codes(directory / filename))
     ranks_dir = _safe_subdir(directory, ("ranks",))
     if ranks_dir is not None:
-        status_val = _read_regular_text(ranks_dir / "rank-1.status").strip()
-        if status_val == "0":
-            codes.add("r1_status_0")
-        elif status_val:
-            codes.add("r1_status_nonzero")
         for path, is_rank1 in _iter_safe_rank_logs(ranks_dir):
             codes.update(_scan_file_codes(path))
             if is_rank1:
                 codes.update(_scan_file_codes(path, RANK1_RULES))
+        status_val = _read_regular_text(ranks_dir / "rank-1.status").strip()
+        if status_val == "0":
+            # Only attach healthy rank-1 exit status as context on a failed run;
+            # never let a healthy worker exit turn a clean archive into a failure.
+            if outcome == "fail" or codes:
+                codes.add("r1_status_0")
+        elif status_val:
+            codes.add("r1_status_nonzero")
     return codes
 
 

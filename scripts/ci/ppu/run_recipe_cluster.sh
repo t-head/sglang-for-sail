@@ -93,7 +93,26 @@ verify_cluster_cleanup() {
 
 export JOB_NAME="" SOURCE_STAGE_DIR="" INPUT_JOB_STATUS=failed INPUT_WORKFLOW_STATUS=failure
 cleanup_state="${RUNNER_TEMP:-/tmp}/ppu-cleanup-state.json"
+cleanup_verified_marker="${RUNNER_TEMP:-/tmp}/ppu-cleanup-verified.json"
+rm -f -- "$cleanup_verified_marker"
 phase() { printf '%s\n' "$1" > "$raw/recipe-phase.txt"; }
+write_cleanup_verified_marker() {
+    local source_kind=$1
+    mkdir -p -- "$(dirname -- "$cleanup_verified_marker")" || return 1
+    local tmp="${cleanup_verified_marker}.tmp.$$"
+    printf '{"cleanup_verified": true, "schema": "ppu-cleanup/v1", "source": "%s"}\n' "$source_kind" > "$tmp" &&
+        mv -- "$tmp" "$cleanup_verified_marker"
+}
+cleanup_staging_fallback() {
+    [[ -n "$JOB_NAME" && -n "$SOURCE_STAGE_DIR" ]] || return 0
+    local parent
+    parent=$(dirname -- "$SOURCE_STAGE_DIR")
+    if [[ "$(basename -- "$SOURCE_STAGE_DIR")" == "source.tar.gz" &&
+        "$(basename -- "$parent")" == "${JOB_NAME}."* ]]; then
+        rm -f -- "$SOURCE_STAGE_DIR"
+        rmdir -- "$parent" 2>/dev/null || true
+    fi
+}
 child=""
 run_backend() {
     local rc=0
@@ -116,12 +135,18 @@ finish() {
         if [[ "$INPUT_WORKFLOW_STATUS" != cancelled ]] && collect_pod_statuses && [[ "$mode" != legacy && ! -f "$raw/provenance.json" ]]; then
             record_runtime_image || true
         fi
-        if bash "$infra/cleanup.sh" && verify_cluster_cleanup; then
+        local cleanup_ok=0
+        bash "$infra/cleanup.sh" || cleanup_ok=1
+        cleanup_staging_fallback
+        if (( cleanup_ok == 0 )) && verify_cluster_cleanup; then
+            write_cleanup_verified_marker orchestrator_trap
             rm -f -- "$cleanup_state"
         else
             rc=1
             phase cleanup
         fi
+    else
+        write_cleanup_verified_marker no_cluster_resources
     fi
     if [[ "$mode" == legacy ]]; then
         export PPU_LEGACY_RETAINED=true RECIPE_OUTCOME=failure
@@ -313,16 +338,21 @@ job_hash=$(printf '%s' "$raw" | sha256sum | cut -c1-16)
 export JOB_NAME="sglang-recipe-$job_hash"
 stage_dir=$(mktemp -d "${stage_root%/}/$JOB_NAME.XXXXXXXX")
 export SOURCE_STAGE_DIR="$stage_dir/source.tar.gz"
-tar -czf "$SOURCE_STAGE_DIR" --exclude='./.ppu-infra' --exclude='./.git/config' \
-    --exclude='./.git/config.worktree' --exclude='./.git/hooks' \
-    --exclude='./.git/modules' --exclude='./.git/worktrees' -C "$GITHUB_WORKSPACE" .
+# Persist the cleanup record BEFORE writing the staging tarball or submitting
+# so a hard kill during tar/submit always leaves durable state for failsafe cleanup.
+mkdir -p -- "$(dirname -- "$cleanup_state")"
 jq -n \
     --arg job_name "$JOB_NAME" \
     --arg namespace "$INPUT_NAMESPACE" \
     --argjson nnodes "$INPUT_NNODES" \
     --arg source_stage_dir "$SOURCE_STAGE_DIR" \
     '{job_name:$job_name, namespace:$namespace, nnodes:$nnodes, source_stage_dir:$source_stage_dir}' \
-    > "${cleanup_state}.tmp" && mv -- "${cleanup_state}.tmp" "$cleanup_state"
+    > "${cleanup_state}.tmp"
+mv -- "${cleanup_state}.tmp" "$cleanup_state"
+[[ -s "$cleanup_state" ]]
+tar -czf "$SOURCE_STAGE_DIR" --exclude='./.ppu-infra' --exclude='./.git/config' \
+    --exclude='./.git/config.worktree' --exclude='./.git/hooks' \
+    --exclude='./.git/modules' --exclude='./.git/worktrees' -C "$GITHUB_WORKSPACE" .
 run_backend "$infra/submit.sh"
 [[ $(read_output job_status) == scheduled ]]
 export JOB_START_TIME JOB_DEADLINE

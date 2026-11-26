@@ -79,10 +79,33 @@ def _peer_failures(barrier_dir: Path | None, *, own_rank: int) -> list[str]:
     )
 
 
+def _kill_process_group_members(pgid: int, *, grace_s: float = 1.0) -> None:
+    """Terminate any surviving members of a process group after leader exit."""
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+    deadline = time.monotonic() + grace_s
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except (ProcessLookupError, PermissionError):
+            return
+        time.sleep(0.05)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def _stop_process_group(process: subprocess.Popen) -> tuple[bool, int | None]:
     """Terminate process group; return (signal_sent, returncode)."""
     if process.poll() is not None:
-        return (False, process.returncode)
+        orig_rc = process.returncode
+        # Even if the leader already exited, reap any surviving child processes
+        # that remain in its session/process group.
+        _kill_process_group_members(process.pid)
+        return (False, orig_rc)
     signal_sent = True
     try:
         os.killpg(process.pid, signal.SIGTERM)
@@ -96,6 +119,7 @@ def _stop_process_group(process: subprocess.Popen) -> tuple[bool, int | None]:
         except ProcessLookupError:
             pass
         rc = process.wait(timeout=5)
+    _kill_process_group_members(process.pid)
     return (signal_sent, rc)
 
 
@@ -110,8 +134,45 @@ def _flag_value(flags: list[str], name: str) -> str | None:
     return value
 
 
+def _pp_layer_indices(
+    num_layers: int,
+    *,
+    pp_size: int,
+    pp_rank: int,
+    server_env: dict[str, str] | None = None,
+) -> tuple[int, int]:
+    """Mirror sglang.srt.distributed.utils.get_pp_indices."""
+    partition_str = (server_env or {}).get("SGLANG_PP_LAYER_PARTITION")
+    if partition_str is None:
+        partition_str = os.getenv("SGLANG_PP_LAYER_PARTITION")
+    if pp_size == 1:
+        partition_str = None
+    if partition_str is not None:
+        partitions = [int(layer) for layer in partition_str.split(",")]
+        if len(partitions) != pp_size or sum(partitions) != num_layers:
+            raise ValueError(
+                f"invalid SGLANG_PP_LAYER_PARTITION={partition_str!r} for "
+                f"pp_size={pp_size}, num_layers={num_layers}"
+            )
+        start = sum(partitions[:pp_rank])
+        return start, start + partitions[pp_rank]
+    base_layers = num_layers // pp_size
+    remainder = num_layers % pp_size
+    # SGLang assigns remainder layers to the last `remainder` stages.
+    if pp_rank >= pp_size - remainder:
+        partitions_without_extra = pp_size - remainder
+        start = pp_rank * (base_layers + 1) - partitions_without_extra
+        return start, start + base_layers + 1
+    start = pp_rank * base_layers
+    return start, start + base_layers
+
+
 def select_pp_stage_shards(
-    snapshot: Path, *, pp_size: int, pp_rank: int
+    snapshot: Path,
+    *,
+    pp_size: int,
+    pp_rank: int,
+    server_env: dict[str, str] | None = None,
 ) -> tuple[list[Path], tuple[int, int], int]:
     """Return the safetensors shards needed by this pipeline-parallel stage."""
     config_path = snapshot / "config.json"
@@ -124,10 +185,9 @@ def select_pp_stage_shards(
         num_layers = cfg["text_config"].get("num_hidden_layers")
     if not isinstance(num_layers, int) or num_layers < pp_size:
         return [], (0, 0), 0
-    per_stage = num_layers // pp_size
-    remainder = num_layers % pp_size
-    start = pp_rank * per_stage + min(pp_rank, remainder)
-    end = start + per_stage + (1 if pp_rank < remainder else 0)
+    start, end = _pp_layer_indices(
+        num_layers, pp_size=pp_size, pp_rank=pp_rank, server_env=server_env
+    )
 
     weight_map = json.loads(index_path.read_text(encoding="utf-8")).get(
         "weight_map", {}
@@ -171,6 +231,7 @@ def warm_pp_stage_shards(
     nnodes: int,
     node_rank: int,
     barrier_dir: Path | None,
+    server_env: dict[str, str] | None = None,
     max_workers: int = 8,
     timeout_s: float = 10800.0,
     poll_s: float = 2.0,
@@ -186,7 +247,7 @@ def warm_pp_stage_shards(
     if nnodes <= 1 or pp_raw is None or not pp_raw.isdigit() or int(pp_raw) != nnodes:
         return 0.0
     shards, (start_layer, end_layer), total_shards = select_pp_stage_shards(
-        snapshot, pp_size=nnodes, pp_rank=node_rank
+        snapshot, pp_size=nnodes, pp_rank=node_rank, server_env=server_env
     )
     if not shards:
         return 0.0
@@ -968,19 +1029,90 @@ def cached_model_path(repo_id, revision):
     return str(snapshot.resolve(strict=True)), revision
 
 
+def _resolve_gang_snapshot(
+    hf_model_id: str,
+    revision: str | None,
+    *,
+    nnodes: int,
+    node_rank: int,
+    barrier_dir: Path | None,
+    timeout_s: float = 300.0,
+    poll_s: float = 0.5,
+) -> tuple[str, str]:
+    """Ensure every node in a multi-node gang resolves the exact same snapshot."""
+    if nnodes <= 1 or revision is not None or barrier_dir is None:
+        return cached_model_path(hf_model_id, revision)
+    manifest = "snapshot-revision.json"
+    if node_rank == 0:
+        try:
+            model_path, snapshot_revision = cached_model_path(hf_model_id, None)
+            _barrier_write(
+                barrier_dir,
+                manifest,
+                {"hf_model_id": hf_model_id, "revision": snapshot_revision},
+            )
+            return model_path, snapshot_revision
+        except Exception:
+            _barrier_write(
+                barrier_dir,
+                "fail-rank-0.json",
+                {"rank": 0, "exit_code": 1, "reason": "model_cache_check"},
+            )
+            raise
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        names = _barrier_names(barrier_dir)
+        if _peer_failures(barrier_dir, own_rank=node_rank) or "rank0.done" in names:
+            raise RuntimeError("rank 0 failed before publishing model snapshot")
+        if manifest in names:
+            payload = json.loads((barrier_dir / manifest).read_text(encoding="utf-8"))
+            locked_revision = payload.get("revision")
+            if payload.get("hf_model_id") != hf_model_id or not isinstance(
+                locked_revision, str
+            ):
+                raise ValueError("mismatched gang snapshot metadata")
+            return cached_model_path(hf_model_id, locked_revision)
+        time.sleep(poll_s)
+    raise TimeoutError("timed out waiting for rank 0 snapshot revision")
+
+
 def run(policy_path, tier, queue_s):
     policy = _load_yaml(policy_path)
     recipe = REPO_ROOT / policy["recipe"]
     assets = RESULTS.parent / "assets.json"
     recipe_ppu = _load_yaml(recipe)["ppu"]
+    expected_nnodes = int(
+        os.environ.get("PPU_CI_NNODES", os.environ.get("RECIPE_NNODES", "1"))
+    )
+    expected_width = int(os.environ.get("RECIPE_PPU_COUNT", "8"))
+    node_rank = int(
+        os.environ.get("PPU_CI_NODE_RANK", os.environ.get("NODE_RANK", "0"))
+    )
+    if expected_nnodes < 1 or not (0 <= node_rank < expected_nnodes):
+        raise ValueError("incorrect recipe identity or device width")
+
+    dist_init_addr = os.environ.get("PPU_CI_DIST_INIT_ADDR", "")
+    barrier_dir = None
+    if expected_nnodes > 1:
+        ranks_dir = os.environ.get("PPU_CI_RANKS_DIR", "")
+        if not ranks_dir or not dist_init_addr:
+            raise ValueError(
+                "multi-node execution requires ranks dir and rendezvous address"
+            )
+        barrier_dir = Path(ranks_dir) / "barrier"
+
     revision = os.environ.get("PPU_CI_HF_MODEL_REVISION")
     uses_cache_ref = revision is None and "PPU_CI_HF_CACHE_ROOT" in os.environ
     if revision is None and not uses_cache_ref:
         model_path = os.environ["PPU_RECIPE_CONTAINER_MODEL"]
     else:
         phase("model_cache_check")
-        model_path, snapshot_revision = cached_model_path(
-            recipe_ppu["hf_model_id"], revision
+        model_path, snapshot_revision = _resolve_gang_snapshot(
+            recipe_ppu["hf_model_id"],
+            revision,
+            nnodes=expected_nnodes,
+            node_rank=node_rank,
+            barrier_dir=barrier_dir,
         )
     assets.write_text(
         json.dumps({name: model_path for name in recipe_ppu["assets"].values()})
@@ -995,32 +1127,13 @@ def run(policy_path, tier, queue_s):
     if uses_cache_ref:
         resolve["cache_revision"] = snapshot_revision
     config = resolve_recipe(recipe, **resolve)
-    expected_nnodes = int(
-        os.environ.get("PPU_CI_NNODES", os.environ.get("RECIPE_NNODES", "1"))
-    )
-    expected_width = int(os.environ.get("RECIPE_PPU_COUNT", "8"))
-    node_rank = int(
-        os.environ.get("PPU_CI_NODE_RANK", os.environ.get("NODE_RANK", "0"))
-    )
     if (
-        expected_nnodes < 1
-        or not (0 <= node_rank < expected_nnodes)
-        or config["nodes"] != expected_nnodes
+        config["nodes"] != expected_nnodes
         or config["devices_per_node"] != expected_width
         or config["ppu_count"] != expected_nnodes * expected_width
         or policy["model_id"] != config["model_id"]
     ):
         raise ValueError("incorrect recipe identity or device width")
-
-    dist_init_addr = os.environ.get("PPU_CI_DIST_INIT_ADDR", "")
-    barrier_dir = None
-    if expected_nnodes > 1:
-        ranks_dir = os.environ.get("PPU_CI_RANKS_DIR", "")
-        if not ranks_dir or not dist_init_addr:
-            raise ValueError(
-                "multi-node execution requires ranks dir and rendezvous address"
-            )
-        barrier_dir = Path(ranks_dir) / "barrier"
 
     warm_s = 0.0
     if tier == "model_sanity" and expected_nnodes > 1:
@@ -1030,6 +1143,7 @@ def run(policy_path, tier, queue_s):
             nnodes=expected_nnodes,
             node_rank=node_rank,
             barrier_dir=barrier_dir,
+            server_env=config["server_env"],
         )
 
     if expected_nnodes > 1 and node_rank > 0:
