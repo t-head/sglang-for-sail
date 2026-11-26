@@ -73,6 +73,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "handle_kv_cache_sharding",
         "handle_moe_kernel_config",
         "handle_a2a_moe",
+        "validate_cp_tp_group_sharing_final_ep",
         "handle_eplb_and_dispatch",
         "handle_expert_distribution_metrics",
         "handle_shared_experts_tp",
