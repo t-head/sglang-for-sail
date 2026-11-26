@@ -120,11 +120,23 @@ def _validate_target(entry):
     return NotificationTarget(webhook_url, signing_secret)
 
 
+def _load_json_unique_keys(raw):
+    def reject_duplicate_keys(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("Duplicate JSON key")
+            result[key] = value
+        return result
+
+    return json.loads(raw, object_pairs_hook=reject_duplicate_keys)
+
+
 def parse_targets(raw):
     if not isinstance(raw, str) or len(raw.encode("utf-8")) > TARGETS_LIMIT:
         raise ValueError("Invalid notification targets configuration")
     try:
-        config = json.loads(raw)
+        config = _load_json_unique_keys(raw)
     except ValueError:
         raise ValueError("Invalid notification targets configuration") from None
     if not isinstance(config, dict):
@@ -167,7 +179,7 @@ def resolve_target(version="", environ=None):
     return None
 
 
-def _extract_version(raw):
+def _extract_version(raw, *, allow_bare_version=True):
     if not isinstance(raw, str):
         return ""
     candidate = raw.strip()
@@ -187,13 +199,15 @@ def _extract_version(raw):
                 ):
                     return version
         return ""
+    if candidate == "main":
+        return "main"
     for prefix in ("releases/", "release/", "yuhe/"):
         if candidate.startswith(prefix):
             version = candidate[len(prefix) :]
             if version != "main" and len(version) <= 64 and VERSION.fullmatch(version):
                 return version
             return ""
-    if len(candidate) <= 64 and VERSION.fullmatch(candidate):
+    if allow_bare_version and len(candidate) <= 64 and VERSION.fullmatch(candidate):
         return candidate
     return ""
 
@@ -203,8 +217,10 @@ def normalize_version(explicit_version="", notify_ref="", fallback_version=""):
         if not isinstance(explicit_version, str):
             return ""
         if explicit_version.strip():
-            return _extract_version(explicit_version)
-    return _extract_version(notify_ref) or _extract_version(fallback_version)
+            return _extract_version(explicit_version, allow_bare_version=True)
+    return _extract_version(notify_ref, allow_bare_version=False) or _extract_version(
+        fallback_version, allow_bare_version=True
+    )
 
 
 def signed_url(url, secret, timestamp_ms):
