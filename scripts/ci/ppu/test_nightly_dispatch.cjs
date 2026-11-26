@@ -146,3 +146,14 @@ test("workflow planner script treats 404 branch lookup as absent and rethrows ot
     /Service Unavailable/,
   );
 });
+
+test("nightly-dispatch-ppu forwards PPU_CI_NOTIFY_TARGETS_JSON to both release jobs", () => {
+  const workflow = readFileSync(
+    resolve(__dirname, "../../../.github/workflows/nightly-dispatch-ppu.yml"),
+    "utf8",
+  );
+  const matches = workflow.match(
+    /^\s+PPU_CI_NOTIFY_TARGETS_JSON:\s+\$\{\{\s*secrets\.PPU_CI_NOTIFY_TARGETS_JSON\s*\}\}\s*$/gm,
+  );
+  assert.equal(matches?.length, 2);
+});
