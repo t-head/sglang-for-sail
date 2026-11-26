@@ -57,5 +57,3 @@ presets:
     select:
       features:
         deepep: false
-    env:
-      SGLANG_OPT_FLASHMLA_SPARSE_PREFILL: "0"
