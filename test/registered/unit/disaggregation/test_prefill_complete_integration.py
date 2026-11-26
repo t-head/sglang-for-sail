@@ -445,7 +445,17 @@ class TestAllocationIntegration(CustomTestCase):
                     )
                     override.install()
                     try:
-                        req = Mock(finished_reason=None, to_finish=None)
+                        # Numeric extend_end/prefix_len boundaries: the chunked
+                        # path compares them to decide whether anything was
+                        # computed, and bare child mocks would raise on `>`.
+                        # Zero keeps the continuation uncomputed, matching the
+                        # yielding scenarios this test drives below.
+                        req = Mock(
+                            finished_reason=None,
+                            to_finish=None,
+                            extend_end=0,
+                            prefix_len=0,
+                        )
                         scheduler = SimpleNamespace(
                             chunked_req=req,
                             tree_cache=Mock(),
