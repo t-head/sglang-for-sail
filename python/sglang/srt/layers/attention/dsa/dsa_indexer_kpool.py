@@ -1367,9 +1367,44 @@ class IndexerKPool(MultiPlatformOp):
             attn_metadata, "kpool_extend_pooled_page_tables", None
         )
         zero_starts_by_batch = getattr(attn_metadata, "kpool_extend_zero_starts", None)
+        if zero_starts_by_batch is not None and not (
+            isinstance(zero_starts_by_batch, torch.Tensor)
+            and zero_starts_by_batch.shape[0] == forward_batch.batch_size
+        ):
+            # Guard (C2): only per-request shaped zero_starts may be
+            # indexed by batch position; otherwise fall back to zeros.
+            zero_starts_by_batch = None
         pooled_seq_lens_expanded = getattr(
             attn_metadata, "kpool_seqlens_expanded", None
         )
+        if (
+            is_in_breakable_cuda_graph()
+            and topk_offsets is not None
+            and topk_offsets.shape[0] < token_nums
+        ):
+            # Guard (C3): stale fused topk offsets would make the fused
+            # RAGGED producer emit per-request-local indices while the
+            # fused consumer reads them as concatenated-KV global
+            # positions (dsa_backend adds no offset when use_fused_topk).
+            # Rebuild them once for the batch from the live mirrors with
+            # the same formula the eager metadata builder uses
+            # (repeat_interleave of cu_seqlens_k[:-1] over the extend
+            # lengths), so every request keeps its concatenated-KV start,
+            # not just the first one.
+            _ext_lens = forward_batch.extend_seq_lens_cpu
+            _kv_lens = forward_batch.seq_lens_cpu
+            if _ext_lens is not None and _kv_lens is not None:
+                _ext_t = torch.as_tensor(_ext_lens, dtype=torch.int64)
+                _cu = torch.cumsum(_kv_lens.to(torch.int64), 0)
+                _starts = torch.cat((_cu.new_zeros(1), _cu[:-1]))
+                _rebuilt = torch.repeat_interleave(_starts, _ext_t)
+                topk_offsets = (
+                    _rebuilt.to(device=q_fp8.device, dtype=torch.int32)
+                    if _rebuilt.shape[0] <= token_nums
+                    else None
+                )
+            else:
+                topk_offsets = None
 
         q_offset = 0
         cache_write_stream = None
@@ -1393,12 +1428,28 @@ class IndexerKPool(MultiPlatformOp):
                 pending_cache_tensors.clear()
 
             q_slice = slice(q_offset, q_offset + q_len)
-            local_seqlens = seq_lens_expanded[q_slice]
-            if pooled_seq_lens_expanded is None:
+            if is_in_breakable_cuda_graph():
+                # Guard (C1): inside a breakable prefill graph break the
+                # metadata expanded seqlens may follow the request/draft row
+                # family; rebuild the per-token view from the live batch
+                # (identical formula to the eager metadata builder) so the
+                # MQA-logits kernels keep per-query-row starts/ends.
+                local_seqlens = torch.arange(
+                    seq_len - q_len + 1,
+                    seq_len + 1,
+                    dtype=torch.int32,
+                    device=q_fp8.device,
+                )
+                local_pool_lens = torch.div(
+                    local_seqlens, kpool, rounding_mode="floor"
+                ).to(torch.int32)
+            elif pooled_seq_lens_expanded is None:
+                local_seqlens = seq_lens_expanded[q_slice]
                 local_pool_lens = torch.div(
                     local_seqlens, kpool, rounding_mode="floor"
                 ).to(torch.int32)
             else:
+                local_seqlens = seq_lens_expanded[q_slice]
                 local_pool_lens = pooled_seq_lens_expanded[q_slice]
 
             if pool_seq_len > 0:
@@ -1859,6 +1910,14 @@ class IndexerKPool(MultiPlatformOp):
             if forward_batch.seq_lens_cpu is not None:
                 max_kv_len = forward_batch.seq_lens_cpu.max().item()
                 skip_logits_computation = max_kv_len <= self.index_topk
+            # Under a breakable prefill CUDA graph the captured attention
+            # segment consumes per-token top-k rows from the bridge's padded
+            # buffer, but skip_logits routes through the PAGED
+            # decode/verify-shaped transform whose row count follows the
+            # request/draft family. Always use the per-token ragged/plan
+            # producers inside a BCG prefill break.
+            if skip_logits_computation and is_in_breakable_cuda_graph():
+                skip_logits_computation = False
 
         if skip_logits_computation:
             return self._forward_cuda_skip_logits(
@@ -1889,6 +1948,37 @@ class IndexerKPool(MultiPlatformOp):
         )
 
         has_kpool_extend_plan = metadata.attn_metadata.kpool_extend_plan is not None
+        if has_kpool_extend_plan and is_in_breakable_cuda_graph():
+            # Guard (C5): inside a BCG prefill break a plan whose
+            # per-token row count does not match this batch is a stale
+            # capture artifact; drop it from the metadata itself so the
+            # _get_topk_ragged delegation cannot re-enter the plan producer
+            # (double squeeze of weights), falling back to the live
+            # per-token rebuild path.
+            _kpool_plan = metadata.attn_metadata.kpool_extend_plan
+            # The plan records logical per-token rows while x may carry
+            # bucket/DP/CP padding, so validate against the same logical
+            # contract the prefill bridge computes (sum of the live extend
+            # lengths, or the interleaved indexer row count), not the
+            # physical row count; comparing with x would drop legitimate
+            # padded-batch plans into the rebuild path.
+            from sglang.srt.layers.cp.interleave import is_interleave_extend
+
+            _contract_rows = x.shape[0]
+            _ext_lens = forward_batch.extend_seq_lens_cpu
+            if _ext_lens is not None:
+                _contract_rows = int(sum(_ext_lens))
+            if is_interleave_extend(forward_batch):
+                from sglang.srt.layers.cp.bcg.interleave_bcg import (
+                    cp_interleave_indexer_rows,
+                )
+
+                _contract_rows = int(cp_interleave_indexer_rows(forward_batch)[1])
+            if _kpool_plan.seq_lens_expanded.shape[0] != _contract_rows:
+                # NOTE: the metadata dataclass is frozen; plain assignment
+                # raises FrozenInstanceError, so use this standard bypass.
+                object.__setattr__(metadata.attn_metadata, "kpool_extend_plan", None)
+                has_kpool_extend_plan = False
         is_prefill = forward_batch.forward_mode.is_extend_without_speculative()
         defer_kpool_cache_write = (
             is_prefill and return_indices and not has_kpool_extend_plan

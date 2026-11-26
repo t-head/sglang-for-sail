@@ -424,9 +424,26 @@ def _kpool_plan_to_gpu(
     ragged_paged_page_table_row_index = None
     if need_paged:
         req_to_token = get_req_to_token_pool().req_to_token
+        # >>> E20-2 E19-family point-source fix
+        # Repeats now come from the same CPU ledger that defines output_size,
+        # so sum(repeats) == output_size by construction in both eager and
+        # captured segments (frozen-consistent at capture; live-consistent at
+        # eager re-run).  ragged_q_len_t stays untouched for its other users.
+        if torch.cuda.is_current_stream_capturing():
+            # F1 gate: never insert a host->device copy into a capture stream.
+            # In-capture execution keeps the original device ledger frozen with
+            # the capture-time-consistent output_size.
+            _e20_repeats = ragged_q_len_t
+        else:
+            _e20_repeats = torch.tensor(
+                [int(v) for v in cpu.ragged_q_len],
+                dtype=ragged_q_len_t.dtype,
+                device=ragged_q_len_t.device,
+            )
+        # <<< E20-2 (F1: rebuild gated out of capture streams)
         ragged_paged_page_table_row_index = torch.repeat_interleave(
             local_req_pool_indices.to(torch.int32),
-            ragged_q_len_t,
+            _e20_repeats,
             output_size=sum(cpu.ragged_q_len),
         )
         ragged_paged_page_table = req_to_token
