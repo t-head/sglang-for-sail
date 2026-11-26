@@ -2051,6 +2051,9 @@ class Envs:
     SGLANG_DSA_FUSE_TOPK = EnvBool(True)
     # Opt into the PPU-only compiler mode for BF16 prefill TopK.
     SGLANG_DSA_TOPK_NO_SIMT = EnvBool(False)
+    # Opt-in PPU DeepSelect kernel route for GLM5.3 DSA top-k (default OFF
+    # keeps 0.5.23 auto dispatch).
+    SGLANG_DSA_DEEPSELECT = EnvBool(False)
     # Enabled for supported CUDA KPool geometry; set to 0 to use ordinary metadata.
     SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION = EnvBool(True)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
