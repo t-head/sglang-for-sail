@@ -1,0 +1,339 @@
+---
+title: "Contribution guide for SAIL"
+description: "Develop SGLang-for-SAIL: source builds, local tests, recipe-based PPU CI, kernel changes, and pull requests."
+mode: wide
+---
+This guide covers the SGLang-for-SAIL development workflow: building from source, testing locally, and getting changes through CI and review. It separates recipe-based PPU CI from the inherited upstream test workflows.
+
+Unless noted, run all commands from the repository root.
+
+## Install SGLang from source
+
+### Fork and clone the repository
+
+Fork [t-head/sglang-for-sail](https://github.com/t-head/sglang-for-sail), clone it, and branch from your intended PR base. Confirm the base branch with maintainers; not every release uses `main`.
+
+```bash
+# Replace YOUR_USERNAME with your GitHub account.
+git clone https://github.com/YOUR_USERNAME/sglang-for-sail.git
+cd sglang-for-sail
+git remote add upstream https://github.com/t-head/sglang-for-sail.git
+git fetch upstream
+BASE_BRANCH=release/x.x.x
+git switch -c feature/my-change "upstream/$BASE_BRANCH"
+```
+
+### Build from source
+
+Follow the [SAIL source build instructions](/docs/hardware-platforms/sail) to build `sglang-kernel` (imported as `sgl_kernel`) and `sglang`. Skip the initial `git clone` and `cd sglang` commands. Run the remaining commands from your existing `sglang-for-sail` checkout.
+
+## Format code with pre-commit
+
+Formatting follows `.pre-commit-config.yaml`: Ruff and isort for Python, clang-format for C++/CUDA, plus checks for spelling, secrets, and registered tests.
+
+```bash
+python3 -m pip install pre-commit
+pre-commit install
+pre-commit run --all-files
+```
+
+For a focused check, use `pre-commit run --files PATH_TO_CHANGED_FILE`. Inspect automatic changes and rerun until checks pass; repository-wide runs may need extra tooling for the affected languages.
+
+Work on a topic branch rather than committing directly to the target branch. The Mintlify link-check hook is opt-in and runs at the manual stage (see the documentation section below).
+
+## Run and add unit tests
+
+Add unit tests for any new feature or bug fix to ensure coverage and prevent regressions.
+
+### Unit tests (no server required)
+
+Unit tests live under `test/registered/unit/`, mirroring the `python/sglang/srt/` tree. They validate component logic **without** a server or real model weights, and are CPU-only. GPU operator tests belong under `test/registered/kernels/ops/`. Install the runtime and test dependencies for your environment first.
+
+SGLang supports both [unittest](https://docs.python.org/3/library/unittest.html) and [pytest](https://docs.pytest.org/). Per `test/registered/unit/README.md`, each test file should:
+
+- Use `CustomTestCase` for unittest classes.
+- Add a top-level CI registration (below).
+- Include an entry point so CI can run the file directly; for pytest, propagate the status with `sys.exit(pytest.main(...))`.
+
+```python
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+```
+
+Use a measured runtime estimate. Validate registration changes with `python3 scripts/lint/check_registered_tests.py`.
+
+**Run tests locally:**
+
+```bash
+# Closest to how CI executes an individual registered test file
+python3 test/registered/unit/mem_cache/test_radix_cache_unit.py
+
+# Run a registered CI suite
+python3 test/run_suite.py --hw cpu --suite base-a-test-cpu
+
+# Pytest remains useful for local directory-level discovery
+pytest test/registered/unit/mem_cache/ -v
+```
+
+### E2E tests (server required)
+
+For tests that launch a server, see `test/registered/README.md` for placement guidance.
+
+### PPU recipes and hardware tests
+
+PPU recipe CI is configured under `test/ppu/`, with orchestration under `scripts/ci/ppu/`:
+
+| Location | Purpose |
+| --- | --- |
+| `test/ppu/recipes/` | Serving arguments, environment, features, presets, and hardware overrides. |
+| `test/ppu/policy/models/` | Per-model `fast_sanity` and `model_sanity` policies and resource requirements. |
+| `test/ppu/policy/datasets/` and `test/ppu/golden/` | Dataset definitions and accuracy references. |
+| `test/ppu/unit/`, `test/ppu/module/`, `test/ppu/e2e/` | Device-facing tests, separate from recipe selection. |
+| `test/registered/` | Registered suites, including the opt-in single-device PPU suite. |
+
+See `test/ppu/README.md` for the generated model/card matrix and `scripts/ci/ppu/README.md` for runner prerequisites. The two tiers differ:
+
+- **Fast Sanity**: full-layer dummy weights, with streaming and non-streaming probes.
+- **Model Sanity**: real weights, full GSM8K evaluation, KV-cache checks, and diagnostic microbenchmarks.
+
+Recipe jobs request 2, 4, or 8 PPU cards; they are not an A → B → C single-/dual-device pipeline.
+
+You can run structural checks without PPU hardware using Python 3.12 and PyYAML:
+
+```bash
+python3 -m pip install PyYAML
+python3 -B scripts/ci/ppu/ppu_recipe.py validate --all --sglang-parser skip
+python3 -B scripts/ci/ppu/ppu_recipe.py render-matrix --check
+python3 -B -m unittest discover -s scripts/ci/ppu -p 'test_recipe*.py'
+```
+
+`--sglang-parser skip` validates recipe structure only, not compatibility with the installed server. In a provisioned SAIL runtime, also run with `--sglang-parser required`. After recipe or policy changes, regenerate the matrix (never edit it by hand): `python3 -B scripts/ci/ppu/ppu_recipe.py render-matrix --output test/ppu/README.md`.
+
+For CI infrastructure changes, run `node --test scripts/ci/ppu/test_ppu_approval.cjs`. On Linux with `flock`, `git`, `jq`, PyYAML, and `huggingface-hub`, also run `bash scripts/ci/ppu/run_selftests.sh`.
+
+The separate registered PPU suite is:
+
+```bash
+# Requires a provisioned single-device PPU runtime and its model/dataset assets.
+python3 test/run_suite.py --hw ppu --suite extra-test-1-gpu-ppu --continue-on-error
+```
+
+This suite is not recipe Fast Sanity. CI prepares its environment through `scripts/ci/ppu/build_and_test.sh` and `prepare_runtime.py`. Registering a test with `register_ppu_ci(...)` does not add it to the recipe matrix.
+
+## Write documentation
+
+Documentation is a good way for new contributors to learn the SGLang codebase. See [docs/README.md](../../README.md) for the current Mintlify setup and validation commands.
+
+## Test the accuracy
+If your code changes model output, run an accuracy evaluation appropriate for the affected model and feature. For example, after launching a server, run the unified GSM8K evaluator:
+
+```bash
+# Launch a server
+sglang serve --model-path Qwen/Qwen3-8B
+
+# Evaluate
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:30000/v1 \
+  --num-examples 200
+```
+
+Please note that the above script is primarily a sanity check, not a rigorous accuracy or speed test.
+This test can have significant variance (1%–5%) in accuracy due to batching and the non-deterministic nature of the inference engine.
+Also, do not rely on the "Latency/Output throughput" from this script, as it is not a proper speed test.
+
+GSM8K is too easy for many state-of-the-art models, so use a more challenging or feature-specific evaluation when appropriate. See [Evaluating New Models with SGLang](/docs/developer_guide/evaluating_new_models) for current MMLU, GSM8K, HellaSwag, GPQA, HumanEval, and MMMU commands. Additional examples are available in [test/manual/eval](https://github.com/sgl-project/sglang/tree/main/test/manual/eval).
+
+## Benchmark the speed
+Refer to [Benchmark and Profiling](/docs/developer_guide/benchmark_and_profiling).
+
+## Pull request titles
+
+Use the repository-wide format checked by CI:
+
+```text
+[Type] scope: title
+[Type] [Hardware] scope: title
+```
+
+- **Type**: `Feat`, `Fix`, `Refactor`, `Perf`, `Doc`, `Test`, `CI`, `Chore`, or `Misc`.
+- **Scope**: A required module or model name. Use `/` for submodules, such as `diffusion/scheduler`; there is no fixed scope list or letter-case requirement.
+- **Hardware**: Optional, for hardware-specific changes only. Use a single uppercase tag, such as `AMD` or `NVIDIA`, except for the canonical spellings `Intel`, `Apple`, `Huawei`, and `Ascend`.
+- **Title**: A short, clear description in the imperative mood. Use one space between fields and after the colon, with no leading or trailing whitespace.
+- **Reverts**: Keep GitHub's default title, `Revert "original title"`.
+
+For example:
+
+```text
+[Fix] attention: Fix KV cache indexing
+[Perf] diffusion/scheduler: Reduce scheduling overhead
+[Perf] [AMD] diffusion/attention: Optimize decode performance
+[Fix] [PPU] attention: Correct KV cache indexing
+```
+
+Write commit messages that explain the change and its motivation. Include dependencies or porting context when relevant. The title check applies only to PR titles.
+
+## Requesting a review for merge
+
+Find any of the following reviewers to review your pull request:
+
+- @wzw285933
+- @Vinsmoke86
+- @yuhe-drinks-soda
+- @YaohuiiiiPeng
+- @Soda4542
+- @coldpudding-ali
+- @chunjianghc
+- @xuehengz
+- @linkewy
+- @xujiantaoxjt-cyber
+
+## How to trigger CI tests
+
+### PPU workflow overview
+
+This tree has no `.github/workflows/ci.yaml`. Its PPU entry points are independent of the inherited upstream workflows:
+
+| Workflow under `.github/workflows/` | Purpose | PR authorization |
+| --- | --- | --- |
+| `pr-test-ppu.yml` | Native candidate build and recipe Fast Sanity. | `run-ci` + fresh `run-ci-ppu`. |
+| `nightly-test-ppu.yml` | Recipe Model Sanity; also reused by PR Fast Sanity. | Direct Model Sanity requires `run-ci` + fresh `run-ci-ppu-nightly`. |
+| `pr-test-ppu-extra.yml` | Opt-in registered single-device suite on `main` PRs. | `run-ci` + `run-ci-ppu-extra`, through the generic PR gate. |
+
+The normal recipe PR path is:
+
+```text
+PPU revision approval -> change/run-scope check -> Linux infrastructure selftests
+                                                     |
+                                  +------------------+------------------+
+                                  |                                     |
+                         native SAIL wheel build                cluster configuration check
+                                  |                                     |
+                                  +------------------+------------------+
+                                                     |
+                                            recipe Fast Sanity
+                                                     |
+                                           pr-test-ppu-finish
+```
+
+The finish job checks the selftests, native build, cluster check, and Fast Sanity result when PPU tests are in scope. An approved recipe PR is in scope even without a PPU-path match; legacy-only dispatch is separate and does not satisfy this check. Note that `nightly-test-ppu.yml` has PR, manual, and reusable triggers but no `schedule` trigger of its own.
+
+### Approve recipe CI for a PR revision
+
+Recipe workflows accept PRs targeting `main`, `sail_ci_cd`, and `release/**`. They run via `pull_request_target`, using the base branch's workflow definition and the approved PR head as the candidate source. Approval is restricted to `t-head/sglang-for-sail`.
+
+1. Mark the PR ready for review and have a maintainer inspect its current head revision.
+2. Ensure `run-ci` is present. A maintainer with `write`, `maintain`, or `admin` permission applies the workload label: `run-ci-ppu` (Fast Sanity) or `run-ci-ppu-nightly` (Model Sanity). The two labels may arrive in either order.
+3. After **every new push**, remove and reapply the workload label. Its latest addition must be newer than the latest push to the head branch; an old label does not approve new code.
+4. Check the resulting Actions run and tested SHA. Reruns recheck live PR state, label provenance, and head SHA, so rerunning an old revision cannot authorize a newer one.
+
+These rules also apply to fork PRs. Being the PR author, holding a generic slash-command permission, or having review approval does not grant recipe-CI approval; only the labels do.
+
+Maintainers can also dispatch manually. `pr-test-ppu.yml` offers `preflight_only`, `model_filter`, `run_model_sanity`, and `run_legacy_sanity` (the last runs only EAGLE3/DFlash single-device checks on the two configured board types). Manual Model Sanity supports model filtering and candidate artifact reuse. See `scripts/ci/ppu/README.md` and the workflow inputs for prerequisites and allowed refs.
+
+### Inherited slash commands and PPU Extra
+
+The comment handler (`scripts/ci/utils/slash_command_handler.py`) reads `scripts/ci/opt_in_ci_tiers.json`. Its `ppu` argument selects **PPU Extra**, not recipe Fast Sanity or Model Sanity.
+
+| Command | Behavior |
+| --- | --- |
+| `/tag-run-ci-label [hardware ...]` | Add `run-ci` and the selected opt-in labels; does not itself start tests. |
+| `/tag-and-rerun-ci [hardware ...]` | Add labels and request eligible reruns. No-argument `/run-ci` is an alias. |
+| `/rerun-failed-ci` | Retry latest-commit runs that failed, skipped, were canceled, or timed out; eligible generic-gate skips are rerun in full. |
+| `/run-extra-ci ppu` | Add `run-ci` / `run-ci-ppu-extra` and rerun eligible PPU Extra runs. `/run-ci ppu` and `/run-full-ci ppu` select the same tier. |
+| `/run-cpu-ci` | Dispatch the CPU unit suite without PPU hardware or a `run-ci` label. |
+| `/rerun-test`, `/rerun-group` | Selective reruns for supported upstream backends; not a PPU recipe launcher. |
+
+The bare `extra` argument and shared `run-ci-extra` label are retired; use a hardware-specific tier. Label commands require `can_tag_run_ci_label` in `.github/CI_PERMISSIONS.json`, and hardware rerun commands also require `can_rerun_failed_ci`. PR authors may run `/rerun-failed-ci` on their own PRs, but that does not grant labeling permission. See the [upstream command reference](/docs/developer_guide/contribution_guide#how-to-trigger-ci-tests) for selective-rerun permissions and syntax.
+
+<Note>
+Labels added with `GITHUB_TOKEN` do not trigger new label-event workflows; for recipe CI, use the maintainer-applied workload-label process above. A comment reaction is not evidence that PPU tests ran, so inspect the Actions jobs. If the handler is silent, check its run, permissions, and command syntax.
+</Note>
+
+### Rate limits and concurrency
+
+The generic `.github/workflows/pr-gate.yml` (used by PPU Extra) defaults to a 120-minute cooldown for low-permission actors, with workflow and per-user overrides. Recipe workflows use `ppu-approval.yml`, which has no cooldown.
+
+Concurrency is workflow-specific:
+
+- `pr-test-ppu.yml` and `pr-test-ppu-extra.yml` cancel older runs; the former groups by PR/run-mode and isolates unrelated label events.
+- `nightly-test-ppu.yml` uses `queue: max`. In `t-head/sglang-for-sail`, scheduled or manually dispatched `model_sanity` runs through the nightly dispatcher or the nightly test workflow share the cross-release `sglang-ppu-nightly` group. Other runs, including PR-triggered runs and `fast_sanity`, use the run-specific group `ppu-{tier}-{ref}-{run_id}`.
+
+Do not assume a new push cancels every PPU workload or removes the need to renew revision approval.
+
+## Code style guidance
+- Avoid code duplication. If the same code snippet (more than five lines) appears multiple times, extract it into a shared function.
+- Minimize device synchronization. Reduce expensive CPU-GPU synchronization operations, such as `tensor.item()` or `tensor.cpu()`, whenever possible. Use vectorized code.
+- Prioritize extreme efficiency. SGLang is a runtime, and most of your code runs on the critical path for every request. Optimize all minor overheads as much as possible, especially in the model forward code.
+  - A common pattern is some runtime checks in the model forward pass (e.g., [this](https://github.com/sgl-project/sglang/blob/f1b0eda55c2c4838e8ab90a0fac7fb1e3d7064ab/python/sglang/srt/models/deepseek_v2.py#L486-L491)). These are very likely the same for every layer. Please cache the result as a single boolean value in `__init__` whenever possible.
+- Make functions as pure as possible. Avoid in-place modification of arguments.
+- Prefer immutable data and compute configuration-derived values once during initialization when their inputs cannot change.
+- Keep functions under roughly 100 lines and make orchestration functions read like high-level pseudocode by extracting details into focused helpers.
+- Keep files concise. If a file exceeds 2,000 lines of code, split it into cohesive smaller modules.
+- Avoid adding mixins; prefer composition or plain functions. Use `msgspec.Struct` for new data containers instead of `dataclasses.dataclass` or `attrs`.
+- Prefer keyword arguments for calls with two or more arguments, and pass callees the specific values they need instead of a large state-holding object.
+- In a file, put core data structures at the top of the file. Put utility functions at the bottom of the file.
+- Keep tests run fast.
+  - If a single test file runs longer than 500 seconds, split it into multiple smaller files (e.g., `test_eagle_infer_a.py`, `test_eagle_infer_b.py`).
+  - If a single job in a GitHub Actions workflow runs longer than 30 minutes, split it into smaller jobs or steps.
+  - Reuse server launches across test methods in E2E test files.
+- Never use `pickle.loads()`, `pickle.load()`, or `recv_pyobj()` to deserialize untrusted or network-received data. Python's [pickle module is not secure](https://docs.python.org/3/library/pickle.html) — it can execute arbitrary code during deserialization. Use safe serialization formats such as [msgpack](https://github.com/jcrist/msgspec) or JSON instead.
+- When supporting new hardware or features, follow these guidelines:
+  - Do not drastically change existing code.
+  - Always prefer new files to introduce specific components for your new hardware (e.g., `allocator_ascend.py`).
+  - If you write multiple if/else blocks for new features, ensure the common path (e.g., NVIDIA hardware or the existing code path) is the first branch.
+
+## How to update kernels in SGLang
+
+Choose the path based on the kernel's dependencies:
+
+- **JIT** (in-tree): lightweight kernels with no CUTLASS or other large C++ dependency.
+- **AOT** (`sglang-kernel`): heavyweight kernels, large C++ dependencies, or operations needing wheel packaging and Torch operator registration.
+
+### Update sglang-kernel
+
+The `sglang-kernel` distribution lives under `python/sglang/kernels/aot/` and is imported as `sgl_kernel`. PPU CI builds native SAIL candidate wheels; the CUDA build path and released pins in `python/pyproject.toml` are not a substitute for the SAIL build config. Test the changed kernel and its caller together, and keep packaged runtime dependencies compatible with the release image.
+
+For an AOT kernel change:
+
+1. Implement the kernel under `python/sglang/kernels/aot/csrc/` and update its declaration and Torch registration. For SAIL, check `common_extension_sail.cc` and the source lists in `setup_sail.py`; update the CUDA CMake configuration only when that build also needs the change.
+2. Expose the Python API under `python/sglang/kernels/aot/python/sgl_kernel/`.
+3. Add correctness tests under `python/sglang/kernels/aot/tests/`, or registered operator regressions under `test/registered/kernels/ops/`, and benchmarks when applicable.
+4. Rebuild through the native SAIL build entry point above and run the affected tests on PPU hardware. Selective upstream reruns do not build a PR-local AOT wheel.
+
+### Update JIT kernels
+
+For lightweight operations, prefer the in-tree JIT path under `python/sglang/kernels/jit/`. SAIL compilation support includes `python/sglang/kernels/jit/utils/compile/sailify.py`; shared operator wrappers live under `python/sglang/kernels/ops/`. See [JIT kernel development](/docs/developer_guide/development_jit_kernel_guide), and validate the SAIL compiler path as well as numerical correctness.
+
+## PPU development notes
+
+### Hardware backends
+
+The runtime backend is `python/sglang/srt/hardware_backend/sail/`, with platform identity in `python/sglang/srt/platforms/sail.py`.
+
+- `SailSRTPlatform` uses CUDA-compatible PyTorch device operations. Its platform identity is SAIL, but its device type stays `cuda`; do not replace tensor device strings with `ppu` or `sail`.
+- Auto-detection recognizes SAIL before generic CUDA. Use `current_platform.is_sail()` for platform-specific behavior. `SGLANG_PLATFORM` selects installed plugin entry points; it is not a generic device-name override.
+- For targeted adaptations, use the hook framework in `python/sglang/srt/plugins/hook_registry.py` and existing SAIL hook modules. Ensure new hook modules are imported by the SAIL init path before their targets are used.
+- Keep hardware-specific implementations isolated and preserve shared backend interfaces. The NPU port can provide design examples, but its device and installation behavior differs from SAIL.
+
+### Cherry-pick workflow
+
+When porting an upstream fix or carrying SAIL adaptations to a new upstream base:
+
+- Scan upstream commits for relevant changes and analyze each commit's message and diff.
+- Apply patches one by one, resolving conflicts against the existing PPU adaptations.
+- When resolving conflicts involving new upstream features (e.g., new hardware support), retain both the upstream feature and the existing PPU path.
+- Record the source commit and verify renamed imports, hook targets, kernel build configuration, and test registration.
+- Run local structural/unit checks and the affected PPU hardware tests. Request Fast Sanity and, for model-output changes, the relevant Model Sanity policies; do not treat a successful cherry-pick as validation.
+
+## Tips for newcomers
+
+If you want to contribute but don't have a specific idea in mind, pick issues labeled "good first issue" or "help wanted". These tasks typically have lower complexity and provide an excellent introduction to the codebase.
+
+Also check out the following materials as startup guide:
+- [Mini-SGLang](https://github.com/sgl-project/mini-sglang) for a quick overview on the structure of SGLang.
+- [Code Walk-through](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/tree/main/sglang/code-walk-through) for a deeper look into SGLang's workflow.
+
+If you have any questions, please feel free to reach out to the team.
+
+Thank you for contributing to SGLang-for-SAIL.
