@@ -102,7 +102,12 @@ class IpcModelLoader(BaseModelLoader):
         # (client mode) or serving wrong-numerics IPC weights. Checked here so
         # it applies regardless of whether the daemon is reachable.
         quant_method, engine_quant_config = self._resolve_engine_quant(model_config)
-        check_ipc_quant_support(quant_method, engine_quant_config, where="client")
+        check_ipc_quant_support(
+            quant_method,
+            engine_quant_config,
+            where="client",
+            hf_config=model_config.hf_config,
+        )
 
         # Try to fetch state from daemon
         cache_data = self._fetch_from_cache(model_config, device_config)

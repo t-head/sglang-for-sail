@@ -1,7 +1,9 @@
+import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     EndWeightUpdateReqInput,
@@ -11,7 +13,8 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
     _WeightUpdateSession,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
+from sglang.srt.runtime_context import get_parallel, override_platform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -212,6 +215,58 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
 
         self.assertFalse(output.success)
         self.assertEqual(self.recorded, [])
+
+
+class TestKimiWeightUpdateAdmission(CustomTestCase):
+    def test_session_rejected_before_fanout_only_for_selected_kimi_w8a8(self):
+        def config(arch):
+            return SimpleNamespace(hf_config=SimpleNamespace(architectures=[arch]))
+
+        kimi = config("KimiK31ForConditionalGeneration")
+        other = config("LlamaForCausalLM")
+        spec = SimpleNamespace(
+            speculative_algorithm="STANDALONE",
+            speculative_draft_model_path="draft",
+            speculative_draft_model_revision=None,
+        )
+        for selector, target, draft, mode, ppu, allowed in (
+            ("target", kimi, other, "w8a8", True, False),
+            ("all", other, kimi, "w8a8", True, False),
+            ("draft", other, kimi, "w8a8", True, False),
+            ("draft", kimi, other, "w8a8", True, True),
+            ("target", other, kimi, "w8a8", True, True),
+            ("all", kimi, other, "bf16", True, True),
+            ("all", kimi, other, "w8a8", False, True),
+        ):
+            with (
+                self.subTest(selector=selector, mode=mode, ppu=ppu, allowed=allowed),
+                override_platform(is_ppu=ppu),
+                envs.SGLANG_PPU_DENSE_GEMM_MODE.override(mode),
+                patch(
+                    "sglang.srt.managers.tokenizer_control_mixin.get_spec",
+                    return_value=spec,
+                ),
+                patch(
+                    "sglang.srt.configs.model_config.ModelConfig.from_server_args",
+                    return_value=draft,
+                ),
+            ):
+                manager = Mock(model_config=target)
+                manager._weight_update_session_call = AsyncMock(
+                    return_value=(True, "ok")
+                )
+                request = BeginWeightUpdateReqInput(selector=selector)
+                success, message = asyncio.run(
+                    TokenizerControlMixin.begin_weight_update(manager, request)
+                )
+                self.assertEqual(success, allowed)
+                if allowed:
+                    manager._weight_update_session_call.assert_awaited_once_with(
+                        manager.begin_weight_update_communicator, request
+                    )
+                else:
+                    manager._weight_update_session_call.assert_not_awaited()
+                    self.assertIn("update_weights_from_disk", message)
 
 
 class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):

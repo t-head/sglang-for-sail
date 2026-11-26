@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import fastapi
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqInput,
@@ -90,6 +91,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_lora,
     get_parallel,
+    get_platform,
     get_serving,
     get_spec,
 )
@@ -487,6 +489,32 @@ class TokenizerControlMixin:
         obj: BeginWeightUpdateReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
+        # Reject before fan-out: some PP stages may host no selected layers.
+        if get_platform().is_ppu and envs.SGLANG_PPU_DENSE_GEMM_MODE.get() == "w8a8":
+            from sglang.srt.configs.model_config import ModelConfig, is_kimi_k3
+
+            kimi_selected = obj.selector != "draft" and is_kimi_k3(
+                self.model_config.hf_config
+            )
+            spec = get_spec()
+            if (
+                not kimi_selected
+                and obj.selector != "target"
+                and spec.speculative_algorithm not in (None, "NGRAM")
+            ):
+                draft = ModelConfig.from_server_args(
+                    self.server_args,
+                    model_path=spec.speculative_draft_model_path,
+                    model_revision=spec.speculative_draft_model_revision,
+                    is_draft_model=True,
+                )
+                kimi_selected = is_kimi_k3(draft.hf_config)
+            if kimi_selected:
+                return False, (
+                    "Kimi online W8A8 does not support begin_weight_update: "
+                    "restoring all BF16 projections can exhaust device memory. "
+                    "Use update_weights_from_disk for checkpoint reloads."
+                )
         return await self._weight_update_session_call(
             self.begin_weight_update_communicator, obj
         )
