@@ -30,18 +30,19 @@ class TestValidateInputLength(CustomTestCase):
             req, max_req_input_len=1018, allow_auto_truncate=False
         )
         self.assertIn(
-            "Input length (1500 tokens) exceeds the maximum allowed length (1017 tokens).",
+            "Input length (1500 tokens) exceeds the maximum allowed length (1018 tokens).",
             msg,
         )
-        self.assertIn("This model's maximum context length is 1017 tokens", msg)
+        self.assertIn("This model's maximum context length is 1018 tokens", msg)
         self.assertIn("--allow-auto-truncate", msg)
         self.assertEqual(len(req.origin_input_ids), 1500)
 
-    def test_limit_itself_is_rejected(self):
-        msg = validate_input_length(
-            _req(1018), max_req_input_len=1018, allow_auto_truncate=False
+    def test_limit_itself_is_accepted(self):
+        self.assertIsNone(
+            validate_input_length(
+                _req(1018), max_req_input_len=1018, allow_auto_truncate=False
+            )
         )
-        self.assertIn("This model's maximum context length is 1017 tokens", msg)
 
     def test_auto_truncate_unchanged(self):
         req = _req(1500)

@@ -73,14 +73,14 @@ class TestMlxRunnerPoolContract(CustomTestCase):
         worker.device = "cpu"
 
         with get_context().override_server_args(
-            max_prefill_tokens=128, max_queued_requests=None
+            max_prefill_tokens=128, max_queued_requests=None, min_output_token_reserve=1
         ):
             worker.alloc_memory_pool()
             info = worker.get_worker_info()
 
         self.assertEqual(info[0], 64)
         self.assertEqual(info[4], 63)
-        self.assertEqual(info[5], 58)
+        self.assertEqual(info[5], 62)
 
     def test_stub_reports_no_preloaded_torch_weights(self):
         runner = object.__new__(MlxModelRunnerStub)

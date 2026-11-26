@@ -31,12 +31,9 @@ import time
 import traceback
 from array import array
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from contextvars import copy_context
 from datetime import datetime
 from enum import Enum
-from functools import partial
 from http import HTTPStatus
 from typing import (
     Any,
@@ -667,7 +664,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.init_tokenizer_and_processor()
 
         # Initialize blocking request preprocessor
-        self.init_request_preprocessor()
 
         # Init inter-process communication
         self.init_ipc_channels(port_args)
@@ -798,14 +794,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 f"{model_class.__name__}"
             )
 
-    def init_request_preprocessor(self):
-        self._request_preprocessor_executor = ThreadPoolExecutor(max_workers=1)
-
     async def run_in_request_preprocessor(self, func, *args, **kwargs):
-        func_call = partial(copy_context().run, func, *args, **kwargs)
-        return await asyncio.get_running_loop().run_in_executor(
-            self._request_preprocessor_executor, func_call
-        )
+        return await asyncio.to_thread(func, *args, **kwargs)
 
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.asyncio.Context(2)
