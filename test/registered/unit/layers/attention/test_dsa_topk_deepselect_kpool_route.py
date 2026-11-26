@@ -111,7 +111,9 @@ def test_gate_predicates_on_the_dtype_the_producer_ships(dtype):
 
 def test_scores_must_be_a_matrix():
     with gate():
-        reason = tb._deepselect_kpool_skip_reason(torch.zeros(4, 2048, 8192), GROUP_TOPK)
+        reason = tb._deepselect_kpool_skip_reason(
+            torch.zeros(4, 2048, 8192), GROUP_TOPK
+        )
         assert "rank" in reason
 
 
@@ -190,7 +192,9 @@ def test_hit_marker_and_each_reason_are_logged_once(caplog):
         with _never_reached():
             for _ in range(3):
                 assert _call(_rows(64, 128)) is None
-        misses = [r for r in caplog.records if "below the kpool served band" in r.message]
+        misses = [
+            r for r in caplog.records if "below the kpool served band" in r.message
+        ]
         assert len(misses) == 1, "a repeated decline logs one line"
 
 
@@ -198,9 +202,7 @@ def test_row_starts_are_forwarded_to_the_selection():
     starts = torch.zeros(4096, dtype=torch.int32) + 512
     lengths = torch.full((4096,), 7680, dtype=torch.int32)
     with gate():
-        with mock.patch.object(
-            ds, "topk_kpool_groups", return_value=starts
-        ) as stub:
+        with mock.patch.object(ds, "topk_kpool_groups", return_value=starts) as stub:
             got = tb.deepselect_kpool_group_ids(
                 _rows(4096, 8192), lengths, GROUP_TOPK, row_starts=starts
             )

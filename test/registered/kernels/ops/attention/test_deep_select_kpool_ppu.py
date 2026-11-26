@@ -128,7 +128,9 @@ def _largest_allocation_bytes(record, fn, *args, **kwargs):
         result = fn(*args, **kwargs)
 
     record.extend(sizes)
-    assert sizes, "the allocation recorder captured nothing, so the bound is meaningless"
+    assert sizes, (
+        "the allocation recorder captured nothing, so the bound is meaningless"
+    )
     return result
 
 
@@ -164,7 +166,9 @@ def test_kpool_group_ids_match_fused_kernel(rows, width, distribution):
         got_scores = torch.gather(scores.cpu(), 1, got.clamp(min=0))
         assert torch.equal(
             ref_scores.sort(dim=1).values, got_scores.sort(dim=1).values
-        ), f"tie groups differ in score values (rows={rows} width={width}); index agreement was {mean:.4f}"
+        ), (
+            f"tie groups differ in score values (rows={rows} width={width}); index agreement was {mean:.4f}"
+        )
     else:
         # BF16 staging churns a small number of boundary pools per row; the design
         # target is 99.5% and below 99% the gate stops this route.
@@ -342,7 +346,9 @@ def test_pooled_topk_matches_fused_route_with_page_table_row_index():
     on_req = torch.div(on.clamp(min=0), TABLE_BASE, rounding_mode="floor")
     expected = row_index.cpu().unsqueeze(1).expand_as(on_req)
     valid = on >= 0
-    assert bool((on_req[valid] == expected[valid]).all()), "page row index lost in gather"
+    assert bool((on_req[valid] == expected[valid]).all()), (
+        "page row index lost in gather"
+    )
     assert bool((on[:, TOPK:] == -1).all()) and bool((off[:, TOPK:] == -1).all())
 
 
@@ -394,9 +400,7 @@ def test_kpool_shape_reason_boundaries():
     assert "below the kpool served band" in kpool_group_topk_shape_reason(
         2048, 4096, GROUP_TOPK
     )
-    assert "not a served kpool bucket" in kpool_group_topk_shape_reason(
-        4096, 40960, 96
-    )
+    assert "not a served kpool bucket" in kpool_group_topk_shape_reason(4096, 40960, 96)
 
 
 def test_disabled_switch_never_touches_the_wheel():
@@ -411,6 +415,6 @@ def test_disabled_switch_never_touches_the_wheel():
     ):
         logits = torch.randn(4096, 16384, dtype=torch.float32)
         lengths = torch.full((4096,), 16384, dtype=torch.int32)
-        assert (
-            tb.deepselect_kpool_group_ids(logits, lengths, GROUP_TOPK) is None
-        ), "the switch off must short-circuit before any wheel call"
+        assert tb.deepselect_kpool_group_ids(logits, lengths, GROUP_TOPK) is None, (
+            "the switch off must short-circuit before any wheel call"
+        )
