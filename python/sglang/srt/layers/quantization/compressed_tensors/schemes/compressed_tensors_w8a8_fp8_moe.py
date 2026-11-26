@@ -27,7 +27,7 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     swap_w13_to_w31,
 )
-from sglang.srt.runtime_context import get_exec, process_model_config
+from sglang.srt.runtime_context import get_exec, get_platform, process_model_config
 from sglang.srt.utils import get_bool_env_var, is_hip, is_sail, set_weight_attrs
 
 if TYPE_CHECKING:
@@ -64,11 +64,14 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             self.weight_quant.strategy == QuantizationStrategy.CHANNEL
             and self.input_quant.strategy == QuantizationStrategy.TOKEN
         )
-        if self.use_ppu_mega_moe and (not per_channel or not input_quant.dynamic):
-            raise ValueError(
-                "PPU FP8 MegaMoE requires channelwise weights and dynamic "
-                "per-token activation quantization."
-            )
+        if self.use_ppu_mega_moe:
+            if get_platform().device_sm != 89:
+                raise ValueError("PPU FP8 MegaMoE requires SM89.")
+            if not per_channel or not input_quant.dynamic:
+                raise ValueError(
+                    "PPU FP8 MegaMoE requires channelwise weights and dynamic "
+                    "per-token activation quantization."
+                )
         if not (per_tensor or per_channel):
             assert self.weight_quant.strategy == QuantizationStrategy.BLOCK
             self.weight_block_size = self.weight_quant.block_structure
@@ -87,12 +90,13 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         if self.use_ppu_mega_moe:
             architectures = process_model_config().hf_config.architectures
             if architectures[0] not in (
+                "Glm5NextForConditionalGeneration",
                 "MiniMaxM3SparseForCausalLM",
                 "MiniMaxM3SparseForConditionalGeneration",
             ):
                 raise ValueError(
-                    "PPU compressed-tensors FP8 MegaMoE currently supports only "
-                    "MiniMax M3 architectures with no ordinary-runner fallback."
+                    "PPU compressed-tensors FP8 MegaMoE supports only GLM-5.3-Flash "
+                    "and MiniMax M3 architectures with no ordinary-runner fallback."
                 )
             offload = get_exec().offload
             if offload.cpu_offload_gb > 0 or offload.offload_group_size > 0:
@@ -138,10 +142,14 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         if self.use_ppu_mega_moe:
             from sglang.srt.layers.moe.mega_moe import check_mega_moe_shapes
 
-            if extra_weight_attrs.get("with_bias", False):
+            if extra_weight_attrs.get("with_bias", False) or getattr(
+                layer, "with_bias", False
+            ):
                 raise ValueError("PPU FP8 MegaMoE does not support expert bias.")
             if layer.num_fused_shared_experts:
                 raise ValueError("PPU FP8 MegaMoE requires separate shared experts.")
+            if getattr(layer, "moe_tp_size", 1) != 1:
+                raise ValueError("PPU FP8 MegaMoE requires unsharded expert matrices.")
             check_mega_moe_shapes(
                 hidden=hidden_size,
                 intermediate=intermediate_size_per_partition,
@@ -295,6 +303,10 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             layer.w13_input_scale = None
             layer.w2_input_scale = None
 
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        if self.use_ppu_mega_moe and layer._mega_moe_weights_built:
+            raise RuntimeError("In-place reload is not supported for packed FP8 MegaMoE.")
+
     def process_weights_after_loading(self, layer: torch.nn.Module | FusedMoE) -> None:
         if self.use_ppu_mega_moe:
             self._prepare_ppu_mega_moe_weights(layer)
@@ -406,6 +418,8 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             return
         from deep_gemm import transform_weights_for_fp8_mega_moe
 
+        from sglang.srt.layers.moe.ultra_ep_ppu import mega_moe_runtime
+
         # Checkpoint rows are [gate; up]. DeepGEMM interleaves both E4M3
         # rows and their FP32 channel scales in groups of eight, without
         # requantization. Keep the registered parameters as the owning storage
@@ -421,6 +435,8 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         layer.w2_weight_scale.data = l2[1]
         layer.mega_l1_weights = l1
         layer.mega_l2_weights = l2
+        if mega_moe_runtime.is_enabled():
+            mega_moe_runtime.register_physical_weights(layer)
         layer._mega_moe_weights_built = True
 
     def create_moe_runner(
@@ -431,6 +447,12 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             if (
                 not moe_runner_config.is_gated
                 or moe_runner_config.apply_router_weight_on_input
+                or getattr(moe_runner_config, "no_combine", False)
+                or (
+                    process_model_config().hf_config.architectures[0]
+                    == "Glm5NextForConditionalGeneration"
+                    and moe_runner_config.activation != "silu"
+                )
             ):
                 raise ValueError(
                     "PPU FP8 MegaMoE requires gated experts and router weights "

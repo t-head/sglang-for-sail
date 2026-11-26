@@ -1519,6 +1519,8 @@ class Envs:
     # DeepGEMM Mega MoE
     # ===================================================================
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(8192)
+    SGLANG_OPT_ULTRA_EP_PPU = EnvBool(False)
+    SGLANG_OPT_ULTRA_EP_PPU_REDUNDANT_PER_RANK = EnvInt(0)
     # Blackwell MegaMoE uses a whole-grid software barrier. Keep a small
     # residency margin so every cluster can launch beside other streams.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
