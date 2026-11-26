@@ -195,10 +195,10 @@ import json
 import os
 import re
 import sys
-from pathlib import Path, PurePosixPath
+from pathlib import PurePosixPath
 
 sys.path.insert(0, "scripts/ci/ppu")
-from recipe_cluster_config import resolve_pinned_model_revision_key
+from recipe_cluster_config import PINNED_MODEL_REVISION_SPECS
 
 keys = ["TIER", "PPU_CI_SOURCE_SHA", "PPU_CI_WORKER_ARTIFACT_DIR"]
 if os.environ["TIER"] == "legacy":
@@ -220,14 +220,14 @@ else:
         keys += ["PPU_CI_GSM8K_PATH"]
 values = {key: os.environ[key] for key in keys}
 if os.environ["TIER"] != "legacy":
-    revision_key = resolve_pinned_model_revision_key(
-        os.environ["MODEL_KEY"], Path(".")
-    )
-    if revision_key is not None:
+    spec = PINNED_MODEL_REVISION_SPECS.get(os.environ["MODEL_KEY"])
+    if spec is not None:
+        revision_key, pinned_repo = spec
         revision = os.environ[revision_key]
         if not re.fullmatch(r"[0-9a-f]{40}", revision):
             raise ValueError("expected a pinned model snapshot")
         values["PPU_CI_HF_MODEL_REVISION"] = revision
+        values["PPU_CI_HF_MODEL_REVISION_REPO"] = pinned_repo
 for key, value in values.items():
     if not value or any(ord(char) < 32 for char in value):
         raise ValueError("invalid worker input")
@@ -235,6 +235,7 @@ for key, value in values.items():
         "PPU_CI_SOURCE_SHA",
         "PPU_CI_RECIPE_IMAGE_KEY",
         "PPU_CI_HF_MODEL_REVISION",
+        "PPU_CI_HF_MODEL_REVISION_REPO",
         "PPU_CI_SKIP_WHEEL_INSTALL",
         "PPU_CI_RECIPE_TREE_SHA256",
     ):
