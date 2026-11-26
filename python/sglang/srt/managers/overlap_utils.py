@@ -205,6 +205,7 @@ class ConfidenceRelay(msgspec.Struct):
     req_pool_size: int
     pool: Any
     confidence_buf: Optional[torch.Tensor] = None
+    written_generation: Optional[torch.Tensor] = None
     conf_ring: Optional[torch.Tensor] = None
     gen_ring: Optional[torch.Tensor] = None
     copy_done: Optional[list] = None
@@ -217,6 +218,7 @@ class ConfidenceRelay(msgspec.Struct):
         self.confidence_buf = torch.empty(
             (self.req_pool_size, gamma), dtype=torch.float32, device=self.device
         )
+        self.written_generation = torch.zeros(self.req_pool_size, dtype=torch.int64)
         if _is_cuda:
             depth = CONFIDENCE_RELAY_RING_DEPTH
             self.conf_ring = torch.empty(
@@ -229,10 +231,20 @@ class ConfidenceRelay(msgspec.Struct):
                 torch.get_device_module(self.device).Event() for _ in range(depth)
             ]
 
-    def scatter(self, indices: torch.Tensor, confidence: torch.Tensor) -> None:
+    def scatter(
+        self,
+        indices: torch.Tensor,
+        confidence: torch.Tensor,
+        *,
+        indices_cpu: torch.Tensor,
+    ) -> None:
         if not self.initialized:
             self._lazy_init(confidence)
         self.confidence_buf[indices] = confidence.to(self.confidence_buf.dtype)
+        # PD preallocation can bump a row's pool generation well before that
+        # row first decodes. Only a confidence write can make that generation
+        # valid; a ring copy may also include rows from retired requests.
+        self.written_generation[indices_cpu] = self.pool.req_generation[indices_cpu]
 
     def issue_ring_copy(self, *, stream, publish_ready) -> None:
         if not self.initialized or stream is None or publish_ready is None:
@@ -242,7 +254,7 @@ class ConfidenceRelay(msgspec.Struct):
         with torch.get_device_module(self.device).stream(stream):
             self.conf_ring[slot].copy_(self.confidence_buf, non_blocking=True)
             self.copy_done[slot].record()
-        self.gen_ring[slot].copy_(self.pool.req_generation)
+        self.gen_ring[slot].copy_(self.written_generation)
         self.ring_pos += 1
 
     def resolve(
@@ -262,7 +274,7 @@ class ConfidenceRelay(msgspec.Struct):
             idx_cpu = batch.req_pool_indices_cpu
             return ResolvedConfidence(
                 confidence=self.confidence_buf[idx].cpu(),
-                generation=self.pool.req_generation[idx_cpu].clone(),
+                generation=self.written_generation[idx_cpu],
             )
 
         if self.ring_pos < CONFIDENCE_RELAY_RING_LAG:
@@ -651,6 +663,8 @@ class FutureMap:
         future_indices: torch.Tensor,
         new_seq_lens: torch.Tensor,
         confidence: Optional[torch.Tensor] = None,
+        *,
+        req_pool_indices_cpu: Optional[torch.Tensor] = None,
     ) -> None:
         indices = future_indices
         if indices.shape[0] == 0:
@@ -664,7 +678,10 @@ class FutureMap:
             )
         publish_confidence = self.needs_confidence_relay and confidence is not None
         if publish_confidence:
-            self.confidence_relay.scatter(indices, confidence)
+            assert req_pool_indices_cpu is not None
+            self.confidence_relay.scatter(
+                indices, confidence, indices_cpu=req_pool_indices_cpu
+            )
         # Only spec_v2 needs the event; it gates the seq_lens D2H on the private stream.
         if self.spec_algo.is_some():
             if self.publish_ready is None:

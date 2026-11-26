@@ -1587,6 +1587,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     f"{ragged_layout.graph_num_tokens}"
                 )
                 self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
+                if envs.SGLANG_ENABLE_PPU_DSPARK_MEGAMOE_COMPACT.get():
+                    # Both the pre-plan and replay paths must refresh this
+                    # slot, including on active -> idle transitions.
+                    self.buffers.num_token_non_padded.copy_(
+                        forward_batch.global_num_token_non_padded
+                    )
             self._set_dp_real_num_tokens(self.raw_num_token)
             self._copy_replay_inputs(forward_batch)
             if (

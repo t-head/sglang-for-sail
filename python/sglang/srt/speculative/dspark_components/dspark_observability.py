@@ -797,6 +797,7 @@ class DsparkStepObservers:
         dumped["simulate_acc_len"] = (
             self._simulate_acc_len if self._simulate_acc_len > 0 else None
         )
+        dumped["graph_cost_supported"] = self._planner.supports_graph_cost
         return dumped
 
     def clear_info_records(self) -> None:
@@ -840,6 +841,7 @@ class DsparkStepObservers:
         req_pool_indices: torch.Tensor,
         verify_tier_num_tokens: int,
         dp_tier_num_tokens: Optional[int],
+        target_graph_replayed: bool,
     ) -> None:
         planner = self._planner
         self._maybe_record_sts_collect(
@@ -914,7 +916,9 @@ class DsparkStepObservers:
                     verify_tokens_dp_synced=(
                         -1 if dp_tier_num_tokens is None else int(dp_tier_num_tokens)
                     ),
-                    verify_tokens_graph_key=num_verify_tokens,
+                    verify_tokens_graph_key=(
+                        num_verify_tokens if target_graph_replayed else -1
+                    ),
                     predicted_step_ms=predicted_step_ms,
                     predicted_theta=predicted_theta,
                     verify_lens=layout.verify_lens if layout is not None else None,

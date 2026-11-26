@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import bisect
-from typing import Optional
+from typing import Literal, Optional
 
 import msgspec
 
@@ -59,12 +59,13 @@ def _interp_clamped(xs: list[int], ys: list[float], x: float) -> float:
     return ys[lo] + frac * (ys[hi] - ys[lo])
 
 
-class SpsAdditiveCostTable(msgspec.Struct, frozen=True):
+class SpsAdditiveCostTable(msgspec.Struct, frozen=True, omit_defaults=True):
     bias_seconds: float
     bs_probes: list[int]
     alpha_seconds: list[float]
     m_probes: list[int]
     theta_seconds: list[float]
+    m_axis: Literal["logical_tokens", "graph_tokens"] = "logical_tokens"
 
     def __post_init__(self) -> None:
         for name, probes, values in (
@@ -86,12 +87,20 @@ class SpsAdditiveCostTable(msgspec.Struct, frozen=True):
             raise ValueError(f"bias_seconds must be > 0, got {self.bias_seconds}.")
 
     def step_time(self, *, num_reqs: int, budget: int) -> float:
+        if self.m_axis != "logical_tokens":
+            raise ValueError("Graph SPS tables require a physical graph size.")
+        return self._step_time(num_reqs=num_reqs, m=num_reqs + budget)
+
+    def graph_step_time(self, *, num_reqs: int, graph_tokens: int) -> float:
+        if self.m_axis != "graph_tokens":
+            raise ValueError("Expected a graph-token SPS table.")
+        return self._step_time(num_reqs=num_reqs, m=graph_tokens)
+
+    def _step_time(self, *, num_reqs: int, m: int) -> float:
         return (
             self.bias_seconds
             + _interp_clamped(self.bs_probes, self.alpha_seconds, float(num_reqs))
-            + _interp_clamped(
-                self.m_probes, self.theta_seconds, float(num_reqs + budget)
-            )
+            + _interp_clamped(self.m_probes, self.theta_seconds, float(m))
         )
 
     def to_json(self) -> str:

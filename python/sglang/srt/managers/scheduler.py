@@ -4688,9 +4688,13 @@ class Scheduler(
                         # Non-spec has no later work — scheduler publishes after return.
                         fwd_kwargs = {}
                         if not batch.spec_algorithm.is_none():
-                            fwd_kwargs["on_publish"] = partial(
-                                self.future_map.publish, future_indices
-                            )
+                            publish = partial(self.future_map.publish, future_indices)
+                            if self._confidence_budget_prepare is not None:
+                                publish = partial(
+                                    publish,
+                                    req_pool_indices_cpu=batch.req_pool_indices_cpu,
+                                )
+                            fwd_kwargs["on_publish"] = publish
                             # Grammar-overlap-capable workers advance the grammar FSM
                             # inside verify() before building the bitmask; hand them the
                             # barrier that resolves the previous batch's committed

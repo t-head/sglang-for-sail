@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.kv_loc_plan import Cols, IdSpaceKind, KVLocPlan
@@ -47,6 +48,7 @@ class DFlashVerifyInput(SpecInput):
     num_tokens_per_req: int = -1
 
     ragged_verify_layout: Optional[RaggedVerifyLayout] = None
+    ragged_verify_is_idle: bool = False
     # Committed/live lengths before the verify caller temporarily expands
     # batch.seq_lens_cpu to the target-attention KV lengths.
     live_seq_lens_cpu: Optional[torch.Tensor] = None
@@ -110,6 +112,16 @@ class DFlashVerifyInput(SpecInput):
             kv_loc_plan=self.kv_loc_plan,
             write_cols=self.kv_loc_cols,
         )
+        if (
+            envs.SGLANG_ENABLE_PPU_DSPARK_MEGAMOE_COMPACT.get()
+            and (layout := self.ragged_verify_layout) is not None
+        ):
+            # The fixed graph geometry includes padding. MoE routing needs the
+            # packed real prefix instead; an idle participant owns no tokens.
+            index = 0 if self.ragged_verify_is_idle else -1
+            verify_forward_batch.global_num_token_non_padded = layout.qo_indptr_device[
+                index
+            ]
 
         can_run_cuda_graph = bool(
             target_worker.model_runner.decode_cuda_graph_runner

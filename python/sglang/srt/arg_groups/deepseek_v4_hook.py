@@ -22,7 +22,7 @@ from sglang.srt.runtime_context import (
     derive_attn_tp_size,
     get_platform,
 )
-from sglang.srt.utils.common import is_gfx95_supported, is_npu
+from sglang.srt.utils.common import is_gfx95_supported, is_npu, is_sail
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -81,6 +81,27 @@ def _dsv41_dspark_pd_parallelism_supported(cfg) -> bool:
     # that. Each attention-DP rank owns whole requests, so no head sharding
     # crosses the transfer.
     return True
+
+
+def _dsv41_dspark_pd_verify_supported(cfg) -> bool:
+    from sglang.srt.speculative.ragged_verify import (
+        RaggedVerifyMode,
+        read_ragged_verify_mode,
+    )
+
+    mode = read_ragged_verify_mode()
+    if mode is RaggedVerifyMode.STATIC:
+        return True
+    # Verify is decode-local. Prefill still writes the same target/draft KV
+    # layout and runs static; the DSpark hook validates the decode topology.
+    return (
+        mode is RaggedVerifyMode.COMPACT
+        and cfg.disaggregation_mode == "decode"
+        and cfg.disaggregation_transfer_backend == "mooncake"
+        and cfg.moe_a2a_backend == "megamoe"
+        and envs.SGLANG_ENABLE_PPU_DSPARK_MEGAMOE_COMPACT.get()
+        and is_sail()
+    )
 
 
 def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None:
@@ -402,18 +423,14 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             )
 
     if cfg.disaggregation_mode != "null" and cfg.speculative_algorithm is not None:
-        from sglang.srt.speculative.ragged_verify import (
-            RaggedVerifyMode,
-            read_ragged_verify_mode,
-        )
-
         if (
-            read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
+            not _dsv41_dspark_pd_verify_supported(cfg)
             or cfg.disaggregation_transfer_backend not in ("mooncake", "nixl")
             or not _dsv41_dspark_pd_parallelism_supported(cfg)
         ):
             raise ValueError(
-                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake or NIXL, "
+                "DeepSeek-V4.1 DSpark PD requires static verify (except opt-in "
+                "PPU MegaMoE Compact on a Mooncake decode worker), Mooncake or NIXL, "
                 "DCP=1, and CP=1 on decode. Prefill CP requires "
                 "--enable-prefill-cp with the interleave strategy. "
                 "DP attention is supported when "

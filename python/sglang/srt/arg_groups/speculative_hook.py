@@ -679,6 +679,40 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     )
 
     ragged_mode = read_ragged_verify_mode()
+    ppu_megamoe_compact = envs.SGLANG_ENABLE_PPU_DSPARK_MEGAMOE_COMPACT.get()
+    if ppu_megamoe_compact:
+        from sglang.srt.utils.common import is_sail
+
+        if not (
+            is_sail()
+            and ragged_mode is RaggedVerifyMode.COMPACT
+            and cfg.moe_a2a_backend == "megamoe"
+            and cfg.nnodes == cfg.pp_size == cfg.dp_size == cfg.attn_cp_size == 1
+            and cfg.tp_size == cfg.attn_dp_size == cfg.ep_size
+            and cfg.attn_dp_size > 1
+            and cfg.moe_dense_tp_size == 1
+            and (
+                cfg.disaggregation_mode == "null"
+                or (
+                    cfg.disaggregation_mode == "decode"
+                    and cfg.disaggregation_transfer_backend == "mooncake"
+                    and cfg.dcp_size == 1
+                    and not cfg.enable_prefill_cp
+                )
+            )
+            and not cfg.disable_cuda_graph
+            and not cfg.disable_overlap_schedule
+            and not cfg.enable_two_batch_overlap
+            and not envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
+            and not envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
+            and not envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get()
+        ):
+            raise ValueError(
+                "PPU DSpark MegaMoE compact verify requires single-node colocate "
+                "or a single-node Mooncake PD decode worker (DCP=1 and no prefill CP), "
+                "with TP=attention-DP=EP, attention CP=1, dense MoE TP=1, "
+                "compact verify, CUDA graphs and the standard overlap scheduler."
+            )
 
     if cfg.attn_dp_size > 1:
         if not cfg.enable_dp_lm_head:
@@ -698,6 +732,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             not _is_npu
             and cfg.moe_a2a_backend != "none"
             and ragged_mode is not RaggedVerifyMode.STATIC
+            and not ppu_megamoe_compact
         ):
             logger.warning(
                 "DSpark with dp attention + "
