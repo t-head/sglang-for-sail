@@ -158,6 +158,9 @@ PD_DISAGG_PREFILL_REQUIRED_PLACEHOLDERS = frozenset({"kv_ip", "kv_port", "ib_dev
 PD_DISAGG_DECODE_REQUIRED_PLACEHOLDERS = frozenset({"kv_ip", "ib_devices"})
 PD_DISAGG_REQUIRED_PLACEHOLDERS = PD_DISAGG_PREFILL_REQUIRED_PLACEHOLDERS
 _PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_ADJACENT_NUMERIC_PLACEHOLDER_RE = re.compile(
+    r"\d\{(?:node_rank|master_port|kv_port)\}|\{(?:node_rank|master_port|kv_port)\}\d"
+)
 ALLOWED_CACHE_MODES = frozenset({"sanity_throughput_guard", "prefix_reuse_bench"})
 
 _PROHIBITED_TOKEN_A = "".join(chr(c) for c in (98, 116, 118))
@@ -843,6 +846,40 @@ def _validate_resolved_topology_and_placeholders(
         raise ValidationError(
             f"{context}: unknown topology placeholder(s): {', '.join(unknown)}"
         )
+    for loc, raw_str in _walk_strings({"flags": flags, "env": server_env}, context):
+        if _ADJACENT_NUMERIC_PLACEHOLDER_RE.search(raw_str):
+            raise ValidationError(
+                f"{loc}: numeric topology placeholder must not be concatenated with digits: {raw_str!r}"
+            )
+
+    def _validate_ib_device_wiring(ib_dev: str | None, *, backend: str) -> None:
+        if not isinstance(ib_dev, str):
+            raise ValidationError(
+                f"{context}: {backend} disaggregation requires "
+                f"--disaggregation-ib-device to wire '{{ib_devices}}'"
+            )
+        if ib_dev == "{ib_devices}":
+            return
+        if ib_dev.startswith("{"):
+            try:
+                parsed_ib = json.loads(ib_dev)
+            except json.JSONDecodeError as exc:
+                raise ValidationError(
+                    f"{context}: --disaggregation-ib-device invalid JSON map: {exc}"
+                ) from exc
+            if (
+                isinstance(parsed_ib, dict)
+                and parsed_ib
+                and all(
+                    isinstance(k, str) and v == "{ib_devices}"
+                    for k, v in parsed_ib.items()
+                )
+            ):
+                return
+        raise ValidationError(
+            f"{context}: {backend} disaggregation requires --disaggregation-ib-device "
+            f"to be exact '{{ib_devices}}' (or a per-GPU JSON map of '{{ib_devices}}'), got {ib_dev!r}"
+        )
 
     def _require_multinode_wiring() -> None:
         nnodes_raw = _flag_value(entries, "--nnodes")
@@ -863,33 +900,35 @@ def _validate_resolved_topology_and_placeholders(
             )
 
         node_rank_raw = _flag_value(entries, "--node-rank")
-        if node_rank_raw is None or "{node_rank}" not in node_rank_raw:
+        if node_rank_raw != "{node_rank}":
             raise ValidationError(
-                f"{context}: {topo_kind} topology requires --node-rank wiring {{node_rank}}"
+                f"{context}: {topo_kind} topology requires --node-rank to be exact '{{node_rank}}', "
+                f"got {node_rank_raw!r}"
             )
-        sub_rank_str = _substitute_placeholders_in_str(node_rank_raw)
-        try:
-            sub_rank = int(sub_rank_str)
-        except ValueError as exc:
-            raise ValidationError(
-                f"{context}: --node-rank must resolve to an integer, got {sub_rank_str!r}"
-            ) from exc
-        if not 0 <= sub_rank < topo_nodes:
-            raise ValidationError(
-                f"{context}: --node-rank must be in [0, {topo_nodes - 1}], got {sub_rank}"
+        for probe_rank in (0, topo_nodes - 1):
+            sub_rank_str = _substitute_placeholders_in_str(
+                node_rank_raw, _build_placeholder_table({"node_rank": probe_rank})
             )
+            if int(sub_rank_str) != probe_rank:
+                raise ValidationError(
+                    f"{context}: --node-rank must preserve exact identity for rank {probe_rank}"
+                )
 
         dist_addr_raw = _flag_value(entries, "--dist-init-addr", "--nccl-init-addr")
-        if (
-            dist_addr_raw is None
-            or "{master_addr}" not in dist_addr_raw
-            or "{master_port}" not in dist_addr_raw
-        ):
+        if dist_addr_raw not in {
+            "{master_addr}:{master_port}",
+            "[{master_addr}]:{master_port}",
+        }:
             raise ValidationError(
                 f"{context}: {topo_kind} topology requires --dist-init-addr "
-                f"wiring '{{master_addr}}:{{master_port}}'"
+                f"to be exact '{{master_addr}}:{{master_port}}' or '[{{master_addr}}]:{{master_port}}', "
+                f"got {dist_addr_raw!r}"
             )
-        sub_dist_addr = _substitute_placeholders_in_str(dist_addr_raw)
+        probe_host = "::1" if dist_addr_raw.startswith("[") else "127.0.0.1"
+        sub_dist_addr = _substitute_placeholders_in_str(
+            dist_addr_raw,
+            _build_placeholder_table({"master_addr": probe_host, "master_port": 29500}),
+        )
         _parse_host_port(
             sub_dist_addr,
             context=f"{context}.dist_init_addr",
@@ -991,27 +1030,22 @@ def _validate_resolved_topology_and_placeholders(
 
         if transfer_backend in {"mooncake", "mooncake_tcp", "nixl"}:
             host_ip_env = server_env.get("SGLANG_HOST_IP")
-            if not isinstance(host_ip_env, str) or "{kv_ip}" not in host_ip_env:
+            if host_ip_env != "{kv_ip}":
                 raise ValidationError(
                     f"{context}: {transfer_backend} disaggregation requires env "
-                    f"SGLANG_HOST_IP to wire {{kv_ip}}"
+                    f"SGLANG_HOST_IP to be exact '{{kv_ip}}', got {host_ip_env!r}"
                 )
             if transfer_backend in {"mooncake", "nixl"}:
-                ib_dev = _flag_value(entries, "--disaggregation-ib-device")
-                if not isinstance(ib_dev, str) or "{ib_devices}" not in ib_dev:
-                    raise ValidationError(
-                        f"{context}: {transfer_backend} disaggregation requires "
-                        f"--disaggregation-ib-device to wire {{ib_devices}}"
-                    )
+                _validate_ib_device_wiring(
+                    _flag_value(entries, "--disaggregation-ib-device"),
+                    backend=transfer_backend,
+                )
             bootstrap_port_raw = _flag_value(entries, "--disaggregation-bootstrap-port")
             if role == "prefill":
-                if (
-                    not isinstance(bootstrap_port_raw, str)
-                    or "{kv_port}" not in bootstrap_port_raw
-                ):
+                if bootstrap_port_raw != "{kv_port}":
                     raise ValidationError(
                         f"{context}: {transfer_backend} pd_prefill requires "
-                        f"--disaggregation-bootstrap-port to wire {{kv_port}}"
+                        f"--disaggregation-bootstrap-port to be exact '{{kv_port}}', got {bootstrap_port_raw!r}"
                     )
                 _validate_port_value(
                     _substitute_placeholders_in_str(bootstrap_port_raw),
@@ -1349,6 +1383,7 @@ def _resolve_recipe_from_doc(
         "attn_dp_size": attn_dp_val,
         "model_id": model_blk["model_id"],
         "hf_model_id": hf_model_id,
+        "assets": copy.deepcopy(eff_assets),
         "resolved_model": resolved_model,
         "resolved_tokenizer": resolved_tokenizer,
         "golden_model_key": golden_model_key,

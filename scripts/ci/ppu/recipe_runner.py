@@ -443,7 +443,7 @@ def run(policy_path, tier, queue_s):
     policy = _load_yaml(policy_path)
     recipe = REPO_ROOT / policy["recipe"]
     assets = RESULTS.parent / "assets.json"
-    recipe_ppu = _load_yaml(recipe)["ppu"]
+    effective = resolve_recipe(recipe, policy_path=policy_path, tier=tier)
     revision = os.environ.get("PPU_CI_HF_MODEL_REVISION")
     uses_cache_ref = revision is None and "PPU_CI_HF_CACHE_ROOT" in os.environ
     if revision is None and not uses_cache_ref:
@@ -451,10 +451,10 @@ def run(policy_path, tier, queue_s):
     else:
         phase("model_cache_check")
         model_path, snapshot_revision = cached_model_path(
-            recipe_ppu["hf_model_id"], revision
+            effective["hf_model_id"], revision
         )
     assets.write_text(
-        json.dumps({name: model_path for name in recipe_ppu["assets"].values()})
+        json.dumps({name: model_path for name in effective["assets"].values()})
     )
 
     resolve = dict(
@@ -470,6 +470,9 @@ def run(policy_path, tier, queue_s):
     if (
         config["ppu_count"] != expected_width
         or policy["model_id"] != config["model_id"]
+        or config["hf_model_id"] != effective["hf_model_id"]
+        or config["resolved_model"] != model_path
+        or config["resolved_tokenizer"] != model_path
     ):
         raise ValueError("incorrect recipe identity or device width")
     result = {
