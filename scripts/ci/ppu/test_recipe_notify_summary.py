@@ -557,6 +557,59 @@ class NotifySummaryTest(unittest.TestCase):
             + f'"default":{{"webhook_url":"https://example.com/{secret_marker}"}}'
             + " " * (64 * 1024)
             + "}",
+            " ",
+            " " * 65537,
+            "\t" * 65537,
+            "\u2003",
+            "\u2000" * 21846,
+            json.dumps(
+                {
+                    "default": {
+                        "webhook_url": f"https://example.com/{secret_marker}",
+                    },
+                    "routes": {
+                        "v1.1.0": {
+                            "webhook_url": f"https://example.com:notaport/{secret_marker}",
+                        }
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "default": {
+                        "webhook_url": f"https://example.com/{secret_marker}",
+                    },
+                    "routes": {
+                        "v1.1.0": {
+                            "webhook_url": f"https://example.com:65536/{secret_marker}",
+                        }
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "default": {
+                        "webhook_url": f"https://example.com/{secret_marker}",
+                    },
+                    "routes": {
+                        "v1.1.0": {
+                            "webhook_url": f"https://example.com:0/{secret_marker}",
+                        }
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "default": {
+                        "webhook_url": f"https://example.com/{secret_marker}",
+                    },
+                    "routes": {
+                        "v1.1.0": {
+                            "webhook_url": f"https://example.com:/{secret_marker}",
+                        }
+                    },
+                }
+            ),
         ]
         for raw in invalid_payloads:
             with (
@@ -576,6 +629,22 @@ class NotifySummaryTest(unittest.TestCase):
                 self.assertEqual(0, build.return_value.open.call_count)
                 self.assertIn("::warning::", logs.getvalue())
                 self.assertNotIn(secret_marker, logs.getvalue())
+
+        base_json = json.dumps(
+            {
+                "default": {"webhook_url": "https://example.com:8443/robot/send"},
+                "routes": {"v1.1.0": {"webhook_url": "https://[::1]:8443/robot/send"}},
+            }
+        )
+        exact_limit = base_json[:-1] + " " * (64 * 1024 - len(base_json)) + "}"
+        self.assertEqual(64 * 1024, len(exact_limit.encode("utf-8")))
+        with (
+            patch.dict("os.environ", {notify.TARGETS: exact_limit}),
+            patch.object(notify, "build_opener") as build,
+        ):
+            build.return_value.open.return_value.__enter__.return_value.read.return_value = b'{"errcode":0}'
+            self.assertEqual(0, notify.main(["--smoke-test"]))
+            self.assertEqual(1, build.return_value.open.call_count)
 
     def test_run_jobs_strips_targets_and_notification_secrets(self):
         captured_envs = []
