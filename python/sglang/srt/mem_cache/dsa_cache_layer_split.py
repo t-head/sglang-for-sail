@@ -95,7 +95,11 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
             self.pool.layer_transfer_counter.wait_until(
                 layer_id - self.pool.start_layer
             )
-        return self.get_broadcastable_buffer(layer_id)
+        buf = self.get_broadcastable_buffer(layer_id)
+        # FP4 access bypasses get_k_and_scale; preserve MLA KV prefetch overlap.
+        if self.pool.use_fp4_indexer:
+            self.pool.prefetch_kv_buffer(layer_id)
+        return buf
 
     def get_k_and_scale(
         self,
@@ -593,7 +597,18 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         src_tensor = (
             self.kv_buffer[local_idx] if self._is_layer_owned(layer_id) else None
         )
+        # Callers may leave the transfer coordinates unset; fall back to this
+        # pool's own counter and local layer index so the wait below cannot be
+        # skipped by an unset argument.
+        if layer_transfer_counter is None:
+            layer_transfer_counter = self.layer_transfer_counter
+        if layer_transfer_idx is None:
+            layer_transfer_idx = local_idx
         if self.layer_broadcast_comm is None:
+            # The non-comm (synchronous) path still reads a layer another rank
+            # may own; wait for its device-side writes to be published first.
+            if layer_transfer_counter is not None:
+                layer_transfer_counter.wait_until(layer_transfer_idx)
             self._broadcast_tensor_from_owner(
                 self.remote_kv_buffer,
                 layer_id,
@@ -658,6 +673,19 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
 
     def invalidate_index_buffer_for_layer(self, layer_id: int) -> None:
         self.index_key_cache.invalidate(layer_id)
+
+    def invalidate_kv_buffer_for_layer(self, layer_id: int) -> None:
+        """Drop this rank's cached remote copy of ``layer_id``'s KV.
+
+        Mirrors the invalidation that ``set_kv_buffer`` performs for a local
+        write: any rank may hold a broadcast scratch copy, and only the owner
+        submits a transfer, so a host-side write-through must invalidate the
+        copy on every rank rather than only on the owner.
+        """
+        if self.pending_remote_kv_layer_id == layer_id:
+            self._finalize_pending_kv_broadcast(set_remote_layer_id=False)
+        if self.remote_kv_layer_id == layer_id:
+            self.remote_kv_layer_id = None
 
     def _get_broadcastable_index_buffer(self, layer_id: int) -> torch.Tensor:
         return self.index_key_cache.get_broadcastable_buffer(layer_id)
