@@ -23,13 +23,19 @@ _is_sail = is_sail()
 
 
 @functools.cache
-def _mega_mhc_kernel():
+def _mega_mhc_kernel(non_shifted: bool = False):
+    if not ENABLE_JIT_DEEPGEMM:
+        return None
     try:
         import deep_gemm
     except (ImportError, OSError, RuntimeError):
         kernel = None
     else:
         kernel = getattr(deep_gemm, "mega_mhc", None)
+        if non_shifted and not getattr(
+            getattr(deep_gemm, "_C", None), "mega_mhc_h4096_fp32_variance", False
+        ):
+            return None
     if not callable(kernel):
         logger.warning(
             "MegaMHC prefill requested but DeepGEMM has no mega_mhc API; "
@@ -66,7 +72,7 @@ def _mega_mhc_supported() -> bool:
 
     if is_batch_invariant_mode_enabled():
         return False
-    return _mega_mhc_kernel() is not None
+    return _mega_mhc_kernel(non_shifted=False) is not None
 
 
 def mhc_mega_boundary(
@@ -89,34 +95,32 @@ def mhc_mega_boundary(
 ):
     """Update residual, collapse with carried pre, and compute the next stats.
 
-    The collapse uses ``pre`` from the preceding sublayer, not the new pre
-    produced from the updated residual. Preserve this DSv4.1 shifted ordering.
+    DSv4.1 collapses with the carried ``pre``; GLM collapses with the newly
+    computed pre when ``pre`` is None.
     Before CUDA graph capture, warm each execution stream to initialize
     DeepGEMM's per-stream barriers. ``y_fp8`` / ``y_gemm_sf`` also receive the
     normed rows as a DeepGEMM MXFP8 pair. Failures after dispatch propagate:
     never retry against possibly written buffers.
     """
-    kernel = _mega_mhc_kernel()
+    kernel = _mega_mhc_kernel(non_shifted=pre is None)
     if kernel is None:
         raise RuntimeError("DeepGEMM mega_mhc API is unavailable")
     rows, hidden = x.shape
     hc = residual.shape[1]
     updated = torch.empty_like(residual)
     normalized = torch.empty_like(x)
-    next_pre = torch.empty((rows, hc, 1), device=x.device, dtype=torch.float32)
-    next_post = torch.empty_like(next_pre)
+    next_post = torch.empty((rows, hc, 1), device=x.device, dtype=torch.float32)
+    next_pre = torch.empty_like(next_post) if pre is not None else None
     next_comb = torch.empty_like(comb)
     y_routed_sf = y_shared_sf = None
     shared_sf_block_m = 0
     if moe_input is not None:
         assert y_fp8 is None
         y_fp8, y_routed_sf, y_shared_sf, shared_sf_block_m = moe_input
-    # DeepGEMM's shifted BF16 API; FP8/SF outputs remain optional so attention
-    # and MoE keep their own quantization contracts, including MXFP8 swizzling.
     kernel(
         x=x,
         residual=residual,
-        shifted_prev_mix=pre.unsqueeze(-1),
+        shifted_prev_mix=pre.unsqueeze(-1) if pre is not None else None,
         post_mix=post.unsqueeze(-1),
         comb_res_mix=comb,
         fn=fn,
@@ -142,7 +146,11 @@ def mhc_mega_boundary(
         y_shared_sf=y_shared_sf,
         shared_sf_block_m=shared_sf_block_m,
     )
-    return updated, normalized, (next_pre.squeeze(-1), next_post.squeeze(-1), next_comb)
+    return updated, normalized, (
+        next_pre.squeeze(-1) if next_pre is not None else None,
+        next_post.squeeze(-1),
+        next_comb,
+    )
 
 
 def try_mhc_mega_boundary(
@@ -169,10 +177,13 @@ def try_mhc_mega_boundary(
     rows, hidden = x.shape
     if not 0 < rows <= 1 << 20 or hidden <= 0 or hidden % 1024 or sinkhorn_iters < 1:
         return None
+    if pre is None and (
+        envs.SGLANG_DISABLE_GLM_MEGA_MHC.get() or not _is_sail or hidden != 4096
+    ):
+        return None
     tensors = (
         (x, (rows, hidden), torch.bfloat16),
         (residual, (rows, 4, hidden), torch.bfloat16),
-        (pre, (rows, 4), torch.float32),
         (post, (rows, 4), torch.float32),
         (comb, (rows, 4, 4), torch.float32),
         (fn, (24, 4 * hidden), torch.float32),
@@ -180,6 +191,8 @@ def try_mhc_mega_boundary(
         (base, (24,), torch.float32),
         (weight, (hidden,), torch.bfloat16),
     )
+    if pre is not None:
+        tensors += ((pre, (rows, 4), torch.float32),)
     if not x.is_cuda or any(
         tensor.shape != shape
         or tensor.dtype != dtype
@@ -188,7 +201,7 @@ def try_mhc_mega_boundary(
         for tensor, shape, dtype in tensors
     ):
         return None
-    if _mega_mhc_kernel() is None:
+    if _mega_mhc_kernel(non_shifted=pre is None) is None:
         return None
     return mhc_mega_boundary(
         x,

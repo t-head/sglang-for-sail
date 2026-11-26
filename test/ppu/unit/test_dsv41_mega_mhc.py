@@ -1,4 +1,4 @@
-"""AST-isolated CPU dispatch/state regressions for shifted MegaMHC.
+"""AST-isolated CPU dispatch/state regressions for MegaMHC boundaries.
 
 Execute the actual HcState and pre/post orchestration, with tensor/kernel and
 msgspec dependencies stubbed. This is not numerical or accelerator acceptance.
@@ -9,6 +9,7 @@ import ast
 import functools
 import logging
 import runpy
+import subprocess
 import sys
 import unittest
 from contextlib import contextmanager, nullcontext
@@ -70,6 +71,7 @@ BASE_NS = load_definitions(
     ["CustomTestCase"],
     {
         "unittest": unittest,
+        "subprocess": subprocess,
         "envs": ENV_NS["envs"],
         "is_in_ci": lambda: False,
         "_wait_for_gpu_idle_in_ci": lambda: None,
@@ -286,11 +288,78 @@ class TestMegaMHCDispatch(MegaMHCFixture, CustomTestCase):
             (kw["hc_post_scale"], kw["rmsnorm_scale"], kw["num_sinkhorn_iters"]),
             (2.0, 1.0, 10),
         )
-        self.assertNotIn("y_fp8", kw)
+        self.assertIsNone(kw["y_fp8"])
         old = self.ns["mhc_mega_boundary"](*args, 1e-6, 1e-6, 1e-6, 10)
         self.assertEqual(len(old), 3)
         self.assertEqual(old[1].shape, normalized.shape)
         self.assertEqual([t.shape for t in old[2]], [t.shape for t in stats])
+
+    def test_non_shifted_contract_returns_no_next_pre(self):
+        args = inputs(hidden=4096)
+        args[2] = None
+        self.assertIsNone(
+            self.ns["try_mhc_mega_boundary"](*args, 1e-6, 2e-6, 3e-6, 10)
+        )
+        self.backend.mega_mhc.assert_not_called()
+        self.backend._C = SimpleNamespace(mega_mhc_h4096_fp32_variance=True)
+        self.ns["_mega_mhc_kernel"].cache_clear()
+        self.ns["ENABLE_JIT_DEEPGEMM"] = False
+        self.assertIsNone(
+            self.ns["try_mhc_mega_boundary"](*args, 1e-6, 2e-6, 3e-6, 10)
+        )
+        self.ns["ENABLE_JIT_DEEPGEMM"] = True
+        self.ns["_mega_mhc_kernel"].cache_clear()
+
+        updated, normalized, stats = self.ns["try_mhc_mega_boundary"](
+            *args, 1e-6, 2e-6, 3e-6, 10
+        )
+        kw = self.backend.mega_mhc.call_args.kwargs
+        self.assertIs(kw["new_residual"], updated)
+        self.assertIs(kw["y_bf16"], normalized)
+        self.assertIsNone(kw["shifted_prev_mix"])
+        self.assertIsNone(kw["new_prev_mix"])
+        self.assertIsNone(stats[0])
+        self.assertIs(stats[1].source, kw["new_post_mix"])
+        self.assertIs(stats[2], kw["new_comb_res_mix"])
+
+        self.backend.mega_mhc.reset_mock()
+        for hidden, sail in ((5120, True), (4096, False)):
+            with self.subTest(hidden=hidden, sail=sail):
+                restricted = inputs(hidden=hidden)
+                restricted[2] = None
+                self.ns["_is_sail"] = sail
+                self.assertIsNone(
+                    self.ns["try_mhc_mega_boundary"](
+                        *restricted, 1e-6, 2e-6, 3e-6, 10
+                    )
+                )
+        self.backend.mega_mhc.assert_not_called()
+        self.ns["_is_sail"] = True
+
+    def test_glm_opt_out_is_scoped_to_unshifted_boundaries(self):
+        self.backend._C = SimpleNamespace(mega_mhc_h4096_fp32_variance=True)
+        self.ns["_mega_mhc_kernel"].cache_clear()
+        unshifted = inputs(hidden=4096)
+        unshifted[2] = None
+        disabled = self.ns["envs"].SGLANG_DISABLE_GLM_MEGA_MHC
+        with disabled.override(True):
+            self.assertIsNone(
+                self.ns["try_mhc_mega_boundary"](
+                    *unshifted, 1e-6, 2e-6, 3e-6, 10
+                )
+            )
+            self.backend.mega_mhc.assert_not_called()
+            shifted = self.ns["try_mhc_mega_boundary"](
+                *inputs(), 1e-6, 2e-6, 3e-6, 10
+            )
+            self.assertIsNotNone(shifted)
+            self.assertEqual(self.backend.mega_mhc.call_count, 1)
+        with disabled.override(False):
+            self.assertIsNotNone(
+                self.ns["try_mhc_mega_boundary"](
+                    *unshifted, 1e-6, 2e-6, 3e-6, 10
+                )
+            )
 
     def test_invalid_inputs_decline_before_launch(self):
         cases = [inputs(0), inputs(hidden=5121), inputs(1 << 20 | 1)]
@@ -412,7 +481,7 @@ class TestMegaMHCState(MegaMHCFixture, CustomTestCase):
         )
         self.ns["_mix_stats_impl"] = self.mix
         kernels = ModuleType("sglang.kernels.ops.layernorm.mhc")
-        kernels.hc_combine = Mock(
+        kernels.mhc_combine = Mock(
             side_effect=lambda x, *args: Tensor((x.shape[0], 5120))
         )
         kernels.mhc_post = Mock(
@@ -490,7 +559,7 @@ class TestMegaMHCState(MegaMHCFixture, CustomTestCase):
                 self.backend.mega_mhc.call_args_list[1].kwargs["new_prev_mix"],
             )
             self.assertEqual(self.mix.call_count, 1)
-            self.assertEqual(self.kernels.hc_combine.call_count, 1)
+            self.assertEqual(self.kernels.mhc_combine.call_count, 1)
             carried = state.stats
             layer.next_boundary = None
             final = forward(layer, None, state, None, self.batch, None)
@@ -503,7 +572,7 @@ class TestMegaMHCState(MegaMHCFixture, CustomTestCase):
             carried[0],
         )
         self.assertEqual(self.mix.call_count, 1)
-        self.assertEqual(self.kernels.hc_combine.call_count, 1)
+        self.assertEqual(self.kernels.mhc_combine.call_count, 1)
         self.assertEqual(self.kernels.mhc_post.call_count, 1)
 
     def test_state_gate_closes_cp_sp_unshifted_and_norm_seams(self):
@@ -620,6 +689,7 @@ class TestMegaMHCState(MegaMHCFixture, CustomTestCase):
                     nullcontext=nullcontext,
                     is_cp_active=lambda batch: False,
                     is_in_breakable_cuda_graph=lambda: False,
+                    _is_cuda=False,
                     check_cuda_graph_backend=lambda *args: True,
                     Phase=SimpleNamespace(PREFILL=0),
                     Backend=SimpleNamespace(TC_PIECEWISE=0),
@@ -673,7 +743,9 @@ class TestMegaMHCState(MegaMHCFixture, CustomTestCase):
                     config=SimpleNamespace(
                         model_type="deepseek_v41", vision_n_layers=0
                     ),
-                    _check_late_layer_tail_readers=lambda batch: None,
+                    _check_late_layer_tail_readers=lambda *args: None,
+                    decoder_replay_tail=None,
+                    tail_writes_source_kv=False,
                 )
 
                 class HashIDs:
