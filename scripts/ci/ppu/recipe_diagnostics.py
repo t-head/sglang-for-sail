@@ -50,8 +50,13 @@ def _worker_rank_phase(source):
     return None
 
 
-_PEER_WAITING_PHASES = {
+_IN_PROGRESS_PHASES = {
+    "wheel_verification",
     "multinode_network",
+    "runtime_dependencies",
+    "eval_environment",
+    "platform_check",
+    "recipe_validation",
     "model_cache_check",
     "page_cache_warm",
     "server_startup",
@@ -138,6 +143,6 @@ def failure_reason(source):
         return launcher
     rank0_phase = _read_phase(source / "worker-phase.txt")
     peer_failed = _failed_worker_rank_phase(source)
-    if peer_failed and (rank0_phase is None or rank0_phase in _PEER_WAITING_PHASES):
+    if peer_failed and (rank0_phase is None or rank0_phase in _IN_PROGRESS_PHASES):
         return peer_failed
     return rank0_phase or _worker_rank_phase(source) or launcher or "unknown"

@@ -228,21 +228,42 @@ jobs:
               [[ "$TIER" == fast_sanity ]] && job_prefix="Fast Sanity ("
               prior_single_run=0
               if candidate_runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/nightly-test-ppu.yml/runs?event=pull_request_target&head_sha=$PR_HEAD&per_page=20" 2>/dev/null |
-                  jq -r --arg cur "$GITHUB_RUN_ID" '.workflow_runs[] | select((.id | tostring) != $cur and .conclusion != "cancelled" and .conclusion != "skipped") | .id'); then
-                for cand_run in $candidate_runs; do
+                  jq -r --arg cur "$GITHUB_RUN_ID" '.workflow_runs[] | select((.id | tostring) != $cur and .conclusion != "cancelled" and .conclusion != "skipped") | "\(.id)\t\(.status // "")"'); then
+                while IFS=$'\t' read -r cand_run cand_status; do
                   [[ "$cand_run" =~ ^[0-9]+$ ]] || continue
                   if scheduled_single=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$cand_run/jobs?per_page=100" 2>/dev/null |
-                      jq -r --arg prefix "$job_prefix" '
-                        [(if type == "array" then .[].jobs[] else .jobs[] end)
-                         | select(.name | startswith($prefix))
-                         | select((.name | test(", [0-9]+x8\\)$")) | not)
-                         | select(.conclusion != "skipped" and .conclusion != "cancelled")] | length'); then
+                      jq -r --arg prefix "$job_prefix" --arg cur "$GITHUB_RUN_ID" --arg cid "$cand_run" --arg cstatus "$cand_status" '
+                        [if type == "array" then .[].jobs[] else .jobs[] end] as $jobs
+                        | [$jobs[]
+                           | select((.name | startswith($prefix)) or (.name | contains("matrix.model")))
+                           | select((.name | test(", [0-9]+x8\\)$")) | not)] as $single_jobs
+                        | [$single_jobs[]
+                           | select(.name | startswith($prefix))
+                           | select(.conclusion != "skipped" and .conclusion != "cancelled")] as $active_single
+                        | [$jobs[]
+                           | select(.name | startswith($prefix))
+                           | select(.name | test(", [0-9]+x8\\)$"))
+                           | select(.conclusion != "skipped" and .conclusion != "cancelled")] as $gang_jobs
+                        | (any($jobs[]; (.name == "pr-gate" or (.name | startswith("pr-gate /"))) and .status == "completed" and .conclusion == "success")) as $gate_ok
+                        | (any($jobs[]; .name == "plan" and .status == "completed" and .conclusion == "success")) as $plan_ok
+                        | (any($jobs[]; .name == "plan" and (.status != "completed" or .conclusion == "success"))) as $plan_alive
+                        | if ($active_single | length) > 0 then
+                            ($active_single | length)
+                          elif ($cstatus != "completed"
+                                and ($cid | tonumber) < ($cur | tonumber)
+                                and ($single_jobs | length) == 0
+                                and ($gang_jobs | length) == 0
+                                and (($gate_ok and $plan_alive) or $plan_ok)) then
+                            1
+                          else
+                            0
+                          end'); then
                     if [[ "$scheduled_single" =~ ^[1-9][0-9]*$ ]]; then
                       prior_single_run=$scheduled_single
                       break
                     fi
                   fi
-                done
+                done <<< "$candidate_runs"
               fi
               if [[ "$prior_single_run" =~ ^[1-9][0-9]*$ ]]; then
                 echo "::notice::Incremental run-ci-ppu-multinode approval on $PR_HEAD: skipping duplicate single-node matrix already scheduled by another run"

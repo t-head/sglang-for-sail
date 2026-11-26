@@ -166,26 +166,75 @@ from pathlib import Path
 import re
 import sys
 
-detected = [
-    item.strip().lstrip("=")
-    for item in sys.argv[1].lstrip("=").split(",")
-    if item.strip().lstrip("=")
-]
-existing = sys.argv[2].strip()
-if not existing:
-    print("=" + ",".join(detected))
-    raise SystemExit(0)
+sysfs = Path(os.environ.get("RECIPE_GID_SYSFS_ROOT", "/sys/class/infiniband"))
 
-invert = existing.startswith("^")
-rest = existing[1:] if invert else existing
-exact = rest.startswith("=")
-body = rest[1:] if exact else rest
+
+def active_ports_for(dev: str) -> list[int]:
+    ports_dir = sysfs / dev / "ports"
+    if not ports_dir.is_dir():
+        return [1]
+    ports: list[int] = []
+    for pdir in sorted(ports_dir.iterdir(), key=lambda p: (not p.name.isdigit(), int(p.name) if p.name.isdigit() else 0)):
+        if not pdir.name.isdigit() or int(pdir.name) <= 0 or not (pdir / "gids").is_dir():
+            continue
+        state_file = pdir / "state"
+        if state_file.is_file():
+            try:
+                state_txt = state_file.read_text(encoding="utf-8", errors="replace").lower()
+            except OSError:
+                continue
+            if "active" not in state_txt:
+                continue
+        ports.append(int(pdir.name))
+    return ports or [1]
 
 
 def parse_port(raw_port: str) -> int:
     match = re.match(r"[0-9]+", raw_port)
     return int(match.group(0)) if match else 0
 
+
+dev_order: list[str] = []
+eligible_ports: dict[str, list[int]] = {}
+all_active_ports: dict[str, list[int]] = {}
+for raw_item in sys.argv[1].lstrip("=").split(","):
+    token = raw_item.strip().lstrip("=")
+    if not token:
+        continue
+    dev, sep, port_str = token.partition(":")
+    if not dev:
+        continue
+    if dev not in eligible_ports:
+        dev_order.append(dev)
+        eligible_ports[dev] = []
+        all_active_ports[dev] = active_ports_for(dev)
+    if sep:
+        pnum = parse_port(port_str)
+        if pnum > 0 and pnum not in eligible_ports[dev]:
+            eligible_ports[dev].append(pnum)
+    else:
+        for pnum in all_active_ports[dev]:
+            if pnum not in eligible_ports[dev]:
+                eligible_ports[dev].append(pnum)
+
+existing = sys.argv[2].strip()
+if not existing:
+    out_default: list[str] = []
+    for dev in dev_order:
+        elig = eligible_ports[dev]
+        if not elig:
+            continue
+        if elig == all_active_ports[dev]:
+            out_default.append(dev)
+        else:
+            out_default.extend(f"{dev}:{p}" for p in elig)
+    print("=" + ",".join(out_default))
+    raise SystemExit(0)
+
+invert = existing.startswith("^")
+rest = existing[1:] if invert else existing
+exact = rest.startswith("=")
+body = rest[1:] if exact else rest
 
 entries: list[tuple[str, int | None]] = []
 for raw_tok in body.split(","):
@@ -201,37 +250,134 @@ def dev_matches(dev: str, prefix: str) -> bool:
     return dev == prefix if exact else dev.startswith(prefix)
 
 
-sysfs = Path(os.environ.get("RECIPE_GID_SYSFS_ROOT", "/sys/class/infiniband"))
 out_tokens: list[str] = []
-for dev in detected:
+for dev in dev_order:
+    elig = eligible_ports[dev]
     matched = [(prefix, port) for prefix, port in entries if dev_matches(dev, prefix)]
     if not invert:
         if not matched:
             continue
-        if any(port is None for _, port in matched):
+        wildcard = any(port is None for _, port in matched)
+        req_ports = {port for _, port in matched if port is not None}
+        kept = [p for p in elig if wildcard or p in req_ports]
+        if not kept:
+            continue
+        if wildcard and kept == all_active_ports[dev]:
             out_tokens.append(dev)
         else:
-            seen_ports: list[int] = []
-            for _, port in matched:
-                if port is not None and port not in seen_ports:
-                    seen_ports.append(port)
-                    out_tokens.append(f"{dev}:{port}")
+            out_tokens.extend(f"{dev}:{p}" for p in kept)
     else:
         if any(port is None for _, port in matched):
             continue
-        if not matched:
+        excluded_ports = {port for _, port in matched if port is not None}
+        kept = [p for p in elig if p not in excluded_ports]
+        if not kept:
+            continue
+        if kept == all_active_ports[dev]:
             out_tokens.append(dev)
+        else:
+            out_tokens.extend(f"{dev}:{p}" for p in kept)
+
+if not out_tokens:
+    raise SystemExit(
+        "gid: existing NCCL_IB_HCA/PCCL_IB_HCA excludes all RoCE rails supporting the selected GID index"
+    )
+print("=" + ",".join(out_tokens))
+PY
+)
+        export NCCL_IB_HCA="$effective_hcas"
+        export PCCL_IB_HCA="$effective_hcas"
+    elif [[ -n "${NCCL_IB_GID_INDEX:-}" && -n "${NCCL_IB_HCA:-${PCCL_IB_HCA:-}}" && -d "${RECIPE_GID_SYSFS_ROOT:-/sys/class/infiniband}" ]]; then
+        existing_hcas="${NCCL_IB_HCA:-${PCCL_IB_HCA:-}}"
+        effective_hcas=$(python3 -I -B - "$NCCL_IB_GID_INDEX" "$existing_hcas" <<'PY'
+import os
+from pathlib import Path
+import re
+import sys
+
+chosen = int(sys.argv[1])
+existing = sys.argv[2].strip()
+sysfs = Path(os.environ.get("RECIPE_GID_SYSFS_ROOT", "/sys/class/infiniband"))
+
+
+def port_supports_gid(pdir: Path, idx: int) -> bool:
+    if not (pdir / "gids").is_dir():
+        return False
+    state_file = pdir / "state"
+    if state_file.is_file():
+        try:
+            if "active" not in state_file.read_text(encoding="utf-8", errors="replace").lower():
+                return False
+        except OSError:
+            return False
+    types_dir = pdir / "gid_attrs/types"
+    if not types_dir.is_dir():
+        types_dir = pdir / "gid_attr/types"
+    for gfile in (pdir / "gids").iterdir():
+        if not gfile.is_file() or not gfile.name.isdigit() or int(gfile.name) != idx:
+            continue
+        val = re.sub(r"\s+", "", gfile.read_text(encoding="utf-8", errors="replace").lower())
+        if not val or val == "0000:0000:0000:0000:0000:0000:0000:0000" or val.startswith("fe80:"):
+            return False
+        if types_dir.is_dir():
+            tfile = types_dir / gfile.name
+            if not tfile.is_file() or "roce v2" not in tfile.read_text(encoding="utf-8", errors="replace").lower():
+                return False
+        return True
+    return False
+
+
+def parse_port(raw_port: str) -> int:
+    match = re.match(r"[0-9]+", raw_port)
+    return int(match.group(0)) if match else 0
+
+
+invert = existing.startswith("^")
+rest = existing[1:] if invert else existing
+exact = rest.startswith("=")
+body = rest[1:] if exact else rest
+entries = []
+for raw_tok in body.split(","):
+    if not raw_tok:
+        continue
+    prefix, sep, port_str = raw_tok.partition(":")
+    if prefix:
+        entries.append((prefix, parse_port(port_str) if sep else None))
+
+
+def dev_matches(dev: str, prefix: str) -> bool:
+    return dev == prefix if exact else dev.startswith(prefix)
+
+
+out_tokens: list[str] = []
+for dev_dir in sorted(sysfs.iterdir()):
+    ports_dir = dev_dir / "ports"
+    if not dev_dir.is_dir() or not ports_dir.is_dir():
+        continue
+    dev = dev_dir.name
+    elig = sorted(
+        int(p.name)
+        for p in ports_dir.iterdir()
+        if p.name.isdigit() and int(p.name) > 0 and port_supports_gid(p, chosen)
+    )
+    if not elig:
+        continue
+    matched = [(prefix, port) for prefix, port in entries if dev_matches(dev, prefix)]
+    if not invert:
+        if not matched:
+            continue
+        wildcard = any(port is None for _, port in matched)
+        req_ports = {port for _, port in matched if port is not None}
+        kept = [p for p in elig if wildcard or p in req_ports]
+        if kept:
+            out_tokens.append(dev if wildcard and len(kept) == len(elig) else ",".join(f"{dev}:{p}" for p in kept))
+    else:
+        if any(port is None for _, port in matched):
             continue
         excluded_ports = {port for _, port in matched if port is not None}
-        ports_dir = sysfs / dev / "ports"
-        known_ports = (
-            sorted(int(p.name) for p in ports_dir.iterdir() if p.name.isdigit())
-            if ports_dir.is_dir()
-            else [1]
-        )
-        for port in known_ports or [1]:
-            if port not in excluded_ports:
-                out_tokens.append(f"{dev}:{port}")
+        kept = [p for p in elig if p not in excluded_ports]
+        if kept:
+            out_tokens.append(dev if len(kept) == len(elig) else ",".join(f"{dev}:{p}" for p in kept))
 
 if not out_tokens:
     raise SystemExit(

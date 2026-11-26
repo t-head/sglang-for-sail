@@ -4966,6 +4966,59 @@ class MultiNodeRecipeTest(unittest.TestCase):
             )
             self.assertEqual(run_plan("run-ci-ppu-multinode", True), [0, 1])
 
+            # 4) Overlapping earlier in-progress run (id 100 < 123) that passed pr-gate or plan
+            #    before named single-node matrix jobs materialize also suppresses duplicate 11 jobs.
+            runs_json.write_text(
+                json.dumps(
+                    {
+                        "workflow_runs": [
+                            {"id": 100, "status": "in_progress", "conclusion": None}
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            for inflight_jobs in (
+                [
+                    {
+                        "name": "pr-gate / approval",
+                        "status": "completed",
+                        "conclusion": "success",
+                    },
+                    {"name": "plan", "status": "in_progress", "conclusion": None},
+                ],
+                [
+                    {"name": "plan", "status": "completed", "conclusion": "success"},
+                    {"name": "ppu-build", "status": "in_progress", "conclusion": None},
+                    {
+                        "name": "evalscope-wheels",
+                        "status": "in_progress",
+                        "conclusion": None,
+                    },
+                ],
+            ):
+                jobs_json.write_text(
+                    json.dumps({"jobs": inflight_jobs}), encoding="utf-8"
+                )
+                self.assertEqual(run_plan("run-ci-ppu-multinode", True), [0, 1])
+
+            # 5) Prior run that only has gang job (no single-node ownership) must NOT suppress single-node.
+            jobs_json.write_text(
+                json.dumps(
+                    {
+                        "jobs": [
+                            {
+                                "name": "Model Sanity (qwen3.8-2.4t-mxfp4, 2x8)",
+                                "status": "in_progress",
+                                "conclusion": None,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(run_plan("run-ci-ppu-multinode", True), [11, 1])
+
     def test_recent_failures_ignores_passing_image_resolution_archive_and_catches_real_failures(
         self,
     ):
@@ -5099,6 +5152,129 @@ class MultiNodeRecipeTest(unittest.TestCase):
             self.assertEqual(
                 recipe_diagnostics.failure_reason(root), "eval_environment"
             )
+
+            # Reverse ordering: Rank 1 fails FIRST at multinode_network while Rank 0
+            # is still progressing through eval_environment -> must attribute multinode_network
+            # both before Rank 0 stops and after Rank 0 receives SIGTERM (143).
+            rev_root = Path(raw_root) / "peer-first"
+            rev_barrier = rev_root / "ranks/barrier"
+            (rev_root / "ranks/rank-1").mkdir(parents=True)
+            rev_barrier.mkdir(parents=True)
+            (rev_root / "recipe-phase.txt").write_text(
+                "cluster_worker\n", encoding="utf-8"
+            )
+            (rev_root / "worker-phase.txt").write_text(
+                "eval_environment\n", encoding="utf-8"
+            )
+            (rev_root / "ranks/rank-1/worker-phase.txt").write_text(
+                "multinode_network\n", encoding="utf-8"
+            )
+            r1_first = subprocess.run(
+                ["bash", "-c", fallback + '\nwrite_barrier_fallback "1"'],
+                env={
+                    **os.environ,
+                    "node_rank": "1",
+                    "barrier_dir": str(rev_barrier),
+                    "ranks_dir": str(rev_barrier.parent),
+                },
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(r1_first.returncode, 0, r1_first.stderr)
+            self.assertTrue((rev_barrier / "fail-rank-1.json").is_file())
+            self.assertEqual(
+                recipe_diagnostics.failure_reason(rev_root), "multinode_network"
+            )
+            r0_term = subprocess.run(
+                ["bash", "-c", fallback + '\nwrite_barrier_fallback "143"'],
+                env={
+                    **os.environ,
+                    "node_rank": "0",
+                    "barrier_dir": str(rev_barrier),
+                    "ranks_dir": str(rev_barrier.parent),
+                },
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(r0_term.returncode, 0, r0_term.stderr)
+            self.assertEqual(
+                recipe_diagnostics.failure_reason(rev_root), "multinode_network"
+            )
+
+    def test_gid_selector_and_pod_filter_enforce_per_port_gid_eligibility(self):
+        script = REPO_ROOT / "scripts/ci/ppu/recipe_multinode_gid_index.sh"
+        pod_text = (REPO_ROOT / "scripts/ci/ppu/run_recipe_pod.sh").read_text(
+            encoding="utf-8"
+        )
+        hca_block = pod_text[
+            pod_text.index('if [[ -s "$hca_list_file"') : pod_text.index(
+                "    GLOO_SOCKET_IFNAME="
+            )
+        ]
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            sysfs = root / "sysfs"
+            for dev, port, slot in ((0, 1, 3), (0, 2, 5), (1, 1, 3), (2, 1, 5)):
+                pdir = sysfs / f"mlx5_bond_{dev}/ports/{port}"
+                (pdir / "gids").mkdir(parents=True)
+                (pdir / "gid_attrs/types").mkdir(parents=True)
+                (pdir / "state").write_text("4: ACTIVE\n", encoding="utf-8")
+                (pdir / f"gids/{slot}").write_text(
+                    "fd03:0000:0000:0000:0000:0000:0000:0001\n", encoding="utf-8"
+                )
+                (pdir / f"gid_attrs/types/{slot}").write_text(
+                    "RoCE v2\n", encoding="utf-8"
+                )
+            hca_out = root / "rails.txt"
+            det = subprocess.run(
+                ["bash", str(script), "--hca-list-file", str(hca_out)],
+                env={**os.environ, "RECIPE_GID_SYSFS_ROOT": str(sysfs)},
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(det.returncode, 0, det.stderr)
+            self.assertEqual(det.stdout.strip(), "3")
+            self.assertEqual(hca_out.read_text().strip(), "=mlx5_bond_0:1,mlx5_bond_1")
+
+            def eval_filter(existing: str) -> subprocess.CompletedProcess:
+                return subprocess.run(
+                    [
+                        "bash",
+                        "-c",
+                        "set -e\n" + hca_block + '\nprintf "%s" "$NCCL_IB_HCA"',
+                    ],
+                    env={
+                        **os.environ,
+                        "RECIPE_GID_SYSFS_ROOT": str(sysfs),
+                        "NCCL_IB_GID_INDEX": "3",
+                        "hca_list_file": str(hca_out),
+                        "NCCL_IB_HCA": existing,
+                        "PCCL_IB_HCA": "",
+                    },
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+
+            no_ov = eval_filter("")
+            self.assertEqual(no_ov.returncode, 0, no_ov.stderr)
+            self.assertEqual(no_ov.stdout, "=mlx5_bond_0:1,mlx5_bond_1")
+
+            p1 = eval_filter("=mlx5_bond_0:1")
+            self.assertEqual(p1.returncode, 0, p1.stderr)
+            self.assertEqual(p1.stdout, "=mlx5_bond_0:1")
+
+            # Port 2 only exposes GID 5, not the selected GID 3 -> must fail closed!
+            p2 = eval_filter("=mlx5_bond_0:2")
+            self.assertNotEqual(p2.returncode, 0)
+
+            # Excluding port 1 must NOT activate ineligible port 2 on mlx5_bond_0.
+            neg_p1 = eval_filter("^=mlx5_bond_0:1")
+            self.assertEqual(neg_p1.returncode, 0, neg_p1.stderr)
+            self.assertEqual(neg_p1.stdout, "=mlx5_bond_1")
 
     @unittest.skipUnless(
         all(shutil.which(tool) for tool in ("jq", "sha256sum")),
