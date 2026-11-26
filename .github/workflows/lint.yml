@@ -83,7 +83,9 @@ jobs:
         run: node --test .github/actions/check-pr-test-health/action.test.cjs
 
       - name: Test PPU Nightly dispatch
-        run: node --test scripts/ci/ppu/test_nightly_dispatch.cjs
+        run: |
+          node --test scripts/ci/ppu/test_nightly_dispatch.cjs
+          node --test scripts/ci/ppu/test_ppu_approval.cjs
 
       # docs/ (Mintlify) internal-link check. Runs only in CI — contributors
       # are NOT required to install `mint` for local pre-commit. External links

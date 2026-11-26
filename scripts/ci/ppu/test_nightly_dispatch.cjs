@@ -306,29 +306,159 @@ test("extractJobSecrets detects missing binding moved to another job or plan.env
   assert.throws(() => extractJobSecrets(duplicatedInJob, "release-v0523"), /Duplicate secret/);
 });
 
-test("default branch registers pull_request_target label triggers for PR and Nightly PPU workflows", () => {
+function parseInlineList(raw) {
+  const match = /^\[\s*(.*?)\s*\]$/.exec(raw.trim());
+  assert.ok(match, `Expected YAML inline list, got: ${raw}`);
+  if (!match[1]) return [];
+  return match[1].split(",").map(item => item.trim().replace(/^(['"])(.*)\1$/, "$2"));
+}
+
+function parseWorkflowEvents(workflowText) {
+  const lines = workflowText.split(/\r?\n/);
+  const meaningful = line => {
+    const trimmed = line.trim();
+    return trimmed !== "" && !trimmed.startsWith("#");
+  };
+  const indentOf = line => line.match(/^ */)[0].length;
+
+  const onLine = lines.findIndex(line => meaningful(line) && indentOf(line) === 0 && /^on:\s*(?:#.*)?$/.test(line));
+  assert.notEqual(onLine, -1, "Missing top-level on: section");
+
+  const events = Object.create(null);
+  let eventIndent = null;
+  let currentEvent = null;
+  let propIndent = null;
+  let currentProp = null;
+  let itemIndent = null;
+
+  for (let i = onLine + 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (!meaningful(line)) continue;
+    const spaces = indentOf(line);
+    if (spaces === 0) break;
+    eventIndent ??= spaces;
+    if (spaces === eventIndent) {
+      const m = /^\s*([A-Za-z0-9_-]+):\s*(?:#.*)?$/.exec(line);
+      assert.ok(m, `Malformed event entry: ${line}`);
+      currentEvent = m[1];
+      assert.equal(Object.hasOwn(events, currentEvent), false, `Duplicate event ${currentEvent}`);
+      events[currentEvent] = {inputs: []};
+      propIndent = null;
+      currentProp = null;
+      itemIndent = null;
+      continue;
+    }
+    assert.ok(currentEvent && spaces > eventIndent, `Unexpected indentation under on: ${line}`);
+    propIndent ??= spaces;
+    if (spaces === propIndent) {
+      const m = /^\s*([A-Za-z0-9_-]+):\s*(.*?)\s*(?:#.*)?$/.exec(line);
+      assert.ok(m, `Malformed event property under ${currentEvent}: ${line}`);
+      currentProp = m[1];
+      itemIndent = null;
+      if (currentProp === "branches" || currentProp === "types") {
+        events[currentEvent][currentProp] = m[2] ? parseInlineList(m[2]) : [];
+      }
+      continue;
+    }
+    if (currentProp === "inputs") {
+      itemIndent ??= spaces;
+      if (spaces === itemIndent) {
+        const m = /^\s*([A-Za-z0-9_-]+):\s*(?:#.*)?$/.exec(line);
+        assert.ok(m, `Malformed input key under ${currentEvent}.inputs: ${line}`);
+        events[currentEvent].inputs.push(m[1]);
+      }
+    } else if ((currentProp === "branches" || currentProp === "types") && /^\s*-\s+/.test(line)) {
+      itemIndent ??= spaces;
+      if (spaces === itemIndent) {
+        const val = line.replace(/^\s*-\s+/, "").replace(/\s*(?:#.*)?$/, "").replace(/^(['"])(.*)\1$/, "$2");
+        events[currentEvent][currentProp].push(val);
+      }
+    }
+  }
+  return events;
+}
+
+function assertDefaultBranchTriggerSchema(prWorkflow, nightlyWorkflow) {
+  const prEvents = parseWorkflowEvents(prWorkflow);
+  assert.deepEqual(prEvents.pull_request_target?.branches, ["yuhe/v1.0.0", "release/v0.5.23"]);
+  assert.deepEqual(
+    prEvents.pull_request_target?.types,
+    ["opened", "synchronize", "reopened", "labeled", "ready_for_review"],
+  );
+  assert.deepEqual(
+    prEvents.workflow_dispatch?.inputs,
+    ["preflight_only", "model_filter", "run_model_sanity", "run_all_tests", "run_legacy_sanity"],
+  );
+  assert.deepEqual(
+    prEvents.workflow_call?.inputs,
+    ["ref", "run_all_tests", "run_legacy_sanity"],
+  );
+  assert.match(prWorkflow, /^\s*uses:\s*\.\/\.github\/workflows\/ppu-approval\.yml\s*$/m);
+  assert.match(
+    prWorkflow,
+    /^\s*uses:\s*t-head\/sglang-for-sail\/\.github\/workflows\/pr-test-ppu\.yml@release\/v0\.5\.23\s*$/m,
+  );
+  assert.match(
+    prWorkflow,
+    /^\s*uses:\s*t-head\/sglang-for-sail\/\.github\/workflows\/pr-test-ppu\.yml@yuhe\/v1\.0\.0\s*$/m,
+  );
+  assert.match(prWorkflow, /^\s*pr-test-ppu-finish:\s*$/m);
+
+  const nightlyEvents = parseWorkflowEvents(nightlyWorkflow);
+  assert.deepEqual(nightlyEvents.pull_request_target?.branches, ["yuhe/v1.0.0", "release/v0.5.23"]);
+  assert.deepEqual(
+    nightlyEvents.pull_request_target?.types,
+    ["labeled", "synchronize", "reopened", "ready_for_review"],
+  );
+  assert.deepEqual(
+    nightlyEvents.workflow_dispatch?.inputs,
+    ["target_ref", "model_filter", "image_tag", "image_digest", "skip_wheel_build", "wheel_artifact_run_id"],
+  );
+  assert.match(nightlyWorkflow, /^\s*uses:\s*\.\/\.github\/workflows\/ppu-approval\.yml\s*$/m);
+  assert.match(
+    nightlyWorkflow,
+    /^\s*uses:\s*t-head\/sglang-for-sail\/\.github\/workflows\/nightly-test-ppu\.yml@release\/v0\.5\.23\s*$/m,
+  );
+  assert.match(
+    nightlyWorkflow,
+    /^\s*uses:\s*t-head\/sglang-for-sail\/\.github\/workflows\/nightly-test-ppu\.yml@yuhe\/v1\.0\.0\s*$/m,
+  );
+}
+
+test("default branch delegates pull_request_target label triggers and scopes assertions per event", () => {
   const prWorkflow = readFileSync(
     resolve(__dirname, "../../../.github/workflows/pr-test-ppu.yml"),
     "utf8",
   );
-  assert.match(prWorkflow, /^\s*pull_request_target:\s*$/m);
-  assert.match(prWorkflow, /branches:\s*\['yuhe\/v1\.0\.0',\s*'release\/\*\*'\]/);
-  for (const eventType of ["opened", "synchronize", "reopened", "labeled", "ready_for_review"]) {
-    assert.match(prWorkflow, new RegExp(`\\b${eventType}\\b`), `pr-test-ppu.yml must register ${eventType}`);
-  }
-  for (const inputName of ["preflight_only", "model_filter", "run_model_sanity", "run_all_tests", "run_legacy_sanity"]) {
-    assert.match(prWorkflow, new RegExp(`^\\s*${inputName}:\\s*$`, "m"), `pr-test-ppu.yml missing input ${inputName}`);
-  }
-
   const nightlyWorkflow = readFileSync(
     resolve(__dirname, "../../../.github/workflows/nightly-test-ppu.yml"),
     "utf8",
   );
-  assert.match(nightlyWorkflow, /^\s*pull_request_target:\s*$/m);
-  assert.match(nightlyWorkflow, /branches:\s*\['yuhe\/v1\.0\.0',\s*'release\/\*\*'\]/);
-  for (const eventType of ["labeled", "synchronize", "reopened", "ready_for_review"]) {
-    assert.match(nightlyWorkflow, new RegExp(`\\b${eventType}\\b`), `nightly-test-ppu.yml must register ${eventType}`);
-  }
+  assertDefaultBranchTriggerSchema(prWorkflow, nightlyWorkflow);
+
+  const reformattedQuotes = prWorkflow.replace(
+    "branches: ['yuhe/v1.0.0', 'release/v0.5.23']",
+    'branches: [ "yuhe/v1.0.0" , "release/v0.5.23" ]',
+  );
+  assertDefaultBranchTriggerSchema(reformattedQuotes, nightlyWorkflow);
+
+  const missingPrtSynchronize = prWorkflow.replace(
+    "types: [opened, synchronize, reopened, labeled, ready_for_review]",
+    "types: [opened, reopened, labeled, ready_for_review]",
+  );
+  assert.throws(() => assertDefaultBranchTriggerSchema(missingPrtSynchronize, nightlyWorkflow));
+
+  const missingDispatchInput = prWorkflow.replace(
+    /^      run_legacy_sanity:\n        description: "Run only the single-device DFlash and EAGLE3 checks"\n        type: boolean\n        default: false\n/m,
+    "",
+  );
+  assert.throws(() => assertDefaultBranchTriggerSchema(missingDispatchInput, nightlyWorkflow));
+
+  const missingNightlySynchronize = nightlyWorkflow.replace(
+    "types: [labeled, synchronize, reopened, ready_for_review]",
+    "types: [labeled, reopened, ready_for_review]",
+  );
+  assert.throws(() => assertDefaultBranchTriggerSchema(prWorkflow, missingNightlySynchronize));
 
   const tiers = JSON.parse(
     readFileSync(resolve(__dirname, "../opt_in_ci_tiers.json"), "utf8"),

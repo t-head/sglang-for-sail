@@ -1,9 +1,9 @@
 name: PR Test (PPU)
 
-# GitHub Actions only registers pull_request_target and workflow_dispatch event
-# subscriptions when the workflow exists on the default branch (sail_ci_cd).
-# Actual PR and dispatch runs execute the workflow definition from the target
-# base branch (for example release/v0.5.23, yuhe/v1.0.0, or main).
+# GitHub Actions loads pull_request_target workflows from the default branch
+# (sail_ci_cd). Verify PR label approval against the candidate head SHA here,
+# delegate execution to the target branch's reusable workflow, and publish the
+# top-level pr-test-ppu-finish status check on that PR head commit.
 on:
   push:
     branches: [main]
@@ -11,7 +11,7 @@ on:
     branches: [main]
     types: [opened, synchronize, reopened]
   pull_request_target:
-    branches: ['yuhe/v1.0.0', 'release/**']
+    branches: ['yuhe/v1.0.0', 'release/v0.5.23']
     types: [opened, synchronize, reopened, labeled, ready_for_review]
   workflow_dispatch:
     inputs:
@@ -54,19 +54,131 @@ on:
         default: false
 
 permissions:
+  actions: read
   contents: read
+  pull-requests: read
+
+concurrency:
+  group: >-
+    pr-test-ppu-dispatch-${{ inputs.run_legacy_sanity && 'legacy' || (inputs.run_model_sanity && 'model-sanity' || 'recipe') }}-${{
+      (github.event_name == 'pull_request_target' &&
+       github.event.action == 'labeled' &&
+       !contains(fromJSON('["run-ci","run-ci-ppu"]'), github.event.label.name)) &&
+      format('ignored-label-{0}', github.run_id) ||
+      github.event.pull_request.number || inputs.ref || github.ref
+    }}
+  cancel-in-progress: true
 
 defaults:
   run:
     shell: bash
 
 jobs:
+  pr-gate:
+    name: >-
+      ${{ (github.event_name == 'pull_request_target' && github.event.action == 'labeled' &&
+           !contains(fromJSON('["run-ci","run-ci-ppu"]'), github.event.label.name)) &&
+          'ignored-label-pr-gate' || 'pr-gate' }}
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      (github.event.action != 'labeled' ||
+       contains(fromJSON('["run-ci","run-ci-ppu"]'), github.event.label.name))
+    uses: ./.github/workflows/ppu-approval.yml
+    with:
+      label: run-ci-ppu
+
+  release-v0523:
+    needs: pr-gate
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      needs.pr-gate.outputs.approved == 'true' &&
+      github.base_ref == 'release/v0.5.23'
+    uses: t-head/sglang-for-sail/.github/workflows/pr-test-ppu.yml@release/v0.5.23
+    with:
+      ref: ${{ needs.pr-gate.outputs.sha }}
+      run_all_tests: false
+      run_legacy_sanity: false
+    secrets: inherit
+
+  yuhe-v100:
+    needs: pr-gate
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      needs.pr-gate.outputs.approved == 'true' &&
+      github.base_ref == 'yuhe/v1.0.0'
+    uses: t-head/sglang-for-sail/.github/workflows/pr-test-ppu.yml@yuhe/v1.0.0
+    with:
+      ref: ${{ needs.pr-gate.outputs.sha }}
+      run_all_tests: false
+      run_legacy_sanity: false
+    secrets: inherit
+
+  legacy-call:
+    if: github.event_name == 'workflow_call'
+    uses: ./.github/workflows/pr-test-ppu-extra.yml
+    with:
+      ref: ${{ inputs.ref }}
+      run_all_tests: ${{ inputs.run_all_tests }}
+    secrets: inherit
+
   require-target-branch:
     name: require-target-branch
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions: {}
     steps:
       - name: Require an active release or development branch ref
         run: |
-          printf '%s\n' '::error::Select release/v0.5.23, yuhe/v1.0.0, or main as the workflow branch (--ref); sail_ci_cd only registers the default-branch trigger schema.'
+          printf '%s\n' '::error::Select release/v0.5.23, yuhe/v1.0.0, or main as the workflow branch (--ref) when dispatching pr-test-ppu.yml.'
           exit 1
+
+  pr-test-ppu-finish:
+    name: >-
+      ${{ (github.event_name == 'pull_request_target' && github.event.action == 'labeled' &&
+           !contains(fromJSON('["run-ci","run-ci-ppu"]'), github.event.label.name)) &&
+          'ignored-label-pr-test-ppu-finish' || 'pr-test-ppu-finish' }}
+    needs: [pr-gate, release-v0523, yuhe-v100, legacy-call]
+    if: >-
+      always() && (
+        (github.event_name == 'pull_request_target' &&
+         (needs.pr-gate.result == 'failure' || needs.pr-gate.result == 'cancelled' ||
+          needs.pr-gate.outputs.approved == 'true')) ||
+        (github.event_name == 'workflow_call' && needs.legacy-call.result != 'skipped')
+      )
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Require successful delegated PPU PR validation
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          APPROVED_SHA: ${{ needs.pr-gate.outputs.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          NEEDS_JSON: ${{ toJson(needs) }}
+        run: |
+          if jq -e 'any(.[]; .result == "failure" or .result == "cancelled")' <<< "$NEEDS_JSON" >/dev/null; then
+            printf '%s\n' '::error::A PPU PR CI job failed or was cancelled.'
+            exit 1
+          fi
+          if [[ "$EVENT_NAME" == "workflow_call" ]]; then
+            jq -e '.["legacy-call"].result == "success"' <<< "$NEEDS_JSON" >/dev/null
+            printf '%s\n' 'Delegated PPU workflow_call validation passed.'
+            exit 0
+          fi
+          if [[ -z "$APPROVED_SHA" || "$APPROVED_SHA" != "$HEAD_SHA" ]]; then
+            printf '%s\n' '::error::Approved SHA does not match the current PR head SHA.'
+            exit 1
+          fi
+          case "$BASE_REF" in
+            release/v0.5.23) target_job="release-v0523" ;;
+            yuhe/v1.0.0) target_job="yuhe-v100" ;;
+            *)
+              printf '::error::Unsupported PPU PR target branch: %s\n' "$BASE_REF"
+              exit 1
+              ;;
+          esac
+          if ! jq -e --arg j "$target_job" '.[$j].result == "success"' <<< "$NEEDS_JSON" >/dev/null; then
+            printf '::error::Expected delegated job %s to succeed for %s.\n' "$target_job" "$BASE_REF"
+            exit 1
+          fi
+          printf 'PPU PR Fast Sanity passed for %s at %s.\n' "$BASE_REF" "$APPROVED_SHA"

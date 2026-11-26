@@ -1,12 +1,12 @@
 name: Nightly Test (PPU)
 
-# GitHub Actions only registers pull_request_target and workflow_dispatch event
-# subscriptions when the workflow exists on the default branch (sail_ci_cd).
-# Actual PR and dispatch runs execute the workflow definition from the target
-# base branch (for example release/v0.5.23 or yuhe/v1.0.0).
+# GitHub Actions loads pull_request_target workflows from the default branch
+# (sail_ci_cd). Verify run-ci + run-ci-ppu-nightly approval against the
+# candidate PR head SHA here and delegate full Model Sanity execution to the
+# target branch's reusable workflow.
 on:
   pull_request_target:
-    branches: ['yuhe/v1.0.0', 'release/**']
+    branches: ['yuhe/v1.0.0', 'release/v0.5.23']
     types: [labeled, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
@@ -36,19 +36,81 @@ on:
         default: ''
 
 permissions:
+  actions: read
   contents: read
+  pull-requests: read
+
+concurrency:
+  group: >-
+    ppu-nightly-pr-dispatch-${{
+      (github.event_name == 'pull_request_target' &&
+       github.event.action == 'labeled' &&
+       !contains(fromJSON('["run-ci","run-ci-ppu-nightly"]'), github.event.label.name)) &&
+      format('ignored-label-{0}', github.run_id) ||
+      github.event.pull_request.number || github.run_id
+    }}
+  cancel-in-progress: true
 
 defaults:
   run:
     shell: bash
 
 jobs:
+  pr-gate:
+    if: >-
+      github.repository == 't-head/sglang-for-sail' &&
+      github.event_name == 'pull_request_target' &&
+      (github.event.action != 'labeled' ||
+       contains(fromJSON('["run-ci","run-ci-ppu-nightly"]'), github.event.label.name))
+    uses: ./.github/workflows/ppu-approval.yml
+    with:
+      label: run-ci-ppu-nightly
+
+  release-v0523:
+    needs: pr-gate
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      needs.pr-gate.outputs.approved == 'true' &&
+      github.base_ref == 'release/v0.5.23'
+    uses: t-head/sglang-for-sail/.github/workflows/nightly-test-ppu.yml@release/v0.5.23
+    with:
+      ref: ${{ needs.pr-gate.outputs.sha }}
+      tier: model_sanity
+    secrets:
+      PPU_CI_K8S_RUNTIME_DIGEST: ${{ secrets.PPU_CI_K8S_RUNTIME_DIGEST }}
+      PPU_CI_RECIPE_IMAGE_REPO: ${{ secrets.PPU_CI_RECIPE_IMAGE_REPO }}
+      PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS: ${{ secrets.PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS }}
+      PPU_CI_NOTIFY_TARGETS_JSON: ${{ secrets.PPU_CI_NOTIFY_TARGETS_JSON }}
+      PPU_CI_NOTIFY_WEBHOOK_URL: ${{ secrets.PPU_CI_NOTIFY_WEBHOOK_URL }}
+      PPU_CI_NOTIFY_SIGNING_SECRET: ${{ secrets.PPU_CI_NOTIFY_SIGNING_SECRET }}
+      PPU_CI_NOTIFY_ROSTER_JSON: ${{ secrets.PPU_CI_NOTIFY_ROSTER_JSON }}
+
+  yuhe-v100:
+    needs: pr-gate
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      needs.pr-gate.outputs.approved == 'true' &&
+      github.base_ref == 'yuhe/v1.0.0'
+    uses: t-head/sglang-for-sail/.github/workflows/nightly-test-ppu.yml@yuhe/v1.0.0
+    with:
+      ref: ${{ needs.pr-gate.outputs.sha }}
+      tier: model_sanity
+    secrets:
+      PPU_CI_K8S_RUNTIME_DIGEST: ${{ secrets.PPU_CI_K8S_RUNTIME_DIGEST }}
+      PPU_CI_RECIPE_IMAGE_REPO: ${{ secrets.PPU_CI_RECIPE_IMAGE_REPO }}
+      PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS: ${{ secrets.PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS }}
+      PPU_CI_NOTIFY_TARGETS_JSON: ${{ secrets.PPU_CI_NOTIFY_TARGETS_JSON }}
+      PPU_CI_NOTIFY_WEBHOOK_URL: ${{ secrets.PPU_CI_NOTIFY_WEBHOOK_URL }}
+      PPU_CI_NOTIFY_SIGNING_SECRET: ${{ secrets.PPU_CI_NOTIFY_SIGNING_SECRET }}
+      PPU_CI_NOTIFY_ROSTER_JSON: ${{ secrets.PPU_CI_NOTIFY_ROSTER_JSON }}
+
   require-target-branch:
     name: require-target-branch
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions: {}
     steps:
       - name: Require an active release or development branch ref
         run: |
-          printf '%s\n' '::error::Select release/v0.5.23 or yuhe/v1.0.0 as the workflow branch (--ref); sail_ci_cd only registers the default-branch trigger schema.'
+          printf '%s\n' '::error::Select release/v0.5.23 or yuhe/v1.0.0 as the workflow branch (--ref) when dispatching nightly-test-ppu.yml.'
           exit 1

@@ -118,11 +118,11 @@ class TestPPUCISuite(CustomTestCase):
 class TestPPUCIWorkflow(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        path = RUNNER.parent.parent / ".github/workflows/pr-test-ppu.yml"
+        path = RUNNER.parent.parent / ".github/workflows/pr-test-ppu-extra.yml"
         cls.jobs = yaml.safe_load(path.read_text())["jobs"]
 
     def test_runtime_image_is_only_configured_by_runner_environment(self):
-        path = RUNNER.parent.parent / ".github/workflows/pr-test-ppu.yml"
+        path = RUNNER.parent.parent / ".github/workflows/pr-test-ppu-extra.yml"
         workflow = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
         for event in ("workflow_dispatch", "workflow_call"):
             self.assertNotIn("runtime_image", workflow["on"][event]["inputs"])
@@ -140,7 +140,7 @@ class TestPPUCIWorkflow(CustomTestCase):
             ("python/sglang/test/ci/ci_register.py", False),
             ("python/sglang/test/ci/ci_utils.py", False),
             ("test/run_suite.py", False),
-            (".github/workflows/pr-test-ppu.yml", True),
+            (".github/workflows/pr-test-ppu-extra.yml", True),
             ("scripts/ci/ppu/run_test.sh", True),
             ("python/sglang/srt/platforms/sail.py", True),
             ("scripts/ci/ppu/test_ppu_ci_suite.py", True),
@@ -162,7 +162,7 @@ class TestPPUCIWorkflow(CustomTestCase):
             self.jobs["ppu-sanity"]["needs"], ["check-changes", "pr-gate", "ppu-build"]
         )
         self.assertCountEqual(
-            self.jobs["pr-test-ppu-finish"]["needs"],
+            self.jobs["pr-test-ppu-extra-finish"]["needs"],
             ["pr-gate", "check-changes", "ppu-build", "ppu-sanity"],
         )
         self.assertEqual(
@@ -171,7 +171,7 @@ class TestPPUCIWorkflow(CustomTestCase):
             "&& needs.pr-gate.outputs.opted-in != 'false'",
         )
         self.assertEqual(
-            self.jobs["pr-test-ppu-finish"]["if"],
+            self.jobs["pr-test-ppu-extra-finish"]["if"],
             "always() && needs.check-changes.result != 'skipped' "
             "&& needs.pr-gate.outputs.opted-in != 'false'",
         )
@@ -216,7 +216,7 @@ class TestPPUCIWorkflow(CustomTestCase):
         self.assertIn("${{ matrix.runner }}", upload["with"]["name"])
 
     def test_finish_requires_successful_build_and_sanity_when_in_scope(self):
-        finish = self.jobs["pr-test-ppu-finish"]["steps"][0]
+        finish = self.jobs["pr-test-ppu-extra-finish"]["steps"][0]
         statuses = ("success", "failure", "cancelled", "skipped")
         for build, sanity, in_scope in itertools.product(
             statuses, statuses, (True, False)
@@ -224,7 +224,7 @@ class TestPPUCIWorkflow(CustomTestCase):
             with self.subTest(build=build, sanity=sanity, in_scope=in_scope):
                 needs = {
                     name: {"result": "success"}
-                    for name in self.jobs["pr-test-ppu-finish"]["needs"]
+                    for name in self.jobs["pr-test-ppu-extra-finish"]["needs"]
                 }
                 needs["ppu-build"] = {"result": build}
                 needs["ppu-sanity"] = {"result": sanity}
