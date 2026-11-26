@@ -1,0 +1,54 @@
+name: Nightly Test (PPU)
+
+# GitHub Actions only registers pull_request_target and workflow_dispatch event
+# subscriptions when the workflow exists on the default branch (sail_ci_cd).
+# Actual PR and dispatch runs execute the workflow definition from the target
+# base branch (for example release/v0.5.23 or yuhe/v1.0.0).
+on:
+  pull_request_target:
+    branches: ['yuhe/v1.0.0', 'release/**']
+    types: [labeled, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: Target branch or 40-char commit SHA (blank uses default/caller ref)
+        type: string
+        default: ''
+      model_filter:
+        description: Optional comma-separated Recipe model policy slugs (blank = all)
+        type: string
+        default: ''
+      image_tag:
+        description: Allowed runtime image tag (tag only, no registry or repository prefix)
+        type: string
+        default: ''
+      image_digest:
+        description: Optional immutable runtime image digest (sha256:<64-hex>)
+        type: string
+        default: ''
+      skip_wheel_build:
+        description: Skip wheel build (reuse wheel_artifact_run_id or run directly in prebuilt image)
+        type: boolean
+        default: false
+      wheel_artifact_run_id:
+        description: Optional prior run ID to reuse built wheels from when skip_wheel_build is true
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  require-target-branch:
+    name: require-target-branch
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Require an active release or development branch ref
+        run: |
+          printf '%s\n' '::error::Select release/v0.5.23 or yuhe/v1.0.0 as the workflow branch (--ref); sail_ci_cd only registers the default-branch trigger schema.'
+          exit 1

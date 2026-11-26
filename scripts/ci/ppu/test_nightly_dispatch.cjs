@@ -305,3 +305,36 @@ test("extractJobSecrets detects missing binding moved to another job or plan.env
   );
   assert.throws(() => extractJobSecrets(duplicatedInJob, "release-v0523"), /Duplicate secret/);
 });
+
+test("default branch registers pull_request_target label triggers for PR and Nightly PPU workflows", () => {
+  const prWorkflow = readFileSync(
+    resolve(__dirname, "../../../.github/workflows/pr-test-ppu.yml"),
+    "utf8",
+  );
+  assert.match(prWorkflow, /^\s*pull_request_target:\s*$/m);
+  assert.match(prWorkflow, /branches:\s*\['yuhe\/v1\.0\.0',\s*'release\/\*\*'\]/);
+  for (const eventType of ["opened", "synchronize", "reopened", "labeled", "ready_for_review"]) {
+    assert.match(prWorkflow, new RegExp(`\\b${eventType}\\b`), `pr-test-ppu.yml must register ${eventType}`);
+  }
+  for (const inputName of ["preflight_only", "model_filter", "run_model_sanity", "run_all_tests", "run_legacy_sanity"]) {
+    assert.match(prWorkflow, new RegExp(`^\\s*${inputName}:\\s*$`, "m"), `pr-test-ppu.yml missing input ${inputName}`);
+  }
+
+  const nightlyWorkflow = readFileSync(
+    resolve(__dirname, "../../../.github/workflows/nightly-test-ppu.yml"),
+    "utf8",
+  );
+  assert.match(nightlyWorkflow, /^\s*pull_request_target:\s*$/m);
+  assert.match(nightlyWorkflow, /branches:\s*\['yuhe\/v1\.0\.0',\s*'release\/\*\*'\]/);
+  for (const eventType of ["labeled", "synchronize", "reopened", "ready_for_review"]) {
+    assert.match(nightlyWorkflow, new RegExp(`\\b${eventType}\\b`), `nightly-test-ppu.yml must register ${eventType}`);
+  }
+
+  const tiers = JSON.parse(
+    readFileSync(resolve(__dirname, "../opt_in_ci_tiers.json"), "utf8"),
+  );
+  assert.deepEqual(tiers["ppu-extra"], {
+    label: "run-ci-ppu-extra",
+    workflows: [".github/workflows/pr-test-ppu-extra.yml"],
+  });
+});
