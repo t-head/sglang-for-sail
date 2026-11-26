@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+import weakref
 from typing import TYPE_CHECKING, Any, Callable, List
 
 import torch.cuda
@@ -18,12 +19,33 @@ from sglang.srt.eplb.expert_location import (
     get_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
-from sglang.srt.runtime_context import get_exec, get_model, get_parallel
+from sglang.srt.runtime_context import get_device, get_exec, get_model, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
 
 logger = logging.getLogger(__name__)
+
+
+def eplb_async_unavailable_reason() -> str | None:
+    """Check the topology and device supported by the async expert transport."""
+    if not get_exec().moe.enable_eplb:
+        return "EPLB is disabled"
+    if get_exec().moe.enable_eplb_async:
+        return "the host-mirror async backend is enabled"
+    if get_exec().moe.ep_dispatch_algorithm == "lp":
+        return "LP routing requires solver updates at the placement boundary"
+    if get_exec().moe.eplb_rebalance_layers_per_chunk not in (None, 1):
+        return "an explicit multi-layer chunk uses the existing rebalance path"
+    if get_exec().moe.elastic_ep_backend is not None:
+        return "elastic EP requires its existing expert update path"
+    if get_parallel().ep_size != get_parallel().tp_size:
+        return "async expert transfers require EP size equal to TP size"
+    if get_parallel().pp_size != 1:
+        return "async expert transfers do not support pipeline parallelism"
+    if str(get_device().device).split(":")[0] != "cuda":
+        return "async expert transfers require a CUDA device"
+    return None
 
 
 class EPLBManager:
@@ -69,6 +91,11 @@ class EPLBManager:
             f"[EPLBManager] system started, will rebalance per {self._rebalance_num_iterations} iterations."
         )
 
+        self._async_migrator = None
+        self._async_job = None
+        self._finalize_migrator = None
+        self._init_async_migrator()
+
         self._prepared_rebalance_metadata = None
         self._prepared_rebalance_apply_event = None
         self._prepared_update_layer_ids_chunks = None
@@ -82,6 +109,132 @@ class EPLBManager:
         self._async_main_generator = self._async_entrypoint()
         self._main_generator = self._entrypoint()
 
+    def _init_async_migrator(self):
+        from sglang.srt.distributed.parallel_state import get_moe_ep_group
+
+        reason = eplb_async_unavailable_reason()
+        if reason is not None:
+            logger.debug(
+                "[EPLBManager] asynchronous expert copies disabled: %s", reason
+            )
+            return
+
+        from sglang.srt.eplb.eplb_async_migrator import AsyncExpertMigrator
+        from sglang.srt.eplb.eplb_copy_engine import ExpertCopyEngine
+
+        group = get_moe_ep_group()
+        engine = ExpertCopyEngine.try_create(group)
+        ready = torch.tensor([int(engine is not None)], dtype=torch.int32)
+        dist.all_reduce(ready, op=dist.ReduceOp.MIN, group=group.cpu_group)
+        if not ready.item():
+            logger.warning(
+                "[EPLBManager] copy engine unavailable; using synchronous EPLB"
+            )
+            return
+        self._async_migrator = AsyncExpertMigrator(engine)
+
+    def on_model_loaded(self, model: nn.Module):
+        if self._async_migrator is None:
+            return
+        from sglang.srt.distributed.parallel_state import get_moe_ep_group
+        from sglang.srt.eplb.eplb_async_migrator import expert_storage_layout
+        from sglang.srt.eplb.eplb_copy_engine import PeerStagingUnavailable
+
+        group = get_moe_ep_group().cpu_group
+        weights = getattr(model, "routed_experts_weights_of_layer", None)
+        metadata = get_global_expert_location_metadata()
+        layout = (
+            expert_storage_layout(weights, metadata.num_local_physical_experts)
+            if metadata is not None
+            else None
+        )
+        layouts = [None] * dist.get_world_size(group)
+        dist.all_gather_object(layouts, layout, group=group)
+        if layout is None or any(item != layout for item in layouts):
+            logger.info(
+                "Copy-engine EPLB requires matching packed expert storage across EP ranks; using synchronous EPLB"
+            )
+            self._async_migrator = None
+            return
+        # Bind only the migrator: the manager's model getters retain the runner.
+        # Graceful process exit closes explicitly before distributed teardown.
+        self._finalize_migrator = weakref.finalize(self, self._async_migrator.close)
+        self._finalize_migrator.atexit = False
+        try:
+            self._async_migrator.prepare(weights, cpu_group=group, metadata=metadata)
+        except PeerStagingUnavailable as exc:
+            logger.warning("Cannot map peer staging; using synchronous EPLB: %s", exc)
+            self._finalize_migrator()
+            self._async_migrator = None
+            return
+        except BaseException:
+            self._finalize_migrator()
+            raise
+        logger.info(
+            "[EPLBManager] C++ copy engine ready for asynchronous layer-wise rebalance"
+        )
+
+    def close(self):
+        if self._finalize_migrator is not None:
+            self._finalize_migrator()
+        self._async_migrator = None
+        self._async_job = None
+        self._main_generator.close()
+        self._async_main_generator.close()
+
+    def _rebalance_async(self):
+        logger.info("[EPLBManager] rebalance start (async)")
+        passes = 0
+
+        dump_record_output = get_global_expert_distribution_recorder().dump_record(
+            output_mode="object"
+        )
+        if not self._check_rebalance_needed(
+            dump_record_output["average_utilization_rate_over_window"]
+        ):
+            return
+
+        model = self._get_model()
+        model_config = self._model_config
+        from sglang.srt.eplb.eplb_cpu_worker import PlannerConfig
+
+        job = self._async_migrator.start(
+            logical_count=dump_record_output["logical_count"],
+            old_metadata=get_global_expert_location_metadata(),
+            routed_experts_weights_of_layer=model.routed_experts_weights_of_layer,
+            planner_config=PlannerConfig.from_runtime(model_config),
+        )
+        self._async_job = job
+
+        while not self._async_migrator.placement_ready(job):
+            yield
+            passes += 1
+
+        new_expert_location_metadata = self._async_migrator.build_metadata(job)
+        self._log_rebalance_layout_before_update(
+            new_expert_location_metadata,
+            update_layer_ids=job.layer_ids,
+        )
+
+        for layer_id in job.layer_ids:
+            self._async_migrator.issue_layer(job, layer_id)
+            while True:
+                yield
+                passes += 1
+                if self._async_migrator.layer_ready(job, layer_id):
+                    break
+            self._async_migrator.install_layer(job, layer_id)
+
+        self._async_job = None
+
+        self._log_rebalance_layout_after_update(update_layer_ids=job.layer_ids)
+        logger.info(
+            "[EPLBManager] rebalance end (async) layers=%d passes=%d wall=%.3fs",
+            len(job.layer_ids),
+            passes,
+            time.time() - job.time_start,
+        )
+
     def on_forward_pass_end(self):
         if get_exec().moe.enable_eplb_async:
             next(self._async_main_generator)
@@ -89,6 +242,9 @@ class EPLBManager:
         next(self._main_generator)
 
     def reset_generator(self):
+        if self._async_migrator is not None:
+            self._async_migrator.cancel(self._async_job)
+            self._async_job = None
         self._prepared_rebalance_metadata = None
         self._prepared_rebalance_apply_event = None
         self._prepared_update_layer_ids_chunks = None
@@ -152,6 +308,10 @@ class EPLBManager:
             elastic_state.pending_ep_size is not None
             or elastic_state.scale_phase not in ("serving_expanded", "failed")
         ):
+            return
+
+        if self._async_migrator is not None and not is_post_scale_rebalance:
+            yield from self._rebalance_async()
             return
 
         mode = "async" if get_exec().moe.enable_eplb_async else "sync"

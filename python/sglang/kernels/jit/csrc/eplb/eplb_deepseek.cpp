@@ -1,8 +1,11 @@
 #include <ATen/Parallel.h>
 #include <torch/extension.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 namespace py = pybind11;
@@ -44,30 +47,30 @@ std::tuple<torch::Tensor, torch::Tensor> balanced_packing_cpu(torch::Tensor weig
   auto* rank_in_pack_ptr = rank_in_pack.data_ptr<int64_t>();
 
   at::parallel_for(0, num_layers, 0, [&](int64_t begin, int64_t end) {
-    std::vector<float> pack_weights(num_packs);
+    using Pack = std::pair<float, int64_t>;
+    std::vector<Pack> available;
+    available.reserve(num_packs);
     std::vector<int64_t> pack_items(num_packs);
     for (int64_t layer = begin; layer < end; ++layer) {
-      std::fill(pack_weights.begin(), pack_weights.end(), 0.0f);
+      available.clear();
+      for (int64_t pack = 0; pack < num_packs; ++pack) {
+        available.emplace_back(0.0f, pack);
+      }
+      // Initially ordered by rank, so equal loads already form a min-heap.
       std::fill(pack_items.begin(), pack_items.end(), 0);
       const auto row_offset = layer * num_groups;
       for (int64_t pos = 0; pos < num_groups; ++pos) {
         const int64_t group = indices_ptr[row_offset + pos];
-        int64_t best_pack = -1;
-        float best_weight = 0.0f;
-        for (int64_t pack = 0; pack < num_packs; ++pack) {
-          if (pack_items[pack] >= groups_per_pack) {
-            continue;
-          }
-          if (best_pack == -1 || pack_weights[pack] < best_weight) {
-            best_pack = pack;
-            best_weight = pack_weights[pack];
-          }
+        std::pop_heap(available.begin(), available.end(), std::greater<Pack>{});
+        auto& [load, pack] = available.back();
+        pack_index_ptr[row_offset + group] = pack;
+        rank_in_pack_ptr[row_offset + group] = pack_items[pack]++;
+        if (pack_items[pack] == groups_per_pack) {
+          available.pop_back();
+        } else {
+          load += weight_ptr[row_offset + group];
+          std::push_heap(available.begin(), available.end(), std::greater<Pack>{});
         }
-        TORCH_CHECK(best_pack != -1, "No available pack found");
-        pack_index_ptr[row_offset + group] = best_pack;
-        rank_in_pack_ptr[row_offset + group] = pack_items[best_pack];
-        pack_weights[best_pack] += weight_ptr[row_offset + group];
-        pack_items[best_pack] += 1;
       }
     }
   });

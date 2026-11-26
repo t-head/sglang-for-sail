@@ -771,6 +771,8 @@ class ModelRunner:
             draft_model_idx=self.draft_model_idx,
         )
         self.maybe_apply_post_load_model_transforms()
+        if self.eplb_manager is not None:
+            self.eplb_manager.on_model_loaded(self.model)
         self.maybe_init_lora_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
@@ -837,6 +839,11 @@ class ModelRunner:
             if get_exec().moe.enable_eplb and (not self.is_draft_worker)
             else None
         )
+
+    def close_eplb(self):
+        if self.eplb_manager is not None:
+            self.eplb_manager.close()
+            self.eplb_manager = None
 
     def maybe_init_eplb_async_host_mirror(self):
         self.eplb_async_host_mirror_manager = None
