@@ -107,14 +107,24 @@ function fastSanityFixture(branch = base) {
   const target = branch === base ? "release-v0523" : "yuhe-v100";
   f.pr.base.ref = f.context.payload.pull_request.base.ref = branch;
   f.context.runId = 821;
-  const jobs = ["pr-test-ppu-finish", "ppu-fast-sanity / plan", "ppu-fast-sanity / Fast Sanity (qwen)"]
+  const jobs = ["pr-test-ppu-finish", "ppu-fast-sanity / plan", "ppu-fast-sanity / Fast Sanity (qwen)", "ppu-build"]
     .map(name => ({
-      name: target + " / " + name, run_attempt: 1, head_sha: head, status: "completed", conclusion: "success",
+      name: target + " / " + name, run_attempt: 1, head_sha: other, status: "completed", conclusion: "success",
     }));
-  jobs[2].steps = [{name: "Orchestrate PPU Pod with private logs", conclusion: "success"}];
-  f.github.rest.actions = {listJobsForWorkflowRun: Symbol("run jobs")};
+  jobs[2].steps = ["Fetch exact candidate bundle", "Upload checked public evidence"]
+    .map(name => ({name, conclusion: "success"}));
+  jobs[3].steps = [{name: "Upload PPU wheels", conclusion: "success"}];
+  const artifacts = [{name: "ppu-wheels-821-1-" + head, expired: false, size_in_bytes: 2048}];
+  f.github.rest.actions = {
+    listJobsForWorkflowRun: Symbol("run jobs"),
+    listWorkflowRunArtifacts: Symbol("run artifacts"),
+  };
   const paginate = f.github.paginate;
   f.github.paginate = async (route, args) => {
+    if (route === f.github.rest.actions.listWorkflowRunArtifacts) {
+      assert.deepEqual(args, {...f.context.repo, run_id: 821, name: "ppu-wheels-821-1-" + head, per_page: 100});
+      return artifacts;
+    }
     if (route !== f.github.rest.actions.listJobsForWorkflowRun) return paginate(route, args);
     assert.deepEqual(args, {...f.context.repo, run_id: 821, filter: "all", per_page: 100});
     return jobs;
@@ -123,7 +133,7 @@ function fastSanityFixture(branch = base) {
     "pr-gate": {result: "success", outputs: {approved: "true", sha: head}},
     [target]: {result: "success"},
   };
-  return {...f, jobs, target};
+  return {...f, jobs, artifacts, target};
 }
 
 test("both target branches require successful PPU execution on the approved head", async () => {
@@ -144,10 +154,17 @@ test("approval and the delegated job alone cannot satisfy the release check", as
     f => { f.needs["pr-gate"].outputs.sha = other; },
     f => { f.needs[f.target].result = "skipped"; },
     f => { f.jobs.length = 0; },
-    f => { f.jobs.pop(); },
+    f => { f.jobs.splice(2, 1); },
     f => { f.jobs[0].conclusion = "skipped"; },
-    f => { f.jobs[2].head_sha = other; },
+    f => { f.jobs[3].conclusion = "skipped"; },
+    f => { f.jobs[3].steps[0].conclusion = "skipped"; },
+    f => { f.artifacts.length = 0; },
+    f => { f.artifacts[0].name = "ppu-wheels-821-1-" + other; },
+    f => { f.artifacts[0].name = "ppu-wheels-821-2-" + head; },
+    f => { f.artifacts[0].expired = true; },
+    f => { f.artifacts[0].size_in_bytes = 0; },
     f => { f.jobs[2].steps[0].conclusion = "skipped"; },
+    f => { f.jobs[2].steps[1].conclusion = "skipped"; },
     f => { f.jobs[2].name = f.jobs[2].name.replace("Fast Sanity", "Model Sanity"); },
     f => { f.jobs.push({...f.jobs[2], run_attempt: 2, conclusion: "failure"}); },
     f => { f.jobs[2].run_attempt = 2; }, // The old summary predates the new model job.

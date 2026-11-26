@@ -30,13 +30,15 @@ module.exports = async function requireFastSanity({github, context, needs}) {
       latestByName.set(job.name, job);
     }
   }
-  const passed = job => job?.status === "completed" && job.conclusion === "success" &&
-    job.head_sha === pr.head.sha;
+  const passed = job => job?.status === "completed" && job.conclusion === "success";
+  const stepPassed = (job, name) => job.steps?.some(step => step.name === name && step.conclusion === "success");
   const sanity = target + " / ppu-fast-sanity";
+  const build = latestByName.get(target + " / ppu-build");
   const plan = latestByName.get(sanity + " / plan");
   const summary = latestByName.get(target + " / pr-test-ppu-finish");
   // A skipped reusable workflow is recorded under its bare name, with no child jobs.
-  if (!passed(summary) || !passed(plan) || summary.run_attempt < plan.run_attempt ||
+  if (!passed(build) || !stepPassed(build, "Upload PPU wheels") || !passed(plan) || !passed(summary) ||
+      build.run_attempt > plan.run_attempt || summary.run_attempt < plan.run_attempt ||
       [target, sanity].some(name => latestByName.get(name)?.run_attempt >= plan.run_attempt)) {
     throw new Error("The delegated workflow did not complete Fast Sanity for this PR head.");
   }
@@ -44,9 +46,19 @@ module.exports = async function requireFastSanity({github, context, needs}) {
     job.name.startsWith(sanity + " / Fast Sanity (") && job.run_attempt >= plan.run_attempt
   );
   const ranModel = job => passed(job) && job.run_attempt <= summary.run_attempt &&
-    job.steps?.some(step => step.name === "Orchestrate PPU Pod with private logs" && step.conclusion === "success");
+    stepPassed(job, "Fetch exact candidate bundle") && stepPassed(job, "Upload checked public evidence");
   if (!models.length || !models.every(ranModel)) {
     throw new Error("Expected successful PPU execution for every Fast Sanity model on this PR head.");
+  }
+
+  // Both callees upload an immutable wheel bundle named for the checkout SHA
+  // and pass its artifact ID to the model jobs. The run's head_sha is event metadata.
+  const name = `ppu-wheels-${context.runId}-${build.run_attempt}-${pr.head.sha}`;
+  const wheels = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
+    ...context.repo, run_id: context.runId, name, per_page: 100,
+  });
+  if (!wheels.some(artifact => artifact.name === name && artifact.expired === false && artifact.size_in_bytes > 0)) {
+    throw new Error("The Fast Sanity wheel bundle is missing for the approved PR head and build attempt.");
   }
 
   const current = await approval.resolve({github, context, label: "run-ci-ppu", ref: pr.head.sha});
