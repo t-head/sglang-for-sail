@@ -68,7 +68,9 @@ def speculative_sampling_classic_kernel(
                 + (step - 1) * stride_dp_s
                 + draft_token * stride_dp_v
             )
-            q_is_prob = (q > 0.0) & (q <= 1.0)
+            # q only has to be a usable (strictly positive) probability; see the
+            # accept test below for why the upper bound is absent.
+            q_is_prob = q > 0.0
             prefix_prob = tl.where(q_is_prob, tl.minimum(prefix_prob * p / q, 1.0), 0.0)
             prefix_probs += (prefix_prob,)
 
@@ -144,8 +146,12 @@ def speculative_sampling_classic_kernel(
                 + draft_token * stride_dp_v
             )
             coin = tl.load(uni_ptr_base + (step - 1) * stride_uni_s)
-            # A proposal token must have positive probability under its draft distribution.
-            q_is_prob = (q > 0.0) & (q <= 1.0)
+            # A proposal token must have positive probability under its draft
+            # distribution. Only the lower bound is tested: a numerically one-hot
+            # softmax row can round to just above 1.0 (e.g. 1.0000068), and the
+            # former `q <= 1.0` upper bound rejected every such draft outright --
+            # the coin never took part -- which silently collapsed the accept rate.
+            q_is_prob = q > 0.0
             if q_is_prob & (coin * q < p):
                 num_accept += 1
                 cur_prob_row = step
@@ -188,10 +194,13 @@ def speculative_sampling_classic_kernel(
             else:
                 q_ptr = dp_base_ptr_safe + v_offsets * stride_dp_v
                 q_val = tl.load(q_ptr, mask=mask, other=0.0)
-                # Treat any non-probability q (NaN, +-inf, negative) as 0: the
-                # residual falls back to p. A comparison against NaN is false, so
-                # the range test rejects it along with the infinities.
-                q_val = tl.where((q_val >= 0.0) & (q_val <= 1.0), q_val, 0.0)
+                # Treat an unusable q (NaN, +-inf, negative) as 0 so the residual
+                # falls back to p. A comparison against NaN is false, so it is
+                # rejected along with the infinities. A q that merely rounded to
+                # just above 1.0 is clamped to 1.0, NOT zeroed: the draft row said
+                # that token essentially certain, so zeroing it would wrongly
+                # credit the whole of p to the residual.
+                q_val = tl.where(q_val >= 0.0, tl.minimum(q_val, 1.0), 0.0)
                 diff = residual_scale * p_val - q_val
                 val = tl.where(diff > 0.0, diff, 0.0)
 
@@ -219,7 +228,7 @@ def speculative_sampling_classic_kernel(
                 q_ptr = dp_base_ptr_safe + v_offsets * stride_dp_v
                 q_val = tl.load(q_ptr, mask=mask, other=0.0)
                 # Same guard as pass 1.
-                q_val = tl.where((q_val >= 0.0) & (q_val <= 1.0), q_val, 0.0)
+                q_val = tl.where(q_val >= 0.0, tl.minimum(q_val, 1.0), 0.0)
                 diff = residual_scale * p_val - q_val
                 val = tl.where(diff > 0.0, diff, 0.0)
 
