@@ -203,10 +203,11 @@ with interchangeable implementations along **two independent dimensions**:
     `torch.compile(forward_native)`.
   - `forward_triton` / `forward_jit` / `forward_aot` / `forward_cute_dsl` /
     `forward_helion` / `forward_kda` / `forward_cake` / `forward_plugin` /
-    `forward_flashinfer` / `forward_deepgemm` / `forward_aiter` /
-    `forward_torch_npu` — opt-in overrides. A backend is *available* iff its
-    method is overridden; it joins **auto-selection** only when also declared
-    in `capabilities` (device support is metadata, not guesswork).
+    `forward_flashinfer` / `forward_flashmla` / `forward_deepgemm` /
+    `forward_aiter` / `forward_torch_npu` — opt-in overrides. A backend is
+    *available* iff its method is overridden; it joins **auto-selection** only
+    when also declared in `capabilities` (device support is metadata, not
+    guesswork).
 - **Platforms / devices** — optional composite per-device paths:
   `forward_cuda`, `forward_hip` (falls back to `forward_cuda`),
   `forward_npu`, `forward_xpu`, `forward_musa` (no implicit CUDA fallback —

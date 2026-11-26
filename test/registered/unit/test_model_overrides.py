@@ -4413,6 +4413,80 @@ class TestKimiK31DsaBackends(CustomTestCase):
                             fallback if sm == 80 else sm89_result,
                         )
 
+    def test_ppu_q8_fp8_kv_cache_uses_only_active_pd_roles(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _ppu_flashmla_fp8_kv_cache_fallback,
+        )
+
+        for mode, prefill, decode, expected in (
+            ("prefill", "flashmla_sparse_q8", "flashmla_kv", {}),
+            (
+                "prefill",
+                "flashmla_sparse",
+                "flashmla_sparse_q8",
+                {"kv_cache_dtype": "auto"},
+            ),
+            ("decode", "flashmla_sparse", "flashmla_sparse_q8", {}),
+            (
+                "decode",
+                "flashmla_sparse_q8",
+                "flashmla_sparse",
+                {"kv_cache_dtype": "auto"},
+            ),
+            ("null", "flashmla_sparse_q8", "flashmla_sparse_q8", {}),
+            ("null", "flashmla_sparse_q8", "flashmla_kv", {"kv_cache_dtype": "auto"}),
+        ):
+            view = ResolvedView(
+                SimpleNamespace(
+                    kv_cache_dtype="fp8_e4m3",
+                    attention_backend="dsa",
+                    prefill_attention_backend=None,
+                    decode_attention_backend=None,
+                    dsa_prefill_backend=prefill,
+                    dsa_decode_backend=decode,
+                    disaggregation_mode=mode,
+                )
+            )
+            with (
+                self.subTest(mode=mode, prefill=prefill, decode=decode),
+                patch("sglang.srt.utils.common.is_sail", return_value=True),
+                override_platform(device_sm=89),
+            ):
+                self.assertEqual(_ppu_flashmla_fp8_kv_cache_fallback(view), expected)
+
+    def test_ppu_q8_fp8_kv_cache_requires_dsa_for_each_active_role(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _ppu_flashmla_fp8_kv_cache_fallback,
+        )
+
+        fallback = {"kv_cache_dtype": "auto"}
+        for mode, prefill_attention, decode_attention, expected in (
+            ("null", None, "flashmla", fallback),
+            ("prefill", None, "flashmla", {}),
+            ("decode", "flashmla", None, {}),
+        ):
+            view = ResolvedView(
+                SimpleNamespace(
+                    kv_cache_dtype="fp8_e4m3",
+                    attention_backend="dsa",
+                    prefill_attention_backend=prefill_attention,
+                    decode_attention_backend=decode_attention,
+                    dsa_prefill_backend="flashmla_sparse_q8",
+                    dsa_decode_backend="flashmla_sparse_q8",
+                    disaggregation_mode=mode,
+                )
+            )
+            with (
+                self.subTest(mode=mode),
+                patch("sglang.srt.utils.common.is_sail", return_value=True),
+                override_platform(device_sm=89),
+            ):
+                self.assertEqual(
+                    _ppu_flashmla_fp8_kv_cache_fallback(view), expected
+                )
+
     def test_ppu_kimi_kv_cache_resolution_from_user_input(self):
         """Kimi's auto-to-FP8 default must reach the later PPU fallback."""
         from sglang.srt.arg_groups.overrides import (

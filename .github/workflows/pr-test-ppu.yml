@@ -23,7 +23,7 @@ on:
         type: boolean
         default: true
       run_legacy_sanity:
-        description: "Run only the single-device DFlash and EAGLE3 checks"
+        description: "Run the single-device DFlash, EAGLE3 and native-Q8 checks"
         type: boolean
         default: false
   workflow_call:
@@ -39,7 +39,7 @@ on:
         type: boolean
         default: false
       run_legacy_sanity:
-        description: "Run only the single-device DFlash and EAGLE3 checks"
+        description: "Run the single-device DFlash, EAGLE3 and native-Q8 checks"
         type: boolean
         default: false
 

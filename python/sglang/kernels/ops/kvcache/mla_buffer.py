@@ -393,7 +393,14 @@ def set_mla_kv_buffer_fp8_quant_kernel(
     safe_loc = tl.where(is_valid, loc, 0)
     dst_ptr = kv_buffer_fp8_ptr + safe_loc * buffer_stride + offs
 
-    if base + BLOCK <= nope_dim:
+    if rope_dim == 0:
+        # NoPE has no backing RoPE storage; compile out every RoPE access.
+        src = tl.load(
+            cache_k_nope_ptr + pid_loc * nope_stride + offs,
+            mask=mask,
+            other=0.0,
+        )
+    elif base + BLOCK <= nope_dim:
         src = tl.load(
             cache_k_nope_ptr + pid_loc * nope_stride + offs,
             mask=mask,

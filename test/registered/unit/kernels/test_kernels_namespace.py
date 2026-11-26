@@ -19,6 +19,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=26, suite="base-a-test-cpu")
 
 _CPU = PlatformInfo(device_type="cpu")
+_SM89 = PlatformInfo(device_type="cuda", cuda_arch_major=8, cuda_arch_minor=9)
 _SM90 = PlatformInfo(device_type="cuda", cuda_arch_major=9, cuda_arch_minor=0)
 _SM100 = PlatformInfo(device_type="cuda", cuda_arch_major=10, cuda_arch_minor=0)
 _HIP = PlatformInfo(device_type="hip")
@@ -30,6 +31,20 @@ def test_single_backend_resolves_without_backend():
         K.select_kernel("kvcache.reshape_and_cache_flash").backend
         is KernelBackend.TRITON
     )
+
+
+def test_ppu_flashmla_sparse_quantized_kernel_is_inventoried():
+    op = "attention.flash_mla_sparse_quantized_fwd"
+    spec = K.registry.get_backend(op, KernelBackend.FLASHMLA)
+    assert (
+        spec.target
+        == "sglang.kernels.ops.attention.ppu_flash_mla:flash_mla_sparse_quantized_fwd"
+    )
+    assert _module_defines("sglang.kernels.ops.attention", op.split(".", 1)[1])
+    assert _module_defines(*spec.target.split(":", 1))
+    assert K.capabilities_satisfied(spec.capabilities, _SM89)
+    assert not K.capabilities_satisfied(spec.capabilities, _SM90)
+    assert not K.capabilities_satisfied(spec.capabilities, _CPU)
 
 
 def test_shuffle_weighted_sum_has_one_native_primary_backend():

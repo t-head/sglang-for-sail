@@ -21,10 +21,22 @@ VERSION_RE = re.compile(
     r"\d+(?:\.\d+){1,3}(?:(?:a|b|rc|\.post|\.dev)\d+){0,2}(?:\+[A-Za-z0-9_-]{1,24})?"
 )
 LEGACY_SCHEMA = "ppu-legacy-sanity/v1"
-LEGACY_CASES = {
+SM89_BOARD = "ZW-M890P"
+CORE_LEGACY_CASES = {
     "test_basic_sanity_dflash.py": "dflash",
     "test_basic_sanity_eagle3.py": "eagle3",
 }
+NATIVE_Q8_LEGACY_CASES = {
+    "test_dsa_native_q8_ppu.py": "native_q8",
+    "bench_dsa_native_q8_ppu.py": "native_q8_benchmark",
+}
+LEGACY_CASES = CORE_LEGACY_CASES | NATIVE_Q8_LEGACY_CASES
+
+
+def legacy_cases_for_board(board):
+    return LEGACY_CASES if board == SM89_BOARD else CORE_LEGACY_CASES
+
+
 FAST = {"layer_override", "fallback_reason"}
 NIGHTLY = {
     "gsm8k_score",
@@ -65,7 +77,7 @@ def validate_legacy(payload):
         or payload["outcome"] not in {"pass", "fail"}
         or type(payload["private_retention"]) is not bool
         or type(payload["cases"]) is not dict
-        or set(payload["cases"]) != set(LEGACY_CASES.values())
+        or set(payload["cases"]) != set(legacy_cases_for_board(payload["board"]).values())
     ):
         raise ValueError("invalid legacy run identity")
     for case in payload["cases"].values():

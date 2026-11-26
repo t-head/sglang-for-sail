@@ -885,10 +885,21 @@ class RunEvidenceTest(unittest.TestCase):
                 {
                     "dflash": {"status": "fail", "duration_s": 230.2},
                     "eagle3": {"status": "not_run", "duration_s": None},
+                    "native_q8": {"status": "not_run", "duration_s": None},
+                    "native_q8_benchmark": {"status": "not_run", "duration_s": None},
                 },
             )
             with self.assertRaises(ValueError):
                 validate({**result, "outcome": "pass"})
+            validate(
+                {
+                    **result,
+                    "board": "OAM-810E",
+                    "cases": {
+                        key: result["cases"][key] for key in ("dflash", "eagle3")
+                    },
+                }
+            )
             console = io.StringIO()
             artifact, summary = root / "artifact.json", root / "summary"
             publish(result, artifact, summary, console)

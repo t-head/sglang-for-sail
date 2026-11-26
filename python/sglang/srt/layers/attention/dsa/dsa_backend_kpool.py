@@ -42,6 +42,10 @@ class DeepseekSparseAttnBackendKPoolMixin:
         dsa_impl: _DSA_IMPL_T,
         phase: str,
     ) -> None:
+        if dsa_impl == "flashmla_sparse_q8" and getattr(
+            self, "_ppu_native_flat_fp8", False
+        ):
+            return  # Native q8 consumes absolute tail IDs in both phases.
         # q8 prefill consumes the tail columns as ragged ids, like the history
         # picks. Only over a bfloat16 pool: gathering packed fp8 rows through
         # kpool tail columns is untested, so that combination keeps the guard.
