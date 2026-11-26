@@ -11,6 +11,7 @@ PHASES = {
     "eval_environment",
     "platform_check",
     "recipe_validation",
+    "unit_test",
     "model_cache_check",
     "server_startup",
     "server_exit",

@@ -7,6 +7,14 @@ on:
     types: [labeled, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
+      tier:
+        description: PPU workload to run
+        type: choice
+        default: model_sanity
+        options:
+          - model_sanity
+          - light_perf
+          - unit_test
       target_ref:
         description: Target branch or 40-char commit SHA (blank uses default/caller ref)
         type: string
@@ -102,12 +110,13 @@ jobs:
   pr-gate:
     if: >-
       github.repository == 't-head/sglang-for-sail' &&
+      ((inputs.tier != 'light_perf' && inputs.tier != 'unit_test') || github.event_name == 'workflow_dispatch') &&
       (github.event_name != 'pull_request_target' || inputs.tier == 'fast_sanity' ||
        github.event.action != 'labeled' ||
        contains(fromJSON('["run-ci","run-ci-ppu-nightly"]'), github.event.label.name))
     uses: ./.github/workflows/ppu-approval.yml
     with:
-      label: ${{ inputs.tier == 'fast_sanity' && 'run-ci-ppu' || 'run-ci-ppu-nightly' }}
+      label: ${{ (inputs.tier == 'fast_sanity' || inputs.tier == 'light_perf' || inputs.tier == 'unit_test') && 'run-ci-ppu' || 'run-ci-ppu-nightly' }}
       ref: ${{ inputs.target_ref || inputs.ref || '' }}
 
   cluster-preflight:
@@ -145,6 +154,7 @@ jobs:
       input-artifact-id: ${{ steps.plan.outputs.artifact }}
       input-run-id: ${{ steps.plan.outputs.run_id }}
       skip-wheel-install: ${{ steps.plan.outputs.skip_wheel_install }}
+      unit-test-deps: ${{ steps.unit-test-deps.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -182,7 +192,11 @@ jobs:
           fi
           python3 -B scripts/ci/ppu/recipe_image.py validate-inputs \
             --image-tag "$IMAGE_TAG" --image-digest "$IMAGE_DIGEST"
-          models=$(python3 -B scripts/ci/ppu/recipe_select.py "$TIER" --model-filter "$MODEL_FILTER")
+          if [[ "$TIER" == unit_test ]]; then
+            models='{"include":[{"model":"ppu-unit-0","ppu_count":1,"board":"ZW-M890P"},{"model":"ppu-unit-1","ppu_count":1,"board":"ZW-M890P"}]}'
+          else
+            models=$(python3 -B scripts/ci/ppu/recipe_select.py "$TIER" --model-filter "$MODEL_FILTER")
+          fi
           SKIP_WHEEL_INSTALL=false
           if [[ "$SKIP_BUILD" == true ]]; then
             if [[ -n "$WHEEL_ID" ]]; then
@@ -220,6 +234,47 @@ jobs:
           fi
           printf 'source=%s\nmodels=%s\nartifact=%s\nrun_id=%s\nskip_wheel_install=%s\n' \
             "$source" "$models" "$WHEEL_ID" "$WHEEL_RUN" "$SKIP_WHEEL_INSTALL" >> "$GITHUB_OUTPUT"
+      - name: Prepare offline test dependencies for PPU workers
+        if: inputs.tier == 'unit_test'
+        run: |
+          python3 -m pip wheel --only-binary=:all: --wheel-dir unit-test-deps pytest tabulate
+      - name: Upload offline test dependencies
+        if: inputs.tier == 'unit_test'
+        id: unit-test-deps
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-unit-test-deps-${{ github.run_attempt }}
+          path: unit-test-deps/
+          if-no-files-found: error
+
+  cpu-unit-test:
+    name: CPU Unit Tests (shard ${{ matrix.shard }})
+    needs: plan
+    if: inputs.tier == 'unit_test'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.source-sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v5
+      - name: Install CPU test dependencies
+        env:
+          UV_SYSTEM_PYTHON: '1'
+          SGLANG_BUILD_RUST_EXTS: none
+        run: uv pip install -e 'python[dev]' --index-strategy unsafe-best-match --prerelease allow --torch-backend cpu
+      - name: Run registered CPU tests
+        env:
+          UNIT_TEST_SHARD: ${{ matrix.shard }}
+        run: bash scripts/ci/ppu/run_unit_suite.sh cpu "$UNIT_TEST_SHARD"
 
   ppu-build:
     needs: plan
@@ -275,7 +330,7 @@ jobs:
 
   evalscope-wheels:
     needs: plan
-    if: inputs.tier != 'fast_sanity'
+    if: (inputs.tier || 'model_sanity') == 'model_sanity'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     outputs:
@@ -312,18 +367,19 @@ jobs:
   recipe-sanity:
     outputs:
       result: ${{ steps.cluster.outcome }}
-    name: ${{ inputs.tier == 'fast_sanity' && 'Fast Sanity' || 'Model Sanity' }} (${{ matrix.model }})
+    name: ${{ inputs.tier == 'unit_test' && 'PPU Unit Tests' || inputs.tier == 'light_perf' && 'Light Performance' || inputs.tier == 'fast_sanity' && 'Fast Sanity' || 'Model Sanity' }} (${{ matrix.model }})
     needs: [plan, ppu-build, evalscope-wheels]
     if: >-
       !cancelled() && needs.plan.result == 'success' &&
-      (inputs.tier == 'fast_sanity' || needs.evalscope-wheels.result == 'success') &&
+      (inputs.tier == 'fast_sanity' || inputs.tier == 'light_perf' || inputs.tier == 'unit_test' ||
+       needs.evalscope-wheels.result == 'success') &&
       (needs.ppu-build.result == 'success' ||
        ((needs.plan.outputs.input-artifact-id != '' || needs.plan.outputs.skip-wheel-install == 'true') &&
         needs.ppu-build.result == 'skipped'))
     runs-on: k8s-runner-group-cpu-thead
     container:
       image: ghcr.io/actions/actions-runner:latest
-    timeout-minutes: ${{ inputs.tier == 'fast_sanity' && 40 || 360 }}
+    timeout-minutes: ${{ inputs.tier == 'light_perf' && 140 || inputs.tier == 'unit_test' && 70 || inputs.tier == 'fast_sanity' && 40 || 360 }}
     strategy:
       fail-fast: false
       max-parallel: ${{ inputs.tier == 'fast_sanity' && 32 || 4 }}
@@ -331,6 +387,8 @@ jobs:
     env:
       MODEL_KEY: ${{ matrix.model }}
       RECIPE_PPU_COUNT: ${{ matrix.ppu_count || 8 }}
+      RECIPE_NNODES: ${{ matrix.nodes || 1 }}
+      PPU_CI_BOARD: ${{ matrix.board }}
       PPU_CI_SOURCE_SHA: ${{ needs.plan.outputs.source-sha }}
       PPU_CI_RUNTIME_IMAGE_TAG: ${{ inputs.image_tag || '' }}
       PPU_CI_RUNTIME_IMAGE_DIGEST: ${{ inputs.image_digest || '' }}
@@ -354,12 +412,19 @@ jobs:
           merge-multiple: true
           path: wheels
       - name: Fetch the isolated evaluator wheelhouse
-        if: inputs.tier != 'fast_sanity'
+        if: env.TIER == 'model_sanity'
         uses: actions/download-artifact@v4
         with:
           artifact-ids: ${{ needs.evalscope-wheels.outputs.artifact-id }}
           merge-multiple: true
           path: evalscope-wheels
+      - name: Fetch the offline unit test wheelhouse
+        if: inputs.tier == 'unit_test'
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.plan.outputs.unit-test-deps }}
+          merge-multiple: true
+          path: unit-test-deps
       - name: Fetch pinned Cluster Run backend
         uses: actions/checkout@v4
         with:

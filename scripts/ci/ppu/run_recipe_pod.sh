@@ -5,6 +5,11 @@ umask 077
 export PPU_CI_ARTIFACT_DIR=${PPU_CI_WORKER_ARTIFACT_DIR:?}
 [[ -d "$PPU_CI_ARTIFACT_DIR" && ! -L "$PPU_CI_ARTIFACT_DIR" &&
     $(stat -c %a -- "$PPU_CI_ARTIFACT_DIR") == 700 ]] || exit 2
+if [[ "${NNODES:-1}" == 2 && "${NODE_RANK:?}" == 1 ]]; then
+    [[ "$TIER" == light_perf ]]
+    PPU_CI_ARTIFACT_DIR="$PPU_CI_ARTIFACT_DIR/rank-1"
+    mkdir -m 700 -- "$PPU_CI_ARTIFACT_DIR"
+fi
 exec > "$PPU_CI_ARTIFACT_DIR/runtime.log" 2>&1
 # The runtime image may use a different UID than the CPU runner.
 # Return ownership before the runner validates and retains private evidence.
@@ -43,7 +48,8 @@ else
     cache_key=$(python3 -B scripts/ci/ppu/recipe_bundle.py cache-key "$PPU_CI_WHEEL_DIR" "$PPU_CI_SOURCE_SHA")
 fi
 [[ -d "${PPU_CI_HF_CACHE_ROOT:?}/hub" && -d /recipe-jit ]]
-[[ "${RECIPE_PPU_COUNT:?}" =~ ^(2|4|8)$ ]]
+[[ "${RECIPE_PPU_COUNT:?}" =~ ^(2|4|8)$ ||
+   ( ( "$TIER" == light_perf || "$TIER" == unit_test ) && "$RECIPE_PPU_COUNT" == 1 ) ]]
 if [[ "$TIER" == model_sanity ]]; then
     [[ -d "${PPU_CI_GSM8K_PATH:?}" ]]
     export PPU_CI_EVAL_WHEEL_DIR="$PWD/evalscope-wheels"

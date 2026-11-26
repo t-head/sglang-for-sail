@@ -19,6 +19,12 @@ The reusable workflow accepts the same boolean input and a candidate `ref`.
 
 ## Registered Unit Tests
 
+In GitHub Actions, open **Nightly Dispatch (PPU)**, click **Run workflow**,
+select the branch to test, and set `tier` to `unit_test`. It runs both registered
+suites with two shards each. CPU shards use hosted Linux runners. Each PPU shard
+uses one 890P card and keeps its raw logs in the private results archive under
+`unit_test`. The `target_ref` and `model_filter` fields are for model workloads.
+
 From the repository root, use the standard suite runner in an environment with
 the test dependencies installed. Select `base-a-test-cpu-ppu` to run the CPU
 files selected for PPU CI. Those files also keep their community
@@ -43,6 +49,78 @@ The eight GPU DCP push combine and DSA top-k merge tests use NVIDIA NVLink.
 The Mega MoE pre-dispatch test targets Blackwell. These tests retain their CUDA
 suites. The standalone DeepGEMM D32 reproducer remains available for manual
 validation of the legacy ABI.
+
+## Light Performance Pilot
+
+Light Perf runs prefill and decode with full-layer dummy weights. Each policy
+selects serving recipe presets and declares the benchmark engine, input shapes,
+and minimum throughput. Cases retain their original `one_batch` or
+`one_batch_server` engine. The server benchmark uses synthetic `random-ids`
+prompts. Each shape uses the lowest throughput measured for that shape in the
+three reference CI runs as its baseline
+([run 1](https://github.com/t-head/sglang-for-sail/actions/runs/45749088627),
+[run 2](https://github.com/t-head/sglang-for-sail/actions/runs/45781044140),
+[run 3](https://github.com/t-head/sglang-for-sail/actions/runs/45781086154)).
+Policies store the original measurements in token/s.
+`threshold.min_tokens_per_s` accepts a single baseline for the entire case
+or a mapping from every declared `input_len` to its own baseline.
+The effective floor is `baseline * (1 - allowed_drop_ratio)`. The current
+cases allow a 10% drop. An omitted `allowed_drop_ratio` defaults to zero.
+
+| `model_filter` | Board | Allocation |
+| --- | --- | --- |
+| `qwen3.8-27b` | 890P | 2 cards, TP2 |
+| `qwen3.8-27b-810e` | 810E | 1 card, TP1 |
+| `deepseek-v4-flash` | 890P | 4 cards, TP4 |
+| `minimax-m3-fp8` | 890P | 8 cards, TP8 |
+| `minimax-m3` (MXFP4/FP8) | 890P | 8 cards, TP8 |
+| `qwen3.8-flash-next-tp4` | 890P | 4 cards, TP4 |
+| `glm-5.3-flash` | 890P | 8 cards, TP8 |
+| `glm-5.3` | 890P | 8 cards, TP8 |
+
+In GitHub Actions, open **Nightly Dispatch (PPU)** and click **Run workflow**.
+Select the branch containing the pilot, set `tier` to `light_perf`, and
+enter one or more comma-separated `model_filter` values from the table.
+Light Perf uses the selected branch
+revision. The `target_ref` field is for Model Sanity. The standalone
+**Light Performance (PPU)** workflow
+also runs the pilot once its entry file is available on the default branch.
+Both entries use the PPU manual dispatch approval, build the candidate wheel,
+and schedule the allocation for each selected policy. Each Pod uses the existing offline Hugging Face
+cache for the model configuration and tokenizer.
+The job summary shows case status and measured throughput for each input shape.
+Benchmark logs and JSONL measurements are retained in the private results
+directory under the `light_perf` tier.
+
+To dispatch the same workload from the CLI, use the branch containing the pilot:
+
+```bash
+gh workflow run nightly-dispatch-ppu.yml --repo t-head/sglang-for-sail \
+  --ref ci/ut_perf -f tier=light_perf -f model_filter=qwen3.8-27b-810e
+```
+
+For a direct run, use the selected board with the allocation shown above and
+the candidate SGLang build installed. Create a local assets map pointing to the
+BF16 model configuration and tokenizer directory:
+
+```yaml
+qwen3.8-27b: /path/to/local/Qwen3.8-27B
+```
+
+Run from the repository root with that map:
+
+```bash
+PPU_CI_ARTIFACT_DIR="$PWD/light-perf-artifacts" \
+  python3 -B scripts/ci/ppu/recipe_runner.py \
+  test/ppu/policy/models/qwen3.8-27b-810e.yaml light_perf \
+  --assets-map /path/to/assets.yaml --queue-s 0
+```
+
+The runner writes each case's log and JSONL measurements under `results/`.
+It checks that every declared shape produced a result and that each result
+meets the policy threshold. See `results/summary.json` for the overall outcome.
+If the execution environment sets `RECIPE_PPU_COUNT`, the runner checks it
+against the device count resolved from the recipe.
 
 ## Trigger Quick Reference
 

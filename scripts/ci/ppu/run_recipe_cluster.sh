@@ -139,13 +139,31 @@ EXPECTED_IMAGE_REPO=""
 EXPECTED_IMAGE_DIGEST=""
 RECIPE_TREE_SHA256=""
 case "$mode" in
-    fast_sanity|model_sanity)
-        [[ "$MODEL_KEY" =~ ^[a-z0-9][a-z0-9.-]*$ && -f "test/ppu/policy/models/$MODEL_KEY.yaml" ]]
+    fast_sanity|model_sanity|light_perf|unit_test)
         INPUT_NODE_SELECTOR=board-type=ZW-M890P
-        [[ "${RECIPE_PPU_COUNT:?}" =~ ^(2|4|8)$ ]]
+        if [[ "$mode" == unit_test ]]; then
+            [[ "$MODEL_KEY" =~ ^ppu-unit-[01]$ && "${PPU_CI_BOARD:?}" == ZW-M890P &&
+               "${RECIPE_PPU_COUNT:?}" == 1 && -d unit-test-deps && ! -L unit-test-deps ]]
+        elif [[ "$mode" == light_perf && "${PPU_CI_BOARD:?}" == OAM-810E ]]; then
+            [[ "${RECIPE_PPU_COUNT:?}" == 1 ]]
+            INPUT_NODE_SELECTOR=board-type=OAM-810E
+        else
+            [[ "$mode" != light_perf || "${PPU_CI_BOARD:?}" == ZW-M890P ]]
+            [[ "${RECIPE_PPU_COUNT:?}" =~ ^(2|4|8)$ ]]
+        fi
+        if [[ "$mode" != unit_test ]]; then
+            [[ "$MODEL_KEY" =~ ^[a-z0-9][a-z0-9.-]*$ && -f "test/ppu/policy/models/$MODEL_KEY.yaml" ]]
+        fi
         INPUT_NPROC_PER_NODE=$RECIPE_PPU_COUNT
+        if [[ "${RECIPE_NNODES:-1}" != 1 ]]; then
+            [[ "$mode" == light_perf && "$PPU_CI_BOARD" == ZW-M890P &&
+               "$RECIPE_PPU_COUNT" == 8 && "$RECIPE_NNODES" == 2 ]]
+            INPUT_NNODES=2
+        fi
         INPUT_TIMEOUT_MINUTES=330
         [[ "$mode" != fast_sanity ]] || INPUT_TIMEOUT_MINUTES=30
+        [[ "$mode" != light_perf ]] || INPUT_TIMEOUT_MINUTES=130
+        [[ "$mode" != unit_test ]] || INPUT_TIMEOUT_MINUTES=60
         resolved_image_json=$(python3 -B scripts/ci/ppu/recipe_image.py resolve \
             --image-tag "${PPU_CI_RUNTIME_IMAGE_TAG:-}" \
             --image-digest "${PPU_CI_RUNTIME_IMAGE_DIGEST:-}")

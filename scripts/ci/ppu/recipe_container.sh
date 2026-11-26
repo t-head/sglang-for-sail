@@ -46,6 +46,9 @@ if [[ "$skip_wheel_install" == false ]]; then
     python3 -I -B "$checker" snapshot "$artifact_dir/dependencies-after.json"
     python3 -I -B "$checker" check "$artifact_dir/dependencies-before.json" "$artifact_dir/dependencies-after.json"
 fi
+if [[ "${2:-}" == unit_test ]]; then
+    python3 -I -B -m pip install --no-index --find-links unit-test-deps pytest tabulate
+fi
 if [[ "${2:-}" == model_sanity && -n "${PPU_CI_EVAL_WHEEL_DIR:-}" ]]; then
     phase eval_environment
     (cd "$PPU_CI_EVAL_WHEEL_DIR" && sha256sum -- *.whl | cmp -s SHA256SUMS -)
@@ -57,7 +60,9 @@ if [[ "${2:-}" == model_sanity && -n "${PPU_CI_EVAL_WHEEL_DIR:-}" ]]; then
     python3 -I -S -B -c 'import sys; sys.path.insert(0, sys.argv[1]); from evalscope import TaskConfig, run_task' "$eval_dir"
 fi
 phase recipe_validation
-python3 -I -B scripts/ci/ppu/ppu_recipe.py validate --all --require-sglang-parser
+if [[ "${2:-}" != unit_test ]]; then
+    python3 -I -B scripts/ci/ppu/ppu_recipe.py validate --all --require-sglang-parser
+fi
 if [[ "${1:-}" == validate ]]; then
     exit 0
 fi
@@ -118,6 +123,14 @@ if torch_ver:
     versions["torch"] = torch_ver
 Path(sys.argv[1]).write_text(json.dumps(versions, sort_keys=True) + "\n", encoding="utf-8")
 PY
+if [[ "${2:-}" == unit_test ]]; then
+    phase unit_test
+    [[ "${MODEL_KEY:?}" =~ ^ppu-unit-[01]$ ]]
+    bash scripts/ci/ppu/run_unit_suite.sh ppu "${MODEL_KEY##*-}"
+    mkdir -p "$artifact_dir/results"
+    printf '{"outcome":"pass"}\n' > "$artifact_dir/results/summary.json"
+    exit 0
+fi
 # The wrapper adds only the checked-in executor directory to the isolated path.
 python3 -I -B - "$@" <<'PY'
 import runpy
