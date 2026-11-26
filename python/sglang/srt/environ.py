@@ -1880,6 +1880,9 @@ class Envs:
     SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(_default_sail)
     # Also fuse the MegaMHC boundary in decode and target-verify batches (SAIL default).
     SGLANG_OPT_DSV41_MEGA_MHC_DECODE = EnvBool(_default_sail)
+    # Kill switch for GLM's unshifted H4096 MegaMHC boundary only; shifted DSV4.1
+    # prefill/decode and the original GLM fallback are unaffected. Default False.
+    SGLANG_DISABLE_GLM_MEGA_MHC = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)

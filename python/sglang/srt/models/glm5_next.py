@@ -115,9 +115,11 @@ from sglang.srt.multimodal.mm_utils import (
     run_dp_sharded_mrope_vision_model,
 )
 from sglang.srt.runtime_context import (
+    get_exec,
     get_lora,
     get_mm,
     get_parallel,
+    get_platform,
     get_spec,
     linear_attn_parallel_group,
     linear_attn_tp_size,
@@ -893,13 +895,47 @@ class Glm5NextDecoderLayer(nn.Module):
     def hc_ffn_post_pre(
         self, hidden_states, residual, h_res, h_post, out_norm_weight, out_norm_eps
     ):
-        # Fuses hc_post into the pre-norm GEMM; the mhc_pre big-fuse stage
-        # still launches separately, so this is two launches instead of three.
         assert self.config.mhc, "hc_ffn_post_pre is only valid when config.mhc=True"
         num_tokens, hidden_size = hidden_states.shape
+        hc_mult = self.config.hc_mult
+        platform = get_platform()
+        parallel = get_parallel()
+        if (
+            out_norm_weight is not None
+            and out_norm_eps is not None
+            and platform.is_ppu
+            and platform.device_sm == 89
+            and (parallel.attn_cp_size, parallel.attn_dp_size) in ((4, 1), (8, 1), (1, 8))
+            and not get_exec().deterministic.enable_deterministic_inference
+        ):
+            from sglang.kernels.ops.layernorm.mhc_mega import try_mhc_mega_boundary
+
+            mega = try_mhc_mega_boundary(
+                hidden_states,
+                residual.view(num_tokens, hc_mult, hidden_size),
+                None,
+                h_post.view(num_tokens, hc_mult),
+                h_res.view(num_tokens, hc_mult, hc_mult),
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
+                out_norm_weight,
+                self.config.rms_norm_eps,
+                self.config.hc_eps,
+                out_norm_eps,
+                self.config.hc_sinkhorn_iters,
+            )
+            if mega is not None:
+                next_residual, layer_input, (_, post, comb) = mega
+                return (
+                    layer_input,
+                    next_residual.reshape(num_tokens, -1),
+                    comb.reshape(num_tokens, hc_mult * hc_mult),
+                    post.reshape(num_tokens, hc_mult),
+                    True,
+                )
         if num_tokens > _MHC_FUSED_BOUNDARY_MAX_TOKENS:
             return None
-        hc_mult = self.config.hc_mult
         fused = apply_mhc_post_pre_boundary(
             layer_input=hidden_states,
             residual=residual.view(num_tokens, hc_mult, hidden_size),
