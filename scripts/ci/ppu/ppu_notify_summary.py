@@ -89,12 +89,20 @@ def validate_webhook_url(url):
     if not isinstance(url, str) or not url:
         raise ValueError("Expected an HTTPS webhook URL")
     parts = urlsplit(url)
+    try:
+        port = parts.port
+    except ValueError:
+        raise ValueError("Expected an HTTPS webhook URL") from None
+    host_port = parts.netloc.rsplit("]", 1)[-1]
     if (
         parts.scheme != "https"
         or not parts.hostname
         or parts.username is not None
+        or parts.password is not None
         or parts.fragment
         or any(character.isspace() for character in url)
+        or (port is not None and port < 1)
+        or (":" in host_port and port is None)
     ):
         raise ValueError("Expected an HTTPS webhook URL")
     return url
@@ -115,7 +123,10 @@ def _validate_target(entry):
 def parse_targets(raw):
     if not isinstance(raw, str) or len(raw.encode("utf-8")) > TARGETS_LIMIT:
         raise ValueError("Invalid notification targets configuration")
-    config = json.loads(raw)
+    try:
+        config = json.loads(raw)
+    except ValueError:
+        raise ValueError("Invalid notification targets configuration") from None
     if not isinstance(config, dict):
         raise ValueError("Expected a JSON object")
     if not set(config).issubset({"default", "routes"}):
@@ -142,7 +153,7 @@ def resolve_target(version="", environ=None):
     raw_targets = env.get(TARGETS, "")
     fallback_url = env.get(URL, "").strip()
     fallback_secret = env.get(SECRET, "")
-    if raw_targets.strip():
+    if raw_targets:
         default_target, routes = parse_targets(raw_targets)
         if version and version in routes:
             return routes[version]
