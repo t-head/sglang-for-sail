@@ -150,6 +150,7 @@ class _MockTokenizerManager:
         self.chat_template_name: Optional[str] = "llama-3"
 
         # tokenizer stub
+        self.mm_processor = None
         self.tokenizer = Mock()
         self.tokenizer.encode.return_value = [1, 2, 3, 4, 5]
         self.tokenizer.decode.return_value = "Test response"
@@ -176,6 +177,9 @@ class _MockTokenizerManager:
         self.generate_request = Mock(return_value=_mock_generate())
         self.create_abort_task = Mock()
         self.request_logger = Mock(log_requests=False, log_requests_level=0)
+
+    async def run_in_request_preprocessor(self, func, *args, **kwargs):
+        return func(*args, **kwargs)
 
     def config_value(self, name: str):
         """The value in effect for one config field."""

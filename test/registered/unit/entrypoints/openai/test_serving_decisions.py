@@ -185,6 +185,9 @@ class ScoringManager(TokenizerManagerScoreMixin):
         self.requests = []
         self.served_model_name = "served-model"
 
+    async def run_in_request_preprocessor(self, func, *args, **kwargs):
+        return func(*args, **kwargs)
+
     def config_value(self, name):
         return None
 
