@@ -3408,6 +3408,239 @@ class PresetCatalogContractTest(unittest.TestCase):
                 ]
                 self.assertEqual(admitted, [{"model": "glm-5.3-tp16", "ppu_count": 16}])
 
+    def test_runner_binds_effective_variant_checkpoint_assets_and_revision(self):
+        rev_mxfp4 = "a" * 40
+        rev_fp8 = "b" * 40
+        base_glm = _load_yaml(REPO_ROOT / "test/ppu/recipes/zai-org/GLM-5.3.yaml")
+        mxfp4_id = base_glm["ppu"]["hf_model_id"]
+        fp8_id = base_glm["variants"]["fp8_channel"]["hf_model_id"]
+        mxfp4_asset = base_glm["ppu"]["assets"]["model"]
+        fp8_asset = base_glm["variants"]["fp8_channel"]["assets"]["model"]
+        fp8_golden = base_glm["variants"]["fp8_channel"]["golden_model_key"]
+
+        def _make_snapshot(cache_root: Path, repo_id: str, revision: str) -> Path:
+            folder = f"models--{repo_id.replace('/', '--')}"
+            repo_dir = cache_root / folder
+            (repo_dir / "refs").mkdir(parents=True, exist_ok=True)
+            (repo_dir / "refs/main").write_text(revision)
+            snap = repo_dir / "snapshots" / revision
+            snap.mkdir(parents=True, exist_ok=True)
+            for name in ("config.json", "tokenizer.json"):
+                (snap / name).write_text("{}")
+            (snap / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": {"w": "weight.safetensors"}})
+            )
+            (snap / "weight.safetensors").write_bytes(b"fixture")
+            return snap.resolve()
+
+        for inherit_assets in (False, True):
+            with (
+                self.subTest(inherit_assets=inherit_assets),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                root = Path(tmp)
+                shutil.copytree(REPO_ROOT / "test/ppu", root / "test/ppu")
+                cache_root = root / "hf_cache"
+                snap_mxfp4 = _make_snapshot(cache_root, mxfp4_id, rev_mxfp4)
+                snap_fp8 = _make_snapshot(cache_root, fp8_id, rev_fp8)
+                snapshots = {
+                    (mxfp4_id, rev_mxfp4): str(snap_mxfp4),
+                    (fp8_id, rev_fp8): str(snap_fp8),
+                }
+
+                glm_rec_path = root / "test/ppu/recipes/zai-org/GLM-5.3.yaml"
+                if inherit_assets:
+                    glm_doc = _load_yaml(glm_rec_path)
+                    glm_doc["variants"]["fp8_channel"].pop("assets", None)
+                    glm_rec_path.write_text(yaml.safe_dump(glm_doc, sort_keys=False))
+
+                pol = _load_yaml(root / "test/ppu/policy/models/glm-5.3.yaml")
+                pol["variant"] = "fp8_channel"
+                pol["tiers"] = {"fast_sanity": pol["tiers"]["fast_sanity"]}
+                pol_path = root / "test/ppu/policy/models/glm-5.3-fp8.yaml"
+                pol_path.write_text(yaml.safe_dump(pol, sort_keys=False))
+
+                results_dir = root / "artifacts/results"
+                results_dir.mkdir(parents=True)
+                captured_configs = []
+
+                @contextlib.contextmanager
+                def fake_server(config, label, result_dict, timeout):
+                    captured_configs.append((config, label, timeout))
+                    result_dict["cold_start_s"] = 0.5
+                    yield
+
+                def fake_download(*, repo_id, revision, cache_dir, local_files_only):
+                    self.assertTrue(local_files_only)
+                    self.assertEqual(Path(cache_dir), cache_root)
+                    return snapshots[(repo_id, revision)]
+
+                fake_hf_modules = {
+                    "huggingface_hub": SimpleNamespace(snapshot_download=fake_download),
+                    "huggingface_hub.file_download": SimpleNamespace(
+                        repo_folder_name=lambda *, repo_id, repo_type: (
+                            f"models--{repo_id.replace('/', '--')}"
+                        )
+                    ),
+                    "huggingface_hub.utils": SimpleNamespace(
+                        validate_repo_id=lambda repo_id: None
+                    ),
+                }
+                clean_env = {
+                    k: v
+                    for k, v in os.environ.items()
+                    if k
+                    not in {
+                        "PPU_CI_HF_MODEL_REVISION",
+                        "PPU_RECIPE_CONTAINER_MODEL",
+                    }
+                }
+                clean_env.update(
+                    {
+                        "PPU_CI_HF_CACHE_ROOT": str(cache_root),
+                        "HF_HUB_CACHE": str(cache_root),
+                        "RECIPE_PPU_COUNT": "8",
+                    }
+                )
+                with (
+                    patch.dict(os.environ, clean_env, clear=True),
+                    patch.dict(sys.modules, fake_hf_modules),
+                    patch("ppu_recipe.REPO_ROOT", root),
+                    patch("recipe_select.REPO_ROOT", root),
+                    patch("recipe_runner.REPO_ROOT", root),
+                    patch("recipe_runner.RESULTS", results_dir),
+                    patch("recipe_runner.phase"),
+                    patch("recipe_runner.server", side_effect=fake_server),
+                    patch("recipe_runner.probes") as mock_probes,
+                ):
+                    admitted = select("fast_sanity", "glm-5.3-fp8")["include"]
+                    self.assertEqual(
+                        admitted, [{"model": "glm-5.3-fp8", "ppu_count": 8}]
+                    )
+                    summary = run(pol_path, "fast_sanity", 1.0)
+                    mock_probes.assert_called_once()
+                    self.assertEqual(len(captured_configs), 1)
+                    cfg, _, _ = captured_configs[0]
+                    self.assertEqual(cfg["variant"], "fp8_channel")
+                    self.assertEqual(cfg["hf_model_id"], fp8_id)
+                    self.assertEqual(cfg["golden_model_key"], fp8_golden)
+                    self.assertEqual(cfg["resolved_model"], str(snap_fp8))
+                    self.assertEqual(cfg["resolved_tokenizer"], str(snap_fp8))
+                    self.assertNotEqual(cfg["resolved_model"], str(snap_mxfp4))
+                    argv = cfg["argv"]
+                    self.assertEqual(
+                        argv[argv.index("--model-path") + 1], str(snap_fp8)
+                    )
+                    self.assertEqual(
+                        argv[argv.index("--tokenizer-path") + 1], str(snap_fp8)
+                    )
+                    assets_written = json.loads(
+                        (results_dir.parent / "assets.json").read_text()
+                    )
+                    expected_asset_key = mxfp4_asset if inherit_assets else fp8_asset
+                    self.assertEqual(
+                        assets_written, {expected_asset_key: str(snap_fp8)}
+                    )
+                    expected_fp8_digest = resolve_recipe(
+                        glm_rec_path,
+                        policy_path=pol_path,
+                        tier="fast_sanity",
+                        assets_map_path=results_dir.parent / "assets.json",
+                        served_model_name="recipe-model",
+                        cache_revision=rev_fp8,
+                    )["config_digest"]
+                    wrong_mxfp4_digest = resolve_recipe(
+                        glm_rec_path,
+                        policy_path=pol_path,
+                        tier="fast_sanity",
+                        assets_map_path=results_dir.parent / "assets.json",
+                        served_model_name="recipe-model",
+                        cache_revision=rev_mxfp4,
+                    )["config_digest"]
+                    self.assertEqual(summary["config_digest"], expected_fp8_digest)
+                    self.assertNotEqual(summary["config_digest"], wrong_mxfp4_digest)
+
+    def test_exact_topology_placeholder_identity_and_per_gpu_ib_map(self):
+        glm_doc = _load_yaml(REPO_ROOT / "test/ppu/recipes/zai-org/GLM-5.3.yaml")
+
+        # 1. --node-rank "{node_rank}0" or prefixed rank must fail closed.
+        for bad_rank in ("{node_rank}0", "0{node_rank}", "rank-{node_rank}"):
+            bad = copy.deepcopy(glm_doc)
+            args = bad["presets"]["decode_ep"]["args"]
+            args[args.index("--node-rank") + 1] = bad_rank
+            with self.assertRaisesRegex(
+                ValidationError,
+                "numeric topology placeholder|--node-rank to be exact",
+            ):
+                validate_serving_recipe_structure(bad, context="bad_rank")
+
+        # 2. Multi-node rank substitution preserves exact identity for all ranks 0..3.
+        ep_resolved = resolve_recipe(
+            REPO_ROOT / "test/ppu/recipes/zai-org/GLM-5.3.yaml", preset="decode_ep"
+        )
+        for expected_rank in range(4):
+            sub_flags, _ = substitute_validation_placeholders(
+                ep_resolved["flags"],
+                ep_resolved["server_env"],
+                values={"node_rank": expected_rank},
+            )
+            self.assertEqual(
+                sub_flags[sub_flags.index("--node-rank") + 1], str(expected_rank)
+            )
+
+        # 3. --dist-init-addr digit concatenation or prefix must fail; IPv6 bracket form passes.
+        for bad_addr in (
+            "{master_addr}:{master_port}0",
+            "prefix-{master_addr}:{master_port}",
+        ):
+            bad = copy.deepcopy(glm_doc)
+            args = bad["presets"]["decode_ep"]["args"]
+            args[args.index("--dist-init-addr") + 1] = bad_addr
+            with self.assertRaisesRegex(
+                ValidationError,
+                "numeric topology placeholder|--dist-init-addr to be exact",
+            ):
+                validate_serving_recipe_structure(bad, context="bad_dist")
+
+        ipv6_ok = copy.deepcopy(glm_doc)
+        ep_args = ipv6_ok["presets"]["decode_ep"]["args"]
+        ep_args[ep_args.index("--dist-init-addr") + 1] = "[{master_addr}]:{master_port}"
+        validate_serving_recipe_structure(ipv6_ok, context="ipv6_dist")
+
+        # 4. PD placeholder exactness: SGLANG_HOST_IP, bootstrap port, and IB device map.
+        bad_ip = copy.deepcopy(glm_doc)
+        bad_ip["presets"]["pd_prefill"]["env"]["SGLANG_HOST_IP"] = "host-{kv_ip}"
+        with self.assertRaisesRegex(
+            ValidationError, "SGLANG_HOST_IP to be exact '\\{kv_ip\\}'"
+        ):
+            validate_serving_recipe_structure(bad_ip, context="bad_kv_ip")
+
+        bad_port = copy.deepcopy(glm_doc)
+        p_args = bad_port["presets"]["pd_prefill"]["args"]
+        p_args[p_args.index("--disaggregation-bootstrap-port") + 1] = "{kv_port}0"
+        with self.assertRaisesRegex(
+            ValidationError,
+            "numeric topology placeholder|--disaggregation-bootstrap-port to be exact",
+        ):
+            validate_serving_recipe_structure(bad_port, context="bad_kv_port")
+
+        for bad_ib in ("nic_{ib_devices}", '{"0":"rdma0","1":"{ib_devices}"}'):
+            bad_ib_doc = copy.deepcopy(glm_doc)
+            ib_args = bad_ib_doc["presets"]["pd_prefill"]["args"]
+            ib_args[ib_args.index("--disaggregation-ib-device") + 1] = bad_ib
+            with self.assertRaisesRegex(
+                ValidationError,
+                "--disaggregation-ib-device|missing required placeholder",
+            ):
+                validate_serving_recipe_structure(bad_ib_doc, context="bad_ib")
+
+        per_gpu_ib = copy.deepcopy(glm_doc)
+        ib_args = per_gpu_ib["presets"]["pd_prefill"]["args"]
+        ib_args[ib_args.index("--disaggregation-ib-device") + 1] = (
+            '{"0":"{ib_devices}","1":"{ib_devices}"}'
+        )
+        validate_serving_recipe_structure(per_gpu_ib, context="per_gpu_ib")
+
 
 if __name__ == "__main__":
     unittest.main()
