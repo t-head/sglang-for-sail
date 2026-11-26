@@ -45,6 +45,8 @@ class ForwardContext:
     attn_backend: AttentionBackend
     # Resolve after batch preparation; captured calls retain the static buffer.
     moe_num_token_non_padded: Optional[Callable[[], Optional[torch.Tensor]]] = None
+    # The batch owning per-forward scratch, such as shared gate masks.
+    forward_batch: Optional["ForwardBatch"] = None
 
 
 _current: Optional[ForwardContext] = None
@@ -88,10 +90,18 @@ def forward_context(
 ):
     if forward_batch is not None:
         ctx = replace(
-            ctx, moe_num_token_non_padded=forward_batch.moe_num_token_non_padded
+            ctx,
+            forward_batch=forward_batch,
+            moe_num_token_non_padded=forward_batch.moe_num_token_non_padded,
         )
-    elif ctx.moe_num_token_non_padded is None and _current is not None:
-        ctx = replace(ctx, moe_num_token_non_padded=_current.moe_num_token_non_padded)
+    elif _current is not None:
+        inherited = {}
+        if ctx.moe_num_token_non_padded is None:
+            inherited["moe_num_token_non_padded"] = _current.moe_num_token_non_padded
+        if ctx.forward_batch is None:
+            inherited["forward_batch"] = _current.forward_batch
+        if inherited:
+            ctx = replace(ctx, **inherited)
     prev = set_forward_context(ctx)
     try:
         yield
