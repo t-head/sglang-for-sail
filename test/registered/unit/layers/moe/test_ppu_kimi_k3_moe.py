@@ -314,7 +314,10 @@ def test_w4a4_tp_quantization_ignores_import_time_sm(
         silu_quant.assert_not_called()
     else:
         downcast.assert_called_once()
-        silu_quant.assert_called_once_with(ANY, swiglu_limit=None)
+        silu_quant.assert_called_once_with(ANY, swiglu_limit=None, expert_ids=ANY)
+        assert silu_quant.call_args.kwargs["expert_ids"] is (
+            expert_ids if use_tp_fused else None
+        )
         situ.assert_not_called()
     if use_tp_fused:
         fused_gemm.assert_called_once()

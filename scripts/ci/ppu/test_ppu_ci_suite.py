@@ -91,8 +91,10 @@ class TestPPUCISuite(unittest.TestCase):
                 "kernels/ops/attention/test_gdn_pla_prefill.py",
                 "kernels/ops/attention/test_minimax_m3_msa_ppu_page_table_tail.py",
                 "kernels/ops/activation/test_silu_and_mul_masked_post_per_token_quant_fp8.py",
+                "kernels/ops/activation/test_silu_and_mul_post_quant_mxfp4.py",
                 "kernels/ops/communication/test_engram_gather_peer.py",
                 "kernels/ops/gemm/test_ppu_bf16_dense_gemm.py",
+                "unit/layers/attention/test_dsa_k_only_ppu.py",
             ],
         )
 
@@ -147,11 +149,11 @@ class TestPPUCISuite(unittest.TestCase):
                 (
                     "test",
                     (
-                        ("Test Summary: 11/11 passed", 0, 0),
-                        ("Test Summary: 9/9 passed", 0, 1),
-                        ("Test Summary: 9/10 passed", 0, 1),
-                        ("Test Summary: 11/11 passed", 7, 7),
-                        ("Test Summary: 11/11 passed (incomplete)", 0, 1),
+                        ("Test Summary: 13/13 passed", 0, 0),
+                        ("Test Summary: 12/12 passed", 0, 1),
+                        ("Test Summary: 12/13 passed", 0, 1),
+                        ("Test Summary: 13/13 passed", 7, 7),
+                        ("Test Summary: 13/13 passed (incomplete)", 0, 1),
                         ("", 0, 1),
                     ),
                 ),
