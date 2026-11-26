@@ -2035,6 +2035,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>float32</code>, <code>bfloat16</code>, <code>float16</code></td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--mamba-ssm-accum-dtype`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Resident SSM state accumulation dtype for explicit PPU FlashKDA prefill, independent of <code>--mamba-ssm-dtype</code>. Other backends retain their native accumulation behavior.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>bfloat16</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>float32</code>, <code>bfloat16</code></td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-mamba-cache-stochastic-rounding`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable stochastic rounding when writing FP16 Mamba SSM cache states. Requires <code>--mamba-ssm-dtype float16</code> and CUDA. With <code>--mamba-backend triton</code>, requires SM100.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
@@ -2084,21 +2090,27 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--linear-attn-backend`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The default kernel backend for linear attention (GDN/KDA). Can be overridden per-mode by --linear-attn-decode-backend and --linear-attn-prefill-backend.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The default kernel backend for linear attention (GDN/KDA). Can be overridden per-mode by <code>--linear-attn-decode-backend</code> and <code>--linear-attn-prefill-backend</code>. The Helion backend is KDA-only.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`triton`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>triton</code>, <code>cutedsl</code>, <code>flashinfer</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>triton</code>, <code>cutedsl</code>, <code>flashinfer</code>, <code>flashkda</code>, <code>nvidia_kda</code>, <code>ptx_kda</code>, <code>helion</code>, <code>intel_xpu</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--linear-attn-decode-backend`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Override the kernel backend for linear attention decode. If not set, uses --linear-attn-backend.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Override the kernel backend for linear attention decode. If not set, uses <code>--linear-attn-backend</code>. Explicit <code>flashkda</code> decode requires PPU SM89 and the external FlashKDA wheel; inheriting <code>flashkda</code> from <code>--linear-attn-backend</code> keeps Triton decode because the base choice is prefill-only.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>triton</code>, <code>cutedsl</code>, <code>flashinfer</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>triton</code>, <code>cutedsl</code>, <code>flashinfer</code>, <code>flashkda</code>, <code>nvidia_kda</code>, <code>ptx_kda</code>, <code>helion</code>, <code>intel_xpu</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--linear-attn-prefill-backend`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Override the kernel backend for linear attention prefill/extend. If not set, uses --linear-attn-backend.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Override the kernel backend for linear attention prefill/extend. If not set, uses <code>--linear-attn-backend</code>; compatible SM100 GDN models may automatically select FlashInfer. On PPU SM89, an explicit <code>flashkda</code> choice uses the external wheel and <code>--mamba-ssm-accum-dtype</code>; the inherited PPU default continues to use PLA when enabled.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>triton</code>, <code>cutedsl</code>, <code>flashinfer</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>triton</code>, <code>cutedsl</code>, <code>flashinfer</code>, <code>flashkda</code>, <code>nvidia_kda</code>, <code>ptx_kda</code>, <code>helion</code>, <code>intel_xpu</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--linear-attn-verify-backend`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Override the kernel backend for linear attention speculative target-verify. If not set, follows FlashInfer or PPU FlashKDA decode; otherwise uses Triton. PPU FlashKDA verify requires the external wheel and dense top-1 verification.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>triton</code>, <code>cutedsl</code>, <code>flashinfer</code>, <code>flashkda</code>, <code>nvidia_kda</code>, <code>ptx_kda</code>, <code>helion</code>, <code>intel_xpu</code>, <code>nv_cutedsl</code></td>
     </tr>
 </tbody>
 </table>

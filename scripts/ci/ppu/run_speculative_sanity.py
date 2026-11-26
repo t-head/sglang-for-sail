@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Run a selected registered single-device PPU smoke or FP8 operator suite."""
+"""Run a selected registered single-device PPU model, numerical, benchmark or FP8 operator suite."""
 
 import os
 from pathlib import Path
@@ -9,6 +9,8 @@ from sglang.test.ci.ci_register import HWBackend, collect_tests
 FILES = (
     "test/registered/core/test_basic_sanity_eagle3.py",
     "test/registered/core/test_basic_sanity_dflash.py",
+    "test/registered/kernels/ops/attention/test_flashkda_replayssm_ppu.py",
+    "test/registered/kernels/benchmark/attention/bench_flashkda_replayssm_ppu.py",
 )
 FP8_FILES = (
     "test/registered/kernels/ops/moe/test_fp8_mega_moe_ppu.py",

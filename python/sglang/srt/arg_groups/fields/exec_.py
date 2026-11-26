@@ -499,6 +499,17 @@ class ExecMamba(msgspec.Struct):
             choices=["float32", "bfloat16", "float16"],
         ),
     ] = None
+    mamba_ssm_accum_dtype: A[
+        str,
+        Arg(
+            help=(
+                "Resident SSM state accumulation dtype for explicit PPU FlashKDA "
+                "prefill, independent of --mamba-ssm-dtype. Other backends retain "
+                "their native accumulation behavior."
+            ),
+            choices=["float32", "bfloat16"],
+        ),
+    ] = "bfloat16"
     mamba_max_states_per_path: A[
         int,
         "Maximum number of cached Mamba states retained per root-to-tail path "
@@ -554,21 +565,33 @@ class ExecMamba(msgspec.Struct):
     linear_attn_decode_backend: A[
         Optional[str],
         Arg(
-            help="Override the kernel backend for linear attention decode. If not set, uses --linear-attn-backend.",
+            help=(
+                "Override the kernel backend for linear attention decode. If not "
+                "set, uses --linear-attn-backend. Explicit flashkda decode requires "
+                "PPU SM89 and the external FlashKDA wheel; inheriting flashkda from "
+                "--linear-attn-backend keeps Triton decode because the base choice "
+                "is prefill-only."
+            ),
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
         ),
     ] = None
     linear_attn_prefill_backend: A[
         Optional[str],
         Arg(
-            help="Override the kernel backend for linear attention prefill/extend. If not set, uses --linear-attn-backend; compatible SM100 GDN models may automatically select FlashInfer.",
+            help=(
+                "Override the kernel backend for linear attention prefill/extend. "
+                "If not set, uses --linear-attn-backend; compatible SM100 GDN models "
+                "may automatically select FlashInfer. On PPU SM89, an explicit "
+                "flashkda choice uses the external wheel and --mamba-ssm-accum-dtype; "
+                "the inherited PPU default continues to use PLA when enabled."
+            ),
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
         ),
     ] = None
     linear_attn_verify_backend: A[
         Optional[str],
         Arg(
-            help="Override the kernel backend for linear attention speculative target-verify. If not set, follows the decode backend (flashinfer decode -> flashinfer verify, otherwise triton). KDA supports triton, nv_cutedsl, and flashinfer verify backends.",
+            help="Override the kernel backend for linear attention speculative target-verify. If not set, follows FlashInfer or PPU FlashKDA decode; otherwise uses Triton.",
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES + ["nv_cutedsl"],
         ),
     ] = None

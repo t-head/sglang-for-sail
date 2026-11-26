@@ -15,8 +15,9 @@
 import logging
 from abc import ABC
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import ClassVar, List, Optional
 
+import msgspec
 import numpy as np
 import torch
 
@@ -24,6 +25,105 @@ from sglang.srt.distributed.utils import divide
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
+
+
+def ppu_kda_replayssm_native_enabled(params) -> bool:
+    if not params.is_kda or envs.SGLANG_USE_PPU_KDA_REPLAYSSM.get() != "native":
+        return False
+    from sglang.srt.runtime_context import get_exec, get_memory, get_platform
+    from sglang.srt.speculative.ragged_verify import (
+        RaggedVerifyMode,
+        read_ragged_verify_mode,
+    )
+
+    hv, v_dim, k_dim = params.shape.temporal
+    memory = get_memory()
+    return (
+        get_platform().is_ppu
+        and get_platform().device_sm == 89
+        and v_dim == k_dim == 128
+        and params.shape.num_k_heads_per_tp == hv
+        and params.dtype.temporal in (torch.bfloat16, torch.float32)
+        and not memory.enable_page_major_kv_layout
+        and not memory.enable_unified_memory
+        and read_ragged_verify_mode() is RaggedVerifyMode.STATIC
+        and get_exec().mamba.enable_linear_replayssm_spec
+        and 1 <= get_exec().mamba.linear_replayssm_cache_len <= 16
+    )
+
+
+class FlashKDAReplaySSMLayout(msgspec.Struct, frozen=True):
+    """Atomic layout contract shared by record sizing and allocation."""
+
+    num_heads: int
+    record_len: int
+    HEAD_DIM: ClassVar[int] = 128
+    NUM_RECORDS: ClassVar[int] = 3
+
+    @classmethod
+    def from_params(
+        cls, params: "BaseLinearStateParams", record_len: int
+    ) -> "FlashKDAReplaySSMLayout":
+        hv, v_dim, k_dim = params.shape.temporal
+        if (
+            not params.is_kda
+            or record_len < 1
+            or v_dim != cls.HEAD_DIM
+            or k_dim != cls.HEAD_DIM
+            or params.shape.num_k_heads_per_tp != hv
+            or params.dtype.temporal not in (torch.bfloat16, torch.float32)
+        ):
+            raise ValueError(
+                "FlashKDA ReplaySSM needs a positive record length and contiguous "
+                "BF16/FP32 KDA state with equal Q/K/V heads and head dimension 128."
+            )
+        return cls(num_heads=hv, record_len=record_len)
+
+    def tensor_shape(self, num_layers: int, num_slots: int) -> tuple[int, ...]:
+        return (
+            num_layers,
+            num_slots,
+            self.num_heads,
+            self.record_len,
+            self.HEAD_DIM,
+        )
+
+    def bytes_per_req(self, num_layers: int) -> int:
+        return (
+            num_layers
+            * self.NUM_RECORDS
+            * self.num_heads
+            * self.record_len
+            * self.HEAD_DIM
+            * torch.float32.itemsize
+        )
+
+
+def ppu_flashkda_replayssm_layout(
+    params: "BaseLinearStateParams", record_len: int
+) -> Optional[FlashKDAReplaySSMLayout]:
+    """Return the external FlashKDA record layout selected by runtime config."""
+    if not params.is_kda or envs.SGLANG_USE_PPU_KDA_REPLAYSSM.get() != "flashkda":
+        return None
+    from sglang.srt.layers.attention.linear.utils import (
+        default_linear_attn_verify_backend,
+        is_ppu_flashkda_supported,
+    )
+    from sglang.srt.runtime_context import get_exec, get_memory
+
+    mamba = get_exec().mamba
+    if not mamba.enable_linear_replayssm_spec or not is_ppu_flashkda_supported():
+        return None
+    decode = mamba.linear_attn_decode_backend
+    verify = mamba.linear_attn_verify_backend or default_linear_attn_verify_backend(
+        decode or mamba.linear_attn_backend
+    )
+    if decode != "flashkda" or verify != "flashkda":
+        return None
+    memory = get_memory()
+    if memory.enable_page_major_kv_layout or memory.enable_unified_memory:
+        raise ValueError("FlashKDA ReplaySSM requires direct contiguous Mamba slots.")
+    return FlashKDAReplaySSMLayout.from_params(params, record_len)
 
 
 def extra_groups_for_head_shards(ngroups: int, tp_size: int):
@@ -126,14 +226,31 @@ class BaseLinearStateParams(ABC):
             + ssm_numel * self.dtype.temporal.itemsize
         ) * len(self.layers)
 
-    def replayssm_ring_bytes_per_req(self, record_len: int) -> int:
+    def replayssm_ring_bytes_per_req(
+        self,
+        record_len: int,
+        *,
+        flashkda_layout: Optional[FlashKDAReplaySSMLayout] = None,
+    ) -> int:
         """ReplaySSM spec-verify scratch bytes across all layers.
 
         GDN keeps compact d/k/g plus low parts for the activation-dtype d/k
         rings. KDA keeps its raw-input fold window and d/k rings.
         """
+        if flashkda_layout is not None and not ppu_kda_replayssm_native_enabled(self):
+            if flashkda_layout.record_len != record_len:
+                raise ValueError("FlashKDA ReplaySSM record lengths must match")
+            return flashkda_layout.bytes_per_req(len(self.layers))
+
         hv, v_dim, k_dim = self.shape.temporal
         h_k = self.shape.num_k_heads_per_tp
+        if ppu_kda_replayssm_native_enabled(self):
+            return (
+                (hv * v_dim + h_k * k_dim + hv * k_dim)
+                * record_len
+                * torch.float32.itemsize
+                * len(self.layers)
+            )
         conv_b = self.dtype.conv.itemsize
         fp32_b = 4
         if self.is_kda:

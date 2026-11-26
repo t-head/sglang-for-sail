@@ -6,11 +6,23 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_platform
 from sglang.srt.utils.common import rank0_log
+
+
+def is_ppu_flashkda_supported() -> bool:
+    platform = get_platform()
+    return platform.is_ppu and platform.device_sm == 89
+
 
 if TYPE_CHECKING:
     pass
+
+
+def default_linear_attn_verify_backend(decode: str) -> str:
+    if decode == "flashinfer" or (decode == "flashkda" and is_ppu_flashkda_supported()):
+        return decode
+    return "triton"
 
 
 def pp_spec_stable_rows_enabled() -> bool:
@@ -93,10 +105,10 @@ def resolve_linear_attn_backends(
         mamba.linear_attn_prefill_backend or prefill_default or base
     )
 
-    # Unset verify follows decode (flashinfer -> its recurrent kernel, else triton).
+    # Unset verify follows the explicit recurrent backend when supported.
     verify = mamba.linear_attn_verify_backend
     if verify is None:
-        verify = decode.value if decode.is_flashinfer() else "triton"
+        verify = default_linear_attn_verify_backend(decode.value)
 
     backends = LinearAttnBackends(
         decode=decode, prefill=prefill, verify=LinearAttnKernelBackend(verify)

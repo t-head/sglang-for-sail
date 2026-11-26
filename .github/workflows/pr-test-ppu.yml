@@ -213,6 +213,7 @@ jobs:
       PPU_CI_SOURCE_SHA: ${{ needs.check-changes.outputs.source-sha }}
       MAX_JOBS: "2"
       SGL_KERNEL_COMPILE_THREADS: "2"
+      CUDAFY_REPO_URL: ${{ vars.CUDAFY_REPO_URL }}
     outputs:
       wheel-artifact-id: ${{ steps.wheels.outputs.artifact-id }}
     steps:

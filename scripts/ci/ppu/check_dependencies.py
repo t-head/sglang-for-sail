@@ -14,6 +14,7 @@ PINNED_ADDITIONS = {
     "latex2sympy2-extended": "1.11.0",
     "antlr4-python3-runtime": "4.9.3",
     "editdistance": "0.8.1",
+    "flash-kda": "0.0.1+0dfef21",
 }
 
 
@@ -89,7 +90,7 @@ def main():
         return 0
     if args.command == "requirements":
         for name, version in PINNED_ADDITIONS.items():
-            if name != "sailify":
+            if name not in ("sailify", "flash-kda"):
                 print(f"{name}=={version}")
         return 0
     if args.command == "missing-wheels":

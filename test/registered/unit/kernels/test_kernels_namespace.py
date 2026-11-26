@@ -19,6 +19,10 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=26, suite="base-a-test-cpu")
 
 _CPU = PlatformInfo(device_type="cpu")
+_SM89 = PlatformInfo(device_type="cuda", cuda_arch_major=8, cuda_arch_minor=9)
+_SAIL89 = PlatformInfo(
+    device_type="cuda", cuda_arch_major=8, cuda_arch_minor=9, cuda_vendor="sail"
+)
 _SM90 = PlatformInfo(device_type="cuda", cuda_arch_major=9, cuda_arch_minor=0)
 _SM100 = PlatformInfo(device_type="cuda", cuda_arch_major=10, cuda_arch_minor=0)
 _HIP = PlatformInfo(device_type="hip")
@@ -126,6 +130,9 @@ def test_activation_default_backend(monkeypatch, device, expect):
         (Cap.cuda(min_sm=(10, 0)), _SM90, False),
         (Cap.cuda(min_sm=(10, 0)), _SM100, True),
         (Cap.cuda(max_sm=(9, 0)), _SM100, False),
+        (Cap.sail(min_sm=(8, 9), max_sm=(8, 9)), _SAIL89, True),
+        (Cap.sail(min_sm=(8, 9), max_sm=(8, 9)), _SM89, False),
+        (Cap.sail(min_sm=(8, 9), max_sm=(8, 9)), _SM90, False),
     ],
 )
 def test_capability_is_satisfied_by(req, plat, ok):
@@ -156,6 +163,37 @@ def test_platform_detection_distinguishes_musa_cuda_alias(
         torch.musa = SimpleNamespace(is_available=lambda: musa_available)
     monkeypatch.setitem(sys.modules, "torch", torch)
     assert PlatformInfo.detect().device_type == expected_device
+
+
+@pytest.mark.parametrize(
+    "op",
+    (
+        "attention.target_verify_kda_replayssm_ppu",
+        "attention.commit_kda_replayssm_ppu",
+    ),
+)
+def test_replayssm_commit_registry_requires_sail_sm89(op):
+    spec = K.registry.get(op)[0]
+    assert spec.target.startswith("sglang.kernels.ops.attention.linear.")
+    assert spec.is_available(_SAIL89)
+    assert not spec.is_available(_SM89)
+    assert not spec.is_available(_SM90)
+
+
+def test_platform_detection_marks_sail_cuda_vendor(monkeypatch):
+    torch = SimpleNamespace(
+        version=SimpleNamespace(hip=None, musa=None),
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            get_device_capability=lambda: (8, 9),
+            get_device_name=lambda: "ZW-M890P",
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    platform = PlatformInfo.detect()
+    assert platform.device_type == "cuda"
+    assert platform.cuda_vendor == "sail"
+    assert (platform.cuda_arch_major, platform.cuda_arch_minor) == (8, 9)
 
 
 def test_capabilities_or_semantics():
@@ -315,9 +353,9 @@ def test_inventory_targets_survive_module_moves():
         if not module.startswith("sglang.kernels.ops."):
             continue
         path = root.joinpath(*module.split("."))
-        assert path.with_suffix(".py").is_file() or (path / "__init__.py").is_file(), (
-            spec
-        )
+        assert (
+            path.with_suffix(".py").is_file() or (path / "__init__.py").is_file()
+        ), spec
 
 
 def test_reclassified_public_entry_points_are_inventoried():
