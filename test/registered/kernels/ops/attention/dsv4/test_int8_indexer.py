@@ -29,10 +29,12 @@ from sglang.kernels.ops.attention.dsv4.int8_indexer import (
 )
 from sglang.kernels.ops.embeddings.engram_gather import _e4m3fn_to_float
 from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+# backend-specific: cover this path with the SAIL runtime and device kernels.
+register_ppu_ci(est_time=30, suite="extra-unit-test-1-gpu-ppu")
 
 PAGE_SIZE = 64
 

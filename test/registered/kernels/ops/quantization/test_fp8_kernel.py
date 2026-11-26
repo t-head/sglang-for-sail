@@ -8,10 +8,12 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     static_quant_fp8,
 )
 from sglang.srt.utils import is_cuda
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 from sglang.test.kernels.fp8 import TestFP8Base, device
 
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
+# backend-specific: cover this path with the SAIL runtime and device kernels.
+register_ppu_ci(est_time=11, suite="extra-unit-test-1-gpu-ppu")
 
 
 _is_cuda = is_cuda()

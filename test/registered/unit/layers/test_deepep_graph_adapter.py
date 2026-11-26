@@ -21,6 +21,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu-ppu")
 
 _SRT = Path(importlib.util.find_spec("sglang").submodule_search_locations[0]) / "srt"
 _ADAPTER = _SRT / "model_executor/runner_utils/deepep_adapter.py"

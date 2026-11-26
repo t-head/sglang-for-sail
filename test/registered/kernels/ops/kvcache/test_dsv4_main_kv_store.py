@@ -6,10 +6,11 @@ from types import SimpleNamespace
 import torch
 
 from sglang.kernels.ops.kvcache.dsv4_main_kv_store import GetKAndS
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_ppu_ci(est_time=10, suite="extra-unit-test-1-gpu-ppu")
 
 
 class TestDSV4MainKVGather(CustomTestCase):

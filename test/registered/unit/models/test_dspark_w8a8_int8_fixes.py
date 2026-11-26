@@ -36,6 +36,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
+register_cpu_ci(est_time=4, suite="base-a-test-cpu-ppu")
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +272,11 @@ def _make_unquantized_lm_head():
     return lm_head, qm
 
 
+@patch.object(
+    dspark_dense,
+    "get_spec",
+    lambda: SimpleNamespace(speculative_dspark_lm_head_dtype=None),
+)
 class TestDsparkLogitsFromQuantizedLmHead(CustomTestCase):
     """DeepseekV4ForCausalLMDSpark._logits_from_x_post_hc must use
     quant_method.apply when the shared lm_head is quantized."""
@@ -322,6 +328,11 @@ class TestDsparkLogitsFromQuantizedLmHead(CustomTestCase):
 # ---------------------------------------------------------------------------
 
 
+@patch.object(
+    dspark_dense,
+    "get_spec",
+    lambda: SimpleNamespace(speculative_dspark_lm_head_dtype=None),
+)
 class TestDsparkDraftMixinQuantizedLmHead(CustomTestCase):
     """DSparkDraftMixin.compute_base_logits must use quant_method.apply
     when the shared lm_head is quantized."""

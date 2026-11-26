@@ -10,10 +10,12 @@ from sglang.srt.mem_cache.pool_host.dsa import (
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_ppu_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=9, suite="base-b-test-1-gpu-small-amd")
+# backend-specific: cover this path with the SAIL runtime and device kernels.
+register_ppu_ci(est_time=10, suite="extra-unit-test-1-gpu-ppu")
 
 
 def _make_indexer_host(pool, anchor, *, packed_draft_device_pools=(), **kwargs):

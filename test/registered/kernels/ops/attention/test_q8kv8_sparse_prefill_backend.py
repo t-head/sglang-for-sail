@@ -36,7 +36,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_sm90_supported
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 from sglang.test.kernels.deepseek_v4.k_cache_reference import (
     dequantize_k_cache_paged_ref,
     quant_to_nope_fp8_rope_bf16_pack_triton,
@@ -45,6 +45,7 @@ from sglang.test.kernels.deepseek_v4.k_cache_reference import (
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_ppu_ci(est_time=120, suite="extra-unit-test-1-gpu-ppu")
 
 
 def test_q8kv8_sparse_prefill_backend_selector_uses_cli_value(monkeypatch):

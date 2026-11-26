@@ -26,10 +26,12 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
+# backend-specific: cover this path with the SAIL runtime and device kernels.
+register_ppu_ci(est_time=14, suite="extra-unit-test-1-gpu-ppu")
 
 DEVICE = get_device()
 VOCAB = 129280

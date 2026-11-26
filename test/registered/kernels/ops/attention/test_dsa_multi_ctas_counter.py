@@ -18,10 +18,12 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     make_persistent_multi_ctas_kv_counter_buffer,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+# backend-specific: cover this path with the SAIL runtime and device kernels.
+register_ppu_ci(est_time=15, suite="extra-unit-test-1-gpu-ppu")
 
 _NUM_Q_HEADS = 128
 _MAX_CTX_LEN = 64

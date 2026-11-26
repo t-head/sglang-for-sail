@@ -20,10 +20,11 @@ from sglang.srt.models.kimi_k3 import (
     _get_k3_dense_weight,
 )
 from sglang.srt.utils import is_sail
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="4-gpu-b200")
+register_ppu_ci(est_time=12, suite="extra-unit-test-1-gpu-ppu")
 
 _H = 7168
 _QKVG = 6144  # q,k,v,g slices per rank at TP8

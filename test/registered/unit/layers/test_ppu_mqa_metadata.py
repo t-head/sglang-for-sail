@@ -9,6 +9,7 @@ import torch
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu-ppu")
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa import kpool_plan
@@ -66,7 +67,7 @@ def test_compute_metadata_uses_typed_expanded_rows_and_real_owners(fp4):
     )
     with patch.dict("sys.modules", {"deep_gemm": library}):
         result = sail_paged_mqa_metadata(lens, 64, 32, 128, dtype, owners)
-    assert result is marker
+    assert result.tensor is marker
     args, kwargs = builder.call_args
     assert args[0].shape == (4, 1)
     torch.testing.assert_close(args[0][:, 0], lens.flatten())
