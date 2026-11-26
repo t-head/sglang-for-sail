@@ -13,6 +13,9 @@ on:
         value: ${{ jobs.approval.outputs.approved }}
       sha:
         value: ${{ jobs.approval.outputs.sha }}
+      skip_optional_check:
+        description: "An ordinary yuhe PR has not requested Fast Sanity"
+        value: ${{ jobs.approval.outputs.skip_optional_check }}
 permissions:
   contents: read
   pull-requests: read
@@ -22,6 +25,7 @@ jobs:
     outputs:
       approved: ${{ steps.policy.outputs.result }}
       sha: ${{ steps.policy.outputs.sha }}
+      skip_optional_check: ${{ steps.policy.outputs.skip_optional_check }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -48,4 +52,5 @@ jobs:
               allowedDispatchBots: process.env.PPU_CI_ALLOWED_DISPATCH_BOTS || '',
             });
             core.setOutput('sha', res.sha);
+            core.setOutput('skip_optional_check', res.skipOptionalCheck === true);
             return res.approved;

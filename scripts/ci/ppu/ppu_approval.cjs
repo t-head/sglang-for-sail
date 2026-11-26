@@ -64,11 +64,21 @@ async function approvedPullRequest(github, context, label, ref) {
   const {data: pr} = await github.rest.pulls.get({
     ...context.repo, pull_number: eventPR.number,
   });
-  const labels = new Set(pr.labels.map(item => item.name));
-  if (pr.state !== "open" || pr.draft || !isSha(pr.head.sha) ||
+  if (pr.state !== "open" || !isSha(pr.head.sha) ||
       pr.base.ref !== eventPR.base.ref || pr.head.sha !== eventPR.head.sha ||
-      !pr.head.repo || pr.head.repo.id !== eventPR.head.repo?.id ||
-      !labels.has("run-ci") || !labels.has(label)) return DENIED;
+      !pr.head.repo || pr.head.repo.id !== eventPR.head.repo?.id) return DENIED;
+  const requested = labels => labels.some(item => item.name === "run-ci") && labels.some(item => item.name === label);
+  if (!requested(pr.labels)) {
+    // Leave ordinary opt-in PRs neutral. A request withdrawn since this event,
+    // a label removal, or a draft conversion must still invalidate the check.
+    const ordinary = ["opened", "synchronize", "reopened", "ready_for_review", "labeled"].includes(context.payload.action);
+    if (label === "run-ci-ppu" && pr.base.ref === "yuhe/v1.0.0" && ordinary &&
+        Array.isArray(eventPR.labels) && !requested(eventPR.labels)) {
+      return {...DENIED, skipOptionalCheck: true};
+    }
+    return DENIED;
+  }
+  if (pr.draft) return DENIED;
 
   // Both label workflows currently delegate to runners with shared PPU storage.
   if (!context.payload.repository?.id || pr.head.repo.id !== context.payload.repository.id) {

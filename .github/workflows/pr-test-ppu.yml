@@ -150,9 +150,13 @@ jobs:
 
   pr-test-ppu-finish:
     name: >-
-      ${{ needs.pr-gate.result == 'skipped' && 'ignored-ppu-dispatch-finish' || 'pr-test-ppu-finish' }}
+      ${{ (needs.pr-gate.result == 'skipped' ||
+           (needs.pr-gate.result == 'success' && needs.pr-gate.outputs.skip_optional_check == 'true')) &&
+          'ignored-ppu-dispatch-finish' || 'pr-test-ppu-finish' }}
     needs: [pr-gate, release-v0523, yuhe-v100]
-    if: always() && needs.pr-gate.result != 'skipped'
+    if: >-
+      always() && needs.pr-gate.result != 'skipped' &&
+      (needs.pr-gate.result != 'success' || needs.pr-gate.outputs.skip_optional_check != 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

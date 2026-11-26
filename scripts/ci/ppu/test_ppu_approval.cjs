@@ -102,6 +102,33 @@ test("both label workflows stop before shared runners for fork or unknown reposi
   }
 });
 
+test("an unrequested yuhe check is optional; release and revoked requests stay required", async () => {
+  for (const branch of [base, "yuhe/v1.0.0"]) {
+    const f = fixture();
+    f.pr.base.ref = f.context.payload.pull_request.base.ref = branch;
+    f.pr.labels = f.context.payload.pull_request.labels = [];
+    for (const action of ["opened", "synchronize", "reopened", "ready_for_review", "labeled"]) {
+      f.context.payload.action = action;
+      const result = await approved.resolve(f);
+      assert.equal(result.approved, false);
+      assert.equal(result.skipOptionalCheck === true, branch === "yuhe/v1.0.0");
+    }
+    for (const action of ["unlabeled", "converted_to_draft"]) {
+      f.context.payload.action = action;
+      assert.deepEqual(await approved.resolve(f), {approved: false, sha: ""});
+    }
+    f.context.payload.action = "synchronize";
+    f.pr.labels = [{name: "run-ci"}, {name: f.label}];
+    assert.deepEqual(await approved.resolve(f), {approved: true, sha: head}); // Approved since the event.
+    f.pr.labels = [];
+    f.context.payload.pull_request.labels = [{name: "run-ci"}, {name: f.label}];
+    assert.deepEqual(await approved.resolve(f), {approved: false, sha: ""}); // Withdrawn since the event.
+    f.pr.labels = f.context.payload.pull_request.labels;
+    f.change.timestamp = f.timeline[0].created_at;
+    assert.deepEqual(await approved.resolve(f), {approved: false, sha: ""}); // Stale approval.
+  }
+});
+
 function fastSanityFixture(branch = base) {
   const f = fixture();
   const target = branch === base ? "release-v0523" : "yuhe-v100";
@@ -122,8 +149,10 @@ function fastSanityFixture(branch = base) {
   const paginate = f.github.paginate;
   f.github.paginate = async (route, args) => {
     if (route === f.github.rest.actions.listWorkflowRunArtifacts) {
-      assert.deepEqual(args, {...f.context.repo, run_id: 821, name: "ppu-wheels-821-1-" + head, per_page: 100});
-      return artifacts;
+      const {name, ...options} = args;
+      assert.deepEqual(options, {...f.context.repo, run_id: 821, per_page: 100});
+      assert.equal(typeof name, "string");
+      return artifacts.filter(artifact => artifact.name === name);
     }
     if (route !== f.github.rest.actions.listJobsForWorkflowRun) return paginate(route, args);
     assert.deepEqual(args, {...f.context.repo, run_id: 821, filter: "all", per_page: 100});
@@ -140,11 +169,51 @@ test("both target branches require successful PPU execution on the approved head
   for (const branch of [base, "yuhe/v1.0.0"]) {
     await requireFastSanity(fastSanityFixture(branch));
   }
+});
+
+test("retrying a failed model consumes the wheel from the build's original attempt", async () => {
   const f = fastSanityFixture();
-  f.jobs[0].run_attempt = 2; // The delegated summary reran with the failed model.
-  f.jobs[2].conclusion = "failure";
-  f.jobs.unshift({...f.jobs[2], run_attempt: 2, conclusion: "success"});
+  const [summary, plan, model, build] = f.jobs;
+  // Times from Actions run 44685005679. Carried jobs have new IDs and identical execution intervals.
+  Object.assign(build, {id: 136117838321, started_at: "2026-11-20T06:07:51Z", completed_at: "2026-11-20T06:16:57Z"});
+  Object.assign(plan, {started_at: "2026-11-20T06:21:19Z", completed_at: "2026-11-20T06:21:25Z"});
+  Object.assign(model, {started_at: "2026-11-20T07:20:52Z", completed_at: "2026-11-20T07:29:33Z", conclusion: "failure"});
+  Object.assign(summary, {started_at: "2026-11-20T07:54:57Z", completed_at: "2026-11-20T07:55:00Z", conclusion: "failure"});
+  const passedModel = {
+    ...model, name: f.target + " / ppu-fast-sanity / Fast Sanity (deepseek-v4-flash)",
+    started_at: "2026-11-20T06:28:13Z", completed_at: "2026-11-20T06:38:08Z", conclusion: "success",
+  };
+  f.jobs.push(passedModel);
+  f.jobs.unshift(
+    {...summary, run_attempt: 2, started_at: "2026-11-20T08:49:49Z", completed_at: "2026-11-20T08:49:51Z", conclusion: "success"},
+    {...model, run_attempt: 2, started_at: "2026-11-20T08:39:21Z", completed_at: "2026-11-20T08:48:11Z", conclusion: "success"},
+    {...plan, run_attempt: 2},
+    {...build, id: 136173070353, run_attempt: 2},
+    {...passedModel, run_attempt: 2},
+  );
   await requireFastSanity(f);
+  // Rerunning only the top-level report keeps all delegated results and the same wheel.
+  f.jobs.push(...f.jobs.filter(job => job.run_attempt === 2).map(job => ({...job, run_attempt: 3})));
+  await requireFastSanity(f);
+});
+
+test("a fresh build requires matching wheels and fresh model results for its plan", async () => {
+  const f = fastSanityFixture();
+  for (const job of f.jobs) {
+    job.started_at = "2026-11-20T06:07:51Z";
+    job.completed_at = "2026-11-20T06:16:57Z";
+  }
+  const oldModel = {...f.jobs[2], name: f.jobs[2].name.replace("qwen", "minimax")};
+  f.jobs.push(oldModel);
+  const rerun = f.jobs.map(job => ({
+    ...job, run_attempt: 2, started_at: "2026-11-20T08:39:21Z", completed_at: "2026-11-20T08:48:11Z",
+  }));
+  f.jobs.push(...rerun);
+  await assert.rejects(requireFastSanity(f), /wheel bundle is missing/);
+  f.artifacts.push({...f.artifacts[0], name: "ppu-wheels-821-2-" + head});
+  await requireFastSanity(f);
+  Object.assign(rerun.at(-1), {started_at: oldModel.started_at, completed_at: oldModel.completed_at});
+  await assert.rejects(requireFastSanity(f), /every Fast Sanity model/);
 });
 
 test("approval and the delegated job alone cannot satisfy the release check", async () => {
