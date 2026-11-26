@@ -136,7 +136,7 @@ async function approvedCrossBranchTarget(github, repo, ref, workflowSha) {
 async function resolve({github, context, label, ref = "", workflowSha = "", allowedDispatchBots = ""}) {
   const {owner, repo} = context.repo;
   if (owner.toLowerCase() !== "t-head" || repo.toLowerCase() !== "sglang-for-sail" ||
-      !["run-ci-ppu", "run-ci-ppu-nightly"].includes(label)) return DENIED;
+      !["run-ci-ppu", "run-ci-ppu-nightly", "run-ci-ppu-multinode"].includes(label)) return DENIED;
 
   if (context.eventName === "pull_request_target") {
     return approvedPullRequest(github, context, label, ref);

@@ -1,0 +1,41 @@
+schema_version: ppu-serving/v1
+ppu:
+  framework: sglang
+  visibility: public
+  assets: {model: qwen3.8-2.4t-mxfp4, tokenizer: qwen3.8-2.4t-mxfp4}
+  hf_model_id: T-HEAD/Qwen3.8-2.4T-A95B-FP8-mxfp4-fp8-030
+  golden_model_key: qwen3.8_2.4t_mxfp4_tp8_pp2
+  topology: {kind: multi_node, nodes: 2, devices_per_node: 8}
+model:
+  model_id: Qwen/Qwen3.8-2.4T-A95B
+  base_args:
+    - --tp-size
+    - "8"
+    - --pp-size
+    - "2"
+    - --attention-backend
+    - fa3
+    - --mem-fraction-static
+    - "0.8"
+    - --linear-attn-prefill-backend
+    - triton
+    - --linear-attn-decode-backend
+    - triton
+    - --mamba-ssm-dtype
+    - bfloat16
+    - --reasoning-parser
+    - qwen3-thinking
+    - --dist-timeout
+    - "14400"
+    - --watchdog-timeout
+    - "7200"
+    - --trust-remote-code
+variants:
+  default: {precision: mxfp4}
+presets:
+  model_sanity:
+    args:
+      - --page-size
+      - "64"
+      - --mamba-radix-cache-strategy
+      - extra_buffer

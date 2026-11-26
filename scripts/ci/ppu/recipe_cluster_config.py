@@ -10,6 +10,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
 BACKEND_SHA = "96e25147971f5d2a04d828f8ad508cae38a4fa8a"
 CONFIG_NAME = ".sglang-recipe-ci-v0523"
 SETTINGS = {
@@ -142,14 +146,16 @@ def main():
         publish_recent_failures(
             validated_root,
             int(os.environ["GITHUB_RUN_ID"]),
+            model_filter=os.environ.get("PPU_CI_MODEL_FILTER", ""),
             fallback_root=retained.resolve(strict=True),
         )
         return
     if os.environ.get("TIER") != "legacy":
         _verify_retention_root(retention_root_raw, retention_source, os.environ)
+    launcher = str(Path(__file__).resolve().with_name("run_recipe_cluster.sh"))
     os.execvpe(
         "bash",
-        ["bash", "scripts/ci/ppu/run_recipe_cluster.sh"],
+        ["bash", launcher],
         {
             **os.environ,
             **values,

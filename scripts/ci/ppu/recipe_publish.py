@@ -9,9 +9,22 @@ import re
 import sys
 from pathlib import Path
 
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
 from recipe_diagnostics import PHASES
 
 MODEL_POLICY_ROOT = Path(__file__).resolve().parents[3] / "test/ppu/policy/models"
+
+
+def _model_policy_root():
+    override = os.environ.get("PPU_CI_POLICY_ROOT")
+    if override:
+        return Path(override)
+    return MODEL_POLICY_ROOT
+
+
 ALLOWED_ROUTES = {
     "native-build + sglang-release-runtime",
     "prebuilt-image",
@@ -114,7 +127,7 @@ def validate(payload):
     if (
         payload["schema"] != "ppu-sanity/v1"
         or not re.fullmatch(r"[a-z0-9][a-z0-9.-]*", payload["model"])
-        or not (MODEL_POLICY_ROOT / f"{payload['model']}.yaml").is_file()
+        or not (_model_policy_root() / f"{payload['model']}.yaml").is_file()
         or payload["route"] not in ALLOWED_ROUTES
         or not re.fullmatch(r"[0-9a-f]{40}", payload["source_sha"])
         or payload["outcome"] not in {"pass", "fail"}

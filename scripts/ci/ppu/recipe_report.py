@@ -6,6 +6,10 @@ import os
 import sys
 from pathlib import Path
 
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
 from recipe_diagnostics import failure_reason
 from recipe_publish import LEGACY_CASES, LEGACY_SCHEMA
 from recipe_retention import retain
