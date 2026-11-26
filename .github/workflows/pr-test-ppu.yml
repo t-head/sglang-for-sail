@@ -12,7 +12,7 @@ on:
     types: [opened, synchronize, reopened]
   pull_request_target:
     branches: ['yuhe/v1.0.0', 'release/v0.5.23']
-    types: [opened, synchronize, reopened, labeled, ready_for_review]
+    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review, converted_to_draft]
   workflow_dispatch:
     inputs:
       preflight_only:
@@ -38,6 +38,10 @@ on:
         default: false
   workflow_call:
     inputs:
+      legacy_call:
+        description: "Route reusable callers to the original PPU Extra workflow"
+        type: boolean
+        default: true
       ref:
         description: "Git ref to test; defaults to the triggering event SHA"
         required: false
@@ -60,9 +64,9 @@ permissions:
 
 concurrency:
   group: >-
-    pr-test-ppu-dispatch-${{ inputs.run_legacy_sanity && 'legacy' || (inputs.run_model_sanity && 'model-sanity' || 'recipe') }}-${{
+    pr-test-ppu-dispatch-${{ inputs.legacy_call && 'reusable' || (inputs.run_legacy_sanity && 'legacy' || (inputs.run_model_sanity && 'model-sanity' || 'recipe')) }}-${{
       (github.event_name == 'pull_request_target' &&
-       github.event.action == 'labeled' &&
+       contains(fromJSON('["labeled","unlabeled"]'), github.event.action) &&
        !contains(fromJSON('["run-ci","run-ci-ppu"]'), github.event.label.name)) &&
       format('ignored-label-{0}', github.run_id) ||
       github.event.pull_request.number || inputs.ref || github.ref
@@ -76,12 +80,12 @@ defaults:
 jobs:
   pr-gate:
     name: >-
-      ${{ (github.event_name == 'pull_request_target' && github.event.action == 'labeled' &&
+      ${{ (github.event_name == 'pull_request_target' && contains(fromJSON('["labeled","unlabeled"]'), github.event.action) &&
            !contains(fromJSON('["run-ci","run-ci-ppu"]'), github.event.label.name)) &&
           'ignored-label-pr-gate' || 'pr-gate' }}
     if: >-
-      github.event_name == 'pull_request_target' &&
-      (github.event.action != 'labeled' ||
+      github.event_name == 'pull_request_target' && !inputs.legacy_call &&
+      (!contains(fromJSON('["labeled","unlabeled"]'), github.event.action) ||
        contains(fromJSON('["run-ci","run-ci-ppu"]'), github.event.label.name))
     uses: ./.github/workflows/ppu-approval.yml
     with:
@@ -114,7 +118,10 @@ jobs:
     secrets: inherit
 
   legacy-call:
-    if: github.event_name == 'workflow_call'
+    # Reusable workflows inherit the event of the caller. Only workflow_call
+    # declares this input, so existing callers need no changes.
+    needs: require-target-branch
+    if: ${{ !cancelled() && inputs.legacy_call && needs.require-target-branch.result == 'skipped' }}
     uses: ./.github/workflows/pr-test-ppu-extra.yml
     with:
       ref: ${{ inputs.ref }}
@@ -123,62 +130,42 @@ jobs:
 
   require-target-branch:
     name: require-target-branch
-    if: github.event_name == 'workflow_dispatch'
+    if: >-
+      (github.event_name == 'workflow_dispatch' && !inputs.legacy_call) ||
+      (inputs.legacy_call && github.event.pull_request &&
+       (!github.event.pull_request.head.repo.id || github.event.pull_request.head.repo.id != github.event.repository.id))
     runs-on: ubuntu-latest
     permissions: {}
     steps:
       - name: Require an active release or development branch ref
+        env:
+          LEGACY_CALL: ${{ inputs.legacy_call }}
         run: |
+          if [[ "$LEGACY_CALL" == "true" ]]; then
+            echo '::error::Fork PRs require an isolated PPU executor.'
+            exit 1
+          fi
           printf '%s\n' '::error::Select release/v0.5.23, yuhe/v1.0.0, or main as the workflow branch (--ref) when dispatching pr-test-ppu.yml.'
           exit 1
 
   pr-test-ppu-finish:
     name: >-
-      ${{ (github.event_name == 'pull_request_target' && github.event.action == 'labeled' &&
-           !contains(fromJSON('["run-ci","run-ci-ppu"]'), github.event.label.name)) &&
-          'ignored-label-pr-test-ppu-finish' || 'pr-test-ppu-finish' }}
-    needs: [pr-gate, release-v0523, yuhe-v100, legacy-call]
-    if: >-
-      always() && (
-        (github.event_name == 'pull_request_target' &&
-         (needs.pr-gate.result == 'failure' || needs.pr-gate.result == 'cancelled' ||
-          needs.pr-gate.outputs.approved == 'true')) ||
-        (github.event_name == 'workflow_call' && needs.legacy-call.result != 'skipped')
-      )
+      ${{ needs.pr-gate.result == 'skipped' && 'ignored-ppu-dispatch-finish' || 'pr-test-ppu-finish' }}
+    needs: [pr-gate, release-v0523, yuhe-v100]
+    if: always() && needs.pr-gate.result != 'skipped'
     runs-on: ubuntu-latest
-    permissions: {}
     steps:
-      - name: Require successful delegated PPU PR validation
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          sparse-checkout: scripts/ci/ppu
+          persist-credentials: false
+      - name: Require Fast Sanity results for the approved PR head
+        uses: actions/github-script@v8
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          BASE_REF: ${{ github.base_ref }}
-          APPROVED_SHA: ${{ needs.pr-gate.outputs.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          NEEDS_JSON: ${{ toJson(needs) }}
-        run: |
-          if jq -e 'any(.[]; .result == "failure" or .result == "cancelled")' <<< "$NEEDS_JSON" >/dev/null; then
-            printf '%s\n' '::error::A PPU PR CI job failed or was cancelled.'
-            exit 1
-          fi
-          if [[ "$EVENT_NAME" == "workflow_call" ]]; then
-            jq -e '.["legacy-call"].result == "success"' <<< "$NEEDS_JSON" >/dev/null
-            printf '%s\n' 'Delegated PPU workflow_call validation passed.'
-            exit 0
-          fi
-          if [[ -z "$APPROVED_SHA" || "$APPROVED_SHA" != "$HEAD_SHA" ]]; then
-            printf '%s\n' '::error::Approved SHA does not match the current PR head SHA.'
-            exit 1
-          fi
-          case "$BASE_REF" in
-            release/v0.5.23) target_job="release-v0523" ;;
-            yuhe/v1.0.0) target_job="yuhe-v100" ;;
-            *)
-              printf '::error::Unsupported PPU PR target branch: %s\n' "$BASE_REF"
-              exit 1
-              ;;
-          esac
-          if ! jq -e --arg j "$target_job" '.[$j].result == "success"' <<< "$NEEDS_JSON" >/dev/null; then
-            printf '::error::Expected delegated job %s to succeed for %s.\n' "$target_job" "$BASE_REF"
-            exit 1
-          fi
-          printf 'PPU PR Fast Sanity passed for %s at %s.\n' "$BASE_REF" "$APPROVED_SHA"
+          PPU_NEEDS: ${{ toJSON(needs) }}
+        with:
+          script: |
+            const finish = require('./scripts/ci/ppu/ppu_pr_result.cjs');
+            await finish({github, context, needs: JSON.parse(process.env.PPU_NEEDS)});

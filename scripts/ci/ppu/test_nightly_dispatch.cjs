@@ -378,12 +378,11 @@ function parseWorkflowEvents(workflowText) {
   return events;
 }
 
-function assertDefaultBranchTriggerSchema(prWorkflow, nightlyWorkflow) {
-  const prEvents = parseWorkflowEvents(prWorkflow);
+function assertDefaultBranchTriggerSchema(prEvents, nightlyEvents) {
   assert.deepEqual(prEvents.pull_request_target?.branches, ["yuhe/v1.0.0", "release/v0.5.23"]);
   assert.deepEqual(
     prEvents.pull_request_target?.types,
-    ["opened", "synchronize", "reopened", "labeled", "ready_for_review"],
+    ["opened", "synchronize", "reopened", "labeled", "unlabeled", "ready_for_review", "converted_to_draft"],
   );
   assert.deepEqual(
     prEvents.workflow_dispatch?.inputs,
@@ -391,8 +390,26 @@ function assertDefaultBranchTriggerSchema(prWorkflow, nightlyWorkflow) {
   );
   assert.deepEqual(
     prEvents.workflow_call?.inputs,
-    ["ref", "run_all_tests", "run_legacy_sanity"],
+    ["legacy_call", "ref", "run_all_tests", "run_legacy_sanity"],
   );
+  assert.deepEqual(nightlyEvents.pull_request_target?.branches, ["yuhe/v1.0.0", "release/v0.5.23"]);
+  assert.deepEqual(
+    nightlyEvents.pull_request_target?.types,
+    ["labeled", "synchronize", "reopened", "ready_for_review"],
+  );
+  assert.deepEqual(
+    nightlyEvents.workflow_dispatch?.inputs,
+    ["target_ref", "model_filter", "image_tag", "image_digest", "skip_wheel_build", "wheel_artifact_run_id"],
+  );
+}
+
+test("default branch delegates pull_request_target label triggers and scopes assertions per event", () => {
+  const prWorkflow = readFileSync(resolve(__dirname, "../../../.github/workflows/pr-test-ppu.yml"), "utf8");
+  const nightlyWorkflow = readFileSync(resolve(__dirname, "../../../.github/workflows/nightly-test-ppu.yml"), "utf8");
+  const prEvents = parseWorkflowEvents(prWorkflow);
+  const nightlyEvents = parseWorkflowEvents(nightlyWorkflow);
+  assertDefaultBranchTriggerSchema(prEvents, nightlyEvents);
+
   assert.match(prWorkflow, /^\s*uses:\s*\.\/\.github\/workflows\/ppu-approval\.yml\s*$/m);
   assert.match(
     prWorkflow,
@@ -404,16 +421,6 @@ function assertDefaultBranchTriggerSchema(prWorkflow, nightlyWorkflow) {
   );
   assert.match(prWorkflow, /^\s*pr-test-ppu-finish:\s*$/m);
 
-  const nightlyEvents = parseWorkflowEvents(nightlyWorkflow);
-  assert.deepEqual(nightlyEvents.pull_request_target?.branches, ["yuhe/v1.0.0", "release/v0.5.23"]);
-  assert.deepEqual(
-    nightlyEvents.pull_request_target?.types,
-    ["labeled", "synchronize", "reopened", "ready_for_review"],
-  );
-  assert.deepEqual(
-    nightlyEvents.workflow_dispatch?.inputs,
-    ["target_ref", "model_filter", "image_tag", "image_digest", "skip_wheel_build", "wheel_artifact_run_id"],
-  );
   assert.match(nightlyWorkflow, /^\s*uses:\s*\.\/\.github\/workflows\/ppu-approval\.yml\s*$/m);
   assert.match(
     nightlyWorkflow,
@@ -423,42 +430,17 @@ function assertDefaultBranchTriggerSchema(prWorkflow, nightlyWorkflow) {
     nightlyWorkflow,
     /^\s*uses:\s*t-head\/sglang-for-sail\/\.github\/workflows\/nightly-test-ppu\.yml@yuhe\/v1\.0\.0\s*$/m,
   );
-}
 
-test("default branch delegates pull_request_target label triggers and scopes assertions per event", () => {
-  const prWorkflow = readFileSync(
-    resolve(__dirname, "../../../.github/workflows/pr-test-ppu.yml"),
-    "utf8",
-  );
-  const nightlyWorkflow = readFileSync(
-    resolve(__dirname, "../../../.github/workflows/nightly-test-ppu.yml"),
-    "utf8",
-  );
-  assertDefaultBranchTriggerSchema(prWorkflow, nightlyWorkflow);
-
-  const reformattedQuotes = prWorkflow.replace(
-    "branches: ['yuhe/v1.0.0', 'release/v0.5.23']",
-    'branches: [ "yuhe/v1.0.0" , "release/v0.5.23" ]',
-  );
-  assertDefaultBranchTriggerSchema(reformattedQuotes, nightlyWorkflow);
-
-  const missingPrtSynchronize = prWorkflow.replace(
-    "types: [opened, synchronize, reopened, labeled, ready_for_review]",
-    "types: [opened, reopened, labeled, ready_for_review]",
-  );
-  assert.throws(() => assertDefaultBranchTriggerSchema(missingPrtSynchronize, nightlyWorkflow));
-
-  const missingDispatchInput = prWorkflow.replace(
-    /^      run_legacy_sanity:\n        description: "Run only the single-device DFlash and EAGLE3 checks"\n        type: boolean\n        default: false\n/m,
-    "",
-  );
-  assert.throws(() => assertDefaultBranchTriggerSchema(missingDispatchInput, nightlyWorkflow));
-
-  const missingNightlySynchronize = nightlyWorkflow.replace(
-    "types: [labeled, synchronize, reopened, ready_for_review]",
-    "types: [labeled, reopened, ready_for_review]",
-  );
-  assert.throws(() => assertDefaultBranchTriggerSchema(prWorkflow, missingNightlySynchronize));
+  for (const [workflow, event, property, required] of [
+    ["pr", "pull_request_target", "types", "synchronize"],
+    ["pr", "workflow_dispatch", "inputs", "run_legacy_sanity"],
+    ["nightly", "pull_request_target", "types", "synchronize"],
+  ]) {
+    const copy = structuredClone({pr: prEvents, nightly: nightlyEvents});
+    const node = copy[workflow][event];
+    node[property] = node[property].filter(value => value !== required);
+    assert.throws(() => assertDefaultBranchTriggerSchema(copy.pr, copy.nightly), assert.AssertionError);
+  }
 
   const tiers = JSON.parse(
     readFileSync(resolve(__dirname, "../opt_in_ci_tiers.json"), "utf8"),
@@ -467,4 +449,11 @@ test("default branch delegates pull_request_target label triggers and scopes ass
     label: "run-ci-ppu-extra",
     workflows: [".github/workflows/pr-test-ppu-extra.yml"],
   });
+});
+
+test("equivalent YAML spacing and quotes produce the same trigger events", () => {
+  const prefix = "on:\n  pull_request_target:\n";
+  const compact = prefix + "    types: [opened, synchronize]\n";
+  const spaced = prefix + '    types:  [ "opened", \'synchronize\' ]\n';
+  assert.deepEqual(parseWorkflowEvents(spaced), parseWorkflowEvents(compact));
 });

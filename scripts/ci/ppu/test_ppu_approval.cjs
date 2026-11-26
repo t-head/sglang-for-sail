@@ -2,6 +2,7 @@
 const assert = require("node:assert/strict");
 const {test} = require("node:test");
 const approved = require("./ppu_approval.cjs");
+const requireFastSanity = require("./ppu_pr_result.cjs");
 
 const head = "a".repeat(40);
 const other = "b".repeat(40);
@@ -12,14 +13,14 @@ function fixture(label = "run-ci-ppu") {
   const repo = {owner: "t-head", repo: "sglang-for-sail", defaultBranch: "main"};
   const pr = {
     number: 268, state: "open", draft: false, base: {ref: base},
-    head: {sha: head, ref: "feature/topic", repo: {id: 123, owner: {login: "contributor"}, name: "fork"}},
+    head: {sha: head, ref: "feature/topic", repo: {id: 123, owner: {login: repo.owner}, name: repo.repo}},
     labels: [{name: "run-ci"}, {name: label}],
   };
   const context = {
     repo: {owner: repo.owner, repo: repo.repo},
     eventName: "pull_request_target", actor: "github-actions[bot]",
     ref: "refs/heads/" + base, sha: other,
-    payload: {action: "synchronize", pull_request: structuredClone(pr)},
+    payload: {action: "synchronize", repository: {id: 123}, pull_request: structuredClone(pr)},
   };
   const timeline = [{
     event: "labeled", label: {name: label}, actor: {login: "maintainer"},
@@ -68,7 +69,7 @@ function fixture(label = "run-ci-ppu") {
         return {data: [branchActivity[args.ref]]};
       }
       assert.deepEqual(args, {
-        owner: "contributor", repo: "fork", ref: "refs/heads/feature/topic",
+        owner: repo.owner, repo: repo.repo, ref: "refs/heads/feature/topic",
         direction: "desc", per_page: 1,
       });
       return {data: [change]};
@@ -88,6 +89,76 @@ test("the same approved SHA works for either label notification and bot reruns",
     f.context.payload.action = "synchronize";
     delete f.context.payload.label;
     assert.equal(await approved(f), true);
+  }
+});
+
+test("both label workflows stop before shared runners for fork or unknown repositories", async () => {
+  for (const label of ["run-ci-ppu", "run-ci-ppu-nightly"]) {
+    const f = fixture(label);
+    f.pr.head.repo.id = f.context.payload.pull_request.head.repo.id = 456;
+    await assert.rejects(approved.resolve(f), /isolated PPU executor/);
+    delete f.context.payload.repository;
+    await assert.rejects(approved.resolve(f), /isolated PPU executor/);
+  }
+});
+
+function fastSanityFixture(branch = base) {
+  const f = fixture();
+  const target = branch === base ? "release-v0523" : "yuhe-v100";
+  f.pr.base.ref = f.context.payload.pull_request.base.ref = branch;
+  f.context.runId = 821;
+  const jobs = ["pr-test-ppu-finish", "ppu-fast-sanity / plan", "ppu-fast-sanity / Fast Sanity (qwen)"]
+    .map(name => ({
+      name: target + " / " + name, run_attempt: 1, head_sha: head, status: "completed", conclusion: "success",
+    }));
+  jobs[2].steps = [{name: "Orchestrate PPU Pod with private logs", conclusion: "success"}];
+  f.github.rest.actions = {listJobsForWorkflowRun: Symbol("run jobs")};
+  const paginate = f.github.paginate;
+  f.github.paginate = async (route, args) => {
+    if (route !== f.github.rest.actions.listJobsForWorkflowRun) return paginate(route, args);
+    assert.deepEqual(args, {...f.context.repo, run_id: 821, filter: "all", per_page: 100});
+    return jobs;
+  };
+  f.needs = {
+    "pr-gate": {result: "success", outputs: {approved: "true", sha: head}},
+    [target]: {result: "success"},
+  };
+  return {...f, jobs, target};
+}
+
+test("both target branches require successful PPU execution on the approved head", async () => {
+  for (const branch of [base, "yuhe/v1.0.0"]) {
+    await requireFastSanity(fastSanityFixture(branch));
+  }
+  const f = fastSanityFixture();
+  f.jobs[0].run_attempt = 2; // The delegated summary reran with the failed model.
+  f.jobs[2].conclusion = "failure";
+  f.jobs.unshift({...f.jobs[2], run_attempt: 2, conclusion: "success"});
+  await requireFastSanity(f);
+});
+
+test("approval and the delegated job alone cannot satisfy the release check", async () => {
+  for (const change of [
+    f => { f.needs["pr-gate"].outputs.approved = "false"; },
+    f => { f.needs["pr-gate"].result = "cancelled"; },
+    f => { f.needs["pr-gate"].outputs.sha = other; },
+    f => { f.needs[f.target].result = "skipped"; },
+    f => { f.jobs.length = 0; },
+    f => { f.jobs.pop(); },
+    f => { f.jobs[0].conclusion = "skipped"; },
+    f => { f.jobs[2].head_sha = other; },
+    f => { f.jobs[2].steps[0].conclusion = "skipped"; },
+    f => { f.jobs[2].name = f.jobs[2].name.replace("Fast Sanity", "Model Sanity"); },
+    f => { f.jobs.push({...f.jobs[2], run_attempt: 2, conclusion: "failure"}); },
+    f => { f.jobs[2].run_attempt = 2; }, // The old summary predates the new model job.
+    f => { f.jobs.push({...f.jobs[0], name: f.target + " / ppu-fast-sanity", run_attempt: 2, conclusion: "skipped"}); },
+    f => { f.jobs[0].run_attempt = f.jobs[1].run_attempt = 2; }, // A new plan has no model results yet.
+    f => { f.pr.head.sha = other; },
+    f => { f.pr.labels.pop(); },
+  ]) {
+    const f = fastSanityFixture();
+    change(f);
+    await assert.rejects(requireFastSanity(f), /PPU|Fast Sanity|approval/, String(change));
   }
 });
 

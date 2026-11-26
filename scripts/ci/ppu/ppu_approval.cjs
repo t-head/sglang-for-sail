@@ -70,6 +70,11 @@ async function approvedPullRequest(github, context, label, ref) {
       !pr.head.repo || pr.head.repo.id !== eventPR.head.repo?.id ||
       !labels.has("run-ci") || !labels.has(label)) return DENIED;
 
+  // Both label workflows currently delegate to runners with shared PPU storage.
+  if (!context.payload.repository?.id || pr.head.repo.id !== context.payload.repository.id) {
+    throw new Error("Fork PRs require an isolated PPU executor. The shared PPU runners accept same-repository revisions only.");
+  }
+
   const timeline = await github.paginate(github.rest.issues.listEventsForTimeline, {
     ...context.repo, issue_number: pr.number, per_page: 100,
   });
