@@ -329,6 +329,376 @@ class NotifySummaryTest(unittest.TestCase):
         self.assertEqual(201, result["job_id"])
         self.assertEqual(30, result["job_elapsed_s"])
 
+    def test_targets_json_routes_single_target_and_does_not_fallback_on_failure(self):
+        targets = {
+            "default": {
+                "webhook_url": "https://example.com/robot/send?access_token=default-tok",
+                "signing_secret": "SEC-default",
+            },
+            "routes": {
+                "v1.0.0": {
+                    "webhook_url": "https://example.com/robot/send?access_token=v100-tok",
+                    "signing_secret": "SEC-v100",
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "report.json"
+            path.write_text('{"results":[{"model":"atlas","status":"pass"}]}')
+            with (
+                patch.dict(
+                    "os.environ",
+                    {
+                        notify.TARGETS: json.dumps(targets),
+                        notify.URL: "https://example.com/robot/send?access_token=legacy-tok",
+                        notify.SECRET: "SEC-legacy",
+                        "NOTIFY_REF": "yuhe/v1.0.0",
+                    },
+                ),
+                patch.object(notify, "build_opener") as build,
+            ):
+                opener = build.return_value
+                opener.open.return_value.__enter__.return_value.read.return_value = (
+                    b'{"errcode":0}'
+                )
+                self.assertEqual(0, notify.main(["--report", str(path)]))
+                self.assertEqual(1, opener.open.call_count)
+                req = opener.open.call_args.args[0]
+                qs = parse_qs(urlsplit(req.full_url).query)
+                self.assertEqual(["v100-tok"], qs["access_token"])
+                expected_signed = notify.signed_url(
+                    targets["routes"]["v1.0.0"]["webhook_url"],
+                    "SEC-v100",
+                    int(qs["timestamp"][0]),
+                )
+                self.assertEqual(expected_signed, req.full_url)
+                body = json.loads(req.data.decode())
+                self.assertTrue(
+                    body["markdown"]["title"].startswith("[sglang | v1.0.0] ")
+                )
+
+            with (
+                patch.dict(
+                    "os.environ",
+                    {
+                        notify.TARGETS: json.dumps(targets),
+                        notify.URL: "https://example.com/robot/send?access_token=legacy-tok",
+                        notify.SECRET: "SEC-legacy",
+                        "NOTIFY_REF": "yuhe/v1.0.0",
+                    },
+                ),
+                patch.object(notify, "build_opener") as build,
+                redirect_stderr(io.StringIO()) as logs,
+            ):
+                build.return_value.open.side_effect = HTTPError(
+                    "https://example.com/robot/send?access_token=v100-tok",
+                    503,
+                    "v100-tok",
+                    {},
+                    None,
+                )
+                self.assertEqual(0, notify.main(["--report", str(path)]))
+                self.assertEqual(1, build.return_value.open.call_count)
+                self.assertIn("::warning::", logs.getvalue())
+                self.assertNotIn("v100-tok", logs.getvalue())
+                self.assertNotIn("default-tok", logs.getvalue())
+
+    def test_targets_json_unregistered_version_uses_default_then_legacy_then_skips(
+        self,
+    ):
+        targets_with_default = {
+            "default": {
+                "webhook_url": "https://example.com/robot/send?access_token=default-tok",
+                "signing_secret": "SEC-default",
+            },
+            "routes": {
+                "v1.0.0": {
+                    "webhook_url": "https://example.com/robot/send?access_token=v100-tok",
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "report.json"
+            path.write_text('{"results":[{"model":"atlas","status":"pass"}]}')
+            with (
+                patch.dict(
+                    "os.environ",
+                    {
+                        notify.TARGETS: json.dumps(targets_with_default),
+                        notify.URL: "https://example.com/robot/send?access_token=legacy-tok",
+                        "NOTIFY_REF": "release/v1.1.0",
+                    },
+                ),
+                patch.object(notify, "build_opener") as build,
+            ):
+                opener = build.return_value
+                opener.open.return_value.__enter__.return_value.read.return_value = (
+                    b'{"errcode":0}'
+                )
+                self.assertEqual(0, notify.main(["--report", str(path)]))
+                self.assertEqual(1, opener.open.call_count)
+                req = opener.open.call_args.args[0]
+                self.assertEqual(
+                    ["default-tok"],
+                    parse_qs(urlsplit(req.full_url).query)["access_token"],
+                )
+                body = json.loads(req.data.decode())
+                self.assertTrue(
+                    body["markdown"]["title"].startswith("[sglang | v1.1.0] ")
+                )
+
+            routes_only = {
+                "routes": {
+                    "v1.0.0": {
+                        "webhook_url": "https://example.com/robot/send?access_token=v100-tok",
+                    }
+                }
+            }
+            with (
+                patch.dict(
+                    "os.environ",
+                    {
+                        notify.TARGETS: json.dumps(routes_only),
+                        notify.URL: "https://example.com/robot/send?access_token=legacy-tok",
+                        "NOTIFY_REF": "release/v1.1.0",
+                    },
+                ),
+                patch.object(notify, "build_opener") as build,
+            ):
+                opener = build.return_value
+                opener.open.return_value.__enter__.return_value.read.return_value = (
+                    b'{"errcode":0}'
+                )
+                self.assertEqual(0, notify.main(["--report", str(path)]))
+                self.assertEqual(1, opener.open.call_count)
+                req = opener.open.call_args.args[0]
+                self.assertEqual(
+                    ["legacy-tok"],
+                    parse_qs(urlsplit(req.full_url).query)["access_token"],
+                )
+
+            with (
+                patch.dict(
+                    "os.environ",
+                    {
+                        notify.TARGETS: json.dumps(routes_only),
+                        "NOTIFY_REF": "release/v1.1.0",
+                    },
+                ),
+                patch.object(notify, "build_opener") as build,
+                redirect_stderr(io.StringIO()) as logs,
+            ):
+                self.assertEqual(0, notify.main(["--report", "absent.json"]))
+                self.assertEqual(1, notify.main(["--smoke-test"]))
+                self.assertEqual(0, build.return_value.open.call_count)
+                self.assertIn("::warning::", logs.getvalue())
+
+    def test_targets_json_invalid_fails_closed_without_fallback_or_secret_leak(self):
+        secret_marker = "secret-marker-do-not-leak"
+        invalid_payloads = [
+            "{broken-json",
+            "[]",
+            "{}",
+            '{"routes":{}}',
+            json.dumps(
+                {
+                    "default": {"webhook_url": f"https://example.com/{secret_marker}"},
+                    "extra": {},
+                }
+            ),
+            json.dumps(
+                {
+                    "routes": {
+                        "release/v1.0.0": {
+                            "webhook_url": f"https://example.com/{secret_marker}"
+                        }
+                    }
+                }
+            ),
+            json.dumps(
+                {
+                    "default": {
+                        "webhook_url": f"http://example.com/{secret_marker}",
+                        "signing_secret": secret_marker,
+                    }
+                }
+            ),
+            json.dumps(
+                {
+                    "default": {
+                        "webhook_url": f"https://example.com/{secret_marker}#frag",
+                    }
+                }
+            ),
+            json.dumps(
+                {
+                    "default": {
+                        "webhook_url": f"https://user@example.com/{secret_marker}",
+                    }
+                }
+            ),
+            json.dumps(
+                {
+                    "default": {
+                        "webhook_url": f"https://example.com/{secret_marker}",
+                        "unknown": 1,
+                    }
+                }
+            ),
+            json.dumps(
+                {
+                    "default": {
+                        "webhook_url": "https://example.com/robot/send",
+                        "signing_secret": 123,
+                    }
+                }
+            ),
+            "{"
+            + f'"default":{{"webhook_url":"https://example.com/{secret_marker}"}}'
+            + " " * (64 * 1024)
+            + "}",
+        ]
+        for raw in invalid_payloads:
+            with (
+                self.subTest(raw=raw[:40]),
+                patch.dict(
+                    "os.environ",
+                    {
+                        notify.TARGETS: raw,
+                        notify.URL: "https://example.com/robot/send?access_token=legacy-tok",
+                    },
+                ),
+                patch.object(notify, "build_opener") as build,
+                redirect_stderr(io.StringIO()) as logs,
+            ):
+                self.assertEqual(0, notify.main(["--report", "absent.json"]))
+                self.assertEqual(1, notify.main(["--smoke-test"]))
+                self.assertEqual(0, build.return_value.open.call_count)
+                self.assertIn("::warning::", logs.getvalue())
+                self.assertNotIn(secret_marker, logs.getvalue())
+
+    def test_run_jobs_strips_targets_and_notification_secrets(self):
+        captured_envs = []
+
+        def fake_check_output(command, **kwargs):
+            captured_envs.append(kwargs["env"])
+            endpoint = command[4]
+            if endpoint.endswith("/attempts/2"):
+                return b'{"run_started_at":"2023-01-02T03:00:00Z"}'
+            raise AssertionError(endpoint)
+
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    notify.URL: "https://example.com/u",
+                    notify.SECRET: "s",
+                    notify.ROSTER: "{}",
+                    notify.TARGETS: '{"default":{"webhook_url":"https://example.com/t"}}',
+                    "KEEP_ME": "1",
+                },
+            ),
+            patch.object(
+                notify.subprocess, "check_output", side_effect=fake_check_output
+            ),
+        ):
+            _, _ = notify.run_jobs(set())
+        self.assertEqual(1, len(captured_envs))
+        for forbidden in (notify.URL, notify.SECRET, notify.ROSTER, notify.TARGETS):
+            self.assertNotIn(forbidden, captured_envs[0])
+        self.assertEqual("1", captured_envs[0]["KEEP_ME"])
+
+    def test_normalize_version_and_dynamic_version_titles(self):
+        cases = [
+            ("", "main", "", "main"),
+            ("", "refs/heads/main", "", "main"),
+            ("", "releases/v0.35.0", "", "v0.35.0"),
+            ("", "refs/heads/releases/v0.35.0", "", "v0.35.0"),
+            ("", "release/v1.1.0", "", "v1.1.0"),
+            ("", "refs/heads/release/v1.1.0", "", "v1.1.0"),
+            ("", "yuhe/v1.0.0", "", "v1.0.0"),
+            ("", "refs/heads/yuhe/v1.0.0", "", "v1.0.0"),
+            ("", "v1.2.3-rc1", "", "v1.2.3-rc1"),
+            ("v0.5.23", "release/v1.1.0", "v1.0.0", "v0.5.23"),
+            ("", "a" * 40, "v0.5.23", "v0.5.23"),
+            ("", "releases/main", "", ""),
+            ("", "yuhe/main", "", ""),
+            ("", "refs/heads/v1.0.0", "", ""),
+            ("", "refs/tags/v1.0.0", "", ""),
+            ("", "refs/heads/Main", "", ""),
+            ("bad/ref", "release/v1.0.0", "v1.0.0", ""),
+        ]
+        for explicit, ref, fallback, expected in cases:
+            with self.subTest(explicit=explicit, ref=ref, fallback=fallback):
+                self.assertEqual(
+                    expected, notify.normalize_version(explicit, ref, fallback)
+                )
+
+        report = {"results": [{"model": "atlas", "status": "pass"}]}
+        for version, expected_prefix in (
+            ("v1.1.0", "[sglang | v1.1.0] "),
+            ("v0.5.23-rc1", "[sglang | v0.5.23-rc1] "),
+            ("bad/version", "[example/framework] "),
+        ):
+            payload = notify.make_payload(report, "", "mon", version=version)
+            self.assertTrue(payload["markdown"]["title"].startswith(expected_prefix))
+
+    def test_cli_version_precedence_and_smoke_test_version_flag(self):
+        targets = {
+            "default": {
+                "webhook_url": "https://example.com/robot/send?access_token=default-tok"
+            },
+            "routes": {
+                "v0.5.23": {
+                    "webhook_url": "https://example.com/robot/send?access_token=v0523-tok"
+                },
+                "v1.0.0": {
+                    "webhook_url": "https://example.com/robot/send?access_token=v100-tok"
+                },
+            },
+        }
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    notify.TARGETS: json.dumps(targets),
+                    "NOTIFY_REF": "yuhe/v1.0.0",
+                    "NOTIFY_VERSION": "v0.5.23",
+                },
+            ),
+            patch.object(notify, "build_opener") as build,
+        ):
+            opener = build.return_value
+            opener.open.return_value.__enter__.return_value.read.return_value = (
+                b'{"errcode":0}'
+            )
+            self.assertEqual(0, notify.main(["--smoke-test", "--version", "v0.5.23"]))
+            req = opener.open.call_args.args[0]
+            self.assertEqual(
+                ["v0523-tok"], parse_qs(urlsplit(req.full_url).query)["access_token"]
+            )
+            body = json.loads(req.data.decode())
+            self.assertEqual("[sglang | v0.5.23] PPU CI", body["markdown"]["title"])
+
+            opener.open.reset_mock()
+            with patch.dict("os.environ", {"NOTIFY_REF": "", "NOTIFY_VERSION": ""}):
+                self.assertEqual(0, notify.main(["--smoke-test"]))
+                req2 = opener.open.call_args.args[0]
+                self.assertEqual(
+                    ["default-tok"],
+                    parse_qs(urlsplit(req2.full_url).query)["access_token"],
+                )
+                body2 = json.loads(req2.data.decode())
+                self.assertEqual("PPU CI", body2["markdown"]["title"])
+
+            opener.open.reset_mock()
+            with redirect_stderr(io.StringIO()) as logs:
+                self.assertEqual(
+                    1, notify.main(["--smoke-test", "--version", "invalid/ver"])
+                )
+                self.assertEqual(0, opener.open.call_count)
+                self.assertIn("::warning::", logs.getvalue())
+
 
 class SGLangNotificationTest(unittest.TestCase):
     def test_scheduled_nightly_validates_attempt_and_source_and_supports_prebuilt(self):
@@ -396,6 +766,57 @@ class SGLangNotificationTest(unittest.TestCase):
                     self.assertEqual(
                         "build", nightly.collect(root)["results"][0]["phase"]
                     )
+
+    def test_workflow_forwards_targets_json_secret_and_gates_configuration(self):
+        workflow_path = (
+            Path(__file__).resolve().parents[3]
+            / ".github/workflows/nightly-test-ppu.yml"
+        )
+        workflow_doc = yaml.safe_load(workflow_path.read_text())
+        on_section = workflow_doc.get("on", workflow_doc.get(True))
+        secrets_decl = on_section["workflow_call"]["secrets"]
+        self.assertEqual(
+            {"required": False}, secrets_decl["PPU_CI_NOTIFY_TARGETS_JSON"]
+        )
+        steps = workflow_doc["jobs"]["notify-summary"]["steps"]
+        configured = next(step for step in steps if step.get("id") == "configured")
+        send = next(
+            step
+            for step in steps
+            if step.get("name") == "Send one Markdown notification"
+        )
+        self.assertEqual(
+            "${{ secrets.PPU_CI_NOTIFY_TARGETS_JSON }}",
+            configured["env"]["PPU_CI_NOTIFY_TARGETS_JSON"],
+        )
+        self.assertEqual(
+            "${{ secrets.PPU_CI_NOTIFY_TARGETS_JSON }}",
+            send["env"]["PPU_CI_NOTIFY_TARGETS_JSON"],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            for webhook, targets_json, expected in (
+                ("https://example.com/robot/send", "", True),
+                (
+                    "",
+                    '{"default":{"webhook_url":"https://example.com/robot/send"}}',
+                    True,
+                ),
+                ("", "", False),
+            ):
+                output = Path(tmp) / "github_output.txt"
+                output.unlink(missing_ok=True)
+                subprocess.run(
+                    ["bash", "-e", "-c", configured["run"]],
+                    env={
+                        "PATH": "/usr/bin:/bin:/opt/homebrew/bin",
+                        "PPU_CI_NOTIFY_WEBHOOK_URL": webhook,
+                        "PPU_CI_NOTIFY_TARGETS_JSON": targets_json,
+                        "GITHUB_OUTPUT": str(output),
+                    },
+                    check=True,
+                )
+                enabled = output.read_text().strip() if output.exists() else ""
+                self.assertEqual(expected, enabled == "enabled=true")
 
 
 if __name__ == "__main__":
