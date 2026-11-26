@@ -471,6 +471,7 @@ def check_one_batch_results(output, case, *, engine="one_batch"):
     threshold = case["threshold"]
     rows = [json.loads(line) for line in output.read_text().splitlines()]
     measured = set()
+    measurements = []
     passed = True
     for row in rows:
         key = (row["batch_size"], row["input_len"], row["output_len"])
@@ -483,15 +484,22 @@ def check_one_batch_results(output, case, *, engine="one_batch"):
             raise ValueError(f"{case['id']}: server did not generate the requested tokens")
         measured.add(key)
         value = row.get(threshold["metric"])
-        passed &= (
-            type(value) in (int, float)
-            and threshold["min_tokens_per_s"] <= value < math.inf
-        )
+        valid_throughput = type(value) in (int, float) and 0 <= value < math.inf
+        if valid_throughput:
+            measurements.append(
+                {
+                    "batch_size": key[0],
+                    "input_len": key[1],
+                    "output_len": key[2],
+                    "tokens_per_s": value,
+                }
+            )
+        passed &= valid_throughput and value >= threshold["min_tokens_per_s"]
     if measured != expected:
         raise ValueError(
             f"{case['id']}: missing one_batch results for {sorted(expected - measured)}"
         )
-    return passed
+    return passed, measurements
 
 
 def light_perf_worker_args(config, environ):
@@ -637,11 +645,17 @@ def run_light_perf(policy_path, assets_map, queue_s):
                 leader_done.touch()
         if multi_node:
             wait_for_light_perf_marker(peer_done, 45)
-        passed = check_one_batch_results(output, case, engine=config["benchmark_engine"])
+        passed, measurements = check_one_batch_results(
+            output, case, engine=config["benchmark_engine"]
+        )
         results[case_id] = {
             "passed": passed,
             "config_digest": config["config_digest"],
             "results": str(output.relative_to(RESULTS.resolve())),
+            "throughput": {
+                "metric": case["threshold"]["metric"],
+                "rows": measurements,
+            },
         }
     return {
         "queue_s": queue_s,
