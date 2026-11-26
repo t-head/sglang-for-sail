@@ -3555,6 +3555,263 @@ class PresetCatalogContractTest(unittest.TestCase):
         )
         validate_serving_recipe_structure(per_gpu_ib, context="per_gpu_ib")
 
+    def test_cluster_revision_pin_applies_only_to_default_mxfp4_variant(self):
+        from recipe_cluster_config import resolve_pinned_model_revision_key
+
+        rev_mxfp4 = "c" * 40
+        rev_fp8 = "b" * 40
+        base_glm = _load_yaml(REPO_ROOT / "test/ppu/recipes/zai-org/GLM-5.3.yaml")
+        mxfp4_id = base_glm["ppu"]["hf_model_id"]
+        fp8_id = base_glm["variants"]["fp8_channel"]["hf_model_id"]
+
+        for disable_pyyaml in (False, True):
+            with (
+                self.subTest(disable_pyyaml=disable_pyyaml),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                root = Path(tmp)
+                shutil.copytree(REPO_ROOT / "test/ppu", root / "test/ppu")
+                ctx = (
+                    patch.dict(sys.modules, {"yaml": None})
+                    if disable_pyyaml
+                    else contextlib.nullcontext()
+                )
+                with ctx:
+                    self.assertEqual(
+                        resolve_pinned_model_revision_key("glm-5.3", root),
+                        "PPU_CI_GLM53_MODEL_REVISION",
+                    )
+                    self.assertEqual(
+                        resolve_pinned_model_revision_key("deepseek-v4-flash", root),
+                        "PPU_CI_DSV4_FLASH_MODEL_REVISION",
+                    )
+                    self.assertIsNone(
+                        resolve_pinned_model_revision_key("qwen3.8-27b", root)
+                    )
+
+                glm_pol_path = root / "test/ppu/policy/models/glm-5.3.yaml"
+                pol_doc = _load_yaml(glm_pol_path)
+                pol_doc["variant"] = "fp8_channel"
+                glm_pol_path.write_text(yaml.safe_dump(pol_doc, sort_keys=False))
+                with ctx:
+                    self.assertIsNone(
+                        resolve_pinned_model_revision_key("glm-5.3", root)
+                    )
+
+                # Flow-style YAML mapping with non-default variant must also omit MXFP4 pin.
+                glm_pol_path.write_text(
+                    "{schema_version: ppu-test-policy/v1, variant: fp8_channel, "
+                    "recipe: test/ppu/recipes/zai-org/GLM-5.3.yaml}\n"
+                )
+                with ctx:
+                    self.assertIsNone(
+                        resolve_pinned_model_revision_key("glm-5.3", root)
+                    )
+
+                # Default variant whose recipe overrides hf_model_id away from MXFP4 must omit pin.
+                pol_doc.pop("variant", None)
+                glm_pol_path.write_text(yaml.safe_dump(pol_doc, sort_keys=False))
+                rec_path = root / "test/ppu/recipes/zai-org/GLM-5.3.yaml"
+                rec_doc = _load_yaml(rec_path)
+                rec_doc["variants"]["default"]["hf_model_id"] = fp8_id
+                rec_path.write_text(yaml.safe_dump(rec_doc, sort_keys=False))
+                with ctx:
+                    self.assertIsNone(
+                        resolve_pinned_model_revision_key("glm-5.3", root)
+                    )
+
+        if not all(shutil.which(tool) for tool in ("jq", "sha256sum")):
+            return
+
+        # End-to-end launcher -> USER_ENV_JSON -> worker run() on legacy key glm-5.3 with variant=fp8_channel.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            workspace = root / "checkout"
+            staging = root / "staging"
+            retained = root / "retained"
+            tools = root / "bin"
+            cache_root = root / "cache"
+            backend = workspace / ".ppu-infra/cluster-run/scripts"
+            payloads = workspace / "wheels"
+            for folder in (staging, retained, tools, cache_root, backend, payloads):
+                folder.mkdir(parents=True)
+            retained.chmod(0o700)
+            scripts = workspace / "scripts/ci/ppu"
+            shutil.copytree(REPO_ROOT / "scripts/ci/ppu", scripts)
+            shutil.copytree(REPO_ROOT / "test/ppu", workspace / "test/ppu")
+            pol_path = workspace / "test/ppu/policy/models/glm-5.3.yaml"
+            pol_doc = _load_yaml(pol_path)
+            pol_doc["variant"] = "fp8_channel"
+            pol_doc["tiers"] = {"fast_sanity": pol_doc["tiers"]["fast_sanity"]}
+            pol_path.write_text(yaml.safe_dump(pol_doc, sort_keys=False))
+
+            result_fixture = dict(fast_result(), model="glm-5.3")
+            (scripts / "recipe_bundle.py").write_text("# Verified separately\n")
+            (payloads / "recipe-manifest.json").write_text(
+                json.dumps({"recipe_tree_sha256": result_fixture["recipe_tree_sha256"]})
+            )
+            (workspace / "fixture.json").write_text(
+                json.dumps(
+                    {
+                        "outcome": "pass",
+                        "parser_checked": True,
+                        "sse_verified": True,
+                        "cold_start_s": 3.0,
+                        "queue_s": 0,
+                        "layer_override": None,
+                        "config_digest": result_fixture["config_digest"],
+                    }
+                )
+            )
+            (tools / "git").write_text(
+                f'#!/bin/bash\ncase "$1" in -C) echo {BACKEND_SHA};; '
+                f"*) echo {result_fixture['source_sha']};; esac\n"
+            )
+            kube_content = json.dumps(
+                {
+                    "status": {
+                        "containerStatuses": [
+                            {
+                                "name": "worker",
+                                "imageID": "docker-pullable://registry.internal/team/sglang"
+                                + result_fixture["runtime_image"],
+                            }
+                        ]
+                    }
+                }
+            )
+            (tools / "kubectl").write_text(
+                f"#!/bin/bash\nif [[ \"$*\" == *'get pod '* ]]; then echo '{kube_content}'; fi\n"
+            )
+            (tools / "timeout").write_text('#!/bin/bash\nshift\nexec "$@"\n')
+            for tool in tools.iterdir():
+                tool.chmod(0o700)
+            captured_env_file = root / "captured-user-env.json"
+            (backend / "submit.sh").write_text(
+                f'printf "%s" "$USER_ENV_JSON" > "{captured_env_file}"\n'
+                'printf "job_status=scheduled\\nstart_time=1\\ndeadline=2\\nqueue_duration_seconds=4\\n" >> "$GITHUB_OUTPUT"\n'
+            )
+            (backend / "monitor.sh").write_text(
+                'mkdir -p "$PPU_CI_WORKER_ARTIFACT_DIR/results"\n'
+                'cp fixture.json "$PPU_CI_WORKER_ARTIFACT_DIR/results/summary.json"\n'
+                'echo job_status=succeeded >> "$GITHUB_OUTPUT"\n'
+            )
+            (backend / "cleanup.sh").write_text(
+                'unlink "$SOURCE_STAGE_DIR"\nrmdir "$(dirname "$SOURCE_STAGE_DIR")"\n'
+            )
+            export_env = {
+                **os.environ,
+                "PATH": os.pathsep.join(
+                    (
+                        str(tools),
+                        str(Path(sys.executable).parent),
+                        os.environ["PATH"],
+                    )
+                ),
+                "TIER": "fast_sanity",
+                "MODEL_KEY": "glm-5.3",
+                "RECIPE_PPU_COUNT": "8",
+                "GITHUB_OUTPUT": str(root / "gha-output"),
+                "PPU_PUBLIC_SUMMARY": str(root / "gha-summary"),
+                "GITHUB_WORKSPACE": str(workspace),
+                "RUNNER_TEMP": str(root / "runner-temp"),
+                "GITHUB_RUN_ID": "88",
+                "GITHUB_RUN_ATTEMPT": "1",
+                "PPU_CI_K8S_CONFIG_SHA256": "",
+                "PPU_CI_K8S_LOADED_CONFIG_SHA256": "",
+                "PPU_CI_PRIVATE_RESULTS_ROOT": str(retained),
+                "PPU_CI_K8S_PRIVATE_WORKER_ROOT": str(retained),
+                "PPU_CI_K8S_STAGE_ROOT": str(staging),
+                "PPU_CI_SOURCE_SHA": result_fixture["source_sha"],
+                "PPU_CI_JIT_ROOT": str(root / "jit"),
+                "PPU_CI_HF_CACHE_ROOT": str(cache_root),
+                "PPU_CI_GLM53_MODEL_REVISION": rev_mxfp4,
+                "PPU_CI_K8S_RUNTIME_DIGEST": "registry.internal/team/sglang"
+                + result_fixture["runtime_image"],
+            }
+            proc = subprocess.run(
+                ["bash", str(scripts / "run_recipe_cluster.sh")],
+                cwd=workspace,
+                env=export_env,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            user_env = json.loads(captured_env_file.read_text())
+            self.assertNotIn("PPU_CI_HF_MODEL_REVISION", user_env)
+
+            # Feed the exact launcher USER_ENV_JSON into recipe_runner.run().
+            for repo_id, rev in ((mxfp4_id, rev_mxfp4), (fp8_id, rev_fp8)):
+                repo_dir = cache_root / f"models--{repo_id.replace('/', '--')}"
+                (repo_dir / "refs").mkdir(parents=True, exist_ok=True)
+                (repo_dir / "refs/main").write_text(rev)
+                snap = repo_dir / "snapshots" / rev
+                snap.mkdir(parents=True, exist_ok=True)
+                for name in ("config.json", "tokenizer.json"):
+                    (snap / name).write_text("{}")
+                (snap / "model.safetensors.index.json").write_text(
+                    json.dumps({"weight_map": {"w": "weight.safetensors"}})
+                )
+                (snap / "weight.safetensors").write_bytes(b"fixture")
+
+            expected_fp8_snap = str(
+                (
+                    cache_root
+                    / f"models--{fp8_id.replace('/', '--')}"
+                    / "snapshots"
+                    / rev_fp8
+                ).resolve()
+            )
+            worker_results = root / "worker-artifacts/results"
+            worker_results.mkdir(parents=True)
+            captured_cfgs = []
+
+            @contextlib.contextmanager
+            def fake_server(config, label, result_dict, timeout):
+                captured_cfgs.append(config)
+                result_dict["cold_start_s"] = 0.25
+                yield
+
+            fake_hf = {
+                "huggingface_hub": SimpleNamespace(
+                    snapshot_download=lambda *, repo_id, revision, cache_dir, local_files_only: (
+                        str(
+                            (
+                                Path(cache_dir)
+                                / f"models--{repo_id.replace('/', '--')}"
+                                / "snapshots"
+                                / revision
+                            ).resolve(strict=True)
+                        )
+                    )
+                ),
+                "huggingface_hub.file_download": SimpleNamespace(
+                    repo_folder_name=lambda *, repo_id, repo_type: (
+                        f"models--{repo_id.replace('/', '--')}"
+                    )
+                ),
+                "huggingface_hub.utils": SimpleNamespace(
+                    validate_repo_id=lambda repo_id: None
+                ),
+            }
+            worker_env = {**user_env, "HF_HUB_CACHE": str(cache_root)}
+            with (
+                patch.dict(os.environ, worker_env, clear=True),
+                patch.dict(sys.modules, fake_hf),
+                patch("ppu_recipe.REPO_ROOT", workspace),
+                patch("recipe_runner.REPO_ROOT", workspace),
+                patch("recipe_runner.RESULTS", worker_results),
+                patch("recipe_runner.phase"),
+                patch("recipe_runner.server", side_effect=fake_server),
+                patch("recipe_runner.probes"),
+            ):
+                worker_summary = run(pol_path, "fast_sanity", 0.0)
+                self.assertEqual(len(captured_cfgs), 1)
+                self.assertEqual(captured_cfgs[0]["hf_model_id"], fp8_id)
+                self.assertEqual(captured_cfgs[0]["resolved_model"], expected_fp8_snap)
+                self.assertEqual(worker_summary["outcome"], "pass")
+
 
 if __name__ == "__main__":
     unittest.main()
