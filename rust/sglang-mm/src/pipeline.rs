@@ -49,7 +49,6 @@ pub enum DecodedMedia {
         rgb: Vec<u8>,
         height: usize,
         width: usize,
-        jpeg: bool,
     },
 }
 
