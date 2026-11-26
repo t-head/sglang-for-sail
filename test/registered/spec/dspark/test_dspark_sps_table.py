@@ -226,90 +226,77 @@ class TestPdSpsProfiler(CustomTestCase):
         )
         self.assertEqual(error.exception.__cause__.response.status_code, 400)
 
-    def test_endpoint_arguments_distinguish_colocate_from_pd(self):
-        from sglang.benchmark.dspark_sps_profiler import (
-            add_run_args,
-            resolve_profile_url,
-        )
+    def test_fake_prefill_is_explicit_and_uses_the_base_url(self):
+        from sglang.benchmark.dspark_sps_profiler import add_run_args
 
         parser = argparse.ArgumentParser()
         add_run_args(parser)
         colocate = parser.parse_args(["--base-url", "http://engine"])
-        self.assertEqual(resolve_profile_url(colocate), "http://engine")
-        pd = parser.parse_args(
-            ["--prefill-url", "http://prefill", "--decode-url", "http://decode"]
-        )
-        self.assertEqual(resolve_profile_url(pd), "http://decode")
-        partial = parser.parse_args(
-            ["--base-url", "http://decode", "--prefill-url", "http://prefill"]
-        )
-        with self.assertRaisesRegex(ValueError, "both --prefill-url and --decode-url"):
-            resolve_profile_url(partial)
+        self.assertEqual(colocate.base_url, "http://engine")
+        self.assertFalse(colocate.fake_prefill)
+        decode = parser.parse_args(["--base-url", "http://decode", "--fake-prefill"])
+        self.assertEqual(decode.base_url, "http://decode")
+        self.assertTrue(decode.fake_prefill)
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["--fake-prefill"])
 
-    def test_discovers_prefill_bootstrap_and_checks_roles(self):
+    def test_fake_prefill_requires_decode_and_matches_attention_dp_streams(self):
         from sglang.benchmark import dspark_sps_profiler as profiler
 
-        d_info = dict(
-            disaggregation_mode="decode", disaggregation_transfer_backend="mooncake"
+        response = Mock()
+        rank_record = dict(
+            dp_size=1,
+            effective_max_running_requests_per_dp=32,
+            dspark_info_record=dict(
+                mode="static",
+                components=["core", "step_cpu_time"],
+                simulate_acc_len=1.0,
+                verify_num_draft_tokens=6,
+            ),
         )
-        p_info = dict(
-            disaggregation_mode="prefill",
-            disaggregation_transfer_backend="mooncake",
-            disaggregation_bootstrap_port=31003,
+        info = dict(
+            disaggregation_mode="decode",
+            speculative_algorithm="DSPARK",
+            attn_dp_size=2,
+            tokenizer_path="tokenizer",
+            internal_states=[rank_record, rank_record],
         )
-        reply = Mock()
-        reply.json.return_value = p_info
-        args = dict(
-            base_url="http://decode:31002",
-            info=d_info,
-            prefill_url="http://prefill:31001/",
-            bootstrap_host=None,
-            bootstrap_port=None,
-        )
-        with patch.object(profiler.requests, "get", return_value=reply) as get:
-            pd = profiler.fetch_pd_profile_target(**args)
+        response.json.return_value = info
+        args = dict(base_url="http://decode", local_tokenizer_path=None)
+        with patch.object(profiler.requests, "get", return_value=response) as get:
+            context = profiler.fetch_server_context(**args, fake_prefill=True)
             get.assert_called_once_with(
-                "http://prefill:31001/server_info", timeout=profiler.DEFAULT_TIMEOUT
+                "http://decode/server_info", timeout=profiler.DEFAULT_TIMEOUT
             )
-            self.assertEqual((pd.bootstrap_host, pd.bootstrap_port), ("prefill", 31003))
-            override = profiler.fetch_pd_profile_target(
-                **dict(args, bootstrap_host="kv-host", bootstrap_port=31004)
-            )
-            self.assertEqual(
-                (override.bootstrap_host, override.bootstrap_port), ("kv-host", 31004)
-            )
-            p_info["disaggregation_transfer_backend"] = "fake"
-            with self.assertRaisesRegex(ValueError, "same real KV"):
-                profiler.fetch_pd_profile_target(**args)
-        with self.assertRaisesRegex(ValueError, "PD Decode engine"):
-            profiler.fetch_pd_profile_target(
-                **dict(args, info={"disaggregation_mode": "prefill"})
-            )
+            self.assertEqual(context.dp_size, 2)
+            self.assertEqual(context.skip_max_running_requests_threshold, 64)
+            self.assertTrue(context.fake_prefill)
+            with self.assertRaisesRegex(ValueError, "pass --fake-prefill"):
+                profiler.fetch_server_context(**args)
+            info["attn_dp_size"] = 4
+            with self.assertRaisesRegex(ValueError, "exposes 2 SPS streams"):
+                profiler.fetch_server_context(**args, fake_prefill=True)
+            info["disaggregation_mode"] = "prefill"
+            with self.assertRaisesRegex(ValueError, "requires a PD Decode engine"):
+                profiler.fetch_server_context(**args, fake_prefill=True)
 
-    def test_paired_bootstrap_payloads_assign_only_decode_rank(self):
-        from sglang.benchmark.dspark_sps_profiler import (
-            PdProfileTarget,
-            pd_profile_payloads,
-        )
+    def test_fake_prefill_payloads_assign_exact_rank_and_room(self):
+        from sglang.benchmark.dspark_sps_profiler import fake_prefill_payloads
+        from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 
-        target = PdProfileTarget("http://prefill:31001", "kv-host", 31003)
-        pairs = pd_profile_payloads(
-            pd=target,
-            input_ids=[[10], [11], [20], [21]],
-            dp_size=2,
-            first_room=501,
-            temperature=1,
-            max_new_tokens=100,
-        )
-        for rank, (prefill, decode) in enumerate(pairs):
-            self.assertNotIn("routed_dp_rank", prefill)
-            self.assertEqual(decode, dict(prefill, routed_dp_rank=rank))
+        args = dict(dp_size=2, first_room=501, temperature=1, max_new_tokens=100)
+        payloads = fake_prefill_payloads(input_ids=[[10], [11], [20], [21]], **args)
+        self.assertEqual(len(payloads), 2)
+        for rank, payload in enumerate(payloads):
+            self.assertEqual(payload["routed_dp_rank"], rank)
             self.assertEqual(
-                prefill["bootstrap_room"], [501 + 2 * rank, 502 + 2 * rank]
+                payload["bootstrap_room"], [501 + 2 * rank, 502 + 2 * rank]
             )
-            self.assertEqual(prefill["bootstrap_host"], ["kv-host"] * 2)
-            self.assertEqual(prefill["bootstrap_port"], [31003] * 2)
-            self.assertEqual(prefill["input_ids"], [[10 + 10 * rank], [11 + 10 * rank]])
+            self.assertEqual(payload["bootstrap_host"], [FAKE_BOOTSTRAP_HOST] * 2)
+            self.assertNotIn("bootstrap_port", payload)
+            self.assertEqual(payload["input_ids"], [[10 + 10 * rank], [11 + 10 * rank]])
+        with self.assertRaisesRegex(ValueError, "equal non-empty batch"):
+            fake_prefill_payloads(input_ids=[[10]], **args)
 
 
 class TestLoadSpsTableFromPath(CustomTestCase):

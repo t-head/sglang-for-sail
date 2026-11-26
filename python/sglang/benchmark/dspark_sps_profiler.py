@@ -18,7 +18,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlsplit
 
 import msgspec
 import numpy as np
@@ -119,12 +118,6 @@ INFO_RECORD_ENABLE_HINT = (
 )
 
 
-class PdProfileTarget(msgspec.Struct, frozen=True):
-    prefill_url: str
-    bootstrap_host: str
-    bootstrap_port: int
-
-
 class ServerContext(msgspec.Struct, frozen=True):
     base_url: str
     tokenizer_path: str
@@ -136,7 +129,7 @@ class ServerContext(msgspec.Struct, frozen=True):
     skip_max_running_requests_threshold: float
     skip_token_capacity_threshold: float
     graph_cost_supported: bool = False
-    pd_target: Optional[PdProfileTarget] = None
+    fake_prefill: bool = False
 
 
 class RoundSettings(msgspec.Struct, frozen=True):
@@ -190,9 +183,7 @@ def run_profile(
     repeats: int,
     local_tokenizer_path: Optional[str],
     fracs: Optional[list[float]],
-    prefill_url: Optional[str] = None,
-    prefill_bootstrap_host: Optional[str] = None,
-    prefill_bootstrap_port: Optional[int] = None,
+    fake_prefill: bool = False,
 ) -> None:
     if get_tokenizer is None:
         raise RuntimeError(
@@ -206,11 +197,6 @@ def run_profile(
             "(SGLANG_RAGGED_VERIFY_MODE=static, SGLANG_DSPARK_ENABLE_SPS_RECORD=1); "
             "pass --base-url <url> (it never launches a server)."
         )
-    if prefill_url is None and (
-        prefill_bootstrap_host is not None or prefill_bootstrap_port is not None
-    ):
-        raise ValueError("Prefill bootstrap overrides require --prefill-url.")
-
     offdiag = fracs is not None
     if offdiag:
         for frac in fracs:
@@ -225,15 +211,7 @@ def run_profile(
         base_url=base_url.rstrip("/"),
         local_tokenizer_path=local_tokenizer_path,
         allowed_modes=("compact", "cap-accept") if offdiag else ("static",),
-        **(
-            dict(
-                prefill_url=prefill_url,
-                prefill_bootstrap_host=prefill_bootstrap_host,
-                prefill_bootstrap_port=prefill_bootstrap_port,
-            )
-            if prefill_url is not None
-            else {}
-        ),
+        fake_prefill=fake_prefill,
     )
     vocab_size = len(get_tokenizer(context.tokenizer_path))
     batch_sizes = sorted(set(batch_sizes))
@@ -389,9 +367,7 @@ def profile_all(
     local_tokenizer_path: Optional[str],
     fracs: Optional[list[float]],
     plot: bool,
-    prefill_url: Optional[str] = None,
-    prefill_bootstrap_host: Optional[str] = None,
-    prefill_bootstrap_port: Optional[int] = None,
+    fake_prefill: bool = False,
 ) -> None:
     run_profile(
         base_url=base_url,
@@ -401,9 +377,7 @@ def profile_all(
         repeats=repeats,
         local_tokenizer_path=local_tokenizer_path,
         fracs=fracs,
-        prefill_url=prefill_url,
-        prefill_bootstrap_host=prefill_bootstrap_host,
-        prefill_bootstrap_port=prefill_bootstrap_port,
+        fake_prefill=fake_prefill,
     )
     fit_profile(
         out=out,
@@ -481,24 +455,19 @@ def fetch_server_context(
     base_url: str,
     local_tokenizer_path: Optional[str],
     allowed_modes: tuple[str, ...] = ("static",),
-    prefill_url: Optional[str] = None,
-    prefill_bootstrap_host: Optional[str] = None,
-    prefill_bootstrap_port: Optional[int] = None,
+    fake_prefill: bool = False,
 ) -> ServerContext:
     response = requests.get(base_url + "/server_info", timeout=DEFAULT_TIMEOUT)
     response.raise_for_status()
     info = response.json()
-    pd_target = (
-        fetch_pd_profile_target(
-            base_url=base_url,
-            info=info,
-            prefill_url=prefill_url,
-            bootstrap_host=prefill_bootstrap_host,
-            bootstrap_port=prefill_bootstrap_port,
+    disaggregation_mode = info.get("disaggregation_mode")
+    if fake_prefill and disaggregation_mode != "decode":
+        raise ValueError("--fake-prefill requires a PD Decode engine.")
+    if not fake_prefill and disaggregation_mode in ("prefill", "decode"):
+        raise ValueError(
+            "For P/D calibration, point --base-url at the Decode engine "
+            "and pass --fake-prefill."
         )
-        if prefill_url is not None
-        else None
-    )
 
     speculative_algorithm = info.get("speculative_algorithm")
     if speculative_algorithm != "DSPARK":
@@ -569,7 +538,7 @@ def fetch_server_context(
 
     internal_state = internal_states[0]
     dp_size = int(internal_state.get("dp_size") or 1)
-    if pd_target is not None:
+    if fake_prefill:
         # The legacy dp_size can still be 1 for attention-DP engines.
         dp_size = int(info.get("attn_dp_size") or dp_size)
         if dp_size != len(internal_states):
@@ -606,51 +575,7 @@ def fetch_server_context(
         skip_max_running_requests_threshold=skip_max_running,
         skip_token_capacity_threshold=skip_token_capacity,
         graph_cost_supported=capabilities == {True},
-        pd_target=pd_target,
-    )
-
-
-def fetch_pd_profile_target(
-    *,
-    base_url: str,
-    info: dict,
-    prefill_url: str,
-    bootstrap_host: Optional[str],
-    bootstrap_port: Optional[int],
-) -> PdProfileTarget:
-    if info.get("disaggregation_mode") != "decode":
-        raise ValueError("--decode-url must point to a PD Decode engine.")
-    prefill_url = prefill_url.rstrip("/")
-    parsed = urlsplit(prefill_url)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise ValueError("--prefill-url must be an HTTP(S) Prefill URL.")
-    if prefill_url == base_url:
-        raise ValueError("Prefill and Decode URLs must be distinct.")
-    response = requests.get(prefill_url + "/server_info", timeout=DEFAULT_TIMEOUT)
-    response.raise_for_status()
-    prefill = response.json()
-    if prefill.get("disaggregation_mode") != "prefill":
-        raise ValueError("--prefill-url must point to a PD Prefill engine.")
-    backend = info.get("disaggregation_transfer_backend")
-    if backend in (None, "fake") or backend != prefill.get(
-        "disaggregation_transfer_backend"
-    ):
-        raise ValueError(
-            "Prefill and Decode must use the same real KV transfer backend."
-        )
-    host = bootstrap_host if bootstrap_host is not None else parsed.hostname
-    port = (
-        bootstrap_port
-        if bootstrap_port is not None
-        else prefill.get("disaggregation_bootstrap_port")
-    )
-    if not host or not isinstance(port, int) or not 1 <= port <= 65535:
-        raise ValueError(
-            "Invalid Prefill bootstrap address; set --prefill-bootstrap-host "
-            "and --prefill-bootstrap-port if discovery is not usable."
-        )
-    return PdProfileTarget(
-        prefill_url=prefill_url, bootstrap_host=host, bootstrap_port=port
+        fake_prefill=fake_prefill,
     )
 
 
@@ -780,12 +705,10 @@ def run_one_round(
     if frac is not None:
         set_forced_budget_frac(base_url=context.base_url, frac=frac)
 
-    pd = context.pd_target
-    if pd is None:
-        flush_cache(base_url=context.base_url)
+    if context.fake_prefill:
+        flush_pd_cache(base_url=context.base_url)
     else:
-        for endpoint in (pd.prefill_url, context.base_url):
-            flush_pd_cache(base_url=endpoint)
+        flush_cache(base_url=context.base_url)
     watermarks = [
         max((row.forward_ct for row in rows), default=-1)
         for rows in fetch_rank_rows(base_url=context.base_url)
@@ -803,10 +726,9 @@ def run_one_round(
     )
     load_thread = (
         start_load(**load_args)
-        if pd is None
-        else start_pd_load(
+        if not context.fake_prefill
+        else start_fake_prefill_load(
             **load_args,
-            pd=pd,
             dp_size=context.dp_size,
             timeout_seconds=settings.round_timeout_seconds + DEFAULT_TIMEOUT,
         )
@@ -819,17 +741,13 @@ def run_one_round(
             min_steady_steps=settings.min_steady_steps,
             min_steady_seconds=settings.min_steady_seconds,
             timeout_seconds=settings.round_timeout_seconds,
-            load_thread=load_thread if pd is not None else None,
+            load_thread=load_thread if context.fake_prefill else None,
         )
     finally:
         try:
             abort_all_requests(base_url=context.base_url)
         finally:
-            try:
-                if pd is not None:
-                    abort_all_requests(base_url=pd.prefill_url)
-            finally:
-                load_thread.join(timeout=LOAD_JOIN_TIMEOUT_SECONDS)
+            load_thread.join(timeout=LOAD_JOIN_TIMEOUT_SECONDS)
     if load_thread.is_alive():
         logger.warning(
             "Load batch for bs=%s did not return within %.0fs after abort; "
@@ -924,38 +842,37 @@ def start_load(
     return thread
 
 
-def pd_profile_payloads(
+def fake_prefill_payloads(
     *,
-    pd: PdProfileTarget,
     input_ids: list[list[int]],
     dp_size: int,
     first_room: int,
     temperature: float,
     max_new_tokens: int,
-) -> list[tuple[dict, dict]]:
+) -> list[dict]:
+    from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
+
     if dp_size < 1 or not input_ids or len(input_ids) % dp_size:
         raise ValueError(
-            "PD SPS requires an equal non-empty batch on each Decode rank."
+            "Fake Prefill SPS requires an equal non-empty batch on each Decode rank."
         )
     bs = len(input_ids) // dp_size
-    pairs = []
-    for rank in range(dp_size):
-        start = rank * bs
-        payload = dict(
+    return [
+        dict(
             input_ids=input_ids[start : start + bs],
-            bootstrap_host=[pd.bootstrap_host] * bs,
-            bootstrap_port=[pd.bootstrap_port] * bs,
+            bootstrap_host=[FAKE_BOOTSTRAP_HOST] * bs,
             bootstrap_room=list(range(first_room + start, first_room + start + bs)),
+            routed_dp_rank=rank,
             sampling_params=dict(
                 temperature=temperature, max_new_tokens=max_new_tokens, ignore_eos=True
             ),
             stream=False,
         )
-        pairs.append((payload, dict(payload, routed_dp_rank=rank)))
-    return pairs
+        for rank, start in enumerate(range(0, len(input_ids), bs))
+    ]
 
 
-def start_pd_load(
+def start_fake_prefill_load(
     *,
     base_url: str,
     num_requests: int,
@@ -964,15 +881,13 @@ def start_pd_load(
     temperature: float,
     vocab_size: int,
     rng: random.Random,
-    pd: PdProfileTarget,
     dp_size: int,
     timeout_seconds: float,
 ) -> threading.Thread:
     input_ids = make_profile_input_ids(
         num_requests=num_requests, input_len=input_len, vocab_size=vocab_size, rng=rng
     )
-    pairs = pd_profile_payloads(
-        pd=pd,
+    payloads = fake_prefill_payloads(
         input_ids=input_ids,
         dp_size=dp_size,
         first_room=secrets.randbits(62),
@@ -980,33 +895,23 @@ def start_pd_load(
         max_new_tokens=max_new_tokens,
     )
 
-    def post(url: str, payload: dict, role: str, rank: int) -> None:
+    def post(payload: dict) -> None:
         try:
             res = requests.post(
-                url + "/generate", json=payload, timeout=timeout_seconds
+                base_url + "/generate", json=payload, timeout=timeout_seconds
             )
             res.raise_for_status()
         except requests.RequestException as exc:
             logger.warning(
-                "PD SPS %s load for Decode rank %d ended with %s (may follow abort).",
-                role,
-                rank,
+                "Fake Prefill SPS load for Decode rank %d ended with %s (may follow abort).",
+                payload["routed_dp_rank"],
                 type(exc).__name__,
             )
 
     def send() -> None:
-        # Never serialize P then D: either request can wait for its peer.
-        with ThreadPoolExecutor(max_workers=2 * len(pairs)) as pool:
-            futures = [
-                pool.submit(post, url, payload, role, rank)
-                for rank, (prefill, decode) in enumerate(pairs)
-                for url, payload, role in (
-                    (pd.prefill_url, prefill, "prefill"),
-                    (base_url, decode, "decode"),
-                )
-            ]
-            for future in futures:
-                future.result()
+        with ThreadPoolExecutor(max_workers=len(payloads)) as pool:
+            for _ in pool.map(post, payloads):
+                pass
 
     thread = threading.Thread(target=send, daemon=True)
     thread.start()
@@ -1626,8 +1531,7 @@ def write_manifest(
             round_summary_dict(outcome=outcome, repeat=0) for outcome in rounds
         ],
     }
-    if context.pd_target is not None:
-        manifest["pd_target"] = msgspec.to_builtins(context.pd_target)
+    manifest["fake_prefill"] = context.fake_prefill
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
 
@@ -1706,28 +1610,16 @@ def add_out_arg(parser: argparse.ArgumentParser) -> None:
 
 
 def add_run_args(parser: argparse.ArgumentParser) -> None:
-    endpoints = parser.add_mutually_exclusive_group(required=True)
-    endpoints.add_argument(
+    parser.add_argument(
         "--base-url",
-        help="Colocate DSpark server URL.",
-    )
-    endpoints.add_argument(
-        "--decode-url",
-        help="PD Decode engine URL. Use together with --prefill-url.",
+        required=True,
+        help="Colocated DSpark server URL, or the Decode engine URL with --fake-prefill.",
     )
     parser.add_argument(
-        "--prefill-url",
-        help="PD Prefill engine URL. Use dedicated P/D engines: "
-        "profiling flushes both caches and aborts requests between rounds.",
-    )
-    parser.add_argument(
-        "--prefill-bootstrap-host",
-        help="Prefill bootstrap host reachable from Decode. Defaults to the hostname in --prefill-url.",
-    )
-    parser.add_argument(
-        "--prefill-bootstrap-port",
-        type=int,
-        help="Prefill bootstrap port. Defaults to the port advertised by Prefill /server_info.",
+        "--fake-prefill",
+        action="store_true",
+        help="Calibrate steady Decode step time without real Prefill or KV transfer. "
+        "Use a dedicated Decode engine: profiling flushes its cache and aborts requests.",
     )
     parser.add_argument(
         "--fracs",
@@ -1860,17 +1752,6 @@ def run_batch_sizes(*, args: argparse.Namespace) -> list[int]:
     return build_request_count_sweep(args.max_batch_size)
 
 
-def resolve_profile_url(args: argparse.Namespace) -> str:
-    if (args.prefill_url is None) != (args.decode_url is None):
-        raise ValueError("PD profiling needs both --prefill-url and --decode-url.")
-    if args.prefill_url is None and (
-        args.prefill_bootstrap_host is not None
-        or args.prefill_bootstrap_port is not None
-    ):
-        raise ValueError("Prefill bootstrap overrides require PD profiling.")
-    return args.decode_url or args.base_url
-
-
 def cli_main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -1899,11 +1780,6 @@ def cli_main() -> None:
     add_fit_args(all_parser)
 
     args = parser.parse_args()
-    if args.command in ("run", "all"):
-        try:
-            run_target = resolve_profile_url(args)
-        except ValueError as exc:
-            parser.error(str(exc))
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper()),
         format="%(message)s",
@@ -1911,16 +1787,14 @@ def cli_main() -> None:
 
     if args.command == "run":
         run_profile(
-            base_url=run_target,
+            base_url=args.base_url,
             batch_sizes=run_batch_sizes(args=args),
             settings=run_settings(args=args),
             out=args.out,
             repeats=args.repeats,
             local_tokenizer_path=args.local_tokenizer_path,
             fracs=args.fracs,
-            prefill_url=args.prefill_url,
-            prefill_bootstrap_host=args.prefill_bootstrap_host,
-            prefill_bootstrap_port=args.prefill_bootstrap_port,
+            fake_prefill=args.fake_prefill,
         )
     elif args.command == "fit":
         fit_profile(
@@ -1931,7 +1805,7 @@ def cli_main() -> None:
         )
     else:
         profile_all(
-            base_url=run_target,
+            base_url=args.base_url,
             batch_sizes=run_batch_sizes(args=args),
             settings=run_settings(args=args),
             out=args.out,
@@ -1941,9 +1815,7 @@ def cli_main() -> None:
             local_tokenizer_path=args.local_tokenizer_path,
             fracs=args.fracs,
             plot=args.plot,
-            prefill_url=args.prefill_url,
-            prefill_bootstrap_host=args.prefill_bootstrap_host,
-            prefill_bootstrap_port=args.prefill_bootstrap_port,
+            fake_prefill=args.fake_prefill,
         )
 
 
