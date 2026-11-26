@@ -236,6 +236,7 @@ class TestKPoolStreamScheduling(unittest.TestCase):
             index_kpool_compress=True,
             block_size=128,
             scale_fmt=None,
+            use_int8=0,
             _get_q_k_bf16=prepare_qk,
         )
         indexer._can_overlap_prefill = MethodType(
@@ -455,14 +456,23 @@ def _expected_rows(*, pool_lens, index, width, pad_rows=0):
     return torch.cat([rows, padding])
 
 
-def _chunk_backend(*, topk, index_topk=4, index_kpool=4):
+def _chunk_backend(*, topk, index_topk=4, index_kpool=4, use_int8=False):
+    """Harness for the chunked ragged call sites, with the production method bound.
+
+    ``_fp8_mqa_logits`` became an instance method when the PPU int8 shim landed
+    (it reads ``self.use_int8``), so the namespace has to bind it rather than
+    store the plain function; ``_clean_logits_backend`` below already does this.
+    """
     backend = SimpleNamespace(
         index_topk=index_topk,
         index_kpool=index_kpool,
         alt_stream=None,
+        use_int8=use_int8,
         _topk_from_kpool_logits=topk,
         _get_index_k_read_buffer=lambda pool, layer_id: None,
-        _fp8_mqa_logits=IndexerKPool._fp8_mqa_logits,
+    )
+    backend._fp8_mqa_logits = lambda **kwargs: IndexerKPool._fp8_mqa_logits(
+        backend, **kwargs
     )
     backend._kpool_topk_by_row_chunks = MethodType(
         IndexerKPool._kpool_topk_by_row_chunks, backend

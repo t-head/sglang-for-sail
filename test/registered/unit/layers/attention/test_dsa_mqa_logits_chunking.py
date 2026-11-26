@@ -88,7 +88,11 @@ def _kpool_mqa_logits(num_q, num_k, cap_bytes):
         mock.patch.object(dsa_indexer_kpool, "is_hip", lambda: True),
         mock.patch.object(dsa_indexer_kpool, "MQA_LOGITS_MAX_BYTES_ROCM", cap_bytes),
     ):
+        # ``_fp8_mqa_logits`` is an instance method since the PPU int8 shim
+        # landed (it reads ``self.use_int8``); the harness scores the fp8 route.
+        harness = types.SimpleNamespace(use_int8=0)
         logits = dsa_indexer_kpool.IndexerKPool._fp8_mqa_logits(
+            harness,
             q_fp8,
             k_fp8,
             torch.ones(num_k),
