@@ -620,6 +620,18 @@ def handle_a2a_moe(server_args: Any):
                 "(chunked_prefill_size, or the decode cuda-graph batch size)"
             )
 
+    if (
+        resolved_view(server_args).enable_cp_tp_group_sharing
+        and resolving_view(server_args).disaggregation_mode != "null"
+    ):
+        from sglang.srt.arg_groups.cp_tp_group_sharing_hook import (
+            validate_cp_tp_group_sharing_after_a2a,
+        )
+
+        validate_cp_tp_group_sharing_after_a2a(
+            server_args, model_config_of(server_args)
+        )
+
 
 def validate_deepep_v2_speculative_draft(server_args: Any) -> None:
     """Reject an explicit or inherited DeepEP v2 draft backend."""

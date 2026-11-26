@@ -2,6 +2,7 @@
 """Model integration and topology checks for CP-TP group sharing: prefill CP
 for hybrid linear-attention models where the CP group is the TP group."""
 
+import os
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
@@ -12,6 +13,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+from sglang.srt.runtime_context import get_platform
 
 # Architectures whose model code implements CP-TP group sharing: the CP group
 # is the TP group, the residual stream / attention / indexer are CP-sharded,
@@ -27,6 +29,35 @@ _INTERLEAVE_MODELS: set[str] = {
     "Glm5NextForConditionalGeneration",
     "KimiK31ForConditionalGeneration",
 }
+
+
+def _ppu_mooncake_ep_enabled(server_args: Any, cfg: Any, view: Any) -> bool:
+    return (
+        cfg.disaggregation_mode == "prefill"
+        and cfg.disaggregation_transfer_backend == "mooncake"
+        and server_args.disaggregation_transfer_backend == "mooncake"
+        and get_platform().is_ppu
+        and get_platform().device_sm == 89
+        and envs.MOONCAKE_PROTOCOL.get().lower() == "rdma"
+        and "MC_FORCE_TCP" not in os.environ
+        and cfg.nnodes == 1
+        and view.ep_size == view.attn_cp_size == 8
+        and not cfg.enable_pd_role_switch
+        and not cfg.enable_unified_memory
+        and (cfg.speculative_algorithm or "").upper() in ("", "NEXTN", "EAGLE")
+    )
+
+
+def validate_cp_tp_group_sharing_after_a2a(server_args: Any, model: Any) -> None:
+    cfg, view = resolving_view(server_args), resolved_view(server_args)
+    if (
+        model.hf_config.architectures[0] != "Glm5NextForConditionalGeneration"
+        or cfg.disaggregation_mode == "null"
+        or not view.enable_cp_tp_group_sharing
+    ):
+        return
+    if view.ep_size > 1 and not _ppu_mooncake_ep_enabled(server_args, cfg, view):
+        raise ValueError("--ep-size > 1 is not supported with CP-TP group sharing.")
 
 
 def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
@@ -97,19 +128,18 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
             # Prefill only: a decode node serves plain TP.
             "disaggregation-mode decode": cfg.disaggregation_mode == "decode",
         }
-    elif model.hf_config.architectures[0] == "Glm5NextForConditionalGeneration":
-        if cfg.disaggregation_mode != "null":
-            # Decode pairs with this prefill as plain TP whether it runs no
-            # speculation or one of the algorithms the check above admits.
-            unsupported |= {
-                "disaggregation-mode decode": cfg.disaggregation_mode == "decode",
-                "disaggregation-transfer-backend != mooncake": (
-                    cfg.disaggregation_transfer_backend != "mooncake"
-                ),
-                "pp-size > 1": cfg.pp_size > 1,
-                "dp-size > 1": cfg.dp_size > 1,
-                "ep-size > 1": view.ep_size > 1,
-            }
+    elif arch == "Glm5NextForConditionalGeneration" and cfg.disaggregation_mode != "null":
+        # PPU reports SM89 through device_sm; do not broaden this GLM layout to CUDA.
+        ppu_mooncake_ep = _ppu_mooncake_ep_enabled(server_args, cfg, view)
+        unsupported |= {
+            "disaggregation-mode decode": cfg.disaggregation_mode == "decode",
+            "disaggregation-transfer-backend != mooncake": (
+                cfg.disaggregation_transfer_backend != "mooncake"
+            ),
+            "pp-size > 1": cfg.pp_size > 1,
+            "dp-size > 1": cfg.dp_size > 1,
+            "ep-size > 1": view.ep_size > 1 and not ppu_mooncake_ep,
+        }
     for flag, enabled in unsupported.items():
         if enabled:
             raise ValueError(f"--{flag} is not supported with CP-TP group sharing.")

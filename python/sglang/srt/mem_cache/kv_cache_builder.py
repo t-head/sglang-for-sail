@@ -34,7 +34,7 @@ from sglang.srt.configs.hybrid_arch import (
     linear_attn_model_spec,
     mamba2_config,
 )
-from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
+from sglang.srt.configs.model_config import ModelImpl, get_dsa_index_kpool, is_deepseek_dsa
 from sglang.srt.disaggregation.utils import should_bypass_dsa_cp_prefix_cache
 from sglang.srt.environ import envs
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
@@ -56,6 +56,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_memory,
     get_parallel,
+    get_platform,
     get_schedule,
 )
 from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
@@ -364,6 +365,23 @@ def build_kv_cache(
     retraction_backup = resolve_decode_retraction_backup(tp_worker=tp_worker)
 
     bypass_dsa_cp_prefix_cache = should_bypass_dsa_cp_prefix_cache(is_dsa=is_dsa)
+    # PPU reports SM89 through device_sm; do not broaden this GLM layout to CUDA.
+    if (
+        bypass_dsa_cp_prefix_cache
+        and get_disagg().disaggregation_mode == "prefill"
+        and get_disagg().disaggregation_transfer_backend == "mooncake"
+        and parallel.enable_cp_tp_group_sharing
+        and parallel.attn_cp_size == parallel.moe_ep_size == 8
+        and parallel.cp_strategy == "interleave"
+        and not parallel.dcp_enabled
+        and not parallel.enable_kv_cache_sharding
+        and get_platform().is_ppu
+        and get_platform().device_sm == 89
+        and model_config.hf_config.architectures[0] == "Glm5NextForConditionalGeneration"
+        and page_size == 64 * get_dsa_index_kpool(model_config.hf_config)
+    ):
+        # Each interleave CP rank stores the prefix in the same logical order.
+        bypass_dsa_cp_prefix_cache = False
     disable_radix_cache = (
         get_memory().disable_radix_cache
         or (model_config.is_multimodal and uses_transformers_backend)
