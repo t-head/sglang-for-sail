@@ -636,10 +636,6 @@ class TestPageSizePrecondition(CustomTestCase):
         self.assertEqual(alignment, require_dsa_cp_page_size(256, 4))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestResolvedDsaCpAlignment(CustomTestCase):
     """The gate must follow the *resolved* page geometry, and must not be
     process-cached: an inactive call may not poison a later active one.
@@ -801,6 +797,274 @@ class TestSwitchNameIsThe0523NameOnly(CustomTestCase):
     def test_0523_name_is_the_one_that_unbypasses(self):
         with envs.SGLANG_DSA_CP_PREFIX_CACHE.override(True):
             self.assertTrue(dutils.dsa_cp_prefix_cache_enabled())
+
+
+class TestLayerSplitScratchInvalidation(CustomTestCase):
+    """Every rank must drop its broadcast scratch copy on a host write-through.
+
+    Covers ``invalidate_kv_buffer_for_layer`` (added together with the KV-side
+    write-through invalidation) and keeps it distinct from the index-side twin.
+    The stubs are plain attribute bags: the method under test only reads the
+    broadcast bookkeeping, so no pool, device or process group is needed.
+    """
+
+    def _pool(self, *, pending_layer=None, remote_layer=None):
+        calls = []
+        pool = SimpleNamespace(
+            pending_remote_kv_layer_id=pending_layer,
+            remote_kv_layer_id=remote_layer,
+            pending_remote_kv_broadcast=pending_layer is not None,
+            index_key_cache=SimpleNamespace(
+                invalidate=lambda layer: calls.append(("index", layer))
+            ),
+            _finalize_pending_kv_broadcast=lambda *, set_remote_layer_id: calls.append(
+                ("finalize", set_remote_layer_id)
+            ),
+        )
+        pool.calls = calls
+        return pool
+
+    def test_invalidate_kv_drops_pending_broadcast_without_publishing_it(self):
+        pool = self._pool(pending_layer=7, remote_layer=7)
+
+        LayerSplitDSATokenToKVPool.invalidate_kv_buffer_for_layer(pool, 7)
+
+        self.assertIn(("finalize", False), pool.calls)
+        self.assertIsNone(pool.remote_kv_layer_id)
+
+    def test_invalidate_kv_leaves_other_layers_scratch_copy_alone(self):
+        pool = self._pool(remote_layer=3)
+
+        LayerSplitDSATokenToKVPool.invalidate_kv_buffer_for_layer(pool, 7)
+
+        self.assertEqual(pool.calls, [])
+        self.assertEqual(pool.remote_kv_layer_id, 3)
+
+    def test_invalidate_kv_publishes_nothing_when_only_a_pending_broadcast_exists(
+        self,
+    ):
+        pool = self._pool(pending_layer=7)
+
+        LayerSplitDSATokenToKVPool.invalidate_kv_buffer_for_layer(pool, 7)
+
+        self.assertEqual(pool.calls, [("finalize", False)])
+        self.assertIsNone(pool.remote_kv_layer_id)
+
+    def test_index_invalidation_is_a_separate_call(self):
+        pool = self._pool(remote_layer=7)
+
+        LayerSplitDSATokenToKVPool.invalidate_index_buffer_for_layer(pool, 7)
+
+        self.assertEqual(pool.calls, [("index", 7)])
+        self.assertEqual(pool.remote_kv_layer_id, 7)
+
+
+class TestLayerSplitPrefetchWaits(CustomTestCase):
+    """A prefetch may not skip the wait just because a caller left the transfer
+    coordinates unset (the non-comm path reads a layer another rank owns)."""
+
+    def _pool(self, *, counter, comm=None):
+        broadcasts = []
+        pool = SimpleNamespace(
+            remote_kv_layer_id=None,
+            pending_remote_kv_broadcast=False,
+            pending_remote_kv_layer_id=None,
+            _finalize_pending_kv_broadcast=lambda **_: None,
+            _local_layer_idx=lambda layer_id: layer_id - 100,
+            kv_buffer=["slot-0", "slot-1", "slot-2"],
+            _is_layer_owned=lambda layer_id: False,
+            layer_transfer_counter=counter,
+            layer_broadcast_comm=comm,
+            remote_kv_buffer="remote-scratch",
+            _broadcast_tensor_from_owner=lambda *a, **k: broadcasts.append((a, k)),
+        )
+        pool.broadcasts = broadcasts
+        return pool
+
+    def test_unset_counter_falls_back_to_the_pools_own_counter(self):
+        counter = unittest.mock.Mock()
+        pool = self._pool(counter=counter)
+
+        LayerSplitDSATokenToKVPool.prefetch_kv_buffer(pool, 102)
+
+        counter.wait_until.assert_called_once_with(2)
+        self.assertEqual(len(pool.broadcasts), 1)
+        self.assertEqual(pool.remote_kv_layer_id, 102)
+
+    def test_explicit_coordinates_win_over_the_fallback(self):
+        pool_counter = unittest.mock.Mock()
+        explicit = unittest.mock.Mock()
+        pool = self._pool(counter=pool_counter)
+
+        LayerSplitDSATokenToKVPool.prefetch_kv_buffer(pool, 102, explicit, 5)
+
+        explicit.wait_until.assert_called_once_with(5)
+        pool_counter.wait_until.assert_not_called()
+
+    def test_no_counter_anywhere_still_broadcasts(self):
+        # Nothing to wait for: the synchronous broadcast is still issued, so the
+        # fallback cannot swallow the prefetch.
+        pool = self._pool(counter=None)
+
+        LayerSplitDSATokenToKVPool.prefetch_kv_buffer(pool, 102)
+
+        self.assertEqual(len(pool.broadcasts), 1)
+        self.assertEqual(pool.remote_kv_layer_id, 102)
+
+    def test_already_remote_layer_is_a_no_op(self):
+        counter = unittest.mock.Mock()
+        pool = self._pool(counter=counter)
+        pool.remote_kv_layer_id = 102
+
+        LayerSplitDSATokenToKVPool.prefetch_kv_buffer(pool, 102)
+
+        counter.wait_until.assert_not_called()
+        self.assertEqual(pool.broadcasts, [])
+
+
+class TestHostWriteThroughInvalidatesScratch(CustomTestCase):
+    """The write-through entry must invalidate before the ownership early-return,
+    otherwise a non-owner rank keeps serving a pre-write scratch copy."""
+
+    def _device_pool(self, recorder, *, start_layer=8):
+        return SimpleNamespace(
+            start_layer=start_layer,
+            layer_num=9,
+            invalidate_index_buffer_for_layer=recorder,
+            invalidate_kv_buffer_for_layer=recorder,
+        )
+
+    def test_dsa_host_pool_invalidates_on_a_non_owner_rank(self):
+        seen = []
+        host = SimpleNamespace(
+            _is_device_layer_sharded=lambda device_pool: True,
+            _is_device_layer_owned=lambda device_pool, layer_id: False,
+        )
+
+        DSAIndexerPoolHost.load_to_device_per_layer(
+            host,
+            self._device_pool(lambda layer: seen.append(layer)),
+            None,
+            None,
+            3,
+            "kernel",
+        )
+
+        # start_layer + layer_id: the scratch buffer is indexed by absolute layer.
+        self.assertEqual(seen, [11])
+
+    def test_dsa_host_pool_skips_invalidation_when_layers_are_not_sharded(self):
+        seen = []
+        host = SimpleNamespace(
+            _is_device_layer_sharded=lambda device_pool: False,
+            _is_device_layer_owned=lambda device_pool, layer_id: False,
+        )
+
+        DSAIndexerPoolHost.load_to_device_per_layer(
+            host,
+            self._device_pool(lambda layer: seen.append(layer)),
+            None,
+            None,
+            3,
+            "kernel",
+        )
+
+        self.assertEqual(seen, [])
+
+    def test_mla_host_pool_invalidates_kv_scratch_before_returning_early(self):
+        seen = []
+        host = SimpleNamespace(
+            _is_dummy=False,
+            _is_device_layer_sharded=lambda device_pool: True,
+            _target_layer_indices=set(),
+        )
+
+        MLATokenToKVPoolHost.load_to_device_per_layer(
+            host,
+            self._device_pool(lambda layer: seen.append(layer)),
+            None,
+            None,
+            3,
+            "kernel",
+        )
+
+        self.assertEqual(seen, [11])
+
+    def test_mla_host_pool_skips_invalidation_when_layers_are_not_sharded(self):
+        seen = []
+        host = SimpleNamespace(
+            _is_dummy=False,
+            _is_device_layer_sharded=lambda device_pool: False,
+            _target_layer_indices=set(),
+        )
+
+        MLATokenToKVPoolHost.load_to_device_per_layer(
+            host,
+            self._device_pool(lambda layer: seen.append(layer)),
+            None,
+            None,
+            3,
+            "kernel",
+        )
+
+        self.assertEqual(seen, [])
+
+
+class TestDraftTransferIdsFollowTargetLayerNum(CustomTestCase):
+    """Packed MTP draft layers are addressed host-pool relative.
+
+    The 0.5.21 line used the *device* pool's layer count here; with layer sharding
+    that id is the rank's full layer count, not the number of live target layers,
+    so the draft ids collided with the target range. This asserts the ids the host
+    pool now produces, with a device pool whose ``layer_num`` deliberately
+    disagrees.
+    """
+
+    def _host(self, *, sharded: bool, target_layer_num: int, drafts):
+        calls = []
+        host = SimpleNamespace(
+            _is_device_layer_sharded=lambda device_pool: sharded,
+            _owned_device_layer_ids=lambda device_pool: [0, 1],
+            mtp_draft_device_pools=drafts,
+            target_layer_num=target_layer_num,
+            _backup_from_device_per_layer=lambda pool, h, d, layer_id, io_backend, **kw: (
+                calls.append((pool, layer_id, kw.get("is_draft", False)))
+            ),
+        )
+        return host, calls
+
+    def test_draft_ids_start_at_the_live_target_layer_count(self):
+        draft_a, draft_b = object(), object()
+        host, calls = self._host(
+            sharded=True, target_layer_num=2, drafts=(draft_a, draft_b)
+        )
+        device_pool = SimpleNamespace(layer_num=9)
+
+        DSAIndexerPoolHost.backup_from_device_all_layer(
+            host, device_pool, None, None, "kernel"
+        )
+
+        self.assertEqual(
+            calls,
+            [
+                (device_pool, 0, False),
+                (device_pool, 1, False),
+                (draft_a, 2, True),
+                (draft_b, 3, True),
+            ],
+        )
+
+    def test_no_draft_pools_means_no_extra_ids_at_all(self):
+        # Control for the loop above: a deployment without packed MTP drafts
+        # cannot acquire the new ids, so the change stays inside that scenario.
+        host, calls = self._host(sharded=True, target_layer_num=2, drafts=())
+        device_pool = SimpleNamespace(layer_num=9)
+
+        DSAIndexerPoolHost.backup_from_device_all_layer(
+            host, device_pool, None, None, "kernel"
+        )
+
+        self.assertEqual([layer for _, layer, _ in calls], [0, 1])
 
 
 class TestHiCacheLayoutGate(CustomTestCase):
