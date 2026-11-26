@@ -6,6 +6,21 @@ wheel_dir=${PPU_CI_WHEEL_DIR:-/wheels}
 source_dir=${PPU_CI_RECIPE_SOURCE_DIR:-/source}
 jit_dir=${PPU_CI_RECIPE_JIT_DIR:-/jit}
 
+if [[ "${1:-}" == pd_test ]]; then
+    [[ "${2:-}" == deepseek-v41-flash-1p1d ]] || exit 2
+    [[ $# == 2 || ( $# == 3 && "$3" == --check-only ) ]] || exit 2
+    export PD_TEST_CODE_SOURCE=${PD_TEST_CODE_SOURCE:-installed}
+    [[ "$PD_TEST_CODE_SOURCE" == installed || "$PD_TEST_CODE_SOURCE" == source ]] || exit 2
+    [[ "$PD_TEST_CODE_SOURCE" != source || "${PPU_CI_SKIP_WHEEL_INSTALL:-false}" == true ]] || exit 2
+    [[ "${PD_TEST_DUMMY_WEIGHTS:-0}" == 0 ]] || exit 2
+    [[ "${PPU_CI_SKIP_WHEEL_INSTALL:-false}" == true || "${PPU_CI_SKIP_WHEEL_INSTALL:-false}" == false ]] || exit 2
+    export MODEL_PATH=${PPU_RECIPE_CONTAINER_MODEL:?}
+    export PD_TEST_ARTIFACT_DIR="$artifact_dir/pd"
+    export PPU_CI_RECIPE_JIT_DIR="$jit_dir"
+    export PD_TEST_DUMMY_WEIGHTS=0
+    mkdir -p "$PD_TEST_ARTIFACT_DIR"
+fi
+
 phase() { printf '%s\n' "$1" > "$artifact_dir/worker-phase.txt"; }
 phase runtime_dependencies
 unset PYTHONPATH PYTHONHOME VIRTUAL_ENV
@@ -21,6 +36,11 @@ mkdir -p "$SGLANG_DG_CACHE_DIR" "$DG_JIT_CACHE_DIR" "$TRITON_CACHE_DIR"
 cd "$source_dir"
 skip_wheel_install="${PPU_CI_SKIP_WHEEL_INSTALL:-false}"
 [[ "$skip_wheel_install" == true || "$skip_wheel_install" == false ]] || exit 2
+if [[ "${1:-}" == pd_test ]]; then
+    pd_width=$(python3 -I -B scripts/ci/ppu/ppu_pd.py device-count "$2")
+    [[ "${RECIPE_PPU_COUNT:-$pd_width}" == "$pd_width" ]] || exit 2
+    export RECIPE_PPU_COUNT="$pd_width"
+fi
 checker=scripts/ci/ppu/check_dependencies.py
 cleanup_dirs=()
 cleanup() {
@@ -51,10 +71,12 @@ if [[ "${2:-}" == model_sanity && -n "${PPU_CI_EVAL_WHEEL_DIR:-}" ]]; then
     export PPU_CI_EVAL_SITE="$eval_dir"
     python3 -I -S -B -c 'import sys; sys.path.insert(0, sys.argv[1]); from evalscope import TaskConfig, run_task' "$eval_dir"
 fi
-phase recipe_validation
-python3 -I -B scripts/ci/ppu/ppu_recipe.py validate --all --require-sglang-parser
-if [[ "${1:-}" == validate ]]; then
-    exit 0
+if [[ "${1:-}" != pd_test ]]; then
+    phase recipe_validation
+    python3 -I -B scripts/ci/ppu/ppu_recipe.py validate --all --require-sglang-parser
+    if [[ "${1:-}" == validate ]]; then
+        exit 0
+    fi
 fi
 phase platform_check
 python3 -I -B - "$artifact_dir/runtime-versions.json" <<'PY'
@@ -112,6 +134,17 @@ if torch_ver:
     versions["torch"] = torch_ver
 Path(sys.argv[1]).write_text(json.dumps(versions, sort_keys=True) + "\n", encoding="utf-8")
 PY
+if [[ "${1:-}" == pd_test ]]; then
+    export SGLANG_CACHE_DIR="$jit_dir/sglang" SGLANG_JIT_CACHE_DIR="$jit_dir/sglang/jit"
+    mkdir -p "$SGLANG_JIT_CACHE_DIR"
+    phase pd_preflight
+    python3 -I -B scripts/ci/ppu/check_ppu_environment.py --pd-case "$2"
+    if [[ "${3:-}" == --check-only ]]; then
+        exit 0
+    fi
+    phase pd_test
+    exec python3 -I -B test/ppu/e2e/test_deepseek_v41_flash_pd_ppu.py -v
+fi
 # The wrapper adds only the checked-in executor directory to the isolated path.
 python3 -I -B - "$@" <<'PY'
 import runpy

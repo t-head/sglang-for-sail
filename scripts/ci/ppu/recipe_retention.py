@@ -43,6 +43,12 @@ OPTIONAL_FILES = (
     "results/sglang_serve_fast_2l.log",
     "results/sglang_serve_fast_full.log",
     "results/sglang_serve_model_sanity.log",
+    "results/pd-prefill.log",
+    "results/pd-decode.log",
+    "results/pd-router.log",
+    "results/pd-config.yaml",
+    "results/pd-runtime.json",
+    "results/pd-preflight.log",
 )
 
 

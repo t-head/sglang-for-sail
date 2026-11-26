@@ -1,15 +1,20 @@
+import contextlib
 import fnmatch
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, call, patch
 
 import yaml
 
@@ -583,6 +588,1376 @@ class TestPPUBuildProvenance(unittest.TestCase):
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("Wheel manifest", result.stdout + result.stderr)
+
+
+def load_pd_fixture(path):
+    """Load infrastructure/test code without importing the inference runtime."""
+    spec = importlib.util.spec_from_file_location("ppu_fixture_" + path.stem, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class TestPPUPDEnvironment(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        with patch.dict(sys.modules, {"sglang": None}):
+            self.checker = load_pd_fixture(
+                Path(__file__).with_name("check_ppu_environment.py")
+            )
+            self.pd = load_pd_fixture(Path(__file__).with_name("ppu_pd.py"))
+        self.config = self.pd.load_pd_config()
+
+    def run_main(self, args=(), env=None, failure=None, config=None):
+        values = {
+            "print_host_summary": None,
+            "load_pd_config": self.config if config is None else config,
+            "check_ppu_inventory": 16,
+            "check_device_nodes": None,
+            "check_ppu_sdk": None,
+            "check_torch_compute": 2,
+            "check_visibility_consistency": None,
+            "check_memory_limit": 900 * 1024**3,
+            "check_model": 2,
+            "check_rdma": ["mlx5_0"],
+            "check_pd_devices": None,
+            "check_pd_runtime": {"code_source": "installed"},
+        }
+        checks = Mock()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(sys, "argv", ["checker", *args]))
+            stack.enter_context(patch.object(sys, "path", list(sys.path)))
+            stack.enter_context(patch.dict(os.environ, env or {}, clear=True))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+            for name, value in values.items():
+                module = self.pd if name == "load_pd_config" else self.checker
+                mock = stack.enter_context(
+                    patch.object(module, name, return_value=value)
+                )
+                checks.attach_mock(mock, name)
+                if name == failure:
+                    mock.side_effect = self.checker.CheckFailure("fixture failure")
+            # An accidental SGLang import is a regression even if no PD helper runs.
+            stack.enter_context(
+                patch.dict(sys.modules, {"sglang": None, "ppu_pd": self.pd})
+            )
+            self.last_checks = checks
+            result = self.checker.main()
+        return result, checks
+
+    def test_default_checker_keeps_original_sequence_and_ignores_pd_environment(self):
+        result, checks = self.run_main(
+            env={
+                "PD_TEST_CODE_SOURCE": "invalid",
+                "PD_TEST_DUMMY_WEIGHTS": "1",
+                "MODEL_PATH": "/missing",
+                "RECIPE_PPU_COUNT": "2",
+            },
+            failure="load_pd_config",
+        )
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            checks.mock_calls,
+            [
+                call.print_host_summary(),
+                call.check_ppu_inventory(),
+                call.check_device_nodes(),
+                call.check_ppu_sdk(),
+                call.check_torch_compute(),
+                call.check_visibility_consistency(16, 2),
+            ],
+        )
+
+    def test_pd_opt_in_sequence_and_runtime_artifact(self):
+        env = {
+            "MODEL_PATH": str(self.root / "model"),
+            "IB_DEVICE": "mlx5_0",
+            "NCCL_IB_GID_INDEX": "3",
+            "PD_TEST_ARTIFACT_DIR": str(self.root),
+        }
+        result, checks = self.run_main(["--pd-case", "deepseek-v41-flash-1p1d"], env)
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            checks.mock_calls,
+            [
+                call.print_host_summary(),
+                call.load_pd_config(),
+                call.check_memory_limit(900 * 1024**3),
+                call.check_model(self.root / "model"),
+                call.check_rdma("mlx5_0", 3),
+                call.check_ppu_inventory(),
+                call.check_device_nodes(),
+                call.check_ppu_sdk(),
+                call.check_torch_compute(),
+                call.check_visibility_consistency(16, 2),
+                call.check_pd_devices(8),
+                call.check_pd_runtime(),
+            ],
+        )
+        self.assertEqual(
+            json.loads((self.root / "runtime.json").read_text()),
+            {
+                "case": "deepseek-v41-flash-1p1d",
+                "code_source": "installed",
+                "config_digest": self.pd.config_digest(self.config),
+                "memory_limit_bytes": 900 * 1024**3,
+                "weight_shards": 2,
+                "rdma_devices": ["mlx5_0"],
+            },
+        )
+
+    def test_pd_checker_uses_configured_memory_devices_and_rdma_defaults(self):
+        config = deepcopy(self.config)
+        config["nodes"]["worker"]["devices"] = 4
+        config["ppu"]["topology"]["devices_per_node"] = 4
+        config["roles"]["prefill"]["devices"] = [0, 2]
+        config["roles"]["decode"]["devices"] = [1, 3]
+        config["environment"].update(
+            memory_limit_gib=12, ib_device="mlx5_fixture", gid_index=2
+        )
+        result, checks = self.run_main(
+            ["--pd-case", config["case_id"], "--pd-config", str(self.root / "case.yaml")],
+            {"MODEL_PATH": str(self.root), "PD_TEST_ARTIFACT_DIR": str(self.root)},
+            config=config,
+        )
+        self.assertEqual(result, 0)
+        checks.load_pd_config.assert_called_once_with(self.root / "case.yaml")
+        checks.check_memory_limit.assert_called_once_with(12 * 1024**3)
+        checks.check_pd_devices.assert_called_once_with(4)
+        checks.check_rdma.assert_called_once_with("mlx5_fixture", 2)
+        runtime = json.loads((self.root / "runtime.json").read_text())
+        self.assertEqual(runtime["config_digest"], self.pd.config_digest(config))
+        self.assertNotEqual(runtime["config_digest"], self.pd.config_digest(self.config))
+
+    def test_pd_preflight_failure_stops_without_artifact(self):
+        for failure in (
+            "load_pd_config",
+            "check_memory_limit",
+            "check_model",
+            "check_rdma",
+            "check_pd_devices",
+            "check_pd_runtime",
+            "dummy",
+        ):
+            with self.subTest(failure=failure):
+                result, checks = self.run_main(
+                    ["--pd-case", "deepseek-v41-flash-1p1d"],
+                    {
+                        "MODEL_PATH": str(self.root),
+                        "PD_TEST_ARTIFACT_DIR": str(self.root),
+                        "PD_TEST_DUMMY_WEIGHTS": "1" if failure == "dummy" else "0",
+                    },
+                    failure,
+                )
+                self.assertEqual(result, 1)
+                self.assertFalse((self.root / "runtime.json").exists())
+                expected_last = "print_host_summary" if failure == "dummy" else failure
+                self.assertEqual(checks.mock_calls[-1][0], expected_last)
+
+    def test_checker_rejects_unknown_case_and_arguments_before_checks(self):
+        for args in (["--pd-case", "future-multinode"], ["--pd-case"], ["pd_test"]):
+            with self.subTest(args=args):
+                with self.assertRaises(SystemExit) as error:
+                    self.run_main(args)
+                self.assertEqual(error.exception.code, 2)
+                self.assertEqual(self.last_checks.mock_calls, [])
+
+    def test_memory_limit_and_both_no_swap_paths(self):
+        cgroup = self.root / "cgroup"
+        cgroup.mkdir()
+        meminfo = self.root / "meminfo"
+        limit_file = cgroup / "memory.max"
+        swap_file = cgroup / "memory.swap.max"
+        max_bytes = self.config["environment"]["memory_limit_gib"] * 1024**3
+        for limit in (1, max_bytes):
+            for swap in ("0", "max", "1024"):
+                with self.subTest(limit=limit, swap=swap):
+                    limit_file.write_text(str(limit) + "\n")
+                    swap_file.write_text(swap + "\n")
+                    if swap == "0":
+                        # The container path must not need /proc/meminfo at all.
+                        if meminfo.exists():
+                            meminfo.unlink()
+                    else:
+                        meminfo.write_text("MemTotal: 123 kB\nSwapTotal: 0 kB\n")
+                    self.assertEqual(
+                        self.checker.check_memory_limit(
+                            max_bytes, cgroup=cgroup, meminfo=meminfo
+                        ),
+                        limit,
+                    )
+        for limit in ("max", "0", "-1", "1.5", str(max_bytes + 1)):
+            with self.subTest(limit=limit):
+                limit_file.write_text(limit)
+                with self.assertRaisesRegex(self.checker.CheckFailure, "memory limit"):
+                    self.checker.check_memory_limit(
+                        max_bytes, cgroup=cgroup, meminfo=meminfo
+                    )
+        limit_file.write_text(str(max_bytes))
+        swap_file.write_text("0")
+        with self.assertRaisesRegex(self.checker.CheckFailure, "memory limit"):
+            self.checker.check_memory_limit(
+                max_bytes - 1, cgroup=cgroup, meminfo=meminfo
+            )
+        for swap in ("max", "1024"):
+            for host in ("SwapTotal: 1 kB\n", "SwapTotal: 00 kB\n", "MemTotal: 123 kB\n"):
+                with self.subTest(swap=swap, host=host):
+                    swap_file.write_text(swap)
+                    meminfo.write_text(host)
+                    with self.assertRaisesRegex(self.checker.CheckFailure, "Disable swap"):
+                        self.checker.check_memory_limit(
+                            max_bytes, cgroup=cgroup, meminfo=meminfo
+                        )
+        limit_file.unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.checker.check_memory_limit(max_bytes, cgroup=cgroup, meminfo=meminfo)
+
+    def test_model_shards_missing_empty_and_unsafe_index_paths(self):
+        model = self.root / "model"
+        model.mkdir()
+        files = ("config.json", "tokenizer.json", "model.safetensors.index.json")
+        for name in files:
+            (model / name).write_text("{}")
+        shard = model / "weights/part.safetensors"
+        shard.parent.mkdir()
+        shard.write_bytes(b"fixture")
+        index = model / files[-1]
+        index.write_text(json.dumps({"weight_map": {"a": "weights/part.safetensors",
+                                                   "b": "weights/part.safetensors"}}))
+        self.assertEqual(self.checker.check_model(model), 1)
+        for name in files:
+            with self.subTest(missing=name):
+                path = model / name
+                content = path.read_bytes()
+                path.unlink()
+                with self.assertRaisesRegex(self.checker.CheckFailure, "Missing model file"):
+                    self.checker.check_model(model)
+                path.write_bytes(content)
+        for names, message in (([], "no weight shards"), ([str(shard)], "Invalid"),
+                               (["../outside"], "Invalid"), (["weights/../part"], "Invalid"),
+                               ([7], "Invalid"), (["missing.safetensors"], "Missing or empty")):
+            with self.subTest(names=names):
+                index.write_text(json.dumps({"weight_map": dict(enumerate(names))}))
+                with self.assertRaisesRegex(self.checker.CheckFailure, message):
+                    self.checker.check_model(model)
+        index.write_text(json.dumps({"weight_map": {"a": "weights/part.safetensors"}}))
+        shard.write_bytes(b"")
+        with self.assertRaisesRegex(self.checker.CheckFailure, "empty shard"):
+            self.checker.check_model(model)
+
+    def test_model_accepts_huggingface_snapshot_links_to_external_blobs(self):
+        model, blobs = self.root / "snapshots/revision", self.root / "blobs"
+        model.mkdir(parents=True)
+        blobs.mkdir()
+        content = {
+            "config.json": b"{}", "tokenizer.json": b"{}",
+            "model.safetensors.index.json": b'{"weight_map":{"a":"part.safetensors"}}',
+            "part.safetensors": b"fixture",
+        }
+        for name, value in content.items():
+            (blobs / name).write_bytes(value)
+            (model / name).symlink_to(Path("../../blobs") / name)
+        self.assertEqual(self.checker.check_model(model), 1)
+        (blobs / "part.safetensors").unlink()
+        with self.assertRaisesRegex(self.checker.CheckFailure, "Missing or empty"):
+            self.checker.check_model(model)
+
+    def test_rdma_requires_distinct_devices_active_gid_and_open_verbs(self):
+        sysfs, dev = self.root / "sys", self.root / "dev"
+        dev.mkdir()
+        for number in range(2):
+            port = sysfs / f"infiniband/mlx5_{number}/ports/1"
+            (port / "gids").mkdir(parents=True)
+            (port / "state").write_text("4: ACTIVE\n")
+            (port / "gids/3").write_text("0000:0000:0000:0000:0000:0000:0000:0001\n")
+            verbs = sysfs / f"infiniband_verbs/uverbs{number}"
+            verbs.mkdir(parents=True)
+            (verbs / "ibdev").write_text(f"mlx5_{number}\n")
+            (dev / f"uverbs{number}").write_bytes(b"fixture")
+        check = lambda names="mlx5_0,mlx5_1", gid=3: self.checker.check_rdma(names, gid, sysfs, dev)
+        self.assertEqual(check(), ["mlx5_0", "mlx5_1"])
+        for names, gid in (("mlx5_0,mlx5_0", 3), ("../mlx5_0", 3), ("mlx5_0,", 3),
+                           ("mlx5_0, mlx5_1", 3), ("", 3), ("mlx5_0", -1), ("mlx5_2", 3)):
+            with self.subTest(names=names, gid=gid), self.assertRaises(self.checker.CheckFailure):
+                check(names, gid)
+        for relative, value, message in (
+            ("infiniband/mlx5_1/ports/1/state", "2: INIT", "active port"),
+            ("infiniband/mlx5_1/ports/1/gids/3", "0000:0000:0000:0000", "active port"),
+            ("infiniband_verbs/uverbs1/ibdev", "other_device", "verbs device"),
+        ):
+            with self.subTest(path=relative):
+                path = sysfs / relative
+                old = path.read_text()
+                path.write_text(value)
+                with self.assertRaisesRegex(self.checker.CheckFailure, message):
+                    check()
+                path.write_text(old)
+        (dev / "uverbs1").unlink()
+        with self.assertRaises(FileNotFoundError):
+            check()
+        with patch.object(self.checker.os, "open", side_effect=PermissionError("fixture verbs denied")) as open_verbs:
+            with self.assertRaises(PermissionError):
+                check("mlx5_0")
+            open_verbs.assert_called_once_with(dev / "uverbs0", os.O_RDWR)
+
+    def test_pd_devices_computes_on_configured_width_and_rejects_other_allocations(self):
+        torch = Mock()
+        torch.ones.return_value.__add__ = Mock(
+            return_value=SimpleNamespace(item=lambda: 2)
+        )
+        with patch.dict(sys.modules, {"torch": torch}):
+            for width in (8, 4):
+                with self.subTest(width=width):
+                    torch.ones.reset_mock()
+                    torch.cuda.device_count.return_value = width
+                    self.checker.check_pd_devices(width)
+                    self.assertEqual(
+                        torch.ones.call_args_list,
+                        [call(1, device=f"cuda:{i}") for i in range(width)],
+                    )
+                    for count in (0, 2, 16):
+                        with self.subTest(count=count):
+                            torch.ones.reset_mock()
+                            torch.cuda.device_count.return_value = count
+                            with self.assertRaisesRegex(
+                                self.checker.CheckFailure, f"{width} visible PPUs"
+                            ):
+                                self.checker.check_pd_devices(width)
+                            torch.ones.assert_not_called()
+            torch.cuda.device_count.return_value = 8
+            torch.ones.return_value.__add__.return_value = SimpleNamespace(item=lambda: 3)
+            with self.assertRaisesRegex(self.checker.CheckFailure, "PPU 0 compute failed"):
+                self.checker.check_pd_devices(8)
+
+    def test_pd_yaml_round_trip_digest_and_device_count_cli(self):
+        self.assertEqual(
+            self.pd.PD_CONFIG_PATH,
+            RUNNER.parent / "ppu/recipes/deepseek-ai/DeepSeek-V4.1-Flash-PD.yaml",
+        )
+        self.assertFalse(
+            (RUNNER.parent / "ppu/e2e/DeepSeek-V4.1-Flash-PD.yaml").exists()
+        )
+        path = self.root / "pd.yaml"
+        path.write_text(yaml.safe_dump(self.config, sort_keys=False))
+        self.assertEqual(self.pd.load_pd_config(path), self.config)
+        reordered = dict(reversed(list(self.config.items())))
+        self.assertEqual(
+            self.pd.config_digest(reordered),
+            hashlib.sha256(json.dumps(self.config, sort_keys=True).encode()).hexdigest(),
+        )
+        for args, code, stdout in (
+            (["device-count", self.config["case_id"]], 0, "8\n"),
+            (["device-count", "future-multinode"], 2, ""),
+            ([], 2, ""),
+        ):
+            with self.subTest(args=args):
+                result = subprocess.run(
+                    [sys.executable, "-I", "-B", self.pd.__file__, *args],
+                    cwd=self.root,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(result.returncode, code, result.stderr)
+                self.assertEqual(result.stdout, stdout)
+
+    def test_device_count_cli_reads_changed_yaml_instead_of_fixed_width(self):
+        repo = self.root / "cli"
+        reader = repo / "scripts/ci/ppu/ppu_pd.py"
+        path = repo / "test/ppu/recipes/deepseek-ai/DeepSeek-V4.1-Flash-PD.yaml"
+        reader.parent.mkdir(parents=True)
+        path.parent.mkdir(parents=True)
+        reader.write_bytes(Path(self.pd.__file__).read_bytes())
+        config = deepcopy(self.config)
+        config["nodes"]["worker"]["devices"] = 6
+        config["ppu"]["topology"]["devices_per_node"] = 6
+        config["roles"]["prefill"]["devices"] = [5, 0, 3]
+        config["roles"]["decode"]["devices"] = [1, 2, 4]
+        path.write_text(yaml.safe_dump(config))
+        result = subprocess.run(
+            [sys.executable, "-I", "-B", str(reader), "device-count", config["case_id"]],
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "6\n")
+
+    def test_pd_yaml_rejects_multinode_and_remote_hosts_explicitly(self):
+        path = self.root / "pd.yaml"
+        for host, extra_node in (("10.0.0.1", False), ("localhost", False), ("127.0.0.1", True)):
+            with self.subTest(host=host, extra_node=extra_node):
+                config = deepcopy(self.config)
+                config["nodes"]["worker"]["host"] = host
+                if extra_node:
+                    config["nodes"]["other"] = {"host": "127.0.0.1", "devices": 8}
+                    config["ppu"]["topology"]["nodes"] = 2
+                    config["roles"]["decode"]["node"] = "other"
+                path.write_text(yaml.safe_dump(config))
+                with self.assertRaisesRegex(NotImplementedError, "remote nodes"):
+                    self.pd.load_pd_config(path)
+
+    def test_pd_yaml_rejects_invalid_schema_allocations_ports_and_types(self):
+        invalid = [
+            (("schema_version",), "ppu-pd-test/v2", "Unsupported"),
+            (("case_id",), "future-multinode", "Unsupported"),
+            (("roles",), {"prefill": self.config["roles"]["prefill"]}, "1P1D"),
+            (("roles", "decode", "node"), "missing", "unavailable node"),
+            (("router", "node"), "missing", "unavailable node"),
+            (("roles", "decode", "devices"), [3, 5, 6, 7], "distinct"),
+            (("roles", "decode", "devices"), [4, 5, 6], "cover"),
+            (("roles", "prefill", "devices"), [0, 0, 2, 3], "distinct"),
+            (("roles", "prefill", "devices"), [], "indices"),
+            (("roles", "prefill", "devices"), [-1, 1, 2, 3], "indices"),
+            (("roles", "decode", "devices"), [4, 5, 6, 8], "indices"),
+            (("roles", "prefill", "devices"), [False, 1, 2, 3], "indices"),
+            (("router", "metrics_port"), 8008, "ports"),
+            (("roles", "decode", "nccl_port"), 2030, "ports"),
+            (("roles", "decode", "bootstrap_port"), 2000, "ports"),
+        ]
+        invalid += [
+            (keys, value, "ports")
+            for keys in (
+                ("router", "port"),
+                ("router", "metrics_port"),
+                ("roles", "prefill", "port"),
+                ("roles", "decode", "nccl_port"),
+                ("roles", "prefill", "bootstrap_port"),
+            )
+            for value in (0, -1, 65536, "8008", True)
+        ]
+        invalid += [
+            (("nodes", "worker", "devices"), value, "device count")
+            for value in (0, -1, "8", True)
+        ]
+        invalid += [
+            (path, value, "strings")
+            for path in (("common_env",), ("roles", "prefill", "env"), ("roles", "decode", "env"))
+            for value in ({"FLAG": 1}, {"FLAG": False}, {1: "value"}, ["FLAG=1"])
+        ]
+        invalid += [
+            (path, value, "arguments")
+            for path in (("common_args",), ("roles", "prefill", "args"), ("roles", "decode", "args"), ("router", "args"))
+            for value in ("--flag", ["--flag", 4], [False], [""])
+        ]
+        invalid += [
+            ((key,), value, "timeouts")
+            for key in ("ready_timeout_s", "request_timeout_s")
+            for value in (0, -1, "60", True)
+        ]
+        invalid += [
+            (("environment", "memory_limit_gib"), value, "memory limit")
+            for value in (0, -1, "900", True)
+        ]
+        path = self.root / "pd.yaml"
+        for keys, value, message in invalid:
+            with self.subTest(keys=keys, value=value):
+                config = deepcopy(self.config)
+                target = config
+                for key in keys[:-1]:
+                    target = target[key]
+                target[keys[-1]] = value
+                path.write_text(yaml.safe_dump(config))
+                with self.assertRaisesRegex(ValueError, message):
+                    self.pd.load_pd_config(path)
+
+    def test_pd_yaml_preserves_original_deployment_fingerprint(self):
+        deployment = {
+            "MODEL_PATH": self.config["environment"]["model_path"],
+            "COMMON_ENV": self.config["common_env"],
+            "COMMON_ARGS": self.config["common_args"],
+            "PREFILL_ENV": self.config["roles"]["prefill"]["env"],
+            "DECODE_ENV": self.config["roles"]["decode"]["env"],
+            "PREFILL_ARGS": self.config["roles"]["prefill"]["args"],
+            "DECODE_ARGS": self.config["roles"]["decode"]["args"],
+        }
+        self.assertEqual(
+            hashlib.sha256(json.dumps(deployment, sort_keys=True).encode()).hexdigest(),
+            "593aed8a9bd4f088a7754e6ae803447cb9707bb48e630015f09a43add3caf0a6",
+        )
+
+    def test_runtime_provenance_native_imports_router_and_metadata(self):
+        repo = RUNNER.parent.parent
+        native = ("sgl_kernel", "deep_gemm", "flash_mla", "mooncake.engine", "sglang_router")
+        flags = ("--mini-lb", "--pd-disaggregation", "--prefill", "--decode")
+        for source in ("source", "installed"):
+            origin = (repo / "python" if source == "source" else self.root / "site") / "sglang/__init__.py"
+            platform = Mock()
+            platform.is_sail.return_value = True
+            modules = {"sglang": SimpleNamespace(__file__=str(origin)),
+                       "sglang.srt.platforms": SimpleNamespace(current_platform=platform)}
+            def version(name):
+                if name == "sgl-kernel":
+                    raise self.checker.metadata.PackageNotFoundError(name)
+                return "1.2.3"
+            with self.subTest(source=source), contextlib.ExitStack() as stack:
+                stack.enter_context(patch.dict(os.environ, {"PD_TEST_CODE_SOURCE": source,
+                                                           "PPU_CI_RECIPE_JIT_DIR": str(self.root)}, clear=True))
+                stack.enter_context(patch.object(sys, "path", list(sys.path)))
+                original_path = list(sys.path)
+                stack.enter_context(patch.dict(sys.modules, modules))
+                imports = stack.enter_context(patch.object(self.checker.importlib, "import_module"))
+                router = stack.enter_context(patch.object(self.checker.subprocess, "run", return_value=SimpleNamespace(stdout=" ".join(flags))))
+                stack.enter_context(patch.object(self.checker.metadata, "version", side_effect=version))
+                runtime = self.checker.check_pd_runtime()
+                self.assertEqual(imports.call_args_list, [call(name) for name in native])
+                router.assert_called_once_with(
+                    [sys.executable, "-I", "-B", "-m", "sglang_router.launch_router", "--help"],
+                    check=True, capture_output=True, text=True, timeout=60,
+                )
+                self.assertEqual(sys.path, [str(repo / "python"), *original_path] if source == "source" else original_path)
+                self.assertEqual(runtime, {
+                    "code_source": source, "sglang_import": str(origin.resolve()),
+                    "versions": {name: "1.2.3" for name in ("sglang", "sglang-kernel", "torch", "sglang-router", "deep-gemm")},
+                    "test_sha256": hashlib.sha256((repo / "test/ppu/e2e/test_deepseek_v41_flash_pd_ppu.py").read_bytes()).hexdigest(),
+                    "jit_dir": str(self.root),
+                })
+                platform.is_sail.return_value = False
+                with self.assertRaisesRegex(self.checker.CheckFailure, "SAIL"):
+                    self.checker.check_pd_runtime()
+                platform.is_sail.return_value = True
+                modules["sglang"].__file__ = str(self.root / "wrong/__init__.py" if source == "source" else repo / "python/sglang/__init__.py")
+                with self.assertRaisesRegex(self.checker.CheckFailure, "does not match"):
+                    self.checker.check_pd_runtime()
+                modules["sglang"].__file__ = str(origin)
+                for missing in native:
+                    with self.subTest(missing=missing):
+                        def import_native(name):
+                            if name == missing:
+                                raise ImportError(name)
+                        imports.side_effect = import_native
+                        with self.assertRaises(ImportError):
+                            self.checker.check_pd_runtime()
+                imports.side_effect = None
+                for missing in flags:
+                    with self.subTest(missing=missing):
+                        router.return_value.stdout = " ".join(flag for flag in flags if flag != missing)
+                        with self.assertRaisesRegex(self.checker.CheckFailure, missing):
+                            self.checker.check_pd_runtime()
+                router.side_effect = subprocess.CalledProcessError(7, "router")
+                with self.assertRaises(subprocess.CalledProcessError):
+                    self.checker.check_pd_runtime()
+
+
+class TestPPUPDRecipeContainer(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.source = self.root / "repo with spaces"
+        scripts = self.source / "scripts/ci/ppu"
+        scripts.mkdir(parents=True)
+        self.script = scripts / "recipe_container.sh"
+        self.script.write_bytes(Path(__file__).with_name("recipe_container.sh").read_bytes())
+        self.artifacts, self.wheels, self.tools = (self.root / name for name in ("artifacts", "wheel house", "tools"))
+        for directory in (self.artifacts, self.wheels, self.tools):
+            directory.mkdir()
+        (self.wheels / "runtime-deps").mkdir()
+        (self.wheels / "sglang-fixture.whl").write_bytes(b"not a real wheel")
+        self.events = self.root / "events.jsonl"
+        # Fake only external Python calls. Execute the real inline platform and
+        # executor wrappers, with injected modules and a harmless executor.
+        fake = self.tools / "python3"
+        fake.write_text(f"#!{sys.executable}\n" + r'''
+import json
+import os
+import signal
+import sys
+from importlib import metadata
+from pathlib import Path
+from types import SimpleNamespace
+
+argv = sys.argv[1:]
+args = argv[2:]
+code = sys.stdin.read() if args[0] == "-" else None
+if args[0] == "-":
+    event = "platform" if len(args) == 2 else "executor"
+elif args[:2] == ["-m", "pip"]:
+    event = "install"
+elif args[0].endswith("check_dependencies.py"):
+    event = args[1]
+    if event == "snapshot":
+        event += "-before" if args[2].endswith("before.json") else "-after"
+elif args[0].endswith("ppu_recipe.py"):
+    event = "validation"
+elif args[0].endswith("ppu_pd.py"):
+    event = "config-width"
+elif args[0].endswith("check_ppu_environment.py"):
+    event = "pd_preflight"
+elif args[0].endswith("test_deepseek_v41_flash_pd_ppu.py"):
+    event = "pd_test"
+else:
+    raise AssertionError(args)
+keys = ("PD_TEST_CODE_SOURCE", "PD_TEST_DUMMY_WEIGHTS", "RECIPE_PPU_COUNT",
+        "MODEL_PATH", "PD_TEST_ARTIFACT_DIR", "PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV",
+        "HF_HUB_OFFLINE", "SGLANG_DG_CACHE_DIR", "SGLANG_CACHE_DIR", "SGLANG_JIT_CACHE_DIR")
+with open(os.environ["FIXTURE_EVENTS"], "a") as output:
+    output.write(json.dumps({"event": event, "argv": argv, "cwd": os.getcwd(),
+                            "phase": (Path(os.environ["PPU_CI_ARTIFACT_DIR"]) / "worker-phase.txt").read_text().strip(),
+                            "env": {key: os.environ.get(key) for key in keys}}) + "\n")
+if event == os.environ.get("FIXTURE_FAILURE"):
+    sys.exit(7)
+if event == "config-width":
+    print(os.environ.get("FIXTURE_CONFIG_WIDTH", "8"))
+elif event == "platform":
+    platform = SimpleNamespace(is_sail=lambda: os.environ.get("FIXTURE_SAIL", "true") == "true")
+    sys.modules.update({"sglang": SimpleNamespace(__version__="0.5.18"),
+                       "torch": SimpleNamespace(__version__="2.13.0", cuda=SimpleNamespace(device_count=lambda: int(os.environ["FIXTURE_VISIBLE_COUNT"]))),
+                       "sglang.srt.platforms": SimpleNamespace(current_platform=platform)})
+    def version(name):
+        versions = {"sglang": "0.5.18", "torch": "2.13.0", "sglang-kernel": "0.4.9"}
+        if name not in versions:
+            raise metadata.PackageNotFoundError(name)
+        return versions[name]
+    metadata.version = version
+    sys.argv = ["-", *args[1:]]
+    exec(compile(code, "platform-wrapper", "exec"), {})
+elif event == "executor":
+    sys.argv = ["-", *args[1:]]
+    exec(compile(code, "executor-wrapper", "exec"), {})
+elif event == "pd_test" and os.environ.get("FIXTURE_WAIT_SIGNAL") == "1":
+    def cancelled(signum, frame):
+        with open(os.environ["FIXTURE_EVENTS"], "a") as output:
+            output.write(json.dumps({"event": "cancelled", "signal": signum}) + "\n")
+        sys.exit(128 + signum)
+    signal.signal(signal.SIGTERM, cancelled)
+    print(json.dumps({"pid": os.getpid()}), flush=True)
+    signal.pause()
+''')
+        fake.chmod(0o755)
+        (scripts / "recipe_runner.py").write_text(
+            "import json, os, sys\n"
+            "with open(os.environ['FIXTURE_EVENTS'], 'a') as output:\n"
+            "    output.write(json.dumps({'event': 'runner', 'argv': sys.argv, 'executor_path': sys.path[0]}) + '\\n')\n"
+            "sys.exit(int(os.environ.get('FIXTURE_RUNNER_EXIT', '0')))\n"
+        )
+        # Do not inherit caller PD settings or Python startup configuration.
+        self.env = {
+            "PATH": str(self.tools) + os.pathsep + os.defpath,
+            "PPU_CI_ARTIFACT_DIR": str(self.artifacts), "PPU_CI_WHEEL_DIR": str(self.wheels),
+            "PPU_CI_RECIPE_SOURCE_DIR": str(self.source), "PPU_CI_RECIPE_JIT_DIR": str(self.root / "jit"),
+            "PPU_RECIPE_CONTAINER_MODEL": str(self.root / "mounted model"),
+            "FIXTURE_EVENTS": str(self.events), "FIXTURE_VISIBLE_COUNT": "8",
+            "PYTHONPATH": "/untrusted/source", "PYTHONHOME": "/untrusted/home", "VIRTUAL_ENV": "/untrusted/venv",
+        }
+
+    def run_entry(self, args, **env):
+        self.events.write_text("")
+        result = subprocess.run(
+            ["/bin/bash", str(self.script), *args], cwd=self.root,
+            env={**self.env, **env}, capture_output=True, text=True, timeout=15,
+        )
+        records = [json.loads(line) for line in self.events.read_text().splitlines()]
+        return result, records
+
+    def assert_sequence(self, records, names):
+        self.assertEqual([record["event"] for record in records], names)
+        for record in records:
+            if "phase" not in record:
+                continue
+            self.assertEqual(record["argv"][:2], ["-I", "-B"])
+            self.assertEqual(record["cwd"], str(self.source))
+            for key in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"):
+                self.assertIsNone(record["env"][key])
+            self.assertEqual(record["env"]["HF_HUB_OFFLINE"], "1")
+
+    def test_original_validation_and_executor_keep_non_eight_allocations(self):
+        install = ["snapshot-before", "install", "missing-wheels", "snapshot-after", "check"]
+        for width in (2, 4, 8, 16):
+            for args in (["validate"], ["fixture-model", "fast_sanity"]):
+                with self.subTest(width=width, args=args):
+                    result, records = self.run_entry(
+                        args, RECIPE_PPU_COUNT=str(width), FIXTURE_VISIBLE_COUNT=str(width),
+                        PD_TEST_CODE_SOURCE="invalid", PD_TEST_DUMMY_WEIGHTS="1",
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    tail = ["validation"] if args == ["validate"] else ["validation", "platform", "executor", "runner"]
+                    self.assert_sequence(records, install + tail)
+                    self.assertEqual(records[5]["argv"][2:], [
+                        "scripts/ci/ppu/ppu_recipe.py", "validate", "--all", "--require-sglang-parser",
+                    ])
+                    self.assertFalse((self.artifacts / "pd").exists())
+                    if args != ["validate"]:
+                        self.assertEqual(records[-1]["argv"], [str(self.source / "scripts/ci/ppu/recipe_runner.py"), *args])
+                        self.assertEqual(records[-1]["executor_path"], str(self.source / "scripts/ci/ppu"))
+        result, records = self.run_entry(["fixture-model", "fast_sanity"], PPU_CI_SKIP_WHEEL_INSTALL="true", FIXTURE_RUNNER_EXIT="9")
+        self.assertEqual(result.returncode, 9)
+        self.assert_sequence(records, ["snapshot-before", "validation", "platform", "executor", "runner"])
+
+    def test_pd_default_installed_sequence_fixed_test_and_model_mapping(self):
+        result, records = self.run_entry(
+            ["pd_test", "deepseek-v41-flash-1p1d"], MODEL_PATH="/wrong/model"
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_sequence(
+            records,
+            [
+                "config-width",
+                "snapshot-before",
+                "install",
+                "missing-wheels",
+                "snapshot-after",
+                "check",
+                "platform",
+                "pd_preflight",
+                "pd_test",
+            ],
+        )
+        self.assertEqual(
+            records[0]["argv"][2:],
+            ["scripts/ci/ppu/ppu_pd.py", "device-count", "deepseek-v41-flash-1p1d"],
+        )
+        self.assertIsNone(records[0]["env"]["RECIPE_PPU_COUNT"])
+        self.assertEqual(
+            records[2]["argv"][2:],
+            [
+                "-m",
+                "pip",
+                "install",
+                "--no-deps",
+                "--no-index",
+                "--force-reinstall",
+                str(self.wheels / "sglang-fixture.whl"),
+            ],
+        )
+        self.assertEqual(
+            records[5]["argv"][2:],
+            [
+                "scripts/ci/ppu/check_dependencies.py",
+                "check",
+                str(self.artifacts / "dependencies-before.json"),
+                str(self.artifacts / "dependencies-after.json"),
+            ],
+        )
+        self.assertEqual(
+            records[-2]["argv"][2:],
+            [
+                "scripts/ci/ppu/check_ppu_environment.py",
+                "--pd-case",
+                "deepseek-v41-flash-1p1d",
+            ],
+        )
+        self.assertEqual(
+            records[-1]["argv"][2:],
+            ["test/ppu/e2e/test_deepseek_v41_flash_pd_ppu.py", "-v"],
+        )
+        self.assertEqual(
+            [record["phase"] for record in records],
+            ["runtime_dependencies"] * 6 + ["platform_check", "pd_preflight", "pd_test"],
+        )
+        for index, record in enumerate(records):
+            self.assertEqual(record["env"]["PD_TEST_CODE_SOURCE"], "installed")
+            self.assertEqual(
+                record["env"]["MODEL_PATH"], self.env["PPU_RECIPE_CONTAINER_MODEL"]
+            )
+            if index:
+                self.assertEqual(record["env"]["RECIPE_PPU_COUNT"], "8")
+            self.assertEqual(record["env"]["PD_TEST_DUMMY_WEIGHTS"], "0")
+            self.assertEqual(
+                record["env"]["PD_TEST_ARTIFACT_DIR"], str(self.artifacts / "pd")
+            )
+        self.assertEqual(
+            records[-1]["env"]["SGLANG_JIT_CACHE_DIR"], str(self.root / "jit/sglang/jit")
+        )
+        self.assertEqual(
+            json.loads((self.artifacts / "runtime-versions.json").read_text()),
+            {"sglang": "0.5.18", "sgl_kernel": "0.4.9", "torch": "2.13.0"},
+        )
+
+    def test_pd_check_only_and_source_skip_install(self):
+        for source, skip in (
+            ("source", "true"), ("installed", "true"), ("installed", "false")
+        ):
+            for check_only in (False, True):
+                with self.subTest(source=source, skip=skip, check_only=check_only):
+                    args = ["pd_test", "deepseek-v41-flash-1p1d"]
+                    if check_only:
+                        args.append("--check-only")
+                    result, records = self.run_entry(
+                        args, PD_TEST_CODE_SOURCE=source, PPU_CI_SKIP_WHEEL_INSTALL=skip
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    dependencies = ["config-width", "snapshot-before"]
+                    if skip == "false":
+                        dependencies += ["install", "missing-wheels", "snapshot-after", "check"]
+                    self.assert_sequence(
+                        records,
+                        dependencies + ["platform", "pd_preflight"]
+                        + ([] if check_only else ["pd_test"]),
+                    )
+                    self.assertEqual(records[-1]["env"]["PD_TEST_CODE_SOURCE"], source)
+
+    def test_pd_config_width_is_authoritative_before_installation(self):
+        case = ["pd_test", "deepseek-v41-flash-1p1d"]
+        for width in (0, 2, 4, 16):
+            with self.subTest(width=width):
+                result, records = self.run_entry(case, RECIPE_PPU_COUNT=str(width))
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assert_sequence(records, ["config-width"])
+                self.assertEqual(records[0]["env"]["RECIPE_PPU_COUNT"], str(width))
+        result, records = self.run_entry(case, FIXTURE_FAILURE="config-width")
+        self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
+        self.assert_sequence(records, ["config-width"])
+        for allocation in ({}, {"RECIPE_PPU_COUNT": "6"}):
+            with self.subTest(allocation=allocation):
+                result, records = self.run_entry(
+                    case + ["--check-only"],
+                    FIXTURE_CONFIG_WIDTH="6",
+                    FIXTURE_VISIBLE_COUNT="6",
+                    PPU_CI_SKIP_WHEEL_INSTALL="true",
+                    **allocation,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assert_sequence(
+                    records, ["config-width", "snapshot-before", "platform", "pd_preflight"]
+                )
+                for record in records[1:]:
+                    self.assertEqual(record["env"]["RECIPE_PPU_COUNT"], "6")
+        result, records = self.run_entry(
+            case, FIXTURE_CONFIG_WIDTH="6", RECIPE_PPU_COUNT="8"
+        )
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assert_sequence(records, ["config-width"])
+
+    def test_pd_invalid_arguments_and_case_local_guards_fail_before_python(self):
+        case = ["pd_test", "deepseek-v41-flash-1p1d"]
+        invalid = [
+            (["pd_test"], {}),
+            (["pd_test", "future-multinode"], {}),
+            (case + ["--unknown"], {}),
+            (case + ["--check-only", "extra"], {}),
+            (case, {"PD_TEST_CODE_SOURCE": "other"}),
+            (case, {"PD_TEST_CODE_SOURCE": "source"}),
+            (case, {"PD_TEST_CODE_SOURCE": "source", "PPU_CI_SKIP_WHEEL_INSTALL": "false"}),
+            (case, {"PD_TEST_CODE_SOURCE": "source", "PPU_CI_SKIP_WHEEL_INSTALL": "1"}),
+            (case, {"PPU_CI_SKIP_WHEEL_INSTALL": "invalid"}),
+        ] + [
+            (case, {"PD_TEST_DUMMY_WEIGHTS": value}) for value in ("1", "true", "invalid")
+        ]
+        for args, env in invalid:
+            with self.subTest(args=args, env=env):
+                result, records = self.run_entry(args, **env)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertEqual(records, [])
+        result, records = self.run_entry(case, PPU_RECIPE_CONTAINER_MODEL="")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(records, [])
+
+    def test_install_vendor_platform_or_preflight_failure_never_executes_pd_test(self):
+        sequence = [
+            "config-width",
+            "snapshot-before",
+            "install",
+            "missing-wheels",
+            "snapshot-after",
+            "check",
+            "platform",
+            "pd_preflight",
+        ]
+        for index, failure in enumerate(sequence):
+            with self.subTest(failure=failure):
+                result, records = self.run_entry(
+                    ["pd_test", "deepseek-v41-flash-1p1d"], FIXTURE_FAILURE=failure
+                )
+                self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
+                self.assert_sequence(records, sequence[: index + 1])
+        for env in ({"FIXTURE_SAIL": "false"}, {"FIXTURE_VISIBLE_COUNT": "4"}):
+            with self.subTest(env=env):
+                result, records = self.run_entry(["pd_test", "deepseek-v41-flash-1p1d"], **env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assert_sequence(records, sequence[:-1])
+        result, records = self.run_entry(
+            ["pd_test", "deepseek-v41-flash-1p1d"], FIXTURE_FAILURE="pd_test"
+        )
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(records[-1]["event"], "pd_test")
+
+    def test_exec_delivers_cancellation_directly_to_fixed_pd_test(self):
+        import select
+
+        process = subprocess.Popen(
+            ["/bin/bash", str(self.script), "pd_test", "deepseek-v41-flash-1p1d"],
+            cwd=self.root, env={**self.env, "PPU_CI_SKIP_WHEEL_INSTALL": "true", "FIXTURE_WAIT_SIGNAL": "1"},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True,
+        )
+        try:
+            ready, _, _ = select.select([process.stdout], [], [], 15)
+            self.assertTrue(ready, "Fake PD test did not become ready")
+            line = process.stdout.readline()
+            self.assertTrue(line, process.stderr.read() if process.poll() is not None else "No readiness event")
+            self.assertEqual(json.loads(line)["pid"], process.pid, "Container must exec, not spawn, the fixed test")
+            process.send_signal(signal.SIGTERM)
+            stdout, stderr = process.communicate(timeout=10)
+            self.assertEqual(process.returncode, 128 + signal.SIGTERM, stdout + stderr)
+            records = [json.loads(line) for line in self.events.read_text().splitlines()]
+            self.assertEqual(records[-1], {"event": "cancelled", "signal": signal.SIGTERM})
+        finally:
+            # Also reap a spawned child if the exec assertion ever regresses.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate(timeout=10)
+
+
+class TestPPUPDUnittestLifecycle(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.module = load_pd_fixture(
+            RUNNER.parent / "ppu/e2e/test_deepseek_v41_flash_pd_ppu.py"
+        )
+        self.config = self.module.load_pd_config()
+        self.model = self.root / "model"
+        self.model.mkdir()
+        (self.model / "tokenizer.json").write_text("{}")
+        self.env = {
+            "MODEL_PATH": str(self.model),
+            "PD_TEST_ARTIFACT_DIR": str(self.root / "logs"),
+            "CUDA_VISIBLE_DEVICES": " 7,6,5,4,3,2,1,0 ",
+            "PYTHONPATH": "/caller/additions",
+            "SERVED_MODEL_NAME": "fixture-model",
+            "IB_DEVICE": "mlx5_0,mlx5_1",
+            "NCCL_IB_GID_INDEX": "3",
+            "PD_TEST_REQUEST_TIMEOUT": "60",
+        }
+
+    @contextlib.contextmanager
+    def mocked_class(
+        self, source="installed", ready_failure=None, launch_failure=None, config_path=None
+    ):
+        cls = type(
+            "FixturePD", (self.module.TestDeepSeekV41FlashPDPpu,), {"_class_cleanups": []}
+        )
+        reader = self.module.load_pd_config
+        processes, events = [], []
+        def launch(command, **kwargs):
+            role = "router" if "sglang_router.launch_router" in command else command[command.index("--disaggregation-mode") + 1]
+            events.append(("start", role))
+            if role == launch_failure:
+                raise OSError("fixture launch failed")
+            process = Mock(pid=1000 + len(processes), returncode=None)
+            process.poll.return_value = None
+            processes.append(process)
+            return process
+        def ready(role, url, deadline):
+            events.append(("ready", role))
+            if role == ready_failure:
+                raise TimeoutError("fixture readiness failed")
+        old_handlers = {signal.SIGTERM: Mock(), signal.SIGINT: Mock()}
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                patch.dict(os.environ, {**self.env, "PD_TEST_CODE_SOURCE": source}, clear=True)
+            )
+            stack.enter_context(patch.object(sys, "platform", "linux"))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            stack.enter_context(
+                patch.object(self.module.importlib.util, "find_spec", return_value=Mock())
+            )
+            loader = stack.enter_context(
+                patch.object(
+                    self.module,
+                    "load_pd_config",
+                    side_effect=lambda: (
+                        reader(config_path)
+                        if config_path is not None
+                        else deepcopy(self.config)
+                    ),
+                )
+            )
+            listener = stack.enter_context(patch.object(self.module.socket, "socket"))
+            popen = stack.enter_context(
+                patch.object(self.module.subprocess, "Popen", side_effect=launch)
+            )
+            killpg = stack.enter_context(patch.object(self.module.os, "killpg"))
+            handlers = stack.enter_context(
+                patch.object(
+                    self.module.signal,
+                    "signal",
+                    side_effect=lambda sig, handler: old_handlers[sig],
+                )
+            )
+            wait_ready = stack.enter_context(
+                patch.object(cls, "wait_ready", side_effect=ready)
+            )
+            try:
+                yield cls, SimpleNamespace(
+                    processes=processes,
+                    events=events,
+                    listener=listener,
+                    popen=popen,
+                    killpg=killpg,
+                    handlers=handlers,
+                    old_handlers=old_handlers,
+                    wait_ready=wait_ready,
+                    loader=loader,
+                )
+            finally:
+                cls.doClassCleanups()
+                self.assertEqual(cls.tearDown_exceptions, [])
+
+    def test_source_and_installed_commands_start_and_wait_for_owned_pd_router(self):
+        for source in ("source", "installed"):
+            with self.subTest(source=source):
+                with self.mocked_class(source) as (cls, fixture):
+                    cls.setUpClass()
+                    self.assertEqual(fixture.events, [
+                        ("start", "prefill"), ("start", "decode"),
+                        ("ready", "prefill"), ("ready", "decode"),
+                        ("start", "router"), ("ready", "router"),
+                    ])
+                    self.assertEqual(fixture.listener.return_value.__enter__.return_value.bind.call_args_list,
+                                     [call(("0.0.0.0", port)) for port in (2000, 2256, 8008, 8010, 2001, 2257, 2030, 2286)])
+                    prefix = [sys.executable] + (["-I"] if source == "installed" else [])
+                    repo_python = str(RUNNER.parent.parent / "python")
+                    expected_path = "" if source == "installed" else os.pathsep.join((repo_python, "/caller/additions"))
+                    logs = []
+                    for launch, role, devices, port in zip(fixture.popen.call_args_list[:2],
+                                                          ("prefill", "decode"), ("7,6,5,4", "3,2,1,0"), (2000, 2256)):
+                        command = launch.args[0]
+                        self.assertEqual(command[:len(prefix) + 2], [*prefix, "-m", "sglang.launch_server"])
+                        expected_options = {
+                            "--model-path": str(self.model), "--served-model-name": "fixture-model",
+                            "--disaggregation-mode": role, "--tp-size": "4", "--disaggregation-transfer-backend": "mooncake",
+                            "--disaggregation-bootstrap-port": str(port + 30), "--nccl-port": str(port + 1),
+                            "--host": "0.0.0.0", "--port": str(port), "--disaggregation-ib-device": "mlx5_0,mlx5_1",
+                        }
+                        for option, value in expected_options.items():
+                            self.assertEqual(command[command.index(option) + 1], value)
+                        self.assertNotIn("--load-format", command)
+                        env = launch.kwargs["env"]
+                        self.assertEqual(env["PYTHONPATH"], expected_path)
+                        self.assertEqual(env["CUDA_VISIBLE_DEVICES"], devices)
+                        self.assertEqual(env["WORKER_ROLE"], role + "-only")
+                        self.assertEqual(env["MODEL_PATH"], str(self.model))
+                        self.assertEqual(env["SERVING_PORT"], str(port))
+                        self.assertEqual(env["MOONCAKE_PROTOCOL"], "rdma")
+                        self.assertTrue(launch.kwargs["start_new_session"])
+                        self.assertIs(launch.kwargs["stderr"], subprocess.STDOUT)
+                        logs.append(launch.kwargs["stdout"])
+                    router = fixture.popen.call_args_list[2]
+                    self.assertEqual(
+                        router.args[0],
+                        [
+                            *prefix,
+                            "-m",
+                            "sglang_router.launch_router",
+                            "--pd-disaggregation",
+                            "--mini-lb",
+                            "--policy",
+                            "cache_aware",
+                            "--prefill",
+                            "http://127.0.0.1:2000",
+                            "2030",
+                            "--decode",
+                            "http://127.0.0.1:2256",
+                            "--host",
+                            "127.0.0.1",
+                            "--port",
+                            "8008",
+                            "--prometheus-host",
+                            "127.0.0.1",
+                            "--prometheus-port",
+                            "8010",
+                            "--request-timeout-secs",
+                            "60",
+                        ],
+                    )
+                    fixture.loader.assert_called_once_with()
+                    self.assertEqual(
+                        (cls.artifacts / "pd-config.yaml").read_bytes(),
+                        self.module.PD_CONFIG_PATH.read_bytes(),
+                    )
+                    self.assertEqual(router.kwargs["env"]["PYTHONPATH"], expected_path)
+                    self.assertTrue(router.kwargs["start_new_session"])
+                    logs.append(router.kwargs["stdout"])
+                    self.assertEqual([Path(log.name).name for log in logs], ["prefill.log", "decode.log", "router.log"])
+                    self.assertTrue(all(not log.closed for log in logs))
+                self.assertTrue(all(log.closed for log in logs))
+                self.assertEqual(fixture.killpg.call_args_list, [
+                    call(process.pid, sig) for process in reversed(fixture.processes) for sig in (signal.SIGTERM, signal.SIGKILL)
+                ])
+                for process in fixture.processes:
+                    self.assertEqual(process.wait.call_args_list, [call(timeout=30), call(timeout=30)])
+                self.assertEqual(fixture.handlers.call_args_list[-2:], [
+                    call(signal.SIGINT, fixture.old_handlers[signal.SIGINT]),
+                    call(signal.SIGTERM, fixture.old_handlers[signal.SIGTERM]),
+                ])
+
+    def test_yaml_drives_deployment_and_port_overrides_preserve_relative_offsets(self):
+        config = deepcopy(self.config)
+        config["environment"].update(
+            model_path=str(self.model), ib_device="mlx5_fixture", gid_index=4
+        )
+        config.update(ready_timeout_s=123, request_timeout_s=77)
+        config["common_args"] = ["--fixture-common", "configured"]
+        config["common_env"]["MOONCAKE_PROTOCOL"] = "fixture"
+        for name, devices, port, nccl, bootstrap in (
+            ("prefill", [6, 0, 5], 3100, 3111, 3147),
+            ("decode", [7, 3, 1, 2, 4], 4200, 4222, 4265),
+        ):
+            config["roles"][name].update(
+                devices=devices,
+                host="127.0.0.1",
+                port=port,
+                nccl_port=nccl,
+                bootstrap_port=bootstrap,
+                args=["--disaggregation-mode", name, "--fixture-role", name],
+                env={"WORKER_ROLE": f"configured-{name}", "ROLE_FIXTURE": name},
+            )
+        config["router"].update(
+            port=9500,
+            metrics_port=9567,
+            metrics_host="0.0.0.0",
+            args=["--pd-disaggregation", "--mini-lb", "--policy", "round_robin"],
+        )
+        path = self.root / "deployment.yaml"
+        path.write_text(yaml.safe_dump(config))
+        for key in (
+            "MODEL_PATH", "SERVED_MODEL_NAME", "IB_DEVICE", "NCCL_IB_GID_INDEX",
+            "PD_TEST_REQUEST_TIMEOUT",
+        ):
+            self.env.pop(key)
+        for overrides in (False, True):
+            with self.subTest(overrides=overrides):
+                if overrides:
+                    self.env.update(
+                        PD_TEST_PREFILL_PORT="5100",
+                        PD_TEST_DECODE_PORT="6200",
+                        PD_TEST_ROUTER_PORT="10500",
+                    )
+                with patch.object(self.module, "PD_CONFIG_PATH", path), patch.object(
+                    self.module.time, "monotonic", return_value=1000
+                ), self.mocked_class(config_path=path) as (cls, fixture):
+                    cls.setUpClass()
+                    fixture.loader.assert_called_once_with()
+                    self.assertEqual(cls.model_path, self.model)
+                    self.assertEqual(cls.request_timeout, 77)
+                    self.assertEqual(
+                        (cls.artifacts / "pd-config.yaml").read_bytes(), path.read_bytes()
+                    )
+                    servers = {
+                        launch.args[0][
+                            launch.args[0].index("--disaggregation-mode") + 1
+                        ]: launch
+                        for launch in fixture.popen.call_args_list[:2]
+                    }
+                    expected_ports = []
+                    for name, cards in (
+                        ("prefill", "1,7,2"),
+                        ("decode", "0,4,6,5,3"),
+                    ):
+                        launch = servers[name]
+                        role = config["roles"][name]
+                        delta = 2000 if overrides else 0
+                        port = role["port"] + delta
+                        expected_ports += [port, role["nccl_port"] + delta, role["bootstrap_port"] + delta]
+                        self.assertEqual(
+                            launch.args[0],
+                            [
+                                sys.executable, "-I", "-m", "sglang.launch_server",
+                                "--model-path", str(self.model),
+                                "--served-model-name", str(self.model),
+                                *config["common_args"], *role["args"],
+                                "--disaggregation-bootstrap-port", str(role["bootstrap_port"] + delta),
+                                "--nccl-port", str(role["nccl_port"] + delta),
+                                "--host", role["host"], "--port", str(port),
+                                "--disaggregation-ib-device", "mlx5_fixture",
+                            ],
+                        )
+                        env = launch.kwargs["env"]
+                        self.assertEqual(env["CUDA_VISIBLE_DEVICES"], cards)
+                        self.assertEqual(env["SERVING_PORT"], str(port))
+                        self.assertEqual(env["NCCL_IB_GID_INDEX"], "4")
+                        for key, value in {**config["common_env"], **role["env"]}.items():
+                            self.assertEqual(env[key], value)
+                    prefill, decode = (5100, 6200) if overrides else (3100, 4200)
+                    router_port, metrics_port = (10500, 10567) if overrides else (9500, 9567)
+                    expected_ports += [router_port, metrics_port]
+                    self.assertCountEqual(
+                        fixture.listener.return_value.__enter__.return_value.bind.call_args_list,
+                        [call(("0.0.0.0", port)) for port in expected_ports],
+                    )
+                    self.assertEqual(
+                        fixture.popen.call_args_list[2].args[0],
+                        [
+                            sys.executable, "-I", "-m", "sglang_router.launch_router",
+                            *config["router"]["args"],
+                            "--prefill", f"http://127.0.0.1:{prefill}", str(prefill + 47),
+                            "--decode", f"http://127.0.0.1:{decode}",
+                            "--host", "127.0.0.1", "--port", str(router_port),
+                            "--prometheus-host", "0.0.0.0", "--prometheus-port", str(metrics_port),
+                            "--request-timeout-secs", "77",
+                        ],
+                    )
+                    self.assertEqual(
+                        fixture.wait_ready.call_args_list,
+                        [
+                            call("prefill", f"http://127.0.0.1:{prefill}", 1123),
+                            call("decode", f"http://127.0.0.1:{decode}", 1123),
+                            call("router", f"http://127.0.0.1:{router_port}", 1123),
+                        ],
+                    )
+
+    def test_changed_yaml_width_maps_default_visible_devices(self):
+        config = deepcopy(self.config)
+        config["nodes"]["worker"]["devices"] = 4
+        config["ppu"]["topology"]["devices_per_node"] = 4
+        config["roles"]["prefill"]["devices"] = [2, 0]
+        config["roles"]["decode"]["devices"] = [3, 1]
+        path = self.root / "deployment.yaml"
+        path.write_text(yaml.safe_dump(config))
+        self.env.pop("CUDA_VISIBLE_DEVICES")
+        with patch.object(self.module, "PD_CONFIG_PATH", path), self.mocked_class(
+            config_path=path
+        ) as (cls, fixture):
+            cls.setUpClass()
+            self.assertEqual(
+                {
+                    launch.kwargs["env"]["WORKER_ROLE"]: launch.kwargs["env"][
+                        "CUDA_VISIBLE_DEVICES"
+                    ]
+                    for launch in fixture.popen.call_args_list[:2]
+                },
+                {"prefill-only": "2,0", "decode-only": "3,1"},
+            )
+
+    def test_bad_yaml_fails_before_binding_or_starting_processes(self):
+        path = self.root / "invalid.yaml"
+        remote = deepcopy(self.config)
+        remote["nodes"]["worker"]["host"] = "10.0.0.1"
+        for content, error in (
+            ("schema_version: [", yaml.YAMLError),
+            ("{}", ValueError),
+            (yaml.safe_dump(dict(self.config, nodes=None)), TypeError),
+            (yaml.safe_dump(remote), NotImplementedError),
+        ):
+            with self.subTest(error=error):
+                path.write_text(content)
+                with self.mocked_class(config_path=path) as (cls, fixture):
+                    with self.assertRaises(error):
+                        cls.setUpClass()
+                    fixture.listener.assert_not_called()
+                    fixture.popen.assert_not_called()
+                    fixture.handlers.assert_not_called()
+                    self.assertFalse(Path(self.env["PD_TEST_ARTIFACT_DIR"]).exists())
+
+    def test_invalid_visibility_and_port_overrides_fail_before_startup(self):
+        original = dict(self.env)
+        invalid = (
+            [
+                ("CUDA_VISIBLE_DEVICES", value)
+                for value in (
+                    "0,1,2,3",
+                    "0,1,2,3,4,5,6,6",
+                    "0,1,2,3,4,5,6,",
+                    "0,1,2,3,4,5,6,7,8",
+                )
+            ]
+            + [
+                ("PD_TEST_PREFILL_PORT", value)
+                for value in ("invalid", "0", "-1", "65535", "2256")
+            ]
+            + [
+                ("PD_TEST_DECODE_PORT", "1999"),
+                ("PD_TEST_ROUTER_PORT", "65534"),
+                ("PD_TEST_ROUTER_PORT", "1998"),
+            ]
+        )
+        for key, value in invalid:
+            with self.subTest(key=key, value=value):
+                self.env = {**original, key: value}
+                with self.mocked_class() as (cls, fixture):
+                    with self.assertRaises(ValueError):
+                        cls.setUpClass()
+                    fixture.listener.assert_not_called()
+                    fixture.popen.assert_not_called()
+                    fixture.handlers.assert_not_called()
+                    self.assertFalse(Path(self.env["PD_TEST_ARTIFACT_DIR"]).exists())
+
+    def test_original_port_overrides_keep_bootstrap_nccl_and_metrics_offsets(self):
+        self.env.update(
+            PD_TEST_PREFILL_PORT="3000",
+            PD_TEST_DECODE_PORT="4000",
+            PD_TEST_ROUTER_PORT="9000",
+        )
+        with self.mocked_class() as (cls, fixture):
+            cls.setUpClass()
+            self.assertEqual(
+                fixture.listener.return_value.__enter__.return_value.bind.call_args_list,
+                [call(("0.0.0.0", port)) for port in (3000, 4000, 9000, 9002, 3001, 4001, 3030, 4030)],
+            )
+            self.assertEqual(cls.base_url, "http://127.0.0.1:9000")
+            self.assertEqual(
+                (cls.artifacts / "pd-config.yaml").read_bytes(),
+                self.module.PD_CONFIG_PATH.read_bytes(),
+            )
+
+    def test_partial_startup_failure_cleans_processes_logs_and_handlers(self):
+        for launch_failure, ready_failure, expected in (("decode", None, 1), (None, "prefill", 2), (None, "router", 3)):
+            with self.subTest(launch=launch_failure, ready=ready_failure):
+                with self.mocked_class(ready_failure=ready_failure, launch_failure=launch_failure) as (cls, fixture):
+                    with self.assertRaises((OSError, TimeoutError)):
+                        cls.setUpClass()
+                    self.assertEqual(len(fixture.processes), expected)
+                    logs = [launch.kwargs["stdout"] for launch in fixture.popen.call_args_list]
+                self.assertTrue(all(log.closed for log in logs))
+                self.assertEqual(fixture.killpg.call_args_list, [
+                    call(process.pid, sig) for process in reversed(fixture.processes) for sig in (signal.SIGTERM, signal.SIGKILL)
+                ])
+                self.assertEqual(fixture.handlers.call_args_list[-2:], [
+                    call(signal.SIGINT, fixture.old_handlers[signal.SIGINT]),
+                    call(signal.SIGTERM, fixture.old_handlers[signal.SIGTERM]),
+                ])
+
+    def test_interrupt_kills_all_owned_groups_even_when_one_has_exited(self):
+        cls = self.module.TestDeepSeekV41FlashPDPpu
+        processes = {role: Mock(pid=index) for index, role in enumerate(("prefill", "decode", "router"), 1000)}
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(sig=sig), patch.object(cls, "processes", processes, create=True):
+                with patch.object(self.module.os, "killpg", side_effect=[None, ProcessLookupError(), None]) as kill:
+                    with self.assertRaisesRegex(InterruptedError, str(int(sig))):
+                        cls.interrupt(int(sig), None)
+                    self.assertEqual(kill.call_args_list, [call(process.pid, signal.SIGKILL) for process in processes.values()])
+
+    def test_stop_process_handles_exited_groups_and_escalates_timeout(self):
+        stop = self.module.TestDeepSeekV41FlashPDPpu.stop_process
+        for state in ("running", "exited", "timeout", "gone_after_term"):
+            with self.subTest(state=state):
+                process = Mock(pid=1000)
+                if state == "timeout":
+                    process.wait.side_effect = [subprocess.TimeoutExpired("fixture", 30), None]
+                effects = {"exited": [ProcessLookupError()], "gone_after_term": [None, ProcessLookupError()]}.get(state)
+                with patch.object(self.module.os, "killpg", side_effect=effects) as kill:
+                    stop(process)
+                self.assertEqual(kill.call_args_list, [call(1000, signal.SIGTERM)] + ([] if state == "exited" else [call(1000, signal.SIGKILL)]))
+                self.assertEqual(process.wait.call_args_list, [call()] if state == "exited" else [call(timeout=30), call(timeout=30)])
+
+    def test_request_timeout_kills_workers_and_restores_alarm_on_cleanup(self):
+        cls = self.module.TestDeepSeekV41FlashPDPpu
+        test = cls("test_non_streaming")
+        test.request_timeout = 60
+        test.processes = {"prefill": Mock(pid=1000), "decode": Mock(pid=1001), "router": Mock(pid=1002)}
+        previous = Mock()
+        with patch.object(self.module.signal, "signal", return_value=previous) as handler, \
+             patch.object(self.module.signal, "setitimer") as timer, \
+             patch.object(self.module.os, "killpg", side_effect=[ProcessLookupError(), None, None]) as kill:
+            try:
+                test.setUp()
+                timer.assert_called_once_with(signal.ITIMER_REAL, 60)
+                with self.assertRaisesRegex(TimeoutError, "60 seconds"):
+                    test.request_timed_out(signal.SIGALRM, None)
+                self.assertEqual(kill.call_args_list, [call(process.pid, signal.SIGKILL) for process in test.processes.values()])
+            finally:
+                test.doCleanups()
+            self.assertEqual(timer.call_args_list, [call(signal.ITIMER_REAL, 60), call(signal.ITIMER_REAL, 0)])
+            self.assertEqual(handler.call_args_list, [call(signal.SIGALRM, test.request_timed_out), call(signal.SIGALRM, previous)])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,24 @@
+schema_version: ppu-test-policy/v1
+model_id: deepseek-ai/DeepSeek-V4.1-Flash
+recipe: test/ppu/recipes/deepseek-ai/DeepSeek-V4.1-Flash-PD.yaml
+hardware: zhenwu_m890
+measurement: accuracy_only
+accuracy_gate:
+  method: golden_band
+  golden_band_abs: 0.02
+  golden_source: framework_repo
+  save_per_question: true
+tiers:
+  model_sanity:
+    stages:
+      - id: eval-gsm8k
+        kind: evalscope
+        cache: enabled
+        dataset: gsm8k@2026-11
+        limit: null
+        seed: 42
+        eval_batch_size: 8
+        generation:
+          temperature: 1.0
+          top_p: 1.0
+          max_tokens: 10240
