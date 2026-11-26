@@ -45,6 +45,10 @@ class DeepEPCudaGraphRunnerAdapter:
         if not get_moe_a2a_backend().is_deepep():
             return
         assert self._captured_deepep_mode is not None
-        DeepEPBuffer.set_dispatch_mode(
-            self._captured_deepep_mode, self._captured_deepep_layout
-        )
+        # Re-apply only the captured dispatch mode. Re-applying the layout
+        # archived at capture_complete() would rewind the global buffer
+        # geometry to a stale generation; the host-side low-latency
+        # block-chain walk would then dereference addresses from a recycled
+        # buffer and fault. The live layout (layout=None) is the one the
+        # buffer was last resized to.
+        DeepEPBuffer.set_dispatch_mode(self._captured_deepep_mode)
