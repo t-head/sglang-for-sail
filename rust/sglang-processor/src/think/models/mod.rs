@@ -2,6 +2,7 @@
 //! differently. Every other name goes to Dynamo.
 
 mod deepseek_v4;
+mod step5;
 
 use super::ThinkConfig;
 
@@ -10,6 +11,7 @@ pub(crate) fn think_config(reasoning_parser: &str) -> Option<ThinkConfig> {
     match reasoning_parser {
         "deepseek-v4" => Some(deepseek_v4::THINK),
         "deepseek-v41" => Some(deepseek_v4::THINK_V41),
+        "step5" => Some(step5::THINK),
         _ => None,
     }
 }

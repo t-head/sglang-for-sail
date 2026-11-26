@@ -12,7 +12,7 @@ use crate::think::{ReasoningOptions, ThinkDetector, think_config};
 /// does not know fall back to its non-forced basic parser.
 fn build_reasoning_parser(server_name: &str) -> ReasoningParserWrapper {
     let name = match server_name {
-        "deepseek-r1" | "step3p5" | "step5" => "deepseek_r1",
+        "deepseek-r1" | "step3p5" => "deepseek_r1",
         "kimi_k2" => "kimi_k25",
         "gpt-oss" => "gpt_oss",
         "nemotron_3" => "nemotron3",
@@ -126,6 +126,24 @@ mod tests {
     use super::*;
 
     const NO_IDS: &[u32] = &[];
+
+    #[test]
+    fn step5_hands_tool_calls_to_the_content_parser() {
+        let text = "reasoning<tool_call>{}</tool_call>";
+        let expected = (
+            "reasoning".to_owned(),
+            "<tool_call>{}</tool_call>".to_owned(),
+        );
+        assert_eq!(
+            split_reasoning(Some("step5"), &ReasoningOptions::default(), text, NO_IDS),
+            expected
+        );
+
+        let mut stream = ReasoningStreamSplitter::new(Some("step5"), ReasoningOptions::default());
+        let first = stream.split("reasoning<tool_", NO_IDS);
+        let second = stream.split("call>{}</tool_call>", NO_IDS);
+        assert_eq!((first.0 + &second.0, first.1 + &second.1), expected);
+    }
 
     #[test]
     fn reasoning_parser_aliases_keep_python_semantics() {
