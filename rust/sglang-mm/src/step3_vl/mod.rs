@@ -30,12 +30,6 @@ pub enum Semantics {
     Tensor,
 }
 
-impl Semantics {
-    pub fn for_source(jpeg: bool) -> Self {
-        if jpeg { Self::Tensor } else { Self::Pil }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Window {
     pub x: usize,
@@ -418,13 +412,9 @@ pub fn image_token_runs(
 
 impl MmFamilyProcessor for Step3VlProcessor {
     fn process_item(&self, media: &DecodedMedia) -> Result<ProcessedItem, String> {
-        let DecodedMedia::Image {
-            rgb,
-            height,
-            width,
-            jpeg,
-        } = media;
-        let out = self.preprocess(rgb.clone(), *width, *height, Semantics::for_source(*jpeg))?;
+        let DecodedMedia::Image { rgb, height, width } = media;
+        // The Step3/Step5 CPU processor decodes every image to PIL before cropping.
+        let out = self.preprocess(rgb.clone(), *width, *height, Semantics::Pil)?;
         let n = out.newlines.len();
         let (s, p) = (self.spec.image_size, self.spec.patch_size);
         Ok(ProcessedItem {
@@ -544,10 +534,9 @@ mod python {
         Vec<(u32, u32)>,
     );
 
-    fn parse_semantics(semantics: Option<&str>, data: &[u8]) -> PyResult<Semantics> {
+    fn parse_semantics(semantics: Option<&str>) -> PyResult<Semantics> {
         match semantics {
-            None => Ok(Semantics::for_source(crate::common::is_jpeg(data))),
-            Some("pil") => Ok(Semantics::Pil),
+            None | Some("pil") => Ok(Semantics::Pil),
             Some("tensor") => Ok(Semantics::Tensor),
             Some(other) => Err(PyValueError::new_err(format!(
                 "step3_vl: unknown semantics {other:?}"
@@ -572,7 +561,7 @@ mod python {
         semantics: Option<&str>,
     ) -> PyResult<PyImage<'py>> {
         let proc = Step3VlProcessor::from_spec_json(spec_json).map_err(PyValueError::new_err)?;
-        let semantics = parse_semantics(semantics, &data)?;
+        let semantics = parse_semantics(semantics)?;
         let out = py
             .detach(move || {
                 let (rgb, height, width) = crate::common::decode_rgb(&data)?;
@@ -599,7 +588,7 @@ mod python {
         let modes = datas
             .iter()
             .enumerate()
-            .map(|(i, d)| parse_semantics(semantics.as_ref().map(|s| s[i].as_str()), d))
+            .map(|(i, _)| parse_semantics(semantics.as_ref().map(|s| s[i].as_str())))
             .collect::<PyResult<Vec<_>>>()?;
         let outs = py
             .detach(move || {
@@ -820,6 +809,52 @@ mod tests {
         let n = pil.newlines.len();
         assert_eq!(pil.patch_pixel_values.len(), n * 3 * 504 * 504);
         assert_eq!(ten.patch_pixel_values.len(), n * 3 * 504 * 504);
+    }
+
+    #[test]
+    fn jpeg_request_uses_padded_cpu_crops() {
+        use crate::driver::{ImageSource, MmInput, process};
+        use image::{ExtendedColorType, codecs::jpeg::JpegEncoder};
+
+        let proc = Step3VlProcessor::new(spec()).unwrap();
+        let (width, height) = (729, 200);
+        let mut jpeg = Vec::new();
+        JpegEncoder::new(&mut jpeg)
+            .encode(
+                &vec![255; width as usize * height as usize * 3],
+                width,
+                height,
+                ExtendedColorType::Rgb8,
+            )
+            .unwrap();
+        let (rgb, height, width) = crate::common::decode_rgb(&jpeg).unwrap();
+        let expected = proc
+            .preprocess(rgb.clone(), width, height, Semantics::Pil)
+            .unwrap();
+        let clipped = proc
+            .preprocess(rgb, width, height, Semantics::Tensor)
+            .unwrap();
+        assert_ne!(expected.patch_pixel_values, clipped.patch_pixel_values);
+
+        let result = process(
+            &proc,
+            MmInput {
+                input_ids: vec![7],
+                images: vec![ImageSource::Bytes(jpeg)],
+            },
+        )
+        .unwrap();
+        let patches = &result.items[0]
+            .aux
+            .iter()
+            .find(|(name, _)| name == "patch_pixel_values")
+            .unwrap()
+            .1
+            .data;
+        let TensorData::F32(patches) = patches else {
+            panic!("expected FP32 patch features");
+        };
+        assert_eq!(patches, &expected.patch_pixel_values);
     }
 
     #[test]

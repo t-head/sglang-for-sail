@@ -155,9 +155,7 @@ impl QwenVlProcessor {
 
 impl MmFamilyProcessor for QwenVlProcessor {
     fn process_item(&self, media: &DecodedMedia) -> Result<ProcessedItem, String> {
-        let DecodedMedia::Image {
-            rgb, height, width, ..
-        } = media;
+        let DecodedMedia::Image { rgb, height, width } = media;
         let (h, w) = (*height, *width);
         let (th, tw) = smart_resize(
             h,
@@ -446,12 +444,7 @@ mod python {
         let out = py
             .detach(move || {
                 let (rgb, height, width) = crate::common::decode_rgb(&data)?;
-                proc.process_item(&DecodedMedia::Image {
-                    rgb,
-                    height,
-                    width,
-                    jpeg: false,
-                })
+                proc.process_item(&DecodedMedia::Image { rgb, height, width })
             })
             .map_err(PyValueError::new_err)?;
         let Geometry::Grid([t, h, w]) = out.geometry else {
@@ -641,7 +634,6 @@ mod tests {
                 rgb: vec![0u8; 10 * 2000 * 3],
                 height: 10,
                 width: 2000,
-                jpeg: false,
             })
             .err()
             .expect("degenerate geometry must be an Err, never a panic");
