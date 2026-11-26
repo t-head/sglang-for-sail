@@ -1577,8 +1577,20 @@ class DeepseekV2MoE(nn.Module):
         )
 
         if hidden_states.shape[0] > 0:
-            # router_logits: (num_tokens, n_experts)
-            router_logits = self.gate(hidden_states, forward_batch=forward_batch)
+            mega_topk_output = None
+            if (
+                not use_vision_topk
+                and isinstance(self.topk, TopK)
+                and not getattr(self, "is_hash", False)
+            ):
+                mega_topk_output = self.topk.try_mega_gate(
+                    hidden_states, self.gate.weight, forward_batch=forward_batch
+                )
+            router_logits = (
+                self.gate(hidden_states, forward_batch=forward_batch)
+                if mega_topk_output is None
+                else None
+            )
             if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
                 if self.alt_stream is not None:
                     self.alt_stream.wait_stream(torch.cuda.current_stream())
@@ -1600,7 +1612,9 @@ class DeepseekV2MoE(nn.Module):
                 if getattr(self, "is_hash", False)
                 else {}
             )
-            if use_vision_topk:
+            if mega_topk_output is not None:
+                topk_output = mega_topk_output
+            elif use_vision_topk:
                 # IDs follow the same local row order as hidden_states, including
                 # CP sharding and the attention-TP scatter before DeepEP.
                 topk_output = vision_topk(

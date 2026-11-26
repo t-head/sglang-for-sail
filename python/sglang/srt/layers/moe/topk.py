@@ -110,6 +110,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.utils import (
     MoeRunnerBackendLike,
     RoutingMethodType,
+    get_moe_runner_backend,
     has_per_rank_fused_shared_slots,
     is_deepep_class_backend,
 )
@@ -824,6 +825,114 @@ class TopK(BaseFusedOp):
             return topk_output
         assert TopKOutputChecker.format_is_standard(topk_output)
         return self.waterfill_balancer.expand_topk(topk_output, num_tokens)
+
+    def try_mega_gate(
+        self,
+        hidden_states: torch.Tensor,
+        weight: torch.Tensor,
+        *,
+        forward_batch=None,
+    ) -> Optional[StandardTopKOutput]:
+        if not _is_sail:
+            return None
+        backend = get_moe_a2a_backend()
+        if not (backend.is_megamoe() or backend.is_deepep()):
+            return None
+        cfg = self.topk_config
+        parallel = get_parallel()
+        rows = hidden_states.shape[0]
+        min_rows, max_rows = (2, 256) if parallel.attn_dp_size == 8 else (1, 512)
+        if (
+            not hidden_states.is_cuda
+            or not get_moe_runner_backend().is_deep_gemm()
+            or (parallel.attn_cp_size, parallel.attn_dp_size, parallel.moe_ep_size)
+            not in ((4, 1, 4), (8, 1, 8), (1, 8, 8))
+            or torch.cuda.get_device_capability(hidden_states.device) != (8, 9)
+            or not min_rows <= rows <= max_rows
+            or hidden_states.shape[1:] != (4096,)
+            or weight.shape != (288, 4096)
+            or hidden_states.dtype != torch.bfloat16
+            or weight.dtype != torch.bfloat16
+            or not hidden_states.is_contiguous()
+            or not weight.is_contiguous()
+            or cfg.top_k != 8
+            or cfg.scoring_func != "sigmoid"
+            or cfg.num_expert_group != 1
+            or cfg.topk_group != 1
+            or not cfg.renormalize
+            or cfg.num_shared_topk_slots
+            or cfg.custom_routing_function is not None
+            or cfg.correction_bias is None
+            or cfg.correction_bias.dtype != torch.float32
+            or cfg.correction_bias.ndim != 1
+            or cfg.correction_bias.device != hidden_states.device
+            or cfg.output_format not in (None, TopKOutputFormat.STANDARD)
+            or is_expert_remapping_enabled()
+            or self.enable_waterfill
+            or self.enable_deepep_waterfill
+            or get_exec().deterministic.enable_deterministic_inference
+            or get_lora().enable_lora
+            or envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+            or envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+        ):
+            return None
+        import deep_gemm
+
+        kernel = getattr(deep_gemm, "bf16_mega_gate", None)
+        if kernel is None:
+            return None
+        num_token_non_padded, dispatch_info = self.routing_inputs()
+        if dispatch_info is not None:
+            return None
+        if forward_batch is None and has_forward_context():
+            forward_batch = getattr(get_forward_context(), "forward_batch", None)
+        if forward_batch is not None:
+            from sglang.srt.layers.moe.mega_gate import get_gate_row_mask
+
+            mask = get_gate_row_mask(
+                rows, num_token_non_padded, hidden_states.device, forward_batch
+            )
+        else:
+            mask = (
+                torch.arange(rows, device=hidden_states.device) < num_token_non_padded
+                if num_token_non_padded is not None
+                else None
+            )
+        updater = get_global_expert_location_updater()
+        if updater is not None:
+            updater.set_current_layer_id(self.layer_id, is_nextn=self.is_draft)
+            updater.wait_gpu_stage()
+        scale = (
+            cfg.routed_scaling_factor
+            if cfg.apply_routed_scaling_factor_on_output
+            and cfg.routed_scaling_factor is not None
+            else 1.0
+        )
+        topk_ids, topk_weights = kernel(
+            hidden_states,
+            weight,
+            cfg.top_k,
+            False,
+            1,
+            scale,
+            parallel.moe_ep_rank,
+            scoring_func=cfg.scoring_func,
+            mask=mask,
+            bias=cfg.correction_bias,
+        )
+        topk_ids, topk_weights, recorder_ids = _post_process_topk_ids(
+            topk_ids,
+            topk_weights,
+            cfg,
+            None,
+            self.layer_id,
+            num_token_non_padded=num_token_non_padded,
+        )
+        if recorder_ids is not None:
+            get_global_expert_distribution_recorder().on_select_experts(
+                topk_ids=recorder_ids
+            )
+        return StandardTopKOutput(topk_weights, topk_ids, None)
 
     def forward_musa(self, *args, **kwargs) -> TopKOutput:
         # MUSA follows the CUDA path explicitly: select_experts branches on

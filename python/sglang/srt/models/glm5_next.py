@@ -1,6 +1,6 @@
 import logging
 from array import array
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -1126,6 +1126,27 @@ class Glm5NextModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[torch.Tensor, PPProxyTensors]:
+        total_num_layers = self.end_layer - self.start_layer
+        gate_scope = ExitStack()
+        if forward_batch is not None:
+            from sglang.srt.layers.moe.mega_gate import mega_gate_forward_scope
+
+            gate_scope.enter_context(mega_gate_forward_scope(forward_batch, enabled=True))
+        try:
+            return self._forward_layers(
+                input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
+            )
+        finally:
+            gate_scope.close()
+
+    def _forward_layers(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor,
+        pp_proxy_tensors: Optional[PPProxyTensors],
     ) -> Union[torch.Tensor, PPProxyTensors]:
         total_num_layers = self.end_layer - self.start_layer
         if self.pp_group.is_first_rank:

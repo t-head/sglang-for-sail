@@ -132,10 +132,12 @@ def _physical_dispatch_maps(info) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 @contextmanager
-def mega_gate_forward_scope(forward_batch):
+def mega_gate_forward_scope(forward_batch, *, enabled=None):
     """One model forward: the gate's row masks are built once and shared by its
     MoE layers. Each forward (eager, warmup or graph capture) builds its own."""
-    if forward_batch is None or not envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.get():
+    if enabled is None:
+        enabled = envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.get()
+    if forward_batch is None or not enabled:
         yield
         return
     try:
@@ -160,10 +162,16 @@ def _gate_row_masks(moe, num_tokens, bound, image_input_ids, device, forward_bat
         id(bound) if bound is not None else None,
         id(image_input_ids) if image_input_ids is not None else None,
     )
+    capturing = torch.cuda.is_current_stream_capturing()
     if isinstance(cache, dict):
         hit = cache.get(key)
-        # The cached inputs are held, so their ids cannot be reused this forward.
-        if hit is not None and hit[0] is bound and hit[1] is image_input_ids:
+        # A pre-capture mask must not bypass the graph's count-dependent compute.
+        if (
+            hit is not None
+            and hit[0] is bound
+            and hit[1] is image_input_ids
+            and (not capturing or hit[4])
+        ):
             return hit[2], hit[3]
     valid = None
     if bound is not None:
@@ -175,8 +183,26 @@ def _gate_row_masks(moe, num_tokens, bound, image_input_ids, device, forward_bat
     if image_input_ids is not None:
         image = (image_input_ids[:num_tokens] == moe.config.image_token_id).contiguous()
     if isinstance(cache, dict):
-        cache[key] = (bound, image_input_ids, valid, image)
+        cache[key] = (bound, image_input_ids, valid, image, capturing)
     return valid, image
+
+
+def get_gate_row_mask(
+    rows, bound, device, forward_batch=None
+) -> Optional[torch.Tensor]:
+    """Reuse the forward-scoped valid-row mask when the batch has one."""
+    if bound is None:
+        return None
+    if forward_batch is not None:
+        return _gate_row_masks(
+            moe=None,
+            num_tokens=rows,
+            bound=bound,
+            image_input_ids=None,
+            device=device,
+            forward_batch=forward_batch,
+        )[0]
+    return torch.arange(rows, device=device) < bound.reshape(-1)[:1]
 
 
 def run_mega_gate(
