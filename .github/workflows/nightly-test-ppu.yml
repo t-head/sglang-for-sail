@@ -1,0 +1,116 @@
+name: Nightly Test (PPU)
+
+# GitHub Actions loads pull_request_target workflows from the default branch
+# (sail_ci_cd). Verify run-ci + run-ci-ppu-nightly approval against the
+# candidate PR head SHA here and delegate full Model Sanity execution to the
+# target branch's reusable workflow.
+on:
+  pull_request_target:
+    branches: ['yuhe/v1.0.0', 'release/v0.5.23']
+    types: [labeled, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: Target branch or 40-char commit SHA (blank uses default/caller ref)
+        type: string
+        default: ''
+      model_filter:
+        description: Optional comma-separated Recipe model policy slugs (blank = all)
+        type: string
+        default: ''
+      image_tag:
+        description: Allowed runtime image tag (tag only, no registry or repository prefix)
+        type: string
+        default: ''
+      image_digest:
+        description: Optional immutable runtime image digest (sha256:<64-hex>)
+        type: string
+        default: ''
+      skip_wheel_build:
+        description: Skip wheel build (reuse wheel_artifact_run_id or run directly in prebuilt image)
+        type: boolean
+        default: false
+      wheel_artifact_run_id:
+        description: Optional prior run ID to reuse built wheels from when skip_wheel_build is true
+        type: string
+        default: ''
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: >-
+    ppu-nightly-pr-dispatch-${{
+      (github.event_name == 'pull_request_target' &&
+       github.event.action == 'labeled' &&
+       !contains(fromJSON('["run-ci","run-ci-ppu-nightly"]'), github.event.label.name)) &&
+      format('ignored-label-{0}', github.run_id) ||
+      github.event.pull_request.number || github.run_id
+    }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  pr-gate:
+    if: >-
+      github.repository == 't-head/sglang-for-sail' &&
+      github.event_name == 'pull_request_target' &&
+      (github.event.action != 'labeled' ||
+       contains(fromJSON('["run-ci","run-ci-ppu-nightly"]'), github.event.label.name))
+    uses: ./.github/workflows/ppu-approval.yml
+    with:
+      label: run-ci-ppu-nightly
+
+  release-v0523:
+    needs: pr-gate
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      needs.pr-gate.outputs.approved == 'true' &&
+      github.base_ref == 'release/v0.5.23'
+    uses: t-head/sglang-for-sail/.github/workflows/nightly-test-ppu.yml@release/v0.5.23
+    with:
+      ref: ${{ needs.pr-gate.outputs.sha }}
+      tier: model_sanity
+    secrets:
+      PPU_CI_K8S_RUNTIME_DIGEST: ${{ secrets.PPU_CI_K8S_RUNTIME_DIGEST }}
+      PPU_CI_RECIPE_IMAGE_REPO: ${{ secrets.PPU_CI_RECIPE_IMAGE_REPO }}
+      PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS: ${{ secrets.PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS }}
+      PPU_CI_NOTIFY_TARGETS_JSON: ${{ secrets.PPU_CI_NOTIFY_TARGETS_JSON }}
+      PPU_CI_NOTIFY_WEBHOOK_URL: ${{ secrets.PPU_CI_NOTIFY_WEBHOOK_URL }}
+      PPU_CI_NOTIFY_SIGNING_SECRET: ${{ secrets.PPU_CI_NOTIFY_SIGNING_SECRET }}
+      PPU_CI_NOTIFY_ROSTER_JSON: ${{ secrets.PPU_CI_NOTIFY_ROSTER_JSON }}
+
+  yuhe-v100:
+    needs: pr-gate
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      needs.pr-gate.outputs.approved == 'true' &&
+      github.base_ref == 'yuhe/v1.0.0'
+    uses: t-head/sglang-for-sail/.github/workflows/nightly-test-ppu.yml@yuhe/v1.0.0
+    with:
+      ref: ${{ needs.pr-gate.outputs.sha }}
+      tier: model_sanity
+    secrets:
+      PPU_CI_K8S_RUNTIME_DIGEST: ${{ secrets.PPU_CI_K8S_RUNTIME_DIGEST }}
+      PPU_CI_RECIPE_IMAGE_REPO: ${{ secrets.PPU_CI_RECIPE_IMAGE_REPO }}
+      PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS: ${{ secrets.PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS }}
+      PPU_CI_NOTIFY_TARGETS_JSON: ${{ secrets.PPU_CI_NOTIFY_TARGETS_JSON }}
+      PPU_CI_NOTIFY_WEBHOOK_URL: ${{ secrets.PPU_CI_NOTIFY_WEBHOOK_URL }}
+      PPU_CI_NOTIFY_SIGNING_SECRET: ${{ secrets.PPU_CI_NOTIFY_SIGNING_SECRET }}
+      PPU_CI_NOTIFY_ROSTER_JSON: ${{ secrets.PPU_CI_NOTIFY_ROSTER_JSON }}
+
+  require-target-branch:
+    name: require-target-branch
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Require an active release or development branch ref
+        run: |
+          printf '%s\n' '::error::Select release/v0.5.23 or yuhe/v1.0.0 as the workflow branch (--ref) when dispatching nightly-test-ppu.yml.'
+          exit 1

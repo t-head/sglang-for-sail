@@ -23,7 +23,7 @@ if sys.platform == "linux":
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "scripts/ci/ppu/run_test.sh"
-WORKFLOW = REPO / ".github/workflows/pr-test-ppu.yml"
+WORKFLOW = REPO / ".github/workflows/pr-test-ppu-extra.yml"
 # Finish before GitHub's ~7.5s SIGINT + 2.5s SIGTERM force-kill window.
 CANCELLATION_BUDGET = 7.5
 SHA = "a" * 40
@@ -532,7 +532,8 @@ class TestPPUCIDocker(CustomTestCase):
         step = next(
             step
             for step in workflow["jobs"]["ppu-sanity"]["steps"]
-            if step.get("name") == "Run the PPU model sanity suite in isolated Docker"
+            if step.get("name")
+            == "Run PPU sanity and kernel regressions in isolated Docker"
         )
         env = {
             **self.env,
