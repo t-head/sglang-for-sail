@@ -7,6 +7,10 @@ from unittest.mock import Mock, patch
 from sglang.srt.environ import envs
 from sglang.srt.plugins.hook_registry import HookRegistry
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu-ppu")
 
 _DEEPEP_MODULE = "sglang.srt.layers.moe.token_dispatcher.deepep"
 _HOOK_MODULE = "sglang.srt.hardware_backend.sail.moe.deepep_hooks"

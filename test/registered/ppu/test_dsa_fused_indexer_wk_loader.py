@@ -15,6 +15,10 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     _load_fused_indexer_wk,
 )
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu-ppu")
 
 PREFIX = "model.layers.0.self_attn.indexer"
 FUSED_NAME = PREFIX + ".wk_weights_proj.weight"

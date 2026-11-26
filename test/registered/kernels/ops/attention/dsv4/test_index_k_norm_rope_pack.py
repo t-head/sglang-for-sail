@@ -23,10 +23,12 @@ from sglang.kernels.ops.quantization.fp4_indexer_quant import (
 )
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import RMSNorm, _rope_fq4
 from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+# backend-specific: cover this path with the SAIL runtime and device kernels.
+register_ppu_ci(est_time=30, suite="extra-unit-test-1-gpu-ppu")
 
 HEAD_DIM = 128
 ROPE_DIM = 64

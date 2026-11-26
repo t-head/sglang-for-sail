@@ -32,6 +32,10 @@ from typing import Optional
 from unittest.mock import patch
 
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu-ppu")
 
 # ---------------------------------------------------------------------------
 # Helper: locate python/ source root for AST analysis

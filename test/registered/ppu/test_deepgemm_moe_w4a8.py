@@ -18,6 +18,9 @@ from sglang.srt.layers.moe.moe_runner.deep_gemm import (
 from sglang.srt.layers.moe.moe_runner.ppu_deepgemm_moe import deep_moe_impl_fused
 from sglang.srt.runtime_context import get_context
 from sglang.srt.utils import get_device_sm, is_sail
+from sglang.test.ci.ci_register import register_ppu_ci
+
+register_ppu_ci(est_time=120, suite="extra-unit-test-1-gpu-ppu")
 
 pytestmark = pytest.mark.skipif(
     not is_sail() or get_device_sm() < 89 or not envs.SGLANG_TEST_PPU_W4A8.get(),
@@ -470,3 +473,9 @@ def test_kimi_k3_w4a8_latency(m, fused):
         print(f"M={m} E={case[1][0].shape[0]} fused={fused} median_ms={timings}")
     finally:
         envs.SGLANG_SAIL_DEEPGEMM_MOE_TP_FUSED.set(False)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))

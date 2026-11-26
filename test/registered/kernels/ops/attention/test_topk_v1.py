@@ -29,9 +29,11 @@ import torch
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import amax_topk_blocks
 from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged
 from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 
 register_cuda_ci(est_time=180, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+# backend-specific: cover this path with the SAIL runtime and device kernels.
+register_ppu_ci(est_time=180, suite="extra-unit-test-1-gpu-ppu")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or is_hip(),

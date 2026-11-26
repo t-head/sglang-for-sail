@@ -19,12 +19,12 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
-# ---------------------------------------------------------------------------
-# Locate repo root from this file (tests/ → aot/ → kernels/ → sglang/ → python/ → root)
-# ---------------------------------------------------------------------------
-_REPO_ROOT = (
-    Path(__file__).resolve().parents[5]
-)  # python/sglang/kernels/aot/tests → root
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu-ppu")
+
+_REPO_ROOT = Path(__file__).resolve().parents[5]
 
 
 def _parse_file(rel_path: str) -> ast.Module:

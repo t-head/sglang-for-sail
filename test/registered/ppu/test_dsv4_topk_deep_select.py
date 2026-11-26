@@ -16,6 +16,9 @@ import pytest
 import torch
 
 import sglang.kernels.ops.attention.deep_select as ds
+from sglang.test.ci.ci_register import register_ppu_ci
+
+register_ppu_ci(est_time=60, suite="extra-unit-test-1-gpu-ppu")
 
 
 def _wheel_present() -> bool:
@@ -170,3 +173,9 @@ def test_fp32_fallback_without_backend(monkeypatch: pytest.MonkeyPatch) -> None:
         idx_oob_fill_value=-1,
     )
     torch.testing.assert_close(out.sort(dim=-1).values, expected)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))

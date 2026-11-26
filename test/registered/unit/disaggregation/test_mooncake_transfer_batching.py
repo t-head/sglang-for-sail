@@ -23,6 +23,7 @@ from sglang.test.test_utils import CustomTestCase
 FOREGROUND = TransferIntent.FOREGROUND
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu-ppu")
 
 
 class TestMooncakeTransferBatching(unittest.TestCase):

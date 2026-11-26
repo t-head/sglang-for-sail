@@ -17,6 +17,33 @@ gh workflow run pr-test-ppu.yml --repo t-head/sglang-for-sail \
 
 The reusable workflow accepts the same boolean input and a candidate `ref`.
 
+## Registered Unit Tests
+
+From the repository root, use the standard suite runner in an environment with
+the test dependencies installed. Select `base-a-test-cpu-ppu` to run the CPU
+files selected for PPU CI. Those files also keep their community
+`base-a-test-cpu` registrations. The PPU unit suite requires one device per
+shard and the matching SAIL runtime.
+
+```bash
+PYTHONPATH=python python3 test/run_suite.py --hw cpu --suite base-a-test-cpu-ppu \
+  --auto-partition-id 0 --auto-partition-size 2
+PYTHONPATH=python python3 test/run_suite.py --hw ppu --suite extra-unit-test-1-gpu-ppu \
+  --auto-partition-id 0 --auto-partition-size 2
+```
+
+Run partition IDs 0 and 1 to cover each suite. The PPU unit suite is separate
+from `extra-test-1-gpu-ppu`, which the sanity workflow invokes. For 890P
+hardware coverage in the indexer API tests, set `SGLANG_TEST_INDEXER_GPU=1`.
+For W4A8 coverage with a compatible DeepGEMM build, set
+`SGLANG_TEST_PPU_W4A8=1`. Tests with narrower device requirements have their
+own hardware checks.
+
+The eight GPU DCP push combine and DSA top-k merge tests use NVIDIA NVLink.
+The Mega MoE pre-dispatch test targets Blackwell. These tests retain their CUDA
+suites. The standalone DeepGEMM D32 reproducer remains available for manual
+validation of the legacy ABI.
+
 ## Trigger Quick Reference
 
 Check [`test/ppu/README.md`](../../../test/ppu/README.md) for the exact policy slugs available in each tier. `model_filter` accepts comma-separated slugs that declare the requested tier; avoid leaving it blank during routine branch validation because an empty filter schedules every model in that tier and can saturate the shared 8-card PPU pool.

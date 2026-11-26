@@ -1,6 +1,6 @@
 """PPU DFlash sliding MLA: real FlashMLA, cyclic DCP, and dtype boundaries.
 
-PYTHONPATH=python python -m pytest -q test/manual/ppu/test_dflash_flashmla_swa.py
+PYTHONPATH=python python -m pytest -q test/registered/ppu/test_dflash_flashmla_swa.py
 """
 
 from types import SimpleNamespace
@@ -13,6 +13,14 @@ from sglang.srt.hardware_backend.sail.attention import flashmla_backend
 from sglang.srt.mem_cache import kv_cache_dtype
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import is_sail
+from sglang.test.ci.ci_register import register_ppu_ci
+
+# Re-enable after updating the fixture for the KV router and KV dtype APIs.
+register_ppu_ci(
+    est_time=60,
+    suite="extra-unit-test-1-gpu-ppu",
+    disabled="DFlash fixtures use outdated KV router and dtype APIs",
+)
 
 pytestmark = pytest.mark.skipif(not is_sail(), reason="requires PPU FlashMLA")
 
@@ -336,3 +344,9 @@ def test_draft_kv_dtype_boundary(sail, draft, backend, expected):
         )
     assert dtype == expected
     assert tag == ("auto" if expected == torch.bfloat16 else None)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))

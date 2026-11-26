@@ -18,6 +18,14 @@ from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
     QwenSparseAttnMetadata,
 )
 from sglang.srt.utils.device import get_device_sm, is_sail
+from sglang.test.ci.ci_register import register_ppu_ci
+
+# Re-enable after resolving the BF16 accuracy mismatch for shape (3, 7, 128).
+register_ppu_ci(
+    est_time=120,
+    suite="extra-unit-test-1-gpu-ppu",
+    disabled="BF16 reference accuracy mismatch on 890P",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -481,3 +489,8 @@ def test_fa3_sparse_padded_production_width(rows):
             json.dumps(diagnostics, indent=2)
         )
     torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
+
+
+if __name__ == "__main__":
+
+    sys.exit(pytest.main([__file__]))

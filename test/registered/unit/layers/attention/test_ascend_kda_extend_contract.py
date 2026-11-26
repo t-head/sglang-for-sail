@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu-ppu")
 
 _ASCEND_BACKEND = "sglang.srt.hardware_backend.npu.attention.ascend_kda_backend"
 

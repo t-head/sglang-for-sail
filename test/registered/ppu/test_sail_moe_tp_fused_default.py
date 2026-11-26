@@ -6,11 +6,15 @@ the flag is promoted to default-on so every PPU deep_gemm MoE run gets the gain
 without opt-in. Explicit SGLANG_SAIL_DEEPGEMM_MOE_TP_FUSED=0 must still disable
 it (escape hatch preserved).
 
-Run: python -m pytest -q test/ppu/unit/test_sail_moe_tp_fused_default.py
+Run: python -m pytest -q test/registered/ppu/test_sail_moe_tp_fused_default.py
 (no PPU device needed; env-field semantics only)
 """
 
 from sglang.srt.environ import envs
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu-ppu")
 
 NAME = "SGLANG_SAIL_DEEPGEMM_MOE_TP_FUSED"
 
@@ -28,3 +32,11 @@ def test_explicit_zero_still_disables():
 def test_explicit_one_enables():
     with envs.SGLANG_SAIL_DEEPGEMM_MOE_TP_FUSED.override(True):
         assert envs.SGLANG_SAIL_DEEPGEMM_MOE_TP_FUSED.get() is True
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__]))

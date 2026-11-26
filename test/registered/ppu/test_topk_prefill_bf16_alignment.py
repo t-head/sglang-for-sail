@@ -1,6 +1,9 @@
 import torch
 
 from sglang.kernels.ops.attention.dsv4.topk import top_k_per_row_prefill_bf16
+from sglang.test.ci.ci_register import register_ppu_ci
+
+register_ppu_ci(est_time=60, suite="extra-unit-test-1-gpu-ppu")
 
 TOPK = 2048
 

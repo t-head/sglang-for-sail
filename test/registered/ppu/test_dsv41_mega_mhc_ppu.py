@@ -8,6 +8,9 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.ci.ci_register import register_ppu_ci
+
+register_ppu_ci(est_time=60, suite="extra-unit-test-1-gpu-ppu")
 
 
 class TestMegaMHCPPU(CustomTestCase):

@@ -15,6 +15,14 @@ from sglang.srt.layers.attention.qsa import mqa
 from sglang.srt.layers.attention.qsa import qsa_indexer as indexer_module
 from sglang.srt.layers.attention.qsa.kernel import qsa_fast_topk
 from sglang.srt.utils.device import get_device_sm, is_sail
+from sglang.test.ci.ci_register import register_ppu_ci
+
+# Re-enable after resolving the pointwise mismatch against quantized FP64.
+register_ppu_ci(
+    est_time=120,
+    suite="extra-unit-test-1-gpu-ppu",
+    disabled="Quantized FP64 pointwise comparison fails on 890P",
+)
 
 
 @pytest.mark.parametrize("legacy", [False, True])
@@ -308,3 +316,8 @@ def test_native_compressed_logits_and_poisoned_padding(rows, keys, dim, tmp_path
     assert not numerical_errors, "QUANTIZED_FP64_POINTWISE_MISMATCH: " + "\n".join(
         numerical_errors
     )
+
+
+if __name__ == "__main__":
+
+    sys.exit(pytest.main([__file__]))

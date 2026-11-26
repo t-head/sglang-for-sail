@@ -23,6 +23,8 @@ from sglang.test.ci.ci_register import register_ppu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_ppu_ci(est_time=120, suite="extra-test-1-gpu-ppu")
+# backend-specific: cover this path with the SAIL runtime and device kernels.
+register_ppu_ci(est_time=120, suite="extra-unit-test-1-gpu-ppu")
 
 # (M, N, K): decode-sized, prefill-sized and the lm-head-like wide N.
 _SHAPES = ((16, 8192, 4096), (2048, 8192, 4096), (256, 32768, 4096))

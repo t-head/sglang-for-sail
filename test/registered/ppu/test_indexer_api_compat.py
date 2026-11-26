@@ -9,6 +9,9 @@ from types import MethodType, ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
+from sglang.test.ci.ci_register import register_ppu_ci
+
+register_ppu_ci(est_time=120, suite="extra-unit-test-1-gpu-ppu")
 
 ROOT = Path(__file__).resolve().parents[3]
 ATTENTION = ROOT / "python/sglang/srt/layers/attention"

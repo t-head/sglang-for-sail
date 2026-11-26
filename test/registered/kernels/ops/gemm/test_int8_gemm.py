@@ -5,12 +5,19 @@ import pytest
 import torch
 
 from sglang.srt.utils import is_sail
+from sglang.test.ci.ci_register import register_ppu_ci
+
+# Re-enable once ACEXT INT8 GEMM can query kernel occupancy on 890P.
+register_ppu_ci(
+    est_time=60,
+    suite="extra-unit-test-1-gpu-ppu",
+    disabled="ACEXT INT8 GEMM returns invalid argument in compute_occupancy",
+)
 
 if is_sail():
     from acext import int8_gemm as acext_int8_gemm
 
 from sgl_kernel import int8_scaled_mm
-from utils import is_sm10x
 
 
 def to_int8(tensor: torch.Tensor) -> torch.Tensor:
@@ -46,7 +53,7 @@ def _test_accuracy_once(M, N, K, with_bias, out_dtype, device):
 
 
 @pytest.mark.skipif(
-    is_sm10x(),
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() >= (10, 0),
     reason="int8_scaled_mm is only supported on sm90 and lower",
 )
 @pytest.mark.parametrize("M", [1, 16, 32, 64, 128, 512, 1024, 4096, 8192])

@@ -27,8 +27,8 @@ pulls in torch._inductor), and importing would also resolve a site-packages
 install rather than this checkout.  The only runtime dependency is torch,
 so the test runs anywhere on CPU:
 
-    python test/ppu/unit/test_deepseek_v4_dspark_quant_metadata.py
-    pytest test/ppu/unit/test_deepseek_v4_dspark_quant_metadata.py -v
+    python test/registered/ppu/test_deepseek_v4_dspark_quant_metadata.py
+    pytest test/registered/ppu/test_deepseek_v4_dspark_quant_metadata.py -v
 """
 
 import ast
@@ -43,6 +43,10 @@ from typing import Optional
 import torch
 
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu-ppu")
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _SGLANG_SRC = _REPO_ROOT / "python" / "sglang"
