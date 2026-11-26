@@ -34,7 +34,7 @@ from sglang.srt.runtime_context import (
 logger = logging.getLogger(__name__)
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     concat_cast_kv_fp8_pad,
-    dequantize_k_cache_paged_dsa,
+    dequantize_k_cache_paged_dsa_dispatch,
     gather_cast_kv_fp8_pad_paged,
     gather_dequant_requant_fp8_paged_dsa,
 )
@@ -2847,7 +2847,7 @@ class DeepseekSparseAttnBackend(
                             0, page_table_1_flattened.long()
                         )
                     else:
-                        kv_cache = dequantize_k_cache_paged_dsa(
+                        kv_cache = dequantize_k_cache_paged_dsa_dispatch(
                             kv_cache, page_table_1_flattened
                         )
                 else:
