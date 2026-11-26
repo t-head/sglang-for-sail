@@ -213,8 +213,6 @@ fn test_limits() -> Limits {
         skip_tokenizer_init: false,
         vocab_size: 1000,
         context_len: NO_CONTEXT_CEILING,
-        num_reserved_tokens: 0,
-        allow_auto_truncate: false,
         return_hidden_states_mode: HiddenStatesMode::Null,
         min_output_token_reserve: 1,
     }
