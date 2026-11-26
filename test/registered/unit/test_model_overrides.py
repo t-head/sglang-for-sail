@@ -4356,7 +4356,8 @@ class TestKimiK31DsaBackends(CustomTestCase):
             )
 
     def test_ppu_dsa_flashmla_kv_cache_dtype(self):
-        """ZW890P keeps FP8 only when both DSA phases use the KV backend."""
+        """ZW890P keeps FP8 when both DSA phases use the KV backend, and also for
+        a flashmla_sparse prefill over a flashmla_kv decode on exactly SM89."""
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,
             _ppu_flashmla_fp8_kv_cache_fallback,
@@ -4383,7 +4384,9 @@ class TestKimiK31DsaBackends(CustomTestCase):
             for prefill, decode, sm89_result in (
                 ("flashmla_kv", "flashmla_kv", {}),
                 ("flashmla_sparse", "flashmla_sparse", fallback),
-                ("flashmla_sparse", "flashmla_kv", fallback),
+                # SM89 only: the sparse prefill consumes bf16 while the fp8 prefix
+                # KV is dequantized in front of it and the pool stays fp8.
+                ("flashmla_sparse", "flashmla_kv", {}),
                 ("flashmla_kv", "flashmla_sparse", fallback),
                 ("flashmla_kv", "trtllm", fallback),
                 ("trtllm", "flashmla_kv", fallback),
@@ -4480,7 +4483,13 @@ class TestKimiK31DsaBackends(CustomTestCase):
                         expected_dtype = (
                             "fp8_e4m3"
                             if sm == 89
-                            and expected_prefill == expected_decode == "flashmla_kv"
+                            and expected_decode
+                            == "flashmla_kv"  # fp8-capable decode phase
+                            and expected_prefill
+                            in (  # SM89 keeps fp8 for both of these
+                                "flashmla_kv",
+                                "flashmla_sparse",
+                            )
                             else "auto"
                         )
                         self.assertEqual(
