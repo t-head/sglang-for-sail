@@ -34,7 +34,7 @@ from sglang.srt.runtime_context import (
 logger = logging.getLogger(__name__)
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     concat_cast_kv_fp8_pad,
-    dequantize_k_cache_paged_dsa,
+    dequantize_k_cache_paged_dsa_dispatch,
     gather_cast_kv_fp8_pad_paged,
     gather_dequant_requant_fp8_paged_dsa,
 )
@@ -553,10 +553,23 @@ def _validate_flashmla_sparse_q8_backend(
                 "--kv-cache-dtype bfloat16."
             )
         if device_sm_major != 9:
-            raise ValueError(
-                "--dsa-prefill-backend flashmla_sparse_q8 is SM90-only; got compute "
-                f"capability sm_{device_sm_major}x."
-            )
+            # PPU (sail) does not run the Hopper kernel this rule describes: on
+            # sm89+ it consumes the same fp8 q/KV prep through flash_mla's
+            # quantized sparse-prefill entry (the contract carried on the 0.5.21
+            # adaptation line). Reject PPU below sm89, and reject any build whose
+            # flash_mla lacks the entry, at launch rather than mid-forward.
+            if not (_is_sail and get_platform().device_sm >= 89):
+                raise ValueError(
+                    "--dsa-prefill-backend flashmla_sparse_q8 is SM90-only; got compute "
+                    f"capability sm_{device_sm_major}x."
+                )
+            import flash_mla
+
+            if not hasattr(flash_mla, "flash_mla_sparse_quantized_fwd"):
+                raise ValueError(
+                    "--dsa-prefill-backend flashmla_sparse_q8 on PPU requires a "
+                    "flash_mla build that exports flash_mla_sparse_quantized_fwd."
+                )
         # A mixed batch takes the PAGED top-k transform, which belongs to the
         # bf16 kernel. forward_extend refuses it, but the flag is readable here,
         # so the refusal belongs at launch rather than on the first mixed batch
@@ -2834,7 +2847,7 @@ class DeepseekSparseAttnBackend(
                             0, page_table_1_flattened.long()
                         )
                     else:
-                        kv_cache = dequantize_k_cache_paged_dsa(
+                        kv_cache = dequantize_k_cache_paged_dsa_dispatch(
                             kv_cache, page_table_1_flattened
                         )
                 else:
@@ -3469,9 +3482,12 @@ class DeepseekSparseAttnBackend(
         The top-k width is -1 padded to a multiple of 128 before the pad band
         is sized (kpool rows are index_topk + index_kpool - 1 wide).
         """
-        from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
-            sparse_mla_q8kv8_prefill_fwd,
-        )
+        if _is_sail:
+            from flash_mla import flash_mla_sparse_quantized_fwd
+        else:
+            from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
+                sparse_mla_q8kv8_prefill_fwd,
+            )
 
         num_tokens, num_heads, d_nope = q_nope.shape
         head_dim = d_nope + q_rope.shape[-1]
@@ -3644,20 +3660,36 @@ class DeepseekSparseAttnBackend(
             )
             self._q8kv8_out_bufs = out_bufs
 
-        o, _, _ = sparse_mla_q8kv8_prefill_fwd(
-            q=q_fp8,
-            kv=kv_padded,
-            indices=page_table_1.unsqueeze(1),
-            sm_scale=sm_scale,
-            q_scale=identity_scale,
-            kv_scale=identity_scale,
-            d_v=v_head_dim,
-            attn_sink=None,
-            topk_length=topk_length,
-            out=out_bufs[0][:s_q],
-            max_logits=out_bufs[1][:s_q],
-            lse=out_bufs[2][:s_q],
-        )
+        if _is_sail:
+            # PPU: identical fp8 q/KV prep and identity scale, consumed by the
+            # flash_mla quantized entry (0.5.21 argument set); the sm90 kernel's
+            # aux outputs (max_logits/lse) are not part of this contract.
+            o, _, _ = flash_mla_sparse_quantized_fwd(
+                q=q_fp8,
+                kv=kv_padded,
+                indices=page_table_1.unsqueeze(1),
+                sm_scale=sm_scale,
+                d_v=v_head_dim,
+                attn_sink=None,
+                topk_length=topk_length,
+                out=out_bufs[0][:s_q],
+                compute_aux=False,
+            )
+        else:
+            o, _, _ = sparse_mla_q8kv8_prefill_fwd(
+                q=q_fp8,
+                kv=kv_padded,
+                indices=page_table_1.unsqueeze(1),
+                sm_scale=sm_scale,
+                q_scale=identity_scale,
+                kv_scale=identity_scale,
+                d_v=v_head_dim,
+                attn_sink=None,
+                topk_length=topk_length,
+                out=out_bufs[0][:s_q],
+                max_logits=out_bufs[1][:s_q],
+                lse=out_bufs[2][:s_q],
+            )
 
         # Trim the output back to the original head count if we padded.
         if need_padding:
