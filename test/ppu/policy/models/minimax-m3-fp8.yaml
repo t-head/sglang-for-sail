@@ -58,3 +58,19 @@ tiers:
         warmup_count_by_concurrency:
           1: 2
           16: 8
+  light_perf:
+    engine: one_batch
+    hardware: zhenwu_m890
+    variant: default
+    dummy_weights: true
+    cases:
+      - id: minimax_m3_fp8_channel_tp_prefill
+        preset: one_batch_prefill
+        input: {batch_size: 1, input_len: [4096, 16384, 65536, 102400], output_len: 1}
+        threshold: {metric: prefill_throughput, min_tokens_per_s: 1}
+      - id: minimax_m3_fp8_channel_tp_decode
+        preset: one_batch_decode
+        engine: one_batch_server
+        cache: disabled
+        input: {batch_size: 64, input_len: [4096], output_len: 1536}
+        threshold: {metric: output_throughput, min_tokens_per_s: 1}

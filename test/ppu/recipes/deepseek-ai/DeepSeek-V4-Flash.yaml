@@ -50,6 +50,17 @@ features:
       NCCL_CUMEM_ENABLE: "1"
       SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK: "512"
       SGLANG_SAIL_DEEPEP_RECV_HOOK: "0"
+  one_batch:
+    args:
+      - --tp-size
+      - "4"
+      - --mem-fraction-static
+      - "0.85"
+      - --enable-deepseek-v4-fp4-indexer
+      - --page-size
+      - "64"
+      - --chunked-prefill-size
+      - "8192"
 variants:
   default: {precision: mxfp4}
 presets:
@@ -59,3 +70,10 @@ presets:
         deepep: false
     env:
       SGLANG_OPT_FLASHMLA_SPARSE_PREFILL: "0"
+  one_batch_prefill:
+    select: {features: {deepep: false, one_batch: true}}
+    remove_args: [--disable-prefill-cuda-graph, --reasoning-parser]
+    args: [--cuda-graph-max-bs-decode, "1"]
+  one_batch_decode:
+    select: {features: {deepep: false, one_batch: true}}
+    remove_args: [--disable-prefill-cuda-graph, --reasoning-parser]

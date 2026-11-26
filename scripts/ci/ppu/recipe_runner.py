@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Run Fast Sanity or Model Sanity inside an isolated candidate container."""
+"""Run recipe sanity checks or the light performance pilot."""
 
 import argparse
 import contextlib
@@ -12,12 +12,19 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
-from ppu_recipe import GSM8K_GOLDEN_BAND_ABS, REPO_ROOT, _load_yaml, resolve_recipe
+from ppu_recipe import (
+    GSM8K_GOLDEN_BAND_ABS,
+    REPO_ROOT,
+    _load_yaml,
+    resolve_recipe,
+    validate_policy_structure,
+)
 
 HOST = "http://127.0.0.1:9985"
 MODEL = "recipe-model"
@@ -402,7 +409,7 @@ def run_evaluation(stage, config):
     return json.loads((RESULTS / "gsm8k-result.json").read_text())
 
 
-def cached_model_path(repo_id, revision):
+def cached_model_path(repo_id, revision, *, require_weights=True):
     from huggingface_hub import snapshot_download
 
     cache = Path(os.environ["HF_HUB_CACHE"])
@@ -441,17 +448,206 @@ def cached_model_path(repo_id, revision):
             for name in kimi_tokenizer_files
         ):
             raise ValueError("offline model snapshot lacks tokenizer metadata")
-    index = json.loads((snapshot / "model.safetensors.index.json").read_text())
-    shards = set(index["weight_map"].values())
-    if not shards or any(
-        Path(name).is_absolute()
-        or ".." in Path(name).parts
-        or not (snapshot / name).is_file()
-        or (snapshot / name).stat().st_size == 0
-        for name in shards
-    ):
-        raise ValueError("offline model snapshot has missing shards")
+    if require_weights:
+        index = json.loads((snapshot / "model.safetensors.index.json").read_text())
+        shards = set(index["weight_map"].values())
+        if not shards or any(
+            Path(name).is_absolute()
+            or ".." in Path(name).parts
+            or not (snapshot / name).is_file()
+            or (snapshot / name).stat().st_size == 0
+            for name in shards
+        ):
+            raise ValueError("offline model snapshot has missing shards")
     return str(snapshot.resolve(strict=True)), revision
+
+
+def check_one_batch_results(output, case, *, engine="one_batch"):
+    shape = case["input"]
+    expected = {
+        (shape["batch_size"], length, shape["output_len"])
+        for length in shape["input_len"]
+    }
+    threshold = case["threshold"]
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    measured = set()
+    passed = True
+    for row in rows:
+        key = (row["batch_size"], row["input_len"], row["output_len"])
+        if row["run_name"] != case["id"] or key not in expected or key in measured:
+            raise ValueError(f"{case['id']}: unexpected or duplicate one_batch result")
+        if (
+            engine == "one_batch_server"
+            and row.get("total_output_tokens") != key[0] * key[2]
+        ):
+            raise ValueError(f"{case['id']}: server did not generate the requested tokens")
+        measured.add(key)
+        value = row.get(threshold["metric"])
+        passed &= (
+            type(value) in (int, float)
+            and threshold["min_tokens_per_s"] <= value < math.inf
+        )
+    if measured != expected:
+        raise ValueError(
+            f"{case['id']}: missing one_batch results for {sorted(expected - measured)}"
+        )
+    return passed
+
+
+def light_perf_worker_args(config, environ):
+    argv = list(config["argv"])
+    nodes = config["nodes"]
+    rank = int(environ.get("NODE_RANK", "0"))
+    if nodes != int(environ.get("NNODES", "1")) or not 0 <= rank < nodes:
+        raise ValueError(f"light_perf requires {nodes} nodes and a valid node rank")
+    if nodes > 1:
+        argv[argv.index("--node-rank") + 1] = str(rank)
+        argv[argv.index("--dist-init-addr") + 1] = (
+            f"{environ['MASTER_ADDR']}:{environ['MASTER_PORT']}"
+        )
+        if rank:
+            argv[4] = "sglang.launch_server"
+    return argv, rank
+
+
+def wait_for_light_perf_marker(path, timeout):
+    deadline = time.monotonic() + timeout
+    while not path.is_file():
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"timed out waiting for light_perf marker {path.name}")
+        time.sleep(1)
+
+
+def run_light_perf_peer(argv, env, log, leader_done, peer_done):
+    process = subprocess.Popen(
+        argv,
+        env={**env, "SGLANG_BLOCK_NONZERO_RANK_CHILDREN": "1"},
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    try:
+        wait_for_light_perf_marker(leader_done, 3700)
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+    peer_done.touch()
+
+
+def run_light_perf(policy_path, assets_map, queue_s):
+    policy = _load_yaml(policy_path)
+    validate_policy_structure(policy, context=str(policy_path))
+    recipe = REPO_ROOT / policy["recipe"]
+    settings = policy["tiers"]["light_perf"]
+    cases = settings["cases"]
+    snapshot_revision = None
+    if assets_map is None:
+        phase("model_cache_check")
+        ppu = _load_yaml(recipe)["ppu"]
+        model_path, snapshot_revision = cached_model_path(
+            ppu["hf_model_id"],
+            os.environ.get("PPU_CI_HF_MODEL_REVISION"),
+            require_weights=not settings["dummy_weights"],
+        )
+        assets_map = RESULTS.parent / "light-perf-assets.json"
+        assets_map.write_text(
+            json.dumps({name: model_path for name in ppu["assets"].values()})
+        )
+    plans = [
+        resolve_recipe(
+            recipe,
+            policy_path=policy_path,
+            tier="light_perf",
+            preset=case["preset"],
+            assets_map_path=assets_map,
+            cache_revision=snapshot_revision,
+        )
+        for case in cases
+    ]
+    allocated_width = os.environ.get("RECIPE_PPU_COUNT")
+    expected_width = int(allocated_width) if allocated_width is not None else None
+    for config in plans:
+        nodes = config["nodes"]
+        total = config["ppu_count"]
+        if config["model_id"] != policy["model_id"]:
+            raise ValueError("light_perf requires the policy model")
+        if expected_width is not None and total != expected_width * nodes:
+            raise ValueError(
+                f"light_perf preset {config['preset']!r} requires "
+                f"{total} PPU devices, allocation has {expected_width * nodes}"
+            )
+        if not all(
+            Path(config[key]).is_dir() for key in ("resolved_model", "resolved_tokenizer")
+        ):
+            raise ValueError("light_perf requires local model and tokenizer directories")
+
+    output_dir = Path(tempfile.mkdtemp(prefix="one-batch-", dir=RESULTS.resolve()))
+    results = {}
+    for case, config in zip(cases, plans):
+        case_id = case["id"]
+        worker_args, node_rank = light_perf_worker_args(config, os.environ)
+        env = {**os.environ, **config["server_env"]}
+        multi_node = config["nodes"] > 1
+        if multi_node:
+            shared_results = Path(os.environ["PPU_CI_WORKER_ARTIFACT_DIR"])
+            leader_done = shared_results / f"{case_id}.leader-done"
+            peer_done = shared_results / f"{case_id}.peer-done"
+        shape = case["input"]
+        output = output_dir / f"{case_id}.jsonl"
+        phase(case_id)
+        log_path = output.with_suffix(".log")
+        if node_rank:
+            with log_path.open("wb") as log:
+                run_light_perf_peer(worker_args, env, log, leader_done, peer_done)
+            continue
+        argv = [
+            *worker_args,
+            "--batch-size",
+            str(shape["batch_size"]),
+            "--input-len",
+            *map(str, shape["input_len"]),
+            "--output-len",
+            str(shape["output_len"]),
+            "--run-name",
+            case_id,
+            "--result-filename",
+            str(output),
+        ]
+        if config["benchmark_engine"] == "one_batch_server":
+            argv.extend(["--dataset-name", "random-ids"])
+        try:
+            with log_path.open("wb") as log:
+                subprocess.run(
+                    argv,
+                    env=env,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    timeout=3600,
+                    check=True,
+                )
+        finally:
+            if multi_node:
+                leader_done.touch()
+        if multi_node:
+            wait_for_light_perf_marker(peer_done, 45)
+        passed = check_one_batch_results(output, case, engine=config["benchmark_engine"])
+        results[case_id] = {
+            "passed": passed,
+            "config_digest": config["config_digest"],
+            "results": str(output.relative_to(RESULTS.resolve())),
+        }
+    return {
+        "queue_s": queue_s,
+        "cases": results,
+        "outcome": "pass" if all(case["passed"] for case in results.values()) else "fail",
+    }
 
 
 def run(policy_path, tier, queue_s):
@@ -573,12 +769,24 @@ def main():
         return 0
     parser = argparse.ArgumentParser()
     parser.add_argument("policy", type=Path)
-    parser.add_argument("tier", choices=("fast_sanity", "model_sanity"))
+    parser.add_argument("tier", choices=("fast_sanity", "model_sanity", "light_perf"))
     parser.add_argument("--queue-s", type=float, required=True)
+    parser.add_argument(
+        "--assets-map", type=Path, help="Local assets for light_perf (default: offline cache)"
+    )
     args = parser.parse_args()
+    if args.assets_map is not None and args.tier != "light_perf":
+        parser.error("--assets-map is only supported for light_perf")
+    if args.tier == "light_perf" and args.assets_map is None and not os.environ.get(
+        "HF_HUB_CACHE"
+    ):
+        parser.error("light_perf requires --assets-map or an offline HF_HUB_CACHE")
     os.umask(0o077)
     RESULTS.mkdir(parents=True, exist_ok=True)
-    result = run(args.policy, args.tier, args.queue_s)
+    if args.tier == "light_perf":
+        result = run_light_perf(args.policy, args.assets_map, args.queue_s)
+    else:
+        result = run(args.policy, args.tier, args.queue_s)
     (RESULTS / "summary.json").write_text(json.dumps(result, sort_keys=True) + "\n")
     return int(result["outcome"] != "pass")
 

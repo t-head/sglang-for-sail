@@ -24,3 +24,21 @@ model:
     - deep_gemm
 variants:
   default: {precision: fp8}
+features:
+  one_batch:
+    args: [--disable-shared-experts-fusion, --cuda-graph-backend-prefill, disabled]
+presets:
+  one_batch_prefill:
+    select: {features: {one_batch: true}}
+    remove_args: [--page-size, --kv-cache-dtype]
+    args: [--max-total-tokens, "106496"]
+  one_batch_decode:
+    select: {features: {one_batch: true}}
+    remove_args: [--page-size, --kv-cache-dtype]
+    args:
+      - --chunked-prefill-size
+      - "8192"
+      - --cuda-graph-max-bs-decode
+      - "64"
+      - --max-total-tokens
+      - "360448"

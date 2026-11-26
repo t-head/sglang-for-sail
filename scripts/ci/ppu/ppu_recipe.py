@@ -10,6 +10,7 @@ import copy
 import hashlib
 import importlib
 import json
+import math
 import os
 import re
 import shlex
@@ -28,7 +29,9 @@ GSM8K_GOLDEN_BAND_ABS = 0.02
 SERVING_SCHEMA = "ppu-serving/v1"
 DATASET_SCHEMA = "ppu-dataset/v1"
 POLICY_SCHEMA = "ppu-test-policy/v1"
-POLICY_TIERS = frozenset({"fast_sanity", "model_sanity", "nightly", "release"})
+POLICY_TIERS = frozenset(
+    {"fast_sanity", "model_sanity", "nightly", "release", "light_perf"}
+)
 _UNSET: Any = object()
 
 ALLOWED_ENV_PREFIXES = (
@@ -83,11 +86,17 @@ ALLOWED_PRESET_SLOTS = frozenset(
         "dp_ep_low_latency",
         "eval_longctx",
         "model_sanity",
+        "one_batch_decode",
+        "one_batch_prefill",
         "prefill_long",
         "tp8",
     }
 )
 ALLOWED_CACHE_MODES = frozenset({"sanity_throughput_guard", "prefix_reuse_bench"})
+LIGHT_PERF_METRICS = {
+    "one_batch": {"prefill_throughput", "median_decode_throughput"},
+    "one_batch_server": {"input_throughput", "output_throughput"},
+}
 
 _PROHIBITED_TOKEN_A = "".join(chr(c) for c in (98, 116, 118))
 _PROHIBITED_TOKEN_B = "".join(chr(c) for c in (102, 108, 121, 116, 105, 103, 101, 114))
@@ -325,11 +334,14 @@ def resolve_recipe(
     if policy_path is not None:
         policy = _load_yaml(policy_path)
         validate_policy_structure(policy, context=str(policy_path), base_dir=REPO_ROOT)
+    elif tier == "light_perf":
+        raise ValidationError("light_perf requires a policy")
 
     eff_cache = cache
     eff_dummy = dummy_weights
     eff_layers: int | None = None if layer_override is _UNSET else layer_override
     eff_preset = preset
+    benchmark_engine = None
 
     if policy is not None:
         if tier is None:
@@ -355,7 +367,25 @@ def resolve_recipe(
                 if eff_preset is None and st.get("preset"):
                     eff_preset = st["preset"]
                     break
-        if policy.get("hardware") and hardware == "zhenwu_m890":
+        if tier == "light_perf":
+            hardware = tier_cfg["hardware"]
+            variant = tier_cfg["variant"]
+            eff_dummy = tier_cfg["dummy_weights"]
+            benchmark_settings = {
+                (case.get("engine", tier_cfg["engine"]), case.get("cache"))
+                for case in tier_cfg["cases"]
+                if case["preset"] == eff_preset
+            }
+            if not benchmark_settings:
+                raise ValidationError("light_perf requires a preset from the policy")
+            if len(benchmark_settings) != 1:
+                raise ValidationError(
+                    "light_perf preset has conflicting engine or cache settings"
+                )
+            ((benchmark_engine, policy_cache),) = benchmark_settings
+            if eff_cache is None:
+                eff_cache = policy_cache
+        elif policy.get("hardware") and hardware == "zhenwu_m890":
             hardware = policy["hardware"]
 
     ordered: list[tuple[str, str | None, bool]] = []
@@ -429,7 +459,10 @@ def resolve_recipe(
     elif eff_cache is not None:
         raise ValidationError(f"unsupported cache value: {eff_cache!r}")
 
-    ordered = _apply_flag_entries(ordered, ["--enable-metrics"])
+    if tier != "light_perf":
+        ordered = _apply_flag_entries(ordered, ["--enable-metrics"])
+    elif eff_layers is not None:
+        raise ValidationError("light_perf requires the full model")
     if eff_dummy:
         ordered = _apply_flag_entries(ordered, ["--load-format", "dummy"])
     if eff_layers is not None:
@@ -452,10 +485,19 @@ def resolve_recipe(
 
     # 7. assets-map + runtime endpoint injection
     assets_map = _load_assets_map(assets_map_path)
-    asset_name = ppu_blk["assets"]["model"]
+    asset_names = ppu_blk["assets"]
+    asset_name = asset_names["model"]
+    if (
+        tier == "light_perf"
+        and assets_map_path is not None
+        and not set(asset_names.values()) <= assets_map.keys()
+    ):
+        raise ValidationError(
+            f"{recipe_path}: light_perf requires model and tokenizer asset mappings"
+        )
     hf_model_id = ppu_blk.get("hf_model_id") or model_blk["model_id"]
     resolved_model = assets_map.get(asset_name, hf_model_id)
-    resolved_tokenizer = assets_map.get(ppu_blk["assets"]["tokenizer"], resolved_model)
+    resolved_tokenizer = assets_map.get(asset_names["tokenizer"], resolved_model)
     effective_served_name = (
         served_model_name or ppu_blk.get("served_name") or asset_name
     )
@@ -466,19 +508,17 @@ def resolve_recipe(
         "-I",
         "-B",
         "-m",
-        "sglang.launch_server",
+        f"sglang.benchmark.{benchmark_engine}" if benchmark_engine else "sglang.launch_server",
         "--model-path",
         resolved_model,
         "--tokenizer-path",
         resolved_tokenizer,
-        "--served-model-name",
-        effective_served_name,
-        "--host",
-        host,
-        "--port",
-        str(port),
-        *flags_only,
     ]
+    if tier != "light_perf":
+        argv.extend(
+            ["--served-model-name", effective_served_name, "--host", host, "--port", str(port)]
+        )
+    argv.extend(flags_only)
 
     dp_raw = _flag_value(ordered, "--dp-size")
     tp_raw = _flag_value(ordered, "--tp-size")
@@ -505,6 +545,8 @@ def resolve_recipe(
     }
     if cache_revision is not None:
         digest_payload["cache_revision"] = cache_revision
+    if benchmark_engine is not None:
+        digest_payload["benchmark_engine"] = benchmark_engine
     config_digest = hashlib.sha256(
         json.dumps(digest_payload, separators=(",", ":"), sort_keys=True).encode(
             "utf-8"
@@ -530,6 +572,14 @@ def resolve_recipe(
         "enabled_features": active_features,
         "layer_override": eff_layers,
         "dummy_weights": eff_dummy,
+        **(
+            {
+                "benchmark_engine": benchmark_engine,
+                "nodes": int(_flag_value(ordered, "--nnodes") or "1"),
+            }
+            if benchmark_engine
+            else {}
+        ),
     }
 
 
@@ -939,6 +989,92 @@ def _validate_stage_cache_rules(
                 )
 
 
+def _validate_light_perf(tier, recipe_path: Path | None, *, context: str) -> None:
+    keys = {"engine", "hardware", "variant", "dummy_weights", "cases"}
+    _check_keys(
+        tier,
+        allowed=keys,
+        required=keys,
+        context=context,
+    )
+    if tier["engine"] not in tuple(LIGHT_PERF_METRICS) or tier["hardware"] not in (
+        "zhenwu_810e",
+        "zhenwu_m890",
+    ):
+        raise ValidationError(f"{context}: invalid engine or hardware")
+    if type(tier["dummy_weights"]) is not bool:
+        raise ValidationError(f"{context}: dummy_weights must be a boolean")
+    if recipe_path is None:
+        raise ValidationError(f"{context}: requires a recipe")
+    recipe = _load_yaml(recipe_path)
+    if not isinstance(tier["variant"], str) or tier["variant"] not in recipe.get(
+        "variants", {}
+    ):
+        raise ValidationError(f"{context}: unknown recipe variant")
+    cases = tier["cases"]
+    if not isinstance(cases, list) or not cases:
+        raise ValidationError(f"{context}: cases must be a nonempty list")
+    seen = set()
+    for index, case in enumerate(cases):
+        location = f"{context}.cases[{index}]"
+        keys = {"id", "preset", "input", "threshold"}
+        _check_keys(
+            case,
+            allowed=keys | {"engine", "cache"},
+            required=keys,
+            context=location,
+        )
+        engine = case.get("engine", tier["engine"])
+        if engine not in tuple(LIGHT_PERF_METRICS) or case.get("cache") not in (
+            None,
+            "enabled",
+            "disabled",
+        ):
+            raise ValidationError(f"{location}: invalid benchmark engine or cache")
+        case_id = case["id"]
+        if (
+            not isinstance(case_id, str)
+            or not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", case_id)
+            or case_id in seen
+        ):
+            raise ValidationError(f"{location}: expected a unique case ID")
+        seen.add(case_id)
+        preset = case["preset"]
+        if not isinstance(preset, str) or preset not in recipe.get("presets", {}):
+            raise ValidationError(f"{location}: unknown recipe preset")
+        keys = {"batch_size", "input_len", "output_len"}
+        shape = _check_keys(case["input"], allowed=keys, required=keys, context=location)
+        lengths = shape["input_len"]
+        if (
+            not isinstance(lengths, list)
+            or not lengths
+            or any(type(n) is not int or n <= 0 for n in lengths)
+            or len(set(lengths)) != len(lengths)
+            or any(
+                type(shape[key]) is not int or shape[key] <= 0
+                for key in ("batch_size", "output_len")
+            )
+        ):
+            raise ValidationError(f"{location}: expected positive, distinct shapes")
+        keys = {"metric", "min_tokens_per_s"}
+        threshold = _check_keys(
+            case["threshold"], allowed=keys, required=keys, context=location
+        )
+        metric = threshold["metric"]
+        floor = threshold["min_tokens_per_s"]
+        if (
+            not isinstance(metric, str)
+            or metric not in LIGHT_PERF_METRICS[engine]
+            or (
+                metric in ("median_decode_throughput", "output_throughput")
+                and shape["output_len"] <= 1
+            )
+            or type(floor) not in (int, float)
+            or not 0 < floor < math.inf
+        ):
+            raise ValidationError(f"{location}: invalid throughput threshold")
+
+
 def validate_policy_structure(
     policy: dict[str, Any],
     *,
@@ -1004,6 +1140,10 @@ def validate_policy_structure(
                 f"{context}.replaces_legacy_cases requires tiers.model_sanity"
             )
     if tiers:
+        if "light_perf" in tiers:
+            _validate_light_perf(
+                tiers["light_perf"], recipe_path, context=f"{context}.tiers.light_perf"
+            )
         if "fast_sanity" in tiers:
             fs = _check_keys(
                 tiers["fast_sanity"],
@@ -1601,7 +1741,7 @@ def main(argv: list[str] | None = None) -> int:
     res = sub.add_parser("resolve", help="Resolve a recipe into argv/env/digest")
     res.add_argument("--recipe", type=Path, required=True)
     res.add_argument("--policy", type=Path, default=None)
-    res.add_argument("--tier", choices=["fast_sanity", "model_sanity"], default=None)
+    res.add_argument("--tier", choices=["fast_sanity", "model_sanity", "light_perf"])
     res.add_argument("--variant", default="default")
     res.add_argument("--hardware", default="zhenwu_m890")
     res.add_argument("--preset", default=None)

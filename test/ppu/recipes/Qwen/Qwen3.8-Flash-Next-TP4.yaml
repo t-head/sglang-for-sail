@@ -54,3 +54,24 @@ presets:
       - --mamba-radix-cache-strategy
       - extra_buffer
       - --disable-overlap-schedule
+  one_batch_prefill:
+    remove_args:
+      - --context-length
+      - --attention-backend
+      - --max-running-requests
+      - --chunked-prefill-size
+      - --speculative-algorithm
+      - --speculative-num-steps
+      - --speculative-eagle-topk
+      - --reasoning-parser
+    args: [--max-total-tokens, "106496"]
+  one_batch_decode:
+    remove_args:
+      - --context-length
+      - --attention-backend
+      - --max-running-requests
+      - --speculative-algorithm
+      - --speculative-num-steps
+      - --speculative-eagle-topk
+      - --reasoning-parser
+    args: [--cuda-graph-max-bs-decode, "64", --max-total-tokens, "360448"]

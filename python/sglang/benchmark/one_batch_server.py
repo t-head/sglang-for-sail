@@ -42,6 +42,7 @@ from sglang.profiler import run_profile
 from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.entrypoints.http_server import launch_server
+from sglang.srt.plugins import load_plugins
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_blackwell
 from sglang.srt.utils.auth import admin_auth_headers
@@ -1628,6 +1629,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
 
 
 def cli_main():
+    load_plugins()
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)
