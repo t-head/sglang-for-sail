@@ -70,6 +70,8 @@ on:
         required: false
       PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS:
         required: false
+      PPU_CI_NOTIFY_TARGETS_JSON:
+        required: false
       PPU_CI_NOTIFY_WEBHOOK_URL:
         required: false
       PPU_CI_NOTIFY_SIGNING_SECRET:
@@ -616,9 +618,10 @@ jobs:
       - id: configured
         name: Check notification configuration
         env:
+          PPU_CI_NOTIFY_TARGETS_JSON: ${{ secrets.PPU_CI_NOTIFY_TARGETS_JSON }}
           PPU_CI_NOTIFY_WEBHOOK_URL: ${{ secrets.PPU_CI_NOTIFY_WEBHOOK_URL }}
         run: |
-          if [[ -n "$PPU_CI_NOTIFY_WEBHOOK_URL" ]]; then
+          if [[ -n "$PPU_CI_NOTIFY_TARGETS_JSON" || -n "$PPU_CI_NOTIFY_WEBHOOK_URL" ]]; then
             echo 'enabled=true' >> "$GITHUB_OUTPUT"
           fi
 
@@ -651,6 +654,7 @@ jobs:
           NOTIFY_MATRIX_RESULT: ${{ needs.recipe-sanity-finish.result }}
           NOTIFY_MATRIX: ${{ needs.plan.outputs.all-models }}
           NOTIFY_SOURCE_SHA: ${{ needs.plan.outputs.source-sha }}
+          PPU_CI_NOTIFY_TARGETS_JSON: ${{ secrets.PPU_CI_NOTIFY_TARGETS_JSON }}
           PPU_CI_NOTIFY_WEBHOOK_URL: ${{ secrets.PPU_CI_NOTIFY_WEBHOOK_URL }}
           PPU_CI_NOTIFY_SIGNING_SECRET: ${{ secrets.PPU_CI_NOTIFY_SIGNING_SECRET }}
           PPU_CI_NOTIFY_ROSTER_JSON: ${{ secrets.PPU_CI_NOTIFY_ROSTER_JSON }}
