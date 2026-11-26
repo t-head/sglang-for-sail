@@ -2,11 +2,20 @@ schema_version: ppu-serving/v1
 ppu:
   framework: sglang
   visibility: public
-  assets: {model: glm-5.3-mxfp4, tokenizer: glm-5.3-mxfp4}
+  assets:
+    model: glm-5.3-mxfp4
+    tokenizer: glm-5.3-mxfp4
   hf_model_id: T-HEAD/GLM-5.3-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken
   golden_model_key: glm_5_3_mxfp4
-  topology: {kind: single_node, nodes: 1, devices_per_node: 8}
-  external_env: [DG_USE_MOE_DYNAMIC_TILE, HGGC_EMBEDDED_COPY_THRESHOLD, SGLANG_NSA_DUAL_STREAM]
+  served_name: glm-5.3-mxfp4
+  topology:
+    kind: single_node
+    nodes: 1
+    devices_per_node: 8
+  external_env:
+    - DG_USE_MOE_DYNAMIC_TILE
+    - HGGC_EMBEDDED_COPY_THRESHOLD
+    - SGLANG_NSA_DUAL_STREAM
 model:
   model_id: zai-org/GLM-5.3
   base_args:
@@ -26,5 +35,210 @@ model:
     DG_USE_MOE_DYNAMIC_TILE: "1"
     HGGC_EMBEDDED_COPY_THRESHOLD: "0x10000"
     SGLANG_NSA_DUAL_STREAM: "1"
+features:
+  tool_calling:
+    args:
+      - --tool-call-parser
+      - glm47
+  reasoning:
+    args:
+      - --reasoning-parser
+      - glm45
+  spec_decoding:
+    default_mode: nextn
+    modes:
+      nextn:
+        args:
+          - --speculative-algorithm
+          - NEXTN
+          - --speculative-num-steps
+          - "2"
+          - --speculative-eagle-topk
+          - "1"
+          - --speculative-num-draft-tokens
+          - "3"
 variants:
-  default: {precision: mxfp4}
+  default:
+    precision: mxfp4
+    hardware: zhenwu_m890
+    assets:
+      model: glm-5.3-mxfp4
+      tokenizer: glm-5.3-mxfp4
+    hf_model_id: T-HEAD/GLM-5.3-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken
+    golden_model_key: glm_5_3_mxfp4
+    served_name: glm-5.3-mxfp4
+    extra_args: []
+    extra_env: {}
+  fp8_channel:
+    precision: fp8
+    hardware: zhenwu_m890
+    topology:
+      kind: single_node
+      nodes: 1
+      devices_per_node: 8
+    assets:
+      model: glm-5.3-fp8-channel
+      tokenizer: glm-5.3-fp8-channel
+    hf_model_id: T-HEAD/GLM-5.3-Quant-W-FP8-PerChannel-A-FP8-PerChannel
+    golden_model_key: glm_5_3_fp8_channel
+    served_name: glm-5.3-fp8-channel
+    extra_args:
+      - --tp-size
+      - "8"
+    extra_env: {}
+  w8a8_int8:
+    precision: w8a8_int8
+    hardware: zhenwu_810e
+    topology:
+      kind: single_node
+      nodes: 1
+      devices_per_node: 16
+    assets:
+      model: glm-5.3-w8a8-int8
+      tokenizer: glm-5.3-w8a8-int8
+    hf_model_id: T-HEAD/GLM-5.3-Quant-W-INT8-PerChannel-A-INT8-PerToken
+    golden_model_key: glm_5_3_w8a8_int8
+    served_name: glm-5.3-w8a8-int8
+    extra_args:
+      - --tp-size
+      - "16"
+    extra_env: {}
+hardware_overrides:
+  zhenwu_m890:
+    extra_args: []
+    extra_env: {}
+  zhenwu_810e:
+    extra_args:
+      - --mem-fraction-static
+      - "0.90"
+    extra_env: {}
+presets:
+  prefill:
+    select:
+      features:
+        tool_calling: true
+        reasoning: true
+        spec_decoding: false
+    args:
+      - --context-length
+      - "16384"
+      - --disable-prefill-cuda-graph
+  decode:
+    hardware: zhenwu_m890
+    topology:
+      kind: single_node
+      nodes: 1
+      devices_per_node: 8
+    tp: 8
+    select:
+      features:
+        tool_calling: true
+        reasoning: true
+        spec_decoding: true
+    args: []
+  decode_ep:
+    hardware: zhenwu_m890
+    topology:
+      kind: multi_node_ep
+      nodes: 4
+      devices_per_node: 8
+    tp: 32
+    select:
+      features:
+        tool_calling: true
+        reasoning: true
+        spec_decoding: true
+    args:
+      - --attn-dp-size
+      - "32"
+      - --enable-dp-lm-head
+      - --moe-a2a-backend
+      - deepep
+      - --deepep-mode
+      - low_latency
+      - --moe-dense-tp-size
+      - "1"
+      - --nnodes
+      - "4"
+      - --node-rank
+      - "{node_rank}"
+      - --dist-init-addr
+      - "{master_addr}:{master_port}"
+      - --dist-timeout
+      - "3600"
+      - --watchdog-timeout
+      - "3600"
+    env:
+      NCCL_CUMEM_ENABLE: "1"
+      SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK: "512"
+      SGLANG_SAIL_DEEPEP_RECV_HOOK: "0"
+  pd_prefill:
+    hardware: zhenwu_m890
+    topology:
+      kind: pd_disagg
+      nodes: 1
+      devices_per_node: 8
+      role: prefill
+    tp: 8
+    select:
+      features:
+        tool_calling: true
+        reasoning: true
+        spec_decoding: false
+    args:
+      - --disable-prefill-cuda-graph
+      - --disaggregation-mode
+      - prefill
+      - --disaggregation-transfer-backend
+      - mooncake
+      - --disaggregation-ib-device
+      - "{ib_devices}"
+      - --disaggregation-bootstrap-port
+      - "{kv_port}"
+    env:
+      MC_NUM_QP_PER_EP: "4"
+      MOONCAKE_PROTOCOL: rdma
+      SGLANG_HOST_IP: "{kv_ip}"
+  pd_decode:
+    hardware: zhenwu_m890
+    topology:
+      kind: pd_disagg
+      nodes: 1
+      devices_per_node: 8
+      role: decode
+    tp: 8
+    select:
+      features:
+        tool_calling: true
+        reasoning: true
+        spec_decoding: true
+    args:
+      - --attn-dp-size
+      - "8"
+      - --enable-dp-lm-head
+      - --moe-a2a-backend
+      - deepep
+      - --deepep-mode
+      - low_latency
+      - --moe-dense-tp-size
+      - "1"
+      - --disaggregation-mode
+      - decode
+      - --disaggregation-transfer-backend
+      - mooncake
+      - --disaggregation-ib-device
+      - "{ib_devices}"
+    env:
+      MC_NUM_QP_PER_EP: "4"
+      MOONCAKE_PROTOCOL: rdma
+      NCCL_CUMEM_ENABLE: "1"
+      SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK: "512"
+      SGLANG_HOST_IP: "{kv_ip}"
+      SGLANG_SAIL_DEEPEP_RECV_HOOK: "0"
+notes: >-
+  Reference #0 full-scenario serving recipe for zai-org/GLM-5.3 across Zhenwu
+  M890 (default mxfp4 and fp8_channel) and Zhenwu 810E (w8a8_int8) variants,
+  covering prefill (TP8/TP16 without NEXTN), single-node decode (TP8 with
+  NEXTN), 4-node TP32+AttnDP32+DeepEP decode_ep, and paired Mooncake
+  pd_prefill/pd_decode disaggregation presets. Baseline default resolution
+  remains unchanged for online PR fast_sanity and Nightly model_sanity gates.
