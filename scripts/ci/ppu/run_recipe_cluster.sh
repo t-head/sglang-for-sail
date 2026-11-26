@@ -194,7 +194,11 @@ USER_ENV_JSON=$(python3 -B - <<'PY'
 import json
 import os
 import re
-from pathlib import PurePosixPath
+import sys
+from pathlib import Path, PurePosixPath
+
+sys.path.insert(0, "scripts/ci/ppu")
+from recipe_cluster_config import resolve_pinned_model_revision_key
 
 keys = ["TIER", "PPU_CI_SOURCE_SHA", "PPU_CI_WORKER_ARTIFACT_DIR"]
 if os.environ["TIER"] == "legacy":
@@ -216,12 +220,9 @@ else:
         keys += ["PPU_CI_GSM8K_PATH"]
 values = {key: os.environ[key] for key in keys}
 if os.environ["TIER"] != "legacy":
-    revision_key = {
-        "glm-5.3": "PPU_CI_GLM53_MODEL_REVISION",
-        "glm-5.3-tp4": "PPU_CI_GLM53_MODEL_REVISION",
-        "deepseek-v4-flash": "PPU_CI_DSV4_FLASH_MODEL_REVISION",
-        "deepseek-v4-flash-tp8": "PPU_CI_DSV4_FLASH_MODEL_REVISION",
-    }.get(os.environ["MODEL_KEY"])
+    revision_key = resolve_pinned_model_revision_key(
+        os.environ["MODEL_KEY"], Path(".")
+    )
     if revision_key is not None:
         revision = os.environ[revision_key]
         if not re.fullmatch(r"[0-9a-f]{40}", revision):

@@ -12,6 +12,12 @@ from pathlib import Path
 
 BACKEND_SHA = "96e25147971f5d2a04d828f8ad508cae38a4fa8a"
 CONFIG_NAME = ".sglang-recipe-ci-v0523"
+DEFAULT_MXFP4_REVISION_KEYS = {
+    "glm-5.3": "PPU_CI_GLM53_MODEL_REVISION",
+    "glm-5.3-tp4": "PPU_CI_GLM53_MODEL_REVISION",
+    "deepseek-v4-flash": "PPU_CI_DSV4_FLASH_MODEL_REVISION",
+    "deepseek-v4-flash-tp8": "PPU_CI_DSV4_FLASH_MODEL_REVISION",
+}
 SETTINGS = {
     "PPU_CI_K8S_STAGE_ROOT",
     "PPU_CI_K8S_PRIVATE_WORKER_ROOT",
@@ -84,6 +90,203 @@ def resolve_retention_root(environ, values, fallback):
     if config_root:
         return config_root, "config"
     return str(fallback), "fallback"
+
+
+def _parse_yaml_scalar_token(raw_val: str) -> str | None:
+    s = raw_val.strip()
+    if not s or s.startswith("#"):
+        return None
+    if s[0] in ("'", '"'):
+        quote = s[0]
+        out: list[str] = []
+        i = 1
+        while i < len(s):
+            ch = s[i]
+            if quote == '"' and ch == "\\" and i + 1 < len(s):
+                out.append(s[i + 1])
+                i += 2
+                continue
+            if quote == "'" and ch == "'" and i + 1 < len(s) and s[i + 1] == "'":
+                out.append("'")
+                i += 2
+                continue
+            if ch == quote:
+                rest = s[i + 1 :].strip()
+                if rest and not rest.startswith("#"):
+                    return None
+                return "".join(out).strip()
+            out.append(ch)
+            i += 1
+        return None
+    if s[0] in ("|", ">", "[", "{", "&", "*", "!"):
+        return None
+    s = re.split(r"\s+#", s, maxsplit=1)[0].strip()
+    return s or None
+
+
+def _stdlib_extract_policy_variant_and_recipe(
+    raw_text: str,
+) -> tuple[str | None, str | None]:
+    body_lines = [
+        line
+        for line in raw_text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#") and line.strip() != "---"
+    ]
+    joined = "\n".join(body_lines).strip()
+    if joined.startswith("{"):
+        try:
+            parsed = json.loads(joined)
+        except ValueError:
+            if not joined.endswith("}"):
+                return None, None
+            inner = joined[1:-1]
+            variant_val = "default"
+            recipe_val: str | None = None
+            for match in re.finditer(
+                r'(?:^|,)\s*["\']?([A-Za-z0-9_-]+)["\']?\s*:\s*([^,{}]+)', inner
+            ):
+                k = match.group(1)
+                v = _parse_scalar_token_or_none(match.group(2))
+                if k == "variant":
+                    if not v:
+                        return None, None
+                    variant_val = v
+                elif k == "recipe":
+                    recipe_val = v
+            return variant_val, recipe_val
+        if not isinstance(parsed, dict):
+            return None, None
+        raw_var = parsed.get("variant")
+        if raw_var is None:
+            var_name = "default"
+        elif isinstance(raw_var, str) and raw_var.strip():
+            var_name = raw_var.strip()
+        else:
+            return None, None
+        rec = parsed.get("recipe")
+        return var_name, rec if isinstance(rec, str) else None
+
+    seen_variants: list[str] = []
+    recipe_rel: str | None = None
+    for raw_line in raw_text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#") or stripped in ("---", "..."):
+            continue
+        if raw_line[0].isspace():
+            continue
+        key, sep, rest = raw_line.partition(":")
+        if not sep:
+            continue
+        k = key.strip()
+        if k == "variant":
+            val = _parse_yaml_scalar_token(rest)
+            if not val:
+                return None, None
+            seen_variants.append(val)
+        elif k == "recipe":
+            recipe_rel = _parse_yaml_scalar_token(rest)
+    if len(seen_variants) > 1:
+        return None, None
+    return (seen_variants[0] if seen_variants else "default"), recipe_rel
+
+
+def _parse_scalar_token_or_none(raw_val: str) -> str | None:
+    return _parse_yaml_scalar_token(raw_val)
+
+
+def _stdlib_recipe_default_matches_top_hf_id(raw_text: str) -> bool:
+    ppu_hf: str | None = None
+    default_hf: str | None = None
+    lvl0: str | None = None
+    lvl1: str | None = None
+    lvl1_indent: int | None = None
+    for raw_line in raw_text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#") or stripped in ("---", "..."):
+            continue
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        key, sep, rest = stripped.partition(":")
+        if not sep:
+            continue
+        k = key.strip()
+        if indent == 0:
+            lvl0 = k
+            lvl1 = None
+            lvl1_indent = None
+            continue
+        if lvl0 == "ppu" and k == "hf_model_id" and lvl1 is None:
+            ppu_hf = _parse_yaml_scalar_token(rest)
+        elif lvl0 == "variants":
+            if lvl1_indent is None or indent <= lvl1_indent:
+                lvl1 = k
+                lvl1_indent = indent
+                flow = rest.strip()
+                if lvl1 == "default" and flow.startswith("{") and flow.endswith("}"):
+                    m = re.search(
+                        r'(?:^|[{,])\s*["\']?hf_model_id["\']?\s*:\s*([^,}]+)', flow
+                    )
+                    if m:
+                        default_hf = _parse_yaml_scalar_token(m.group(1))
+                        if default_hf is None:
+                            return False
+            elif lvl1 == "default" and k == "hf_model_id":
+                default_hf = _parse_yaml_scalar_token(rest)
+                if default_hf is None:
+                    return False
+    return default_hf is None or default_hf == ppu_hf
+
+
+def resolve_pinned_model_revision_key(
+    model_key: str, workspace: Path | str = Path(".")
+) -> str | None:
+    """Return the MXFP4 revision env key only when ``model_key`` uses ``default`` MXFP4."""
+    revision_key = DEFAULT_MXFP4_REVISION_KEYS.get(model_key)
+    if revision_key is None:
+        return None
+    root = Path(workspace)
+    policy_path = root / "test/ppu/policy/models" / f"{model_key}.yaml"
+    raw_policy = policy_path.read_text(encoding="utf-8")
+    try:
+        import yaml  # type: ignore[import-not-found]
+    except (ModuleNotFoundError, ImportError):
+        variant_name, recipe_rel = _stdlib_extract_policy_variant_and_recipe(raw_policy)
+        if variant_name != "default":
+            return None
+        if recipe_rel:
+            recipe_path = root / recipe_rel
+            if recipe_path.is_file() and not _stdlib_recipe_default_matches_top_hf_id(
+                recipe_path.read_text(encoding="utf-8")
+            ):
+                return None
+        return revision_key
+
+    doc = yaml.safe_load(raw_policy) or {}
+    if not isinstance(doc, dict):
+        return None
+    raw_variant = doc.get("variant")
+    if raw_variant is None:
+        variant_name = "default"
+    elif isinstance(raw_variant, str) and raw_variant.strip():
+        variant_name = raw_variant.strip()
+    else:
+        return None
+    if variant_name != "default":
+        return None
+    recipe_rel = doc.get("recipe")
+    if isinstance(recipe_rel, str) and recipe_rel.strip():
+        recipe_path = root / recipe_rel
+        if recipe_path.is_file():
+            rdoc = yaml.safe_load(recipe_path.read_text(encoding="utf-8")) or {}
+            if not isinstance(rdoc, dict):
+                return None
+            ppu_hf = (rdoc.get("ppu") or {}).get("hf_model_id")
+            var_doc = (rdoc.get("variants") or {}).get("default") or {}
+            if not isinstance(var_doc, dict):
+                return None
+            eff_hf = var_doc.get("hf_model_id") or ppu_hf
+            if eff_hf != ppu_hf:
+                return None
+    return revision_key
 
 
 def _verify_retention_root(retention_root_raw, retention_source, environ):
