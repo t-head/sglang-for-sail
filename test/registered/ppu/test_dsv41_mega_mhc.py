@@ -19,6 +19,9 @@ from pathlib import Path
 from types import MethodType, ModuleType, SimpleNamespace
 from typing import NamedTuple, Tuple
 from unittest.mock import Mock, patch
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu-ppu")
 
 SRC = Path(__file__).resolve().parents[3] / "python/sglang"
 ADAPTER = SRC / "kernels/ops/layernorm/mhc_mega.py"

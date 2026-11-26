@@ -2,6 +2,9 @@ import torch
 import triton
 
 from sglang.srt.layers.moe.fused_moe_triton.fused_valu_moe import diverse_experts
+from sglang.test.ci.ci_register import register_ppu_ci
+
+register_ppu_ci(est_time=120, suite="extra-unit-test-1-gpu-ppu")
 
 
 # @torch.compile(options={"triton.cudagraphs": True}, fullgraph=True)

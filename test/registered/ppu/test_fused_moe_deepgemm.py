@@ -14,6 +14,9 @@ from sglang.srt.runtime_context import get_context
 from sglang.srt.utils.device import is_sail
 from sglang.srt.utils.network import get_free_port
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.ci.ci_register import register_ppu_ci
+
+register_ppu_ci(est_time=120, suite="extra-unit-test-1-gpu-ppu")
 
 
 class TestFusedMoEDeepGEMMPath(CustomTestCase):

@@ -10,6 +10,9 @@ from unittest import mock
 import torch
 
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.ci.ci_register import register_ppu_ci
+
+register_ppu_ci(est_time=120, suite="extra-unit-test-1-gpu-ppu")
 
 try:
     from sglang.kernels.ops.attention.minimax_sparse.msa_ppu_metadata import (

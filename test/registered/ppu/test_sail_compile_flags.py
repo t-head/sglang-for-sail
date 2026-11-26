@@ -19,6 +19,9 @@ from sglang.kernels.ops.attention import rope
 from sglang.kernels.ops.attention.dsa import tilelang_kernel as dsa
 from sglang.srt.utils import is_sail
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.ci.ci_register import register_ppu_ci
+
+register_ppu_ci(est_time=120, suite="extra-unit-test-1-gpu-ppu")
 
 
 def _copy_prim_func(n: int):

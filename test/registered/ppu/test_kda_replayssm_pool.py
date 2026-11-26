@@ -7,6 +7,9 @@ import pytest
 
 from sglang.srt.mem_cache import kv_cache_configurator as module
 from sglang.srt.runtime_context import get_context, get_exec
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu-ppu")
 
 
 @pytest.mark.parametrize(
@@ -109,3 +112,7 @@ def test_pd_decode_extra_slots_keep_fixed_request_state(mode, role_switch):
         actual = config._handle_max_mamba_cache(1.0)
     expected_bytes = 11 * (1024 + 128)
     assert actual == 1.0 - expected_bytes / (1 << 30)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

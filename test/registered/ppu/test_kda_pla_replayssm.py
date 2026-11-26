@@ -16,6 +16,9 @@ import pytest
 import torch
 
 from sglang.srt.utils.device import is_sail
+from sglang.test.ci.ci_register import register_ppu_ci
+
+register_ppu_ci(est_time=120, suite="extra-unit-test-1-gpu-ppu")
 
 pytestmark = pytest.mark.skipif(not is_sail(), reason="requires PPU")
 
@@ -493,3 +496,7 @@ def test_dispatch_guards():
             },
         ):
             assert not backend._can_run_dspark_cutedsl_mtp(**(args | changes))
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

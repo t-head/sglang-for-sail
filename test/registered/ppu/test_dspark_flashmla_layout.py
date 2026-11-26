@@ -8,9 +8,12 @@ from types import SimpleNamespace
 import torch
 
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu-ppu")
 
 BACKEND_PATH = (
-    Path(__file__).resolve().parents[5]
+    Path(__file__).resolve().parents[3]
     / "python/sglang/srt/layers/attention/flashmla_backend.py"
 )
 
@@ -140,6 +143,7 @@ class TestDSparkFlashMLALayout(CustomTestCase):
             kv_cache_dim=4,
             kv_lora_rank=2,
             is_fp8_kvcache=False,
+            is_dflash_mla_draft=False,
             forward_metadata=SimpleNamespace(
                 block_kv_indices=torch.arange(bs).view(bs, 1),
                 flashmla_metadata=None,
@@ -155,7 +159,9 @@ class TestDSparkFlashMLALayout(CustomTestCase):
             batch_size=bs,
             seq_lens=prefix_lens,
             out_cache_loc=None,
-            spec_algorithm=SimpleNamespace(is_dspark=lambda: dspark),
+            spec_algorithm=SimpleNamespace(
+                is_dspark=lambda: dspark, is_dflash=lambda: False
+            ),
             spec_info=SimpleNamespace(
                 draft_token_num=width if spec_width is None else spec_width
             ),

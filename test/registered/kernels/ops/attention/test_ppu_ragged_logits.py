@@ -4,9 +4,10 @@ import pytest
 import torch
 
 from sglang.kernels.ops.attention.dsa.ppu_logits import restore_ragged_logits
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 
 register_cuda_ci(est_time=3, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_ppu_ci(est_time=3, suite="extra-unit-test-1-gpu-ppu")
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])

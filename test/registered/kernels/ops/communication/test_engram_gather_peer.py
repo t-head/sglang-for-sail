@@ -12,6 +12,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # backend-specific: SAIL forwards the SM80 byte-decoder/SM89 native-FP8 selector.
 register_ppu_ci(est_time=30, suite="extra-test-1-gpu-ppu")
+register_ppu_ci(est_time=30, suite="extra-unit-test-1-gpu-ppu")
 
 _DIM = 256
 _BLOCK = 32

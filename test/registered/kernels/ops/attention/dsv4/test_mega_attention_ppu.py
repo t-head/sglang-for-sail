@@ -11,10 +11,11 @@ import unittest
 import torch
 
 from sglang.srt.utils.device import is_sail
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_ppu_ci(est_time=120, suite="extra-unit-test-1-gpu-ppu")
 
 HEADS, HEAD_DIM, ROPE_DIM = 64, 512, 64
 GROUPS, O_LORA_RANK, Q_LORA_RANK = 8, 1024, 1280

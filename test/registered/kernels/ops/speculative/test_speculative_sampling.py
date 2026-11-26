@@ -9,7 +9,11 @@ from sglang.kernels.jit.utils.common import is_sail_runtime
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.dflash_utils import build_speculative_verify_target_probs
 from sglang.srt.speculative.eagle_utils import _apply_joint_top_k_top_p
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
 
 if torch.version.cuda is not None or is_sail_runtime():
     from flashinfer.sampling import top_k_renorm_probs, top_p_renorm_probs
@@ -37,6 +41,7 @@ else:
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 # backend-specific: gfx950 serves this kernel with its Triton port
 register_amd_ci(est_time=16, stage="base-a-jit-kernel-unit", runner_config="amd")
+register_ppu_ci(est_time=15, suite="extra-unit-test-1-gpu-ppu")
 
 test_cases = [
     (

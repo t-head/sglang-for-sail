@@ -10,6 +10,7 @@ from sglang.test.ci.ci_register import register_ppu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_ppu_ci(est_time=120, suite="extra-test-1-gpu-ppu")
+register_ppu_ci(est_time=120, suite="extra-unit-test-1-gpu-ppu")
 
 COMPARISON_RESULTS = []
 

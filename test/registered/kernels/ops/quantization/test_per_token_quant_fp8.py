@@ -6,10 +6,11 @@ from sgl_kernel import sgl_per_token_quant_fp8 as aot_per_token_quant_fp8
 
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.kernels.ops.quantization.per_token_quant_fp8 import per_token_quant_fp8
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 
 register_cuda_ci(est_time=16, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_cuda_ci(est_time=16, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_ppu_ci(est_time=16, suite="extra-unit-test-1-gpu-ppu")
 
 
 def _run_impl(input: torch.Tensor, *, use_jit: bool):

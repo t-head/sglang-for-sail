@@ -28,10 +28,11 @@ from sglang.kernels.ops.layernorm.rmsnorm_per_token_quant import (
 )
 from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_quant_fp8
 from sglang.srt.layers.quantization.fp8_utils import apply_fp8_linear
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_ppu_ci(est_time=30, suite="extra-unit-test-1-gpu-ppu")
 
 EPS = 1e-6
 # bf16 keeps 8 significand bits, so one ulp is at most 2**-7 of the value (a

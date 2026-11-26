@@ -7,9 +7,10 @@ import torch
 
 from sglang.kernels.ops.attention.dsa.deep_select import topk_transform_ragged
 from sglang.srt.utils import is_sail
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_ppu_ci(est_time=20, suite="extra-unit-test-1-gpu-ppu")
 
 pytestmark = pytest.mark.skipif(
     not is_sail(), reason="Requires the PPU deep_select wheel"

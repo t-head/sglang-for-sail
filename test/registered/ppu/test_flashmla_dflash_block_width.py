@@ -15,6 +15,9 @@ from sglang.srt.layers.attention import flashmla_backend
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu-ppu")
 
 
 class TestFlashMLADFlashBlockWidth(CustomTestCase):
@@ -35,9 +38,14 @@ class TestFlashMLADFlashBlockWidth(CustomTestCase):
                     2 if algorithm == SpeculativeAlgorithm.DFLASH else block_size
                 )
                 backend.kv_lora_rank = 8
+                backend.kv_cache_dim = 16
                 backend.is_fp8_kvcache = False
-                backend.kv_layers = SimpleNamespace(
-                    read=lambda _: SimpleNamespace(key=lambda: torch.zeros((64, 1, 16)))
+                backend.token_to_kv_pool = SimpleNamespace(
+                    layer_router=SimpleNamespace(
+                        read=lambda _: SimpleNamespace(
+                            key=lambda: torch.zeros((64, 1, 16))
+                        )
+                    )
                 )
                 backend.forward_metadata = SimpleNamespace(
                     block_kv_indices=torch.zeros((batch_size, 1), dtype=torch.int32),
