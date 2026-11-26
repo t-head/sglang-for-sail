@@ -310,7 +310,9 @@ def _resolve_step5_model_layer_indices(
         # A pipeline stage owns a slice of the main layers, so its selected
         # attention IDs must cover exactly that slice of the full partition.
         owned = range(selection.start_layer, selection.end_layer)
-        selected = selection.full_attention_layer_ids + selection.swa_attention_layer_ids
+        selected = (
+            selection.full_attention_layer_ids + selection.swa_attention_layer_ids
+        )
         matches = (
             selection.full_attention_layer_ids == tuple(i for i in full if i in owned)
             and selection.swa_attention_layer_ids == tuple(i for i in swa if i in owned)

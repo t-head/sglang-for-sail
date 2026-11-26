@@ -71,11 +71,7 @@ def _jit_module(
         aligned,
         fuse_silu_and_mul,
         use_pdl,
-        *(
-            [use_rn_division]
-            if sorted_layout
-            else [dense, use_rn_division]
-        ),
+        *([use_rn_division] if sorted_layout else [dense, use_rn_division]),
     )
     assert not (masked_layout and sorted_layout)
     layout = "masked" if masked_layout else ("sorted" if sorted_layout else "flat")

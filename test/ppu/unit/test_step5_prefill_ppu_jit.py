@@ -63,12 +63,8 @@ def _qkv(rows, heads, slots, *, seed=0):
     q = torch.randn((rows, heads, HEAD_DIM), generator=gen, device=DEV).to(
         torch.bfloat16
     )
-    k = torch.randn((slots, 1, HEAD_DIM), generator=gen, device=DEV).to(
-        torch.bfloat16
-    )
-    v = torch.randn((slots, 1, HEAD_DIM), generator=gen, device=DEV).to(
-        torch.bfloat16
-    )
+    k = torch.randn((slots, 1, HEAD_DIM), generator=gen, device=DEV).to(torch.bfloat16)
+    v = torch.randn((slots, 1, HEAD_DIM), generator=gen, device=DEV).to(torch.bfloat16)
     return q, k, v
 
 
@@ -133,10 +129,12 @@ def case_single_region(heads):
     scale = HEAD_DIM**-0.5
     out, lse, _, _ = _run_ppu(q, k, v, packed, counts, visible - 1, scale)
 
-    scores = torch.einsum("rhd,kd->rhk", q.float(), k[:visible[0], 0].float())
+    scores = torch.einsum("rhd,kd->rhk", q.float(), k[: visible[0], 0].float())
     scores = scores * scale
     expected = torch.einsum(
-        "rhk,kd->rhd", torch.softmax(scores[:, :, : visible[0]], -1), v[: visible[0], 0].float()
+        "rhk,kd->rhd",
+        torch.softmax(scores[:, :, : visible[0]], -1),
+        v[: visible[0], 0].float(),
     )
     torch.testing.assert_close(
         out.float(), expected, atol=3e-2, rtol=0, msg="single region output"
@@ -161,9 +159,7 @@ def case_matches_reference(heads, rows=6, live=(1, 2, 5, 9, 17, 33), seed=2):
     positions = (lengths - 1).to(torch.int32).contiguous()
     scale = HEAD_DIM**-0.5
     out, lse, physical, starts = _run_ppu(q, k, v, packed, counts, positions, scale)
-    ref_out, ref_lse = _reference(
-        q, k, v, physical, starts, counts, positions, scale
-    )
+    ref_out, ref_lse = _reference(q, k, v, physical, starts, counts, positions, scale)
     torch.testing.assert_close(out.float(), ref_out.float(), atol=4e-2, rtol=0)
     torch.testing.assert_close(lse, ref_lse, atol=5e-2, rtol=0)
 
@@ -182,9 +178,7 @@ def case_physical_differs(heads):
     positions = torch.full((rows,), REGION + 2, dtype=torch.int32, device=DEV)
     scale = HEAD_DIM**-0.5
     out, lse, physical, starts = _run_ppu(q, k, v, packed, counts, positions, scale)
-    ref_out, ref_lse = _reference(
-        q, k, v, physical, starts, counts, positions, scale
-    )
+    ref_out, ref_lse = _reference(q, k, v, physical, starts, counts, positions, scale)
     torch.testing.assert_close(out.float(), ref_out.float(), atol=4e-2, rtol=0)
     torch.testing.assert_close(lse, ref_lse, atol=5e-2, rtol=0)
 

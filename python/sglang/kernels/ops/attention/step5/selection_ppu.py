@@ -38,7 +38,9 @@ class Step5PpuSelectorWorkspace(msgspec.Struct, frozen=True, kw_only=True):
     starts: torch.Tensor  # [rows, 513] int32, logical starts, unused by the pack step
     candidates: torch.Tensor  # [rows, 1, chunks * topk] int32, or one column
     positions64: torch.Tensor  # [rows] int64, converted positions when needed
-    empty_pages: torch.Tensor  # [1] int32, block table placeholder for unpacked selection
+    empty_pages: (
+        torch.Tensor
+    )  # [1] int32, block table placeholder for unpacked selection
 
 
 def ppu_selector_chunks(width: int) -> int:

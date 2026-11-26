@@ -19,15 +19,15 @@ from sglang.kernels.ops.attention.step5.selection import (
     can_use_step5_selection_cute,
     step5_select_regions,
 )
-from sglang.kernels.ops.attention.step5.selection_ppu import (
-    allocate_step5_ppu_selector_workspace,
-    can_use_step5_selection_ppu,
-)
 from sglang.kernels.ops.attention.step5.selection_deepselect import (
     STEP5_HISTORY_REGIONS,
     can_use_step5_selection_deepselect,
     deepselect_score_width,
     step5_select_regions_deepselect,
+)
+from sglang.kernels.ops.attention.step5.selection_ppu import (
+    allocate_step5_ppu_selector_workspace,
+    can_use_step5_selection_ppu,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.step5.metadata import (
@@ -102,7 +102,9 @@ def _allocate_compact_scoring(*, rows, score_width, lengths, device):
         ),
         span_start=async_h2d(starts.astype(np.int32), dtype=torch.int32, device=device),
         span_end=async_h2d(ends.astype(np.int32), dtype=torch.int32, device=device),
-        span_requests=async_h2d(requests.astype(np.int32), dtype=torch.int32, device=device),
+        span_requests=async_h2d(
+            requests.astype(np.int32), dtype=torch.int32, device=device
+        ),
         rows=rows,
         group_rows=group_rows,
         fp8=fp8,
@@ -183,7 +185,9 @@ def allocate_selection_workspace(
         and not use_deepselect
     ):
         compact_scoring = _allocate_compact_scoring(
-            rows=rows, score_width=score_width, lengths=score_lengths,
+            rows=rows,
+            score_width=score_width,
+            lengths=score_lengths,
             device=region_scores.device,
         )
     topk_lengths, topk_lengths_ready = None, False

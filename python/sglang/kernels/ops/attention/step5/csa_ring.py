@@ -116,7 +116,9 @@ def _f32_to_e4m3(x):
 
 
 @triton.jit
-def _compressed_index_key_bytes(index_keys, compression_logits, USE_NATIVE_FP8: tl.constexpr):
+def _compressed_index_key_bytes(
+    index_keys, compression_logits, USE_NATIVE_FP8: tl.constexpr
+):
     # raw payloads retain their BF16 bits, including unused NaN slots, until
     # all eight tokens are ready for the numerical reduction.
     maximum = tl.full((256,), -float("inf"), tl.float32)

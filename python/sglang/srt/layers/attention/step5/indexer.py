@@ -369,9 +369,7 @@ class Step5Indexer(nn.Module):
             from sglang.srt.layers.cp.base import get_cp_strategy
 
             strategy = get_cp_strategy()
-            index_key = strategy.gather_kv_cache(
-                index_key.contiguous(), forward_batch
-            )
+            index_key = strategy.gather_kv_cache(index_key.contiguous(), forward_batch)
             compression_logits = strategy.gather_kv_cache(
                 compression_logits.contiguous(), forward_batch
             )

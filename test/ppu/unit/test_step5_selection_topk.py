@@ -39,8 +39,8 @@ from sglang.kernels.ops.attention.step5.scoring import step5_paged_scores
 from sglang.kernels.ops.attention.step5.selection import step5_select_regions
 from sglang.kernels.ops.attention.step5.selection_triton import (
     canonicalize_zero,
-    launch as pack_regions,
 )
+from sglang.kernels.ops.attention.step5.selection_triton import launch as pack_regions
 from sglang.kernels.ops.attention.step5.sparse_metadata import (
     step5_pack_decode_regions,
 )
@@ -377,14 +377,18 @@ def run_fused_packing_equivalence():
             torch.cuda.synchronize()
 
             assert torch.equal(ids_split, ids_fused), f"{tag}/{packed_width}: ids"
-            assert torch.equal(counts_split, counts_fused), f"{tag}/{packed_width}: counts"
+            assert torch.equal(counts_split, counts_fused), (
+                f"{tag}/{packed_width}: counts"
+            )
             assert torch.equal(packed_split, packed_fused), (
                 f"{tag}/{packed_width}: fused pack differs from the separate pass"
             )
             assert torch.equal(lengths_split, lengths_fused), (
                 f"{tag}/{packed_width}: causal lengths differ"
             )
-            assert (packed_fused >= -1).all(), "tail slots must be -1, not uninitialised"
+            assert (packed_fused >= -1).all(), (
+                "tail slots must be -1, not uninitialised"
+            )
         print(f"PASS fused packing equivalence {tag} (width={width})")
 
 
@@ -480,7 +484,11 @@ def report_cost():
         "VEC=1 det=T tie=SMALL (default)": lambda: _topk(scores),
         "VEC=4 det=T tie=SMALL": lambda: _topk(scores, dsa_graph_safe=False),
         "VEC=1 det=T tie=NONE": lambda: flashinfer.top_k(
-            scores, TOPK, sorted=False, deterministic=True, tie_break=0,
+            scores,
+            TOPK,
+            sorted=False,
+            deterministic=True,
+            tie_break=0,
             dsa_graph_safe=True,
         ),
         "torch.topk": lambda: torch.topk(scores, TOPK, dim=-1, sorted=False).indices,

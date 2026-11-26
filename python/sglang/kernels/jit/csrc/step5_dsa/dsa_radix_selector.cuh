@@ -71,22 +71,41 @@ bool use_w256(const tvm::ffi::TensorView scores) {
 /// \param topk history regions to keep, at most 1024
 /// \param packed translate region ids through \p block_table into physical
 ///     region ids
-void radix_select(const tvm::ffi::TensorView scores,
-                  const tvm::ffi::TensorView query_positions,
-                  const tvm::ffi::TensorView block_table,
-                  const tvm::ffi::TensorView candidate_workspace,
-                  const tvm::ffi::TensorView region_output,
-                  const tvm::ffi::TensorView start_output,
-                  int64_t region_block, int64_t page_size, int64_t topk,
-                  bool packed) {
+void radix_select(
+    const tvm::ffi::TensorView scores,
+    const tvm::ffi::TensorView query_positions,
+    const tvm::ffi::TensorView block_table,
+    const tvm::ffi::TensorView candidate_workspace,
+    const tvm::ffi::TensorView region_output,
+    const tvm::ffi::TensorView start_output,
+    int64_t region_block,
+    int64_t page_size,
+    int64_t topk,
+    bool packed) {
   if (use_w256(scores)) {
     dsa_selector_w256::dsa_radix_select(
-        scores, query_positions, block_table, candidate_workspace,
-        region_output, start_output, region_block, page_size, topk, packed);
+        scores,
+        query_positions,
+        block_table,
+        candidate_workspace,
+        region_output,
+        start_output,
+        region_block,
+        page_size,
+        topk,
+        packed);
   } else {
     dsa_selector_w1024::dsa_radix_select(
-        scores, query_positions, block_table, candidate_workspace,
-        region_output, start_output, region_block, page_size, topk, packed);
+        scores,
+        query_positions,
+        block_table,
+        candidate_workspace,
+        region_output,
+        start_output,
+        region_block,
+        page_size,
+        topk,
+        packed);
   }
 }
 

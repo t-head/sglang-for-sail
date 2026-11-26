@@ -26,8 +26,13 @@ class TestStep5ScoreRegions(CustomTestCase):
         """Physical page order preserves logical causality and stays within bounds."""
         for heads in (2, 4):
             case = make_case(
-                lengths=(7, 13, 9), prefixes=(0, 4097, 8193), heads=heads,
-                width=1031, easy=True, padding=5, seed=17,
+                lengths=(7, 13, 9),
+                prefixes=(0, 4097, 8193),
+                heads=heads,
+                width=1031,
+                easy=True,
+                padding=5,
+                seed=17,
             )
             expected = reference_scores(case).cuda()
             for fp8 in (True, False):
@@ -35,7 +40,11 @@ class TestStep5ScoreRegions(CustomTestCase):
                     with self.subTest(heads=heads, fp8=fp8, variant=variant):
                         actual = make_runner(case, variant, fp8=fp8)["run"]()
                         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-                        self.assertTrue(torch.equal(actual.view(torch.int32), expected.view(torch.int32)))
+                        self.assertTrue(
+                            torch.equal(
+                                actual.view(torch.int32), expected.view(torch.int32)
+                            )
+                        )
 
     def test_random_scores_top512(self):
         """Changing load order or tiling preserves MMA scores and the top-512 tie break."""
@@ -51,13 +60,22 @@ class TestStep5ScoreRegions(CustomTestCase):
 
     def test_wider_query_groups(self):
         """Row reuse preserves per-query causal masking and head reduction."""
-        case = make_case(lengths=(65, 3), prefixes=(8179, 4101), width=1033, easy=True, padding=7, seed=31)
+        case = make_case(
+            lengths=(65, 3),
+            prefixes=(8179, 4101),
+            width=1033,
+            easy=True,
+            padding=7,
+            seed=31,
+        )
         expected = reference_scores(case).cuda()
         for fp8 in (True, False):
             for group in (16, 32):
                 for variant in ("tile", "compact_tile"):
                     with self.subTest(fp8=fp8, group=group, variant=variant):
-                        actual = make_runner(case, variant, fp8=fp8, group_rows=group)["run"]()
+                        actual = make_runner(case, variant, fp8=fp8, group_rows=group)[
+                            "run"
+                        ]()
                         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def test_relu_order_and_positive_zero(self):
@@ -84,7 +102,9 @@ class TestStep5ScoreRegions(CustomTestCase):
 
     def test_graph_replay_refreshes_live_keys(self):
         """Large, small, and large histories under one graph cannot reuse stale K or scores."""
-        case = make_case(lengths=(37,), prefixes=(8192,), width=1037, easy=True, padding=3, seed=41)
+        case = make_case(
+            lengths=(37,), prefixes=(8192,), width=1037, easy=True, padding=3, seed=41
+        )
         for fp8 in (True, False):
             for variant in VARIANTS:
                 with self.subTest(fp8=fp8, variant=variant):
@@ -96,11 +116,17 @@ class TestStep5ScoreRegions(CustomTestCase):
                     with torch.cuda.graph(graph):
                         runner["run"]()
                     for prefix in (8192, 0, 8192):
-                        case["positions"][:37].copy_(torch.arange(prefix, prefix + 37, dtype=torch.int32, device="cuda"))
+                        case["positions"][:37].copy_(
+                            torch.arange(
+                                prefix, prefix + 37, dtype=torch.int32, device="cuda"
+                            )
+                        )
                         case["max_positions"][1] = prefix + 36
                         graph.replay()
                         expected = reference_scores(case).cuda()
-                        torch.testing.assert_close(runner["out"], expected, rtol=0, atol=0)
+                        torch.testing.assert_close(
+                            runner["out"], expected, rtol=0, atol=0
+                        )
 
 
 if __name__ == "__main__":

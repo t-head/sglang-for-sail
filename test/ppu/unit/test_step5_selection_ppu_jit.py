@@ -228,16 +228,16 @@ def run_repeatable():
     positions, row_to_req, req_to_token = _metadata(4, live)
     first = _select(scores, positions, req_to_token, row_to_req)
     second = _select(scores, positions, req_to_token, row_to_req)
-    assert torch.equal(
-        torch.sort(first[0]).values, torch.sort(second[0]).values
-    ), "repeated selection changed the selected set"
+    assert torch.equal(torch.sort(first[0]).values, torch.sort(second[0]).values), (
+        "repeated selection changed the selected set"
+    )
     assert torch.equal(first[1], second[1]), "repeated selection changed the counts"
-    assert torch.equal(
-        torch.sort(first[2]).values, torch.sort(second[2]).values
-    ), "repeated selection changed the packed rows as a set"
-    assert torch.equal(
-        first[3], second[3]
-    ), "repeated selection changed the causal lengths"
+    assert torch.equal(torch.sort(first[2]).values, torch.sort(second[2]).values), (
+        "repeated selection changed the packed rows as a set"
+    )
+    assert torch.equal(first[3], second[3]), (
+        "repeated selection changed the causal lengths"
+    )
     print("PASS repeatability (same set, slot order unspecified)")
 
 

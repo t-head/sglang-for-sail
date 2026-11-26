@@ -689,9 +689,7 @@ class Step5AttentionBackend(AttentionBackend):
         local_group_start = torch.from_numpy(starts).to(
             device=device, dtype=torch.int32
         )
-        local_group_end = torch.from_numpy(ends).to(
-            device=device, dtype=torch.int32
-        )
+        local_group_end = torch.from_numpy(ends).to(device=device, dtype=torch.int32)
         local_valid_rows = torch.tensor(
             [int(np.sum(local_lengths))], dtype=torch.int32, device=device
         )
@@ -985,9 +983,7 @@ class Step5AttentionBackend(AttentionBackend):
                 strategy = get_cp_strategy()
                 kv_cache = torch.cat([k, v], dim=-1).contiguous()
                 kv_full = strategy.gather_kv_cache(kv_cache, forward_batch)
-                k_full, v_full = kv_full.split(
-                    [k.shape[-1], v.shape[-1]], dim=-1
-                )
+                k_full, v_full = kv_full.split([k.shape[-1], v.shape[-1]], dim=-1)
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
                     KVWriteLoc(forward_batch.out_cache_loc),
@@ -1039,9 +1035,7 @@ class Step5AttentionBackend(AttentionBackend):
         # Interleave-CP decode keeps the portable schedule: its local shard owns
         # neither the full-batch positions nor this metadata's scratch.
         decode_positions = (
-            None
-            if cp_local is not None
-            else metadata.indexer_metadata.query_positions
+            None if cp_local is not None else metadata.indexer_metadata.query_positions
         )
         decode_ppu = None if cp_local is not None else metadata.ppu_decode
         if metadata.decode:

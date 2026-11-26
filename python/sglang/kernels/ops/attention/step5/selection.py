@@ -110,7 +110,9 @@ def step5_select_regions(
             or req_to_token.ndim != 2
             or req_to_token.stride(1) != 1
         ):
-            raise ValueError("Step5 selection req_to_token requires device integer [R,C]")
+            raise ValueError(
+                "Step5 selection req_to_token requires device integer [R,C]"
+            )
     if rows == 0:
         return region_ids, counts
     for out, others in (

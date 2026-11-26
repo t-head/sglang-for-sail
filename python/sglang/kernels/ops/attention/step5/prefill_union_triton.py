@@ -94,7 +94,9 @@ def _union_region_table(
     for q_slot in tl.static_range(Q_GROUP):
         q_pos = q_base + q_slot
         row_valid = (q_pos < ROWS) & (q_pos < q_end)
-        count = tl.minimum(tl.load(COUNTS + q_pos, mask=row_valid, other=0), TOPK_WINDOWS)
+        count = tl.minimum(
+            tl.load(COUNTS + q_pos, mask=row_valid, other=0), TOPK_WINDOWS
+        )
         for off in range(0, count, UNION_WIN_BLOCK):
             win = off + tl.arange(0, UNION_WIN_BLOCK)
             valid = row_valid & (win < count) & (win < TOPK_WINDOWS)
@@ -116,9 +118,7 @@ def _union_region_table(
                 old | (1 << q_slot),
                 mask=keep,
             )
-            tl.store(
-                UNION_PHYS + group * CAPACITY + logical_region, phys, mask=keep
-            )
+            tl.store(UNION_PHYS + group * CAPACITY + logical_region, phys, mask=keep)
         tl.debug_barrier()
 
     done = tl.zeros((), dtype=tl.int32)

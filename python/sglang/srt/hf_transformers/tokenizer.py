@@ -619,9 +619,7 @@ def get_tokenizer(
         "subfolder": kwargs.get("subfolder") or "",
     }
     try:
-        step5_tokenizer = _is_step5_checkpoint(
-            tokenizer_name, revision, **file_kwargs
-        )
+        step5_tokenizer = _is_step5_checkpoint(tokenizer_name, revision, **file_kwargs)
         if step5_tokenizer:
             step5_kwargs = dict(common_kwargs, revision=revision)
             step5_kwargs.pop("tokenizer_revision")

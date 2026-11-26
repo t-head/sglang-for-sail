@@ -77,8 +77,20 @@ def _ref_decode(q, k, v, counts, packed, causal, rows, heads, max_phys_regions):
 
 
 def _ref_prefill(
-    q, k, v, uphys, ulog, ucounts, memb, gstart, gend, qpos, rows, heads,
-    slots_div8, q_group_cap,
+    q,
+    k,
+    v,
+    uphys,
+    ulog,
+    ucounts,
+    memb,
+    gstart,
+    gend,
+    qpos,
+    rows,
+    heads,
+    slots_div8,
+    q_group_cap,
 ):
     """Mirror ``sparse_prefill_triton._sparse_prefill``: per group/head union softmax.
 
@@ -151,10 +163,17 @@ def run_decode(heads: int):
 
     # No-split schedule: the Triton decode path requires work == rows, mtp_q_len 1.
     step5_sparse_decode_partials(
-        q, k, v,
-        counts=counts, packed_regions=packed, causal_lengths=causal,
-        query_start_loc=query_start_loc, valid_rows=valid_rows,
-        out=out, lse=lse, softmax_scale=SCALE,
+        q,
+        k,
+        v,
+        counts=counts,
+        packed_regions=packed,
+        causal_lengths=causal,
+        query_start_loc=query_start_loc,
+        valid_rows=valid_rows,
+        out=out,
+        lse=lse,
+        softmax_scale=SCALE,
     )
     torch.cuda.synchronize()
 
@@ -198,16 +217,37 @@ def run_prefill(heads: int):
     lse = torch.zeros(rows, heads, dtype=torch.float32, device=DEV)
 
     step5_sparse_prefill(
-        q, k, v,
-        union_physical=uphys, union_logical=ulog, union_counts=ucounts,
-        membership=memb, group_query_start=gstart, group_query_end=gend,
-        query_positions=qpos, out=out, lse=lse, softmax_scale=SCALE,
+        q,
+        k,
+        v,
+        union_physical=uphys,
+        union_logical=ulog,
+        union_counts=ucounts,
+        membership=memb,
+        group_query_start=gstart,
+        group_query_end=gend,
+        query_positions=qpos,
+        out=out,
+        lse=lse,
+        softmax_scale=SCALE,
     )
     torch.cuda.synchronize()
 
     ref_out, ref_lse = _ref_prefill(
-        q, k, v, uphys, ulog, ucounts, memb, gstart, gend, qpos, rows, heads,
-        slots_div8, q_group_cap,
+        q,
+        k,
+        v,
+        uphys,
+        ulog,
+        ucounts,
+        memb,
+        gstart,
+        gend,
+        qpos,
+        rows,
+        heads,
+        slots_div8,
+        q_group_cap,
     )
     assert torch.allclose(out.float(), ref_out, atol=2e-2, rtol=2e-2), (
         f"prefill heads={heads} out mismatch: "

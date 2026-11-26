@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Paged Step5 scoring over existing SW128 E4M3 compressed_index_keys.
-"""
+"""Paged Step5 scoring over existing SW128 E4M3 compressed_index_keys."""
 
 import functools
 
@@ -370,9 +369,7 @@ def _score_regions_ppu_opt(
     weights = (
         tl.load(
             W + rows_safe[:, None] * HEADS + head_index_safe[None, :],
-            row_valid[:, None]
-            & (head_index[None, :] < HEADS)
-            & (request[:, None] > 0),
+            row_valid[:, None] & (head_index[None, :] < HEADS) & (request[:, None] > 0),
             other=0.0,
         ).to(tl.float32)
         * WEIGHT_SCALE
@@ -422,7 +419,9 @@ def _score_regions_ppu_opt(
             weighted = tl.maximum(products, 0.0) * tl.reshape(
                 weights, (GROUP_ROWS * HEAD_BLOCK, 1)
             )
-            score = tl.sum(tl.reshape(weighted, (GROUP_ROWS, HEAD_BLOCK, BLOCK_R)), axis=1)
+            score = tl.sum(
+                tl.reshape(weighted, (GROUP_ROWS, HEAD_BLOCK, BLOCK_R)), axis=1
+            )
             score = tl.where(regions[None, :] < live[:, None], score, -float("inf"))
             tl.store(
                 Out + rows_safe[:, None] * REGIONS + regions[None, :],
@@ -487,7 +486,9 @@ def _score_regions_ppu_opt(
                     else:
                         keys_r = _decode_e4m3(packed_r, NATIVE_FP8)
                     products_r = tl.dot(query_r, keys_r) * fp8_rescale
-                    score_r = tl.sum(tl.maximum(products_r, 0.0) * weight_r[:, None], axis=0)
+                    score_r = tl.sum(
+                        tl.maximum(products_r, 0.0) * weight_r[:, None], axis=0
+                    )
                     score_r = tl.where(regions < live_r, score_r, -float("inf"))
                 tl.store(
                     Out + row_safe * REGIONS + regions,
@@ -629,8 +630,12 @@ def _score_thirty_two_rows_per_request(
         query_row = group_base + subgroup * 8 + matrix_row // 4
         query = _decode_e4m3(
             tl.load(
-                Q + (query_row[:, None] * HEADS + head[:, None]) * 256 + channel[None, :],
-                (query_row[:, None] < ROWS) & (head[:, None] < HEADS) & (base_request > 0),
+                Q
+                + (query_row[:, None] * HEADS + head[:, None]) * 256
+                + channel[None, :],
+                (query_row[:, None] < ROWS)
+                & (head[:, None] < HEADS)
+                & (base_request > 0),
                 other=0,
             ),
             NATIVE_FP8,
@@ -772,7 +777,7 @@ def _launch_reference(
     group_rows,
     weight_scale,
 ):
-    """ `SGLANG_STEP5_SCORING_REGION_OPT=0` fallback to score_region"""
+    """`SGLANG_STEP5_SCORING_REGION_OPT=0` fallback to score_region"""
     # D256 gathers already consume substantial registers. A 32-region tile
     # reduces that pressure and gives small batches more independent CTAs.
     block_regions = 32

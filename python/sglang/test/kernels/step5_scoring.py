@@ -22,9 +22,15 @@ VARIANTS = ("baseline", "tile", "compact", "compact_tile")
 
 @triton.jit
 def _pack_keys(
-    Keys, Map, MaxPosition, Compact,
-    MAP_STRIDE: tl.constexpr, REGIONS: tl.constexpr,
-    BLOCK_R: tl.constexpr, NATIVE_FP8: tl.constexpr, FP8_INDEXER: tl.constexpr,
+    Keys,
+    Map,
+    MaxPosition,
+    Compact,
+    MAP_STRIDE: tl.constexpr,
+    REGIONS: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    NATIVE_FP8: tl.constexpr,
+    FP8_INDEXER: tl.constexpr,
 ):
     request = tl.program_id(0)
     regions = tl.program_id(1) * BLOCK_R + tl.arange(0, BLOCK_R)
@@ -38,20 +44,28 @@ def _pack_keys(
     channel = tl.arange(0, 256)
     tl.store(
         Compact + (request * REGIONS + regions[:, None]) * 256 + channel[None, :],
-        tl.trans(values), (regions[:, None] < REGIONS),
+        tl.trans(values),
+        (regions[:, None] < REGIONS),
     )
 
 
 @triton.jit
 def _compact_products(
-    query, Compact, request, regions, valid,
-    REGIONS: tl.constexpr, BLOCK_R: tl.constexpr,
-    NATIVE_FP8: tl.constexpr, FP8_INDEXER: tl.constexpr,
+    query,
+    Compact,
+    request,
+    regions,
+    valid,
+    REGIONS: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    NATIVE_FP8: tl.constexpr,
+    FP8_INDEXER: tl.constexpr,
 ):
     channel = tl.arange(0, 256)
     values = tl.load(
         Compact + (request * REGIONS + regions[:, None]) * 256 + channel[None, :],
-        valid[:, None], other=0,
+        valid[:, None],
+        other=0,
     )
     if FP8_INDEXER:
         keys = _e4m3_bytes_to_fp8(tl.trans(values), NATIVE_FP8)
@@ -65,10 +79,23 @@ def _compact_products(
 
 @triton.jit
 def _score_compact(
-    Q, W, Compact, RowToReq, Positions, Out, SpanStart, SpanEnd,
-    HEADS: tl.constexpr, REGIONS: tl.constexpr, BLOCK_R: tl.constexpr,
-    GRID_TILES: tl.constexpr, GROUP_ROWS: tl.constexpr, HEAD_BLOCK: tl.constexpr,
-    EARLY_EXIT: tl.constexpr, NATIVE_FP8: tl.constexpr, FP8_INDEXER: tl.constexpr,
+    Q,
+    W,
+    Compact,
+    RowToReq,
+    Positions,
+    Out,
+    SpanStart,
+    SpanEnd,
+    HEADS: tl.constexpr,
+    REGIONS: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    GRID_TILES: tl.constexpr,
+    GROUP_ROWS: tl.constexpr,
+    HEAD_BLOCK: tl.constexpr,
+    EARLY_EXIT: tl.constexpr,
+    NATIVE_FP8: tl.constexpr,
+    FP8_INDEXER: tl.constexpr,
 ):
     group = tl.program_id(0)
     first_tile = tl.program_id(1)
@@ -83,7 +110,12 @@ def _score_compact(
     uniform = tl.sum(mixed.to(tl.int32), axis=0) == 0
     if EARLY_EXIT:
         live, max_live, last_tile = _live_extent(
-            position, row_valid, request, BLOCK_R, REGIONS, True,
+            position,
+            row_valid,
+            request,
+            BLOCK_R,
+            REGIONS,
+            True,
         )
         if first_tile >= last_tile:
             return
@@ -93,7 +125,8 @@ def _score_compact(
     head = matrix_row % HEAD_BLOCK
     bits = tl.load(
         Q + (query_row[:, None] * HEADS + head[:, None]) * 256 + channel[None, :],
-        (query_row[:, None] < row_limit) & (head[:, None] < HEADS), other=0,
+        (query_row[:, None] < row_limit) & (head[:, None] < HEADS),
+        other=0,
     )
     if FP8_INDEXER:
         query = _e4m3_bytes_to_fp8(bits, NATIVE_FP8)
@@ -101,32 +134,48 @@ def _score_compact(
         query = _decode_e4m3(bits, NATIVE_FP8)
     weights = tl.load(
         W + rows[:, None] * HEADS + tl.arange(0, HEAD_BLOCK)[None, :],
-        row_valid[:, None] & (tl.arange(0, HEAD_BLOCK)[None, :] < HEADS)
-        & (request[:, None] > 0), other=0.0,
+        row_valid[:, None]
+        & (tl.arange(0, HEAD_BLOCK)[None, :] < HEADS)
+        & (request[:, None] > 0),
+        other=0.0,
     ).to(tl.float32)
     if not EARLY_EXIT:
         live, max_live, last_tile = _live_extent(
-            position, row_valid, request, BLOCK_R, REGIONS, True,
+            position,
+            row_valid,
+            request,
+            BLOCK_R,
+            REGIONS,
+            True,
         )
     for tile in range(first_tile, last_tile, GRID_TILES):
         regions = tile * BLOCK_R + tl.arange(0, BLOCK_R)
         in_range = regions < REGIONS
         if uniform & (base_request > 0) & (tile * BLOCK_R < max_live):
             products = _compact_products(
-                query, Compact, base_request, regions,
-                in_range & (regions < max_live), REGIONS, BLOCK_R,
-                NATIVE_FP8, FP8_INDEXER,
+                query,
+                Compact,
+                base_request,
+                regions,
+                in_range & (regions < max_live),
+                REGIONS,
+                BLOCK_R,
+                NATIVE_FP8,
+                FP8_INDEXER,
             )
             weighted = tl.maximum(products, 0.0) * tl.reshape(
-                weights, (GROUP_ROWS * HEAD_BLOCK, 1),
+                weights,
+                (GROUP_ROWS * HEAD_BLOCK, 1),
             )
             score = tl.sum(
-                tl.reshape(weighted, (GROUP_ROWS, HEAD_BLOCK, BLOCK_R)), axis=1,
+                tl.reshape(weighted, (GROUP_ROWS, HEAD_BLOCK, BLOCK_R)),
+                axis=1,
             )
             score = tl.where(regions[None, :] < live[:, None], score, -float("inf"))
             tl.store(
                 Out + rows[:, None] * REGIONS + regions[None, :],
-                _plus_zero(score), row_valid[:, None] & in_range[None, :],
+                _plus_zero(score),
+                row_valid[:, None] & in_range[None, :],
             )
 
 
@@ -151,7 +200,9 @@ def make_case(*, lengths, prefixes, heads=4, width=None, seed=0, easy=False, pad
     shape = (pages, 8, 256)
     if easy:
         physical_keys = torch.randint(-1, 2, shape, generator=generator).float()
-        q = torch.randint(-1, 2, (sum(lengths) + padding, heads, 256), generator=generator).float()
+        q = torch.randint(
+            -1, 2, (sum(lengths) + padding, heads, 256), generator=generator
+        ).float()
         weights = torch.ones((q.shape[0], heads), dtype=torch.float32)
     else:
         physical_keys = torch.randn(shape, generator=generator)
@@ -161,23 +212,38 @@ def make_case(*, lengths, prefixes, heads=4, width=None, seed=0, easy=False, pad
     channel = torch.arange(256)[None, None, :]
     slot = torch.arange(8)[None, :, None]
     page = torch.arange(pages)[:, None, None]
-    offsets = (page * 2048 + (channel // 128) * 1024 + slot * 128
-               + (((channel % 128) // 16) ^ slot) * 16 + channel % 16)
+    offsets = (
+        page * 2048
+        + (channel // 128) * 1024
+        + slot * 128
+        + (((channel % 128) // 16) ^ slot) * 16
+        + channel % 16
+    )
     swizzled = torch.empty(pages * 2048, dtype=torch.uint8)
     swizzled[offsets.reshape(-1)] = key_bytes.reshape(-1)
-    positions = torch.cat([
-        torch.arange(p, p + n, dtype=torch.int32) for p, n in zip(prefixes, lengths)
-    ] + [torch.zeros(padding, dtype=torch.int32)])
-    owners = torch.cat([
-        torch.full((n,), i + 1, dtype=torch.int32) for i, n in enumerate(lengths)
-    ] + [torch.zeros(padding, dtype=torch.int32)])
-    max_positions = torch.tensor([0] + [p + n - 1 for p, n in zip(prefixes, lengths)], dtype=torch.int32)
+    positions = torch.cat(
+        [torch.arange(p, p + n, dtype=torch.int32) for p, n in zip(prefixes, lengths)]
+        + [torch.zeros(padding, dtype=torch.int32)]
+    )
+    owners = torch.cat(
+        [torch.full((n,), i + 1, dtype=torch.int32) for i, n in enumerate(lengths)]
+        + [torch.zeros(padding, dtype=torch.int32)]
+    )
+    max_positions = torch.tensor(
+        [0] + [p + n - 1 for p, n in zip(prefixes, lengths)], dtype=torch.int32
+    )
     return dict(
-        q=q.to(torch.float8_e4m3fn).view(torch.uint8).cuda(), weights=weights.cuda(),
-        keys=swizzled.view(pages, 8, 1, 256).cuda(), mapping=mapping.cuda(),
-        owners=owners.cuda(), positions=positions.cuda(), max_positions=max_positions.cuda(),
-        lengths=tuple(lengths) + ((padding,) if padding else ()), regions=regions,
-        physical_keys=key_bytes.view(torch.float8_e4m3fn).float(), physical_pages=physical,
+        q=q.to(torch.float8_e4m3fn).view(torch.uint8).cuda(),
+        weights=weights.cuda(),
+        keys=swizzled.view(pages, 8, 1, 256).cuda(),
+        mapping=mapping.cuda(),
+        owners=owners.cuda(),
+        positions=positions.cuda(),
+        max_positions=max_positions.cuda(),
+        lengths=tuple(lengths) + ((padding,) if padding else ()),
+        regions=regions,
+        physical_keys=key_bytes.view(torch.float8_e4m3fn).float(),
+        physical_pages=physical,
     )
 
 
@@ -189,11 +255,15 @@ def spans(case, group_rows):
             starts.append(start)
             ends.append(min(start + group_rows, base + length))
         base += length
-    return (torch.tensor(starts, dtype=torch.int32, device="cuda"),
-            torch.tensor(ends, dtype=torch.int32, device="cuda"))
+    return (
+        torch.tensor(starts, dtype=torch.int32, device="cuda"),
+        torch.tensor(ends, dtype=torch.int32, device="cuda"),
+    )
 
 
-def make_runner(case, variant, *, fp8=True, group_rows=8, block_regions=32, grid_tiles=32):
+def make_runner(
+    case, variant, *, fp8=True, group_rows=8, block_regions=32, grid_tiles=32
+):
     if variant not in VARIANTS:
         raise ValueError(variant)
     tuned = variant in ("tile", "compact_tile")
@@ -206,32 +276,80 @@ def make_runner(case, variant, *, fp8=True, group_rows=8, block_regions=32, grid
     native = _native_fp8(case["q"].device)
     early = _early_exit_worthwhile(rows, block, grid)
     out = torch.empty((rows, case["regions"]), dtype=torch.float32, device="cuda")
-    compact_keys = torch.empty(
-        (case["mapping"].shape[0], case["regions"], 256),
-        dtype=torch.uint8 if fp8 else torch.bfloat16, device="cuda",
-    ) if compact else None
+    compact_keys = (
+        torch.empty(
+            (case["mapping"].shape[0], case["regions"], 256),
+            dtype=torch.uint8 if fp8 else torch.bfloat16,
+            device="cuda",
+        )
+        if compact
+        else None
+    )
 
     def pack():
         if compact:
             _pack_keys[(case["mapping"].shape[0], triton.cdiv(case["regions"], 32))](
-                case["keys"], case["mapping"], case["max_positions"], compact_keys,
-                case["mapping"].stride(0), case["regions"], 32, native, fp8, num_warps=4,
+                case["keys"],
+                case["mapping"],
+                case["max_positions"],
+                compact_keys,
+                case["mapping"].stride(0),
+                case["regions"],
+                32,
+                native,
+                fp8,
+                num_warps=4,
             )
 
     def score():
         if compact:
             return _score_compact[(starts.numel(), grid)](
-                case["q"], case["weights"], compact_keys, case["owners"],
-                case["positions"], out, starts, ends,
-                heads, case["regions"], block, grid, group, 4, early, native, fp8,
+                case["q"],
+                case["weights"],
+                compact_keys,
+                case["owners"],
+                case["positions"],
+                out,
+                starts,
+                ends,
+                heads,
+                case["regions"],
+                block,
+                grid,
+                group,
+                4,
+                early,
+                native,
+                fp8,
                 num_warps=2,
             )
         else:
             return _score_regions_ppu_opt[(starts.numel(), grid)](
-                case["q"], case["weights"], case["keys"], case["mapping"],
-                case["owners"], case["positions"], out, starts, ends,
-                heads, rows, case["mapping"].stride(0), case["regions"], block,
-                grid, True, early, 1.0, group, 4, True, True, native, fp8, num_warps=2,
+                case["q"],
+                case["weights"],
+                case["keys"],
+                case["mapping"],
+                case["owners"],
+                case["positions"],
+                out,
+                starts,
+                ends,
+                heads,
+                rows,
+                case["mapping"].stride(0),
+                case["regions"],
+                block,
+                grid,
+                True,
+                early,
+                1.0,
+                group,
+                4,
+                True,
+                True,
+                native,
+                fp8,
+                num_warps=2,
             )
 
     def run():
@@ -240,11 +358,21 @@ def make_runner(case, variant, *, fp8=True, group_rows=8, block_regions=32, grid
         score()
         return out
 
-    return dict(run=run, pack=pack, score=score, out=out, compact_keys=compact_keys,
-                config=(group, block, grid), starts=starts, ends=ends)
+    return dict(
+        run=run,
+        pack=pack,
+        score=score,
+        out=out,
+        compact_keys=compact_keys,
+        config=(group, block, grid),
+        starts=starts,
+        ends=ends,
+    )
 
 
-def make_production_runner(case, *, compact=True, weights=None, q=None, weight_scale=None):
+def make_production_runner(
+    case, *, compact=True, weights=None, q=None, weight_scale=None
+):
     """Call the public scoring and selection APIs with options set by the caller."""
     from sglang.kernels.ops.attention.step5.scoring import step5_paged_scores
     from sglang.srt.layers.attention.step5.region_selection import (
@@ -255,26 +383,41 @@ def make_production_runner(case, *, compact=True, weights=None, q=None, weight_s
     q = case["q"].view(torch.float8_e4m3fn) if q is None else q
     weights = case["weights"] if weights is None else weights
     workspace = allocate_selection_workspace(
-        rows=q.shape[0], score_width=case["regions"], score_group_rows=1,
-        device=q.device, prefill=True, score_lengths=case["lengths"],
+        rows=q.shape[0],
+        score_width=case["regions"],
+        score_group_rows=1,
+        device=q.device,
+        prefill=True,
+        score_lengths=case["lengths"],
         compact_allowed=compact,
     )
 
     def score(**overrides):
         return step5_paged_scores(
-            q, weights, compressed_index_keys=case["keys"],
-            req_to_token=case["mapping"], row_to_req=case["owners"],
-            positions=case["positions"], out=workspace.region_scores,
-            score_groups=workspace.score_groups, compact_workspace=workspace.compact_scoring,
-            weight_scale=weight_scale, **overrides,
+            q,
+            weights,
+            compressed_index_keys=case["keys"],
+            req_to_token=case["mapping"],
+            row_to_req=case["owners"],
+            positions=case["positions"],
+            out=workspace.region_scores,
+            score_groups=workspace.score_groups,
+            compact_workspace=workspace.compact_scoring,
+            weight_scale=weight_scale,
+            **overrides,
         )
 
     def run():
         return select_step5_regions(
-            index_q=q, index_weights=weights, compressed_index_keys=case["keys"],
-            req_to_token=case["mapping"], row_to_req=case["owners"],
-            positions=case["positions"], score_width=case["regions"],
-            scoring_weight_scale=weight_scale, workspace=workspace,
+            index_q=q,
+            index_weights=weights,
+            compressed_index_keys=case["keys"],
+            req_to_token=case["mapping"],
+            row_to_req=case["owners"],
+            positions=case["positions"],
+            score_width=case["regions"],
+            scoring_weight_scale=weight_scale,
+            workspace=workspace,
         )
 
     return dict(run=run, score=score, out=workspace.region_scores, workspace=workspace)
@@ -283,7 +426,9 @@ def make_production_runner(case, *, compact=True, weights=None, q=None, weight_s
 def sparse_request_slots(case, slots=(37, 103), capacity=160):
     """Compact K includes only the current forward's requests, regardless of pool size."""
     mapping = torch.zeros(
-        (capacity, case["mapping"].shape[1]), dtype=torch.int32, device="cuda",
+        (capacity, case["mapping"].shape[1]),
+        dtype=torch.int32,
+        device="cuda",
     )
     owners = case["owners"].clone()
     for original, slot in enumerate(slots, 1):
@@ -325,11 +470,18 @@ def compare_scores(actual, expected, sample_rows=32):
     same = actual == expected
     finite = torch.isfinite(actual) & torch.isfinite(expected)
     delta = torch.where(finite, (actual - expected).abs(), 0.0)
-    indices = torch.linspace(0, actual.shape[0] - 1, min(sample_rows, actual.shape[0])).long().cuda()
+    indices = (
+        torch.linspace(0, actual.shape[0] - 1, min(sample_rows, actual.shape[0]))
+        .long()
+        .cuda()
+    )
     a, b = actual[indices].cpu(), expected[indices].cpu()
     k = min(512, actual.shape[1])
     top_a = torch.argsort(a, dim=1, descending=True, stable=True)[:, :k]
     top_b = torch.argsort(b, dim=1, descending=True, stable=True)[:, :k]
-    return dict(bitwise_equal=torch.equal(actual.view(torch.int32), expected.view(torch.int32)),
-                mismatches=int((~same).sum()), max_abs=float(delta.max()),
-                top512_equal=torch.equal(top_a, top_b))
+    return dict(
+        bitwise_equal=torch.equal(actual.view(torch.int32), expected.view(torch.int32)),
+        mismatches=int((~same).sum()),
+        max_abs=float(delta.max()),
+        top512_equal=torch.equal(top_a, top_b),
+    )

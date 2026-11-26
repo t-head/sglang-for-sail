@@ -71,24 +71,35 @@ def _build_metadata(
     slots = slots_div8 * REGION_TOKENS
     assert capacity <= slots_div8
 
-    q = torch.randn(rows, heads, HEAD_DIM, dtype=torch.bfloat16, device=dev, generator=gen)
+    q = torch.randn(
+        rows, heads, HEAD_DIM, dtype=torch.bfloat16, device=dev, generator=gen
+    )
     k = torch.randn(slots, 1, HEAD_DIM, dtype=torch.bfloat16, device=dev, generator=gen)
     v = torch.randn(slots, 1, HEAD_DIM, dtype=torch.bfloat16, device=dev, generator=gen)
 
     gstart = torch.tensor(
-        [sum(group_rows[:i]) for i in range(len(group_rows))], dtype=torch.int32, device=dev
+        [sum(group_rows[:i]) for i in range(len(group_rows))],
+        dtype=torch.int32,
+        device=dev,
     )
-    gend = (gstart + torch.tensor(group_rows, dtype=torch.int32, device=dev)).contiguous()
+    gend = (
+        gstart + torch.tensor(group_rows, dtype=torch.int32, device=dev)
+    ).contiguous()
 
     groups = len(group_rows)
     ulog = torch.sort(
         torch.stack(
-            [torch.randperm(slots_div8, device=dev, generator=gen)[:capacity] for _ in range(groups)]
+            [
+                torch.randperm(slots_div8, device=dev, generator=gen)[:capacity]
+                for _ in range(groups)
+            ]
         ).to(torch.int32),
         dim=1,
     ).values
     uphys = ((ulog.to(torch.int64) * 5 + 1) % slots_div8).to(torch.int32)
-    memb = (torch.rand(groups, capacity, device=dev, generator=gen) < 0.7).to(torch.int32)
+    memb = (torch.rand(groups, capacity, device=dev, generator=gen) < 0.7).to(
+        torch.int32
+    )
     qpos = torch.zeros(rows, dtype=torch.int32, device=dev)
 
     for g in range(groups):
@@ -114,7 +125,11 @@ def _build_metadata(
                 ulog[g, pick] = -1
                 uphys[g, pick] = -1
         # Query positions trail the union span so causality keeps a prefix.
-        span = int(ulog[g, :count].clamp_min(0).max()) * REGION_TOKENS + REGION_TOKENS if count else 0
+        span = (
+            int(ulog[g, :count].clamp_min(0).max()) * REGION_TOKENS + REGION_TOKENS
+            if count
+            else 0
+        )
         base = int(gstart[g])
         qpos[base : base + n_rows] = torch.arange(
             span - (n_rows - 1), span + 1, dtype=torch.int32, device=dev
@@ -125,10 +140,22 @@ def _build_metadata(
     out = torch.zeros(rows, heads, HEAD_DIM, dtype=torch.bfloat16, device=dev)
     lse = torch.zeros(rows, heads, dtype=torch.float32, device=dev)
     return dict(
-        q=q, k=k, v=v, uphys=uphys, ulog=ulog,
+        q=q,
+        k=k,
+        v=v,
+        uphys=uphys,
+        ulog=ulog,
         ucounts=torch.tensor(union_counts, dtype=torch.int32, device=dev),
-        memb=memb, gstart=gstart, gend=gend, qpos=qpos, out=out, lse=lse,
-        rows=rows, heads=heads, capacity=capacity, slots_div8=slots_div8,
+        memb=memb,
+        gstart=gstart,
+        gend=gend,
+        qpos=qpos,
+        out=out,
+        lse=lse,
+        rows=rows,
+        heads=heads,
+        capacity=capacity,
+        slots_div8=slots_div8,
     )
 
 
@@ -164,7 +191,11 @@ def _reference(case):
         logical_tok = log * REGION_TOKENS + lane
 
         selected = ((memb[g, win].to(torch.int64)[None, :] >> slot[:, None]) & 1).bool()
-        keep = selected & (logical_tok[None, :] <= case["qpos"][row][:, None]) & live[None, :]
+        keep = (
+            selected
+            & (logical_tok[None, :] <= case["qpos"][row][:, None])
+            & live[None, :]
+        )
 
         k_g = k.index_select(0, phys_tok)[:, 0].float()
         v_g = v.index_select(0, phys_tok)[:, 0].float()
@@ -173,7 +204,9 @@ def _reference(case):
         m = score.max(dim=2).values
         has = torch.isfinite(m)
         m_safe = torch.where(has, m, torch.zeros_like(m))
-        p = torch.where(torch.isfinite(score), torch.exp(score - m_safe[:, :, None]), 0.0)
+        p = torch.where(
+            torch.isfinite(score), torch.exp(score - m_safe[:, :, None]), 0.0
+        )
         denom = p.sum(dim=2)
         ok = has & (denom > 0)
         # Index the (row, head) pair: heads of one row are independent, and a
@@ -188,11 +221,18 @@ def _reference(case):
 class TestStep5SparsePrefillTriton(unittest.TestCase):
     def _run(self, case):
         step5_sparse_prefill(
-            case["q"], case["k"], case["v"],
-            union_physical=case["uphys"], union_logical=case["ulog"],
-            union_counts=case["ucounts"], membership=case["memb"],
-            group_query_start=case["gstart"], group_query_end=case["gend"],
-            query_positions=case["qpos"], out=case["out"], lse=case["lse"],
+            case["q"],
+            case["k"],
+            case["v"],
+            union_physical=case["uphys"],
+            union_logical=case["ulog"],
+            union_counts=case["ucounts"],
+            membership=case["memb"],
+            group_query_start=case["gstart"],
+            group_query_end=case["gend"],
+            query_positions=case["qpos"],
+            out=case["out"],
+            lse=case["lse"],
             softmax_scale=SCALE,
         )
         torch.cuda.synchronize()
@@ -215,10 +255,13 @@ class TestStep5SparsePrefillTriton(unittest.TestCase):
         err = (got_out.float() - ref_out).abs()
         tol = 4e-3 * max(1.0, ref_out.abs().max().item())
         self.assertLessEqual(
-            err.max().item(), tol, f"{name}: out max|d|={err.max().item():.5f} > tol={tol:.5f}"
+            err.max().item(),
+            tol,
+            f"{name}: out max|d|={err.max().item():.5f} > tol={tol:.5f}",
         )
         self.assertLessEqual(
-            err.mean().item(), 0.1 * tol,
+            err.mean().item(),
+            0.1 * tol,
             f"{name}: out mean|d|={err.mean().item():.6f} > {0.1 * tol:.6f}",
         )
 
@@ -253,9 +296,13 @@ class TestStep5SparsePrefillTriton(unittest.TestCase):
             with self.subTest(name):
                 empty = (3,) if name == "heads4-empty-groups" else ()
                 case = _build_metadata(
-                    heads=heads, group_rows=group_rows, capacity=capacity,
-                    union_counts=union_counts, slots_div8=slots_div8,
-                    empty_groups=empty, seed=len(name),
+                    heads=heads,
+                    group_rows=group_rows,
+                    capacity=capacity,
+                    union_counts=union_counts,
+                    slots_div8=slots_div8,
+                    empty_groups=empty,
+                    seed=len(name),
                 )
                 self._assert_matches_reference(name, case)
 
@@ -266,7 +313,9 @@ class TestStep5SparsePrefillTriton(unittest.TestCase):
         )
         out, lse = self._run(case)
         self.assertFalse(bool(out.any()), "empty unions produced non-zero output")
-        self.assertTrue(bool(torch.isinf(lse).all()) and bool((lse < 0).all()), "expected -inf LSE")
+        self.assertTrue(
+            bool(torch.isinf(lse).all()) and bool((lse < 0).all()), "expected -inf LSE"
+        )
 
     def test_causal_boundary_is_inclusive(self):
         """The key at ``logical_tok == query_positions[row]`` must be attended."""
@@ -283,7 +332,9 @@ class TestStep5SparsePrefillTriton(unittest.TestCase):
         # One row of six attended tokens: too few elements for the matrix's
         # mean-error bar, so only bound every element by one bf16 ulp here.
         err = (out.float() - ref_out).abs()
-        self.assertLessEqual(err.max().item(), 4e-3 * max(1.0, ref_out.abs().max().item()))
+        self.assertLessEqual(
+            err.max().item(), 4e-3 * max(1.0, ref_out.abs().max().item())
+        )
         self.assertAlmostEqual(lse[0, 0].item(), ref_lse[0, 0].item(), places=2)
 
         # One token past the boundary and the same row must be empty.
@@ -305,9 +356,15 @@ class TestStep5SparsePrefillTriton(unittest.TestCase):
         lse = torch.full((rows, heads), 42.0, dtype=torch.float32, device=dev)
         gen = torch.Generator(device=dev).manual_seed(1)
         step5_sparse_prefill(
-            torch.randn(rows, heads, HEAD_DIM, dtype=torch.bfloat16, device=dev, generator=gen),
-            torch.randn(256, 1, HEAD_DIM, dtype=torch.bfloat16, device=dev, generator=gen),
-            torch.randn(256, 1, HEAD_DIM, dtype=torch.bfloat16, device=dev, generator=gen),
+            torch.randn(
+                rows, heads, HEAD_DIM, dtype=torch.bfloat16, device=dev, generator=gen
+            ),
+            torch.randn(
+                256, 1, HEAD_DIM, dtype=torch.bfloat16, device=dev, generator=gen
+            ),
+            torch.randn(
+                256, 1, HEAD_DIM, dtype=torch.bfloat16, device=dev, generator=gen
+            ),
             union_physical=torch.zeros(2, 4, dtype=torch.int32, device=dev),
             union_logical=torch.zeros(2, 4, dtype=torch.int32, device=dev),
             union_counts=torch.tensor([1, 1], dtype=torch.int32, device=dev),
@@ -315,12 +372,20 @@ class TestStep5SparsePrefillTriton(unittest.TestCase):
             group_query_start=torch.tensor([0, 4], dtype=torch.int32, device=dev),
             group_query_end=torch.tensor([4, 6], dtype=torch.int32, device=dev),
             query_positions=torch.arange(rows, dtype=torch.int32, device=dev),
-            out=out, lse=lse, softmax_scale=SCALE,
+            out=out,
+            lse=lse,
+            softmax_scale=SCALE,
         )
         torch.cuda.synchronize()
-        self.assertTrue(bool((out[6:] == 3.0).all()), "kernel wrote rows outside every group")
-        self.assertTrue(bool((lse[6:] == 42.0).all()), "kernel wrote LSE outside every group")
-        self.assertTrue(bool(torch.isfinite(lse[:6]).all()), "owned rows were not written")
+        self.assertTrue(
+            bool((out[6:] == 3.0).all()), "kernel wrote rows outside every group"
+        )
+        self.assertTrue(
+            bool((lse[6:] == 42.0).all()), "kernel wrote LSE outside every group"
+        )
+        self.assertTrue(
+            bool(torch.isfinite(lse[:6]).all()), "owned rows were not written"
+        )
 
 
 if __name__ == "__main__":

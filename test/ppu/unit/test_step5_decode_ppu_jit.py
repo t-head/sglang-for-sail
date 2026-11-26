@@ -171,7 +171,9 @@ def case_matches_triton(heads, rows=8, live=(1, 4, 16, 33), seed=2):
     """Several regions: match the Triton reference on output and natural LSE."""
     rows, slots = 8, 64 * STEP5_PPU_DECODE_PAGE_SIZE
     q, k, v = _qkv(rows, heads, slots, seed=seed)
-    packed, counts, lengths = _selection(rows, STEP5_PPU_DECODE_REGIONS, live, seed=seed)
+    packed, counts, lengths = _selection(
+        rows, STEP5_PPU_DECODE_REGIONS, live, seed=seed
+    )
     scale = HEAD_DIM**-0.5
     positions = _positions(lengths)
     ref_out, ref_lse = _reference(q, k, v, packed, counts, lengths, scale)

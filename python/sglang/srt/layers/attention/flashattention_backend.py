@@ -1845,9 +1845,7 @@ class FlashAttentionBackend(AttentionBackend):
         ).clamp(min=1)
 
         if local_batch_ids.numel() > 0:
-            metadata.page_table = metadata.page_table.index_select(
-                0, local_batch_ids
-            )
+            metadata.page_table = metadata.page_table.index_select(0, local_batch_ids)
             if metadata.swa_page_table is not None:
                 metadata.swa_page_table = metadata.swa_page_table.index_select(
                     0, local_batch_ids

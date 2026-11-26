@@ -113,9 +113,10 @@ def _norm_inputs(tokens, heads):
     torch.manual_seed(0)
     positions = 64
     exponents = torch.arange(16, dtype=torch.float32, device=DEV) / 16
-    angles = torch.arange(positions, dtype=torch.float32, device=DEV)[
-        :, None
-    ] * (1.0 / 10000.0**exponents)[None]
+    angles = (
+        torch.arange(positions, dtype=torch.float32, device=DEV)[:, None]
+        * (1.0 / 10000.0**exponents)[None]
+    )
     cache = torch.cat((angles.cos(), angles.sin()), dim=-1).to(torch.bfloat16)
     return dict(
         q=torch.randn(tokens, heads, 256, dtype=torch.bfloat16, device=DEV),

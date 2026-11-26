@@ -63,9 +63,7 @@ class Step5DraftModel(nn.Module):
             (16, 1, 8),
             (16, 1, 4),
         ) or parallel.pp_size != 1:
-            raise ValueError(
-                "Step5 draft requires TP4, TP8, TP16, or DP2/TP4 with PP1"
-            )
+            raise ValueError("Step5 draft requires TP4, TP8, TP16, or DP2/TP4 with PP1")
         use_dp_attention_reduce = parallel.attn_dp_size > 1
         if (
             config.num_hidden_layers,

@@ -53,46 +53,95 @@ def _measure_interleaved(graphs, *, repeats, cold, flush, seed):
 
 def _bench_shape(*, rows, context, args, flush):
     width = triton.cdiv(triton.cdiv(context, 8), 256) * 256
-    case = make_case(lengths=(rows,), prefixes=(context - rows,), width=width, seed=args.seed)
+    case = make_case(
+        lengths=(rows,), prefixes=(context - rows,), width=width, seed=args.seed
+    )
     results = []
     for mode in args.modes.split(","):
         fp8 = mode == "fp8"
         for group in map(int, args.groups.split(",")):
-            runners = {name: make_runner(case, name, fp8=fp8, group_rows=group,
-                                         block_regions=args.block_regions, grid_tiles=args.grid_tiles)
-                       for name in VARIANTS}
+            runners = {
+                name: make_runner(
+                    case,
+                    name,
+                    fp8=fp8,
+                    group_rows=group,
+                    block_regions=args.block_regions,
+                    grid_tiles=args.grid_tiles,
+                )
+                for name in VARIANTS
+            }
             baseline = runners["baseline"]["run"]().clone()
             qualifications = {}
             for name, runner in runners.items():
                 actual = runner["run"]()
                 qualifications[name] = compare_scores(actual, baseline)
             graphs = {name: _capture(runner["run"]) for name, runner in runners.items()}
-            pack_graphs = {name: _capture(runners[name]["pack"])
-                           for name in ("compact", "compact_tile")}
+            pack_graphs = {
+                name: _capture(runners[name]["pack"])
+                for name in ("compact", "compact_tile")
+            }
             for cache in args.cache_modes.split(","):
                 samples = _measure_interleaved(
-                    graphs, repeats=args.repeats, cold=cache == "cold", flush=flush, seed=args.seed,
+                    graphs,
+                    repeats=args.repeats,
+                    cold=cache == "cold",
+                    flush=flush,
+                    seed=args.seed,
                 )
                 pack_samples = _measure_interleaved(
-                    pack_graphs, repeats=args.repeats, cold=cache == "cold", flush=flush, seed=args.seed,
+                    pack_graphs,
+                    repeats=args.repeats,
+                    cold=cache == "cold",
+                    flush=flush,
+                    seed=args.seed,
                 )
-                medians = {name: statistics.median(values) for name, values in samples.items()}
-                eligible = [name for name in VARIANTS if qualifications[name]["bitwise_equal"]
-                            and qualifications[name]["top512_equal"]]
+                medians = {
+                    name: statistics.median(values) for name, values in samples.items()
+                }
+                eligible = [
+                    name
+                    for name in VARIANTS
+                    if qualifications[name]["bitwise_equal"]
+                    and qualifications[name]["top512_equal"]
+                ]
                 winner = min(eligible, key=medians.get)
-                print(f"\nrows={rows} context={context} width={width} mode={mode} group={group} cache={cache}", flush=True)
+                print(
+                    f"\nrows={rows} context={context} width={width} mode={mode} group={group} cache={cache}",
+                    flush=True,
+                )
                 for name in VARIANTS:
                     q = qualifications[name]
-                    print(f"  {name:12s} {medians[name]:9.2f} us  "
-                          f"speedup={medians['baseline']/medians[name]:.3f}x  "
-                          f"exact={q['bitwise_equal']} top512={q['top512_equal']} "
-                          f"mismatches={q['mismatches']} max_abs={q['max_abs']:.6g}", flush=True)
-                print(f"  Fastest qualified: {winner}; median pack time (us): "
-                      f"{ {name: round(statistics.median(values), 2) for name, values in pack_samples.items()} }", flush=True)
-                results.append(dict(rows=rows, context=context, width=width, mode=mode, group_rows=group,
-                                    cache=cache, configs={name: runner["config"] for name, runner in runners.items()},
-                                    qualifications=qualifications, medians_us=medians, samples_us=samples,
-                                    pack_samples_us=pack_samples, winner=winner))
+                    print(
+                        f"  {name:12s} {medians[name]:9.2f} us  "
+                        f"speedup={medians['baseline'] / medians[name]:.3f}x  "
+                        f"exact={q['bitwise_equal']} top512={q['top512_equal']} "
+                        f"mismatches={q['mismatches']} max_abs={q['max_abs']:.6g}",
+                        flush=True,
+                    )
+                print(
+                    f"  Fastest qualified: {winner}; median pack time (us): "
+                    f"{ {name: round(statistics.median(values), 2) for name, values in pack_samples.items()} }",
+                    flush=True,
+                )
+                results.append(
+                    dict(
+                        rows=rows,
+                        context=context,
+                        width=width,
+                        mode=mode,
+                        group_rows=group,
+                        cache=cache,
+                        configs={
+                            name: runner["config"] for name, runner in runners.items()
+                        },
+                        qualifications=qualifications,
+                        medians_us=medians,
+                        samples_us=samples,
+                        pack_samples_us=pack_samples,
+                        winner=winner,
+                    )
+                )
             del graphs, pack_graphs, runners, baseline
     return results
 
@@ -106,7 +155,9 @@ def _qualify_production_graph(case, runners, prefix):
     columns = torch.arange(513, device=workspace.packed.device)
     try:
         for history, active, zero_keys in (
-            (0, True, True), (prefix, False, False), (prefix, True, False),
+            (0, True, True),
+            (prefix, False, False),
+            (prefix, True, False),
         ):
             case["positions"].copy_(saved["positions"] - prefix + history)
             if active:
@@ -119,7 +170,9 @@ def _qualify_production_graph(case, runners, prefix):
                 case["keys"].copy_(saved["keys"])
             graph.replay()
             expected_scores = runners["baseline"]["score"]()
-            if not torch.equal(compact["out"].view(torch.int32), expected_scores.view(torch.int32)):
+            if not torch.equal(
+                compact["out"].view(torch.int32), expected_scores.view(torch.int32)
+            ):
                 raise RuntimeError("Graph replay did not refresh production scores")
             expected = selection_snapshot(runners["baseline"])
             valid = columns[None, :] < workspace.counts[:, None]
@@ -128,7 +181,9 @@ def _qualify_production_graph(case, runners, prefix):
             selected = torch.where(valid, workspace.packed, -1).sort(dim=1).values
             actual = (selected, workspace.counts, workspace.lengths)
             if not all(torch.equal(a, b) for a, b in zip(actual, expected)):
-                raise RuntimeError("Graph replay did not refresh the production selector output")
+                raise RuntimeError(
+                    "Graph replay did not refresh the production selector output"
+                )
     finally:
         for name, value in saved.items():
             case[name].copy_(value)
@@ -141,7 +196,10 @@ def _bench_production_shape(*, rows, context, args, flush):
 
     width = triton.cdiv(triton.cdiv(context, 8), 256) * 256
     case = make_case(
-        lengths=(rows,), prefixes=(context - rows,), width=width, seed=args.seed,
+        lengths=(rows,),
+        prefixes=(context - rows,),
+        width=width,
+        seed=args.seed,
     )
     results = []
     for mode in args.modes.split(","):
@@ -157,7 +215,9 @@ def _bench_production_shape(*, rows, context, args, flush):
             if scratch is None:
                 raise RuntimeError("This shape does not enable compact scoring")
             if any(r["workspace"].ppu_selector is None for r in runners.values()):
-                raise RuntimeError("The radix selector is unavailable for a production-path comparison")
+                raise RuntimeError(
+                    "The radix selector is unavailable for a production-path comparison"
+                )
             baseline = runners["baseline"]["score"]().clone()
             qualification = compare_scores(runners["compact"]["score"](), baseline)
             expected = selection_snapshot(runners["baseline"])
@@ -172,36 +232,62 @@ def _bench_production_shape(*, rows, context, args, flush):
                 valid = columns[None, :] < workspace.counts[:, None]
                 selector_valid &= not bool((valid & (workspace.packed < 0)).any())
             qualification["selector_valid"] = selector_valid
-            if not all(qualification[k] for k in (
-                "bitwise_equal", "top512_equal", "selector_equal", "selector_valid",
-            )):
+            if not all(
+                qualification[k]
+                for k in (
+                    "bitwise_equal",
+                    "top512_equal",
+                    "selector_equal",
+                    "selector_valid",
+                )
+            ):
                 raise RuntimeError(f"Production entry point mismatch: {qualification}")
             qualification["graph_refresh_equal"] = _qualify_production_graph(
-                case, runners, context - rows,
+                case,
+                runners,
+                context - rows,
             )
             for stage, entry in (("score", "score"), ("score_selector", "run")):
-                graphs = {name: _capture(runner[entry]) for name, runner in runners.items()}
+                graphs = {
+                    name: _capture(runner[entry]) for name, runner in runners.items()
+                }
                 for cache in args.cache_modes.split(","):
                     samples = _measure_interleaved(
-                        graphs, repeats=args.repeats, cold=cache == "cold",
-                        flush=flush, seed=args.seed,
+                        graphs,
+                        repeats=args.repeats,
+                        cold=cache == "cold",
+                        flush=flush,
+                        seed=args.seed,
                     )
-                    medians = {name: statistics.median(v) for name, v in samples.items()}
+                    medians = {
+                        name: statistics.median(v) for name, v in samples.items()
+                    }
                     speedup = medians["baseline"] / medians["compact"]
                     print(
                         f"production rows={rows} context={context} mode={mode} "
                         f"stage={stage} cache={cache} baseline={medians['baseline']:.2f}us "
                         f"compact={medians['compact']:.2f}us speedup={speedup:.3f}x "
                         f"exact={qualification['bitwise_equal']} "
-                        f"selector={qualification['selector_equal']}", flush=True,
+                        f"selector={qualification['selector_equal']}",
+                        flush=True,
                     )
-                    results.append(dict(
-                        rows=rows, context=context, width=width, mode=mode, stage=stage,
-                        cache=cache, group_rows=scratch.group_rows,
-                        compact_bytes=scratch.keys.numel() * scratch.keys.element_size(),
-                        qualification=qualification, medians_us=medians,
-                        samples_us=samples, speedup=speedup,
-                    ))
+                    results.append(
+                        dict(
+                            rows=rows,
+                            context=context,
+                            width=width,
+                            mode=mode,
+                            stage=stage,
+                            cache=cache,
+                            group_rows=scratch.group_rows,
+                            compact_bytes=scratch.keys.numel()
+                            * scratch.keys.element_size(),
+                            qualification=qualification,
+                            medians_us=medians,
+                            samples_us=samples,
+                            speedup=speedup,
+                        )
+                    )
                 del graphs
     return results
 
@@ -229,14 +315,22 @@ def main():
         parser.error("At least three repetitions are required")
     torch.cuda.set_device(0)
     props = torch.cuda.get_device_properties(0)
-    metadata = dict(device=props.name, capability=torch.cuda.get_device_capability(),
-                    torch=torch.__version__, triton=triton.__version__, sms=props.multi_processor_count,
-                    seed=args.seed, cache_flush_bytes=128 * 1024 * 1024,
-                    scope="Prequantized Q. Times include wipe, K packing, and scoring, excluding allocation and selection.",
-                    inputs="Synthetic. Physical pages are shuffled and each page is contiguous.",
-                    statistics="Median graph call time over shuffled trials, excluding cold-cache flushing")
+    metadata = dict(
+        device=props.name,
+        capability=torch.cuda.get_device_capability(),
+        torch=torch.__version__,
+        triton=triton.__version__,
+        sms=props.multi_processor_count,
+        seed=args.seed,
+        cache_flush_bytes=128 * 1024 * 1024,
+        scope="Prequantized Q. Times include wipe, K packing, and scoring, excluding allocation and selection.",
+        inputs="Synthetic. Physical pages are shuffled and each page is contiguous.",
+        statistics="Median graph call time over shuffled trials, excluding cold-cache flushing",
+    )
     if args.production:
-        metadata["scope"] = "Public API. Includes wipe, packing, and scoring per layer. Separate timings include selection and address folding."
+        metadata["scope"] = (
+            "Public API. Includes wipe, packing, and scoring per layer. Separate timings include selection and address folding."
+        )
     print(json.dumps(metadata, ensure_ascii=False), flush=True)
     flush = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
     shapes = [(args.rows, context) for context in map(int, args.contexts.split(","))]
@@ -250,8 +344,12 @@ def main():
         results.extend(bench_shape(rows=rows, context=context, args=args, flush=flush))
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(json.dumps(dict(metadata=metadata, results=results), indent=2,
-                                         ensure_ascii=False) + "\n")
+        args.output.write_text(
+            json.dumps(
+                dict(metadata=metadata, results=results), indent=2, ensure_ascii=False
+            )
+            + "\n"
+        )
         print(f"Results saved to {args.output}", flush=True)
 
 

@@ -74,9 +74,7 @@ def _reference(qkv, q_weight, k_weight, positions, cache, heads):
         c = cos.unsqueeze(1)
         s = sin.unsqueeze(1)
         roped = torch.cat((x1 * c - x2 * s, x2 * c + x1 * s), dim=-1)
-        return torch.cat((roped, x[..., 2 * half :].float()), dim=-1).to(
-            torch.bfloat16
-        )
+        return torch.cat((roped, x[..., 2 * half :].float()), dim=-1).to(torch.bfloat16)
 
     q = rope(norm(packed[:, :heads, :], q_weight))
     k = rope(norm(packed[:, heads : heads + 1, :], k_weight))

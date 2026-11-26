@@ -54,7 +54,9 @@ def step5_pack_decode_regions(
         or req_to_token.ndim != 2
         or req_to_token.stride(1) != 1
     ):
-        raise ValueError("Step5 req_to_token requires device integer [requests, context]")
+        raise ValueError(
+            "Step5 req_to_token requires device integer [requests, context]"
+        )
     if (
         packed_regions.device != region_ids.device
         or packed_regions.dtype != torch.int64

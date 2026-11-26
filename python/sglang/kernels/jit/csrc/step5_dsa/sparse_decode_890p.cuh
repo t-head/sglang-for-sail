@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <sgl_kernel/tensor.h>
+
 #include <sgl_kernel/utils.cuh>
-#include <algorithm>
-#include <cmath>
-#include <cfloat>
 
 #include "step5_dsa_device.cuh"
+#include <algorithm>
+#include <cfloat>
+#include <cmath>
 
 namespace sglang::step5_decode {
 using namespace step5_dsa;
@@ -17,9 +18,9 @@ constexpr int kDirectRows = 4096;
 
 struct Decode {
   const __ppu_bfloat16 *q, *k, *v;
-  const int64_t *packed;
+  const int64_t* packed;
   const int32_t *lengths, *counts, *valid_rows;
-  __ppu_bfloat16 *out;
+  __ppu_bfloat16* out;
   float *lse, *partial, *partial_lse;
   int rows, heads, slots, packed_stride, physical_regions, splits, capacity;
   float scale;
@@ -48,8 +49,7 @@ __global__ __launch_bounds__(32 * Warps, Warps == 1 ? 4 : 1) void packed_attenti
   const int warp = Warps == 1 ? 0 : __builtin_ppu_to_uniform_b32(threadIdx.x / 32);
   const int block = blockIdx.x * Warps + warp;
   if constexpr (Warps > 1) {
-    if (block >= (Direct ? p.rows : p.rows * p.splits))
-      return;
+    if (block >= (Direct ? p.rows : p.rows * p.splits)) return;
   }
   const int row = Direct ? block : Warps == 1 ? block / p.splits : block % p.rows;
   const int split = Direct ? 0 : Warps == 1 ? block % p.splits : block / p.rows;
@@ -59,16 +59,17 @@ __global__ __launch_bounds__(32 * Warps, Warps == 1 ? 4 : 1) void packed_attenti
   const int tiles = (p.slots + TG - 1) / TG;
   const int stride = (p.slots + p.splits - 1) / p.splits;
   const int begin = Direct ? 0 : Warps == 1 ? split * stride : (split * tiles / p.splits) * TG;
-  const int end = Direct ? p.slots : Warps == 1 ? min(p.slots, begin + stride)
-      : min(p.slots, ((split + 1) * tiles / p.splits) * TG);
+  const int end = Direct       ? p.slots
+                  : Warps == 1 ? min(p.slots, begin + stride)
+                               : min(p.slots, ((split + 1) * tiles / p.splits) * TG);
   const int64_t pos = int64_t(p.lengths[row]) - 1;
   const int live = row < p.valid_rows[0] && pos >= 0 ? p.counts[row] : 0;
   const int width = min(end, live) - begin;
-  const auto *packed = p.packed + int64_t(row) * p.packed_stride;
+  const auto* packed = p.packed + int64_t(row) * p.packed_stride;
 
   __shared__ __align__(128) KvStage<TG> key_stage[Warps], value_stage[Warps];
-  auto &sk = key_stage[warp];
-  auto &sv = value_stage[warp];
+  auto& sk = key_stage[warp];
+  auto& sv = value_stage[warp];
   MmaOperand qfrag[kHeadMmaTiles];
   MmaAccumulator output[kHeadMmaTiles];
 #pragma unroll
@@ -77,10 +78,9 @@ __global__ __launch_bounds__(32 * Warps, Warps == 1 ? 4 : 1) void packed_attenti
     clear_fragment(output[d]);
 #pragma unroll
     for (int tau = 0; tau < Halves; ++tau) {
-      const auto *src = p.q + (int64_t(row) * Heads + head + tau * 8) * kHeadDim;
-      qfrag[d].x[tau] = *reinterpret_cast<const uint32_t *>(src + 16 * d + 2 * t0);
-      qfrag[d].x[tau + 2] =
-          *reinterpret_cast<const uint32_t *>(src + 16 * d + 2 * t0 + 8);
+      const auto* src = p.q + (int64_t(row) * Heads + head + tau * 8) * kHeadDim;
+      qfrag[d].x[tau] = *reinterpret_cast<const uint32_t*>(src + 16 * d + 2 * t0);
+      qfrag[d].x[tau + 2] = *reinterpret_cast<const uint32_t*>(src + 16 * d + 2 * t0 + 8);
     }
   }
 
@@ -111,23 +111,18 @@ __global__ __launch_bounds__(32 * Warps, Warps == 1 ? 4 : 1) void packed_attenti
     bool nonempty = false, full = true;
 #pragma unroll
     for (int r = 0; r < TG; ++r) {
-      ids[r] = __builtin_ppu_to_uniform_b32(
-          __shfl_sync(0xffffffffu, region, (base & 31) + r));
-      counts[r] = __builtin_ppu_to_uniform_b32(
-          __shfl_sync(0xffffffffu, visible, (base & 31) + r));
+      ids[r] = __builtin_ppu_to_uniform_b32(__shfl_sync(0xffffffffu, region, (base & 31) + r));
+      counts[r] = __builtin_ppu_to_uniform_b32(__shfl_sync(0xffffffffu, visible, (base & 31) + r));
       nonempty |= counts[r] != 0;
       full &= counts[r] == kRegionTokens;
     }
-    if (!nonempty)
-      continue;
+    if (!nonempty) continue;
 #pragma unroll
     for (int r = 0; r < TG; ++r) {
       const int start = counts[r] == 0 ? kRegionTokens : 0;
       const int64_t offset = int64_t(ids[r]) * kRegionTokens * kHeadDim;
-      aiu_copy_group(&sk[r][0][0][0], p.k + offset, counts[r] + start,
-                     start, kRegionTokens);
-      aiu_copy_group(&sv[r][0][0][0], p.v + offset, counts[r] + start,
-                     start, kRegionTokens);
+      aiu_copy_group(&sk[r][0][0][0], p.k + offset, counts[r] + start, start, kRegionTokens);
+      aiu_copy_group(&sv[r][0][0][0], p.v + offset, counts[r] + start, start, kRegionTokens);
     }
     asm volatile("ppu.cp.async.commit_group;" ::: "memory");
     asm volatile("ppu.cp.async.wait_group 0;" ::: "memory");
@@ -158,8 +153,7 @@ __global__ __launch_bounds__(32 * Warps, Warps == 1 ? 4 : 1) void packed_attenti
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
           const int tau = (i >> 1) & 1;
-          if (tau < Halves)
-            peak[tau] = fmaxf(peak[tau], scores[t].x[i]);
+          if (tau < Halves) peak[tau] = fmaxf(peak[tau], scores[t].x[i]);
         }
       }
     } else {
@@ -170,8 +164,7 @@ __global__ __launch_bounds__(32 * Warps, Warps == 1 ? 4 : 1) void packed_attenti
           const int tau = (i >> 1) & 1;
           const bool valid = tau < Halves && 2 * t0 + (i & 1) < counts[2 * t + (i >> 2)];
           scores[t].x[i] = valid ? scores[t].x[i] : -INFINITY;
-          if (tau < Halves)
-            peak[tau] = fmaxf(peak[tau], scores[t].x[i]);
+          if (tau < Halves) peak[tau] = fmaxf(peak[tau], scores[t].x[i]);
         }
       }
     }
@@ -190,8 +183,7 @@ __global__ __launch_bounds__(32 * Warps, Warps == 1 ? 4 : 1) void packed_attenti
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
           const int tau = (i >> 1) & 1;
-          if (tau < Halves)
-            output[d].x[i] *= rescale[tau];
+          if (tau < Halves) output[d].x[i] *= rescale[tau];
         }
       }
     } else {
@@ -215,8 +207,7 @@ __global__ __launch_bounds__(32 * Warps, Warps == 1 ? 4 : 1) void packed_attenti
 #pragma unroll
           for (int i = 0; i < 8; ++i) {
             const int tau = (i >> 1) & 1;
-            if (tau < Halves)
-              output[d].x[i] *= rescale[tau];
+            if (tau < Halves) output[d].x[i] *= rescale[tau];
           }
         }
       }
@@ -233,8 +224,7 @@ __global__ __launch_bounds__(32 * Warps, Warps == 1 ? 4 : 1) void packed_attenti
           b = __exp2f(fmaf(scores[t].x[i + 1], scale2, -maximum[tau]));
           denom[tau] += a + b;
         }
-        *reinterpret_cast<__ppu_bfloat162 *>(&prob[t].x[i / 2]) =
-            __floats2bfloat162_rn(a, b);
+        *reinterpret_cast<__ppu_bfloat162*>(&prob[t].x[i / 2]) = __floats2bfloat162_rn(a, b);
       }
     }
 #pragma unroll
@@ -264,8 +254,7 @@ __global__ __launch_bounds__(32 * Warps, Warps == 1 ? 4 : 1) void packed_attenti
     }
     if constexpr (!Direct && Warps > 1) {
       // The warp merge skips empty splits and their unwritten partials.
-      if (p.splits > 1 && norm == 0.f)
-        continue;
+      if (p.splits > 1 && norm == 0.f) continue;
     }
 #pragma unroll
     for (int d = 0; d < kHeadMmaTiles; ++d) {
@@ -275,10 +264,9 @@ __global__ __launch_bounds__(32 * Warps, Warps == 1 ? 4 : 1) void packed_attenti
         const int i = 2 * tau + 4 * half;
         const float a = output[d].x[i] * inv, b = output[d].x[i + 1] * inv;
         if (Direct || p.splits == 1)
-          *reinterpret_cast<__ppu_bfloat162 *>(p.out + h * kHeadDim + dim) =
-              __floats2bfloat162_rn(a, b);
+          *reinterpret_cast<__ppu_bfloat162*>(p.out + h * kHeadDim + dim) = __floats2bfloat162_rn(a, b);
         else
-          *reinterpret_cast<float2 *>(p.partial + scalar * kHeadDim + dim) = make_float2(a, b);
+          *reinterpret_cast<float2*>(p.partial + scalar * kHeadDim + dim) = make_float2(a, b);
       }
     }
   }
@@ -295,22 +283,20 @@ __global__ void merge_attention(Decode p) {
     const float weight = peak > -INFINITY ? __expf(local - peak) : 0.f;
     const float sum = warp_sum(weight);
     weights[tid] = sum > 0 ? weight / sum : 0.f;
-    if (tid == 0)
-      p.lse[h] = sum > 0 ? peak + __logf(sum) : -INFINITY;
+    if (tid == 0) p.lse[h] = sum > 0 ? peak + __logf(sum) : -INFINITY;
   }
   __syncthreads();
-  if (tid >= kHeadDim / 4)
-    return;
+  if (tid >= kHeadDim / 4) return;
   float4 result = make_float4(0.f, 0.f, 0.f, 0.f);
   for (int s = 0; s < p.splits; ++s) {
-    const float4 data = reinterpret_cast<const float4 *>(p.partial + (first + s) * kHeadDim)[tid];
+    const float4 data = reinterpret_cast<const float4*>(p.partial + (first + s) * kHeadDim)[tid];
     const float w = weights[s];
     result.x = fmaf(w, data.x, result.x);
     result.y = fmaf(w, data.y, result.y);
     result.z = fmaf(w, data.z, result.z);
     result.w = fmaf(w, data.w, result.w);
   }
-  auto *dst = reinterpret_cast<__ppu_bfloat162 *>(p.out + h * kHeadDim + tid * 4);
+  auto* dst = reinterpret_cast<__ppu_bfloat162*>(p.out + h * kHeadDim + tid * 4);
   dst[0] = __floats2bfloat162_rn(result.x, result.y);
   dst[1] = __floats2bfloat162_rn(result.z, result.w);
 }
@@ -324,14 +310,13 @@ __global__ void merge_attention_warp(Decode p) {
   const float weight = peak > -INFINITY ? __expf(local - peak) : 0.f;
   const float sum = warp_sum(weight);
   const float w = sum > 0 ? weight / sum : 0.f;
-  if (lane == 0)
-    p.lse[h] = sum > 0 ? peak + __logf(sum) : -INFINITY;
+  if (lane == 0) p.lse[h] = sum > 0 ? peak + __logf(sum) : -INFINITY;
   uint32_t active = __ballot_sync(0xffffffffu, w != 0.f);
   float2 result[3] = {};
   while (active) {
     const int split = __ffs(active) - 1;
     const float scale = __shfl_sync(0xffffffffu, w, split);
-    const auto *data = reinterpret_cast<const float2 *>(p.partial + (first + split) * kHeadDim) + lane;
+    const auto* data = reinterpret_cast<const float2*>(p.partial + (first + split) * kHeadDim) + lane;
 #pragma unroll
     for (int d = 0; d < 3; ++d) {
       const float2 value = data[d * 32];
@@ -340,7 +325,7 @@ __global__ void merge_attention_warp(Decode p) {
     }
     active &= active - 1;
   }
-  auto *dst = reinterpret_cast<__ppu_bfloat162 *>(p.out + h * kHeadDim) + lane;
+  auto* dst = reinterpret_cast<__ppu_bfloat162*>(p.out + h * kHeadDim) + lane;
 #pragma unroll
   for (int d = 0; d < 3; ++d)
     dst[d * 32] = __floats2bfloat162_rn(result[d].x, result[d].y);
@@ -359,8 +344,7 @@ void launch(Decode p, DLDevice device) {
   if (!Direct && p.splits > 1) {
     const int output_heads = p.rows * p.heads;
     if constexpr (Warps > 1)
-      host::LaunchKernel(output_heads / kMergeWarps, 32 * kMergeWarps, device)(
-          merge_attention_warp, p);
+      host::LaunchKernel(output_heads / kMergeWarps, 32 * kMergeWarps, device)(merge_attention_warp, p);
     else
       host::LaunchKernel(output_heads, 64, device)(merge_attention, p);
   }
@@ -376,11 +360,18 @@ int64_t split_capacity(int64_t rows) {
 }
 
 void run(
-    tvm::ffi::TensorView q, tvm::ffi::TensorView k, tvm::ffi::TensorView v,
-    tvm::ffi::TensorView packed, tvm::ffi::TensorView counts,
-    tvm::ffi::TensorView lengths, tvm::ffi::TensorView valid_rows,
-    tvm::ffi::TensorView partial, tvm::ffi::TensorView partial_lse,
-    tvm::ffi::TensorView out, tvm::ffi::TensorView lse, double scale) {
+    tvm::ffi::TensorView q,
+    tvm::ffi::TensorView k,
+    tvm::ffi::TensorView v,
+    tvm::ffi::TensorView packed,
+    tvm::ffi::TensorView counts,
+    tvm::ffi::TensorView lengths,
+    tvm::ffi::TensorView valid_rows,
+    tvm::ffi::TensorView partial,
+    tvm::ffi::TensorView partial_lse,
+    tvm::ffi::TensorView out,
+    tvm::ffi::TensorView lse,
+    double scale) {
   using namespace host;
   auto device = SymbolicDevice{};
   device.set_options<kDLCUDA>();
@@ -390,9 +381,17 @@ void run(
   auto width = SymbolicSize{"packed width"};
   auto capacity = SymbolicSize{"split capacity"};
   TensorMatcher({rows, heads, kHeadDim})
-      .with_dtype<__ppu_bfloat16>().with_device(device).ensure_alignment(16).verify(q).verify(out);
+      .with_dtype<__ppu_bfloat16>()
+      .with_device(device)
+      .ensure_alignment(16)
+      .verify(q)
+      .verify(out);
   TensorMatcher({slots, 1, kHeadDim})
-      .with_dtype<__ppu_bfloat16>().with_device(device).ensure_alignment(16).verify(k).verify(v);
+      .with_dtype<__ppu_bfloat16>()
+      .with_device(device)
+      .ensure_alignment(16)
+      .verify(k)
+      .verify(v);
   TensorMatcher({rows, width}).with_dtype<int64_t>().with_device(device).verify(packed);
   TensorMatcher({rows}).with_dtype<int32_t>().with_device(device).verify(counts).verify(lengths);
   TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(valid_rows);
@@ -403,7 +402,10 @@ void run(
   RuntimeCheck(r >= 1 && r <= 516 && std::isfinite(scale) && scale > 0);
   const int64_t scratch_rows = n >= kDirectRows ? 0 : n;
   TensorMatcher({scratch_rows, heads, capacity, kHeadDim})
-      .with_dtype<float>().with_device(device).ensure_alignment(16).verify(partial);
+      .with_dtype<float>()
+      .with_device(device)
+      .ensure_alignment(16)
+      .verify(partial);
   TensorMatcher({scratch_rows, heads, capacity}).with_dtype<float>().with_device(device).verify(partial_lse);
   const auto c = capacity.unwrap();
   RuntimeCheck(c >= 1 && c <= kMaxSplits);
@@ -413,17 +415,25 @@ void run(
   const int partitions = n <= kSingleWarpRows ? selected : (selected + 1) / 2;
   const int splits = std::min({int(split_capacity(n)), int(c), partitions});
   const Decode p{
-      static_cast<const __ppu_bfloat16 *>(q.data_ptr()),
-      static_cast<const __ppu_bfloat16 *>(k.data_ptr()),
-      static_cast<const __ppu_bfloat16 *>(v.data_ptr()),
-      static_cast<const int64_t *>(packed.data_ptr()),
-      static_cast<const int32_t *>(lengths.data_ptr()),
-      static_cast<const int32_t *>(counts.data_ptr()),
-      static_cast<const int32_t *>(valid_rows.data_ptr()),
-      static_cast<__ppu_bfloat16 *>(out.data_ptr()),
-      static_cast<float *>(lse.data_ptr()), static_cast<float *>(partial.data_ptr()),
-      static_cast<float *>(partial_lse.data_ptr()), int(n), int(h), selected,
-      int(r), int(s / kRegionTokens), splits, int(c), float(scale),
+      static_cast<const __ppu_bfloat16*>(q.data_ptr()),
+      static_cast<const __ppu_bfloat16*>(k.data_ptr()),
+      static_cast<const __ppu_bfloat16*>(v.data_ptr()),
+      static_cast<const int64_t*>(packed.data_ptr()),
+      static_cast<const int32_t*>(lengths.data_ptr()),
+      static_cast<const int32_t*>(counts.data_ptr()),
+      static_cast<const int32_t*>(valid_rows.data_ptr()),
+      static_cast<__ppu_bfloat16*>(out.data_ptr()),
+      static_cast<float*>(lse.data_ptr()),
+      static_cast<float*>(partial.data_ptr()),
+      static_cast<float*>(partial_lse.data_ptr()),
+      int(n),
+      int(h),
+      selected,
+      int(r),
+      int(s / kRegionTokens),
+      splits,
+      int(c),
+      float(scale),
   };
   const auto target = device.unwrap();
   const tvm::ffi::CUDADeviceGuard guard(target.device_id);
@@ -435,4 +445,4 @@ void run(
     launch<2>(p, target);
 }
 
-} // namespace sglang::step5_decode
+}  // namespace sglang::step5_decode

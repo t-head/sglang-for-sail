@@ -226,9 +226,7 @@ def run_selection_contract():
     flat = torch.zeros((4, NUM_EXPERTS), dtype=torch.float32, device=DEV)
     weights, ids = _launch(op, flat, rank.to(DEV))
     want = torch.argsort(-rank, stable=True)[:TOPK].to(torch.int32)
-    assert torch.equal(ids, want.to(DEV).repeat(4, 1)), (
-        "bias must drive selection"
-    )
+    assert torch.equal(ids, want.to(DEV).repeat(4, 1)), "bias must drive selection"
     assert torch.allclose(weights, torch.full((4, TOPK), 3.0 / TOPK, device=DEV)), (
         "bias leaked into the routing weights"
     )

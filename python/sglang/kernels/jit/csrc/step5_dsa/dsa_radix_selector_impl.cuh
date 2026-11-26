@@ -8,16 +8,17 @@
 // Rounds 0-1 use 2048-bin histograms (11-bit extraction); round 2 uses
 // 1024 bins (10-bit).  Only standard device APIs are used.
 
+#include <sgl_kernel/tensor.h>
+#include <sgl_kernel/utils.h>
+
+#include <sgl_kernel/utils.cuh>
+
+#include <tvm/ffi/container/tensor.h>
+
 #include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <vector>
-
-#include <sgl_kernel/tensor.h>
-#include <sgl_kernel/utils.h>
-#include <sgl_kernel/utils.cuh>
-
-#include <tvm/ffi/container/tensor.h>
 
 // Each include of this file yields one thread-count specialization; the
 // namespace encodes the thread count so two specializations coexist in one
@@ -39,9 +40,9 @@ namespace dsa_selector_w1024 {
 #endif
 
 constexpr int kThreads = DSA_SELECTOR_THREADS;
-constexpr int kRadix = 1024;              // 2^10 for last round
-constexpr int kCoarseRadix = 2048;        // 2^11 for first two rounds
-constexpr int kNumSelectorRounds = 3;     // [11, 11, 10]
+constexpr int kRadix = 1024;           // 2^10 for last round
+constexpr int kCoarseRadix = 2048;     // 2^11 for first two rounds
+constexpr int kNumSelectorRounds = 3;  // [11, 11, 10]
 constexpr int kStreamingChunkRegions = 16384;
 constexpr float kRegionEpsilon = 1.0e-9f;
 
@@ -57,14 +58,12 @@ constexpr int kRegisterCachePerThread = (kThreads == 1024) ? 4 : 8;
 constexpr int kRegisterCacheRegions = kRegisterCachePerThread * kThreads;
 constexpr int kSmemBufferRegions = 8192 - kRegisterCacheRegions;
 constexpr int kMaxBufferedRegions = 8192;  // register + smem cache capacity
-static_assert(kRegisterCacheRegions <= kMaxBufferedRegions,
-              "Register cache cannot exceed total buffered regions");
-static_assert(kSmemBufferRegions > 0,
-              "Smem buffer must be positive for all supported warp sizes");
+static_assert(kRegisterCacheRegions <= kMaxBufferedRegions, "Register cache cannot exceed total buffered regions");
+static_assert(kSmemBufferRegions > 0, "Smem buffer must be positive for all supported warp sizes");
 
-static_assert(kThreads >= 256 && kThreads <= 1024 &&
-                  (kThreads & (kThreads - 1)) == 0,
-              "Step5 DSA selector threads must be a power of two in [256,1024]");
+static_assert(
+    kThreads >= 256 && kThreads <= 1024 && (kThreads & (kThreads - 1)) == 0,
+    "Step5 DSA selector threads must be a power of two in [256,1024]");
 
 // Shared storage for selector and chunk kernels.
 // The histogram and (equal_counts + warp_sum) are used in disjoint phases,
@@ -115,19 +114,28 @@ __device__ __forceinline__ uint32_t ordered_score(float score, int region) {
 }
 
 __device__ __forceinline__ void store_region(
-    int region, int slot, int request, int head, int heads, int output_width,
-    int const* block_table, int block_table_stride, int block_table_length,
-    int regions_per_page, int region_block, bool packed, int* region_output,
+    int region,
+    int slot,
+    int request,
+    int head,
+    int heads,
+    int output_width,
+    int const* block_table,
+    int block_table_stride,
+    int block_table_length,
+    int regions_per_page,
+    int region_block,
+    bool packed,
+    int* region_output,
     int* start_output) {
   int selected = region;
   int start = region * region_block;
   if (packed) {
     int const logical_page = region / regions_per_page;
     int const fragment = region - logical_page * regions_per_page;
-    int const physical_page =
-        logical_page >= 0 && logical_page < block_table_length
-            ? block_table[request * block_table_stride + logical_page]
-            : -1;
+    int const physical_page = logical_page >= 0 && logical_page < block_table_length
+                                  ? block_table[request * block_table_stride + logical_page]
+                                  : -1;
     bool const valid = physical_page >= 0;
     selected = valid ? physical_page * regions_per_page + fragment : -1;
     start = valid ? start : -1;
@@ -150,9 +158,8 @@ constexpr int kThreadStaging = 8;
 // mask so the SIMT mask stays consistent on PPU).  Returns the base slot
 // claimed for the warp and writes this lane's exclusive offset into
 // warp_exclusive.
-__device__ __forceinline__ int claim_warp_output_slots(
-    int staged_count, int thread, DsaRadixShared& storage,
-    int& warp_exclusive) {
+__device__ __forceinline__ int
+claim_warp_output_slots(int staged_count, int thread, DsaRadixShared& storage, int& warp_exclusive) {
   int const lane_id = thread & 31;
   int warp_inclusive = staged_count;
 #pragma unroll
@@ -175,8 +182,7 @@ __device__ __forceinline__ int claim_warp_output_slots(
 // index than this thread.  Replaces the tree reduction over
 // storage.equal_counts[] with two warp-level shuffle passes plus two
 // __syncthreads, cutting sync overhead from 2*log2(kThreads) to 2.
-__device__ __forceinline__ int equal_count_higher_equal(
-    int local_equal, int thread, DsaRadixShared& storage) {
+__device__ __forceinline__ int equal_count_higher_equal(int local_equal, int thread, DsaRadixShared& storage) {
   int const lane_id = thread & 31;
   int const warp_id = thread >> 5;
 
@@ -210,8 +216,7 @@ __device__ __forceinline__ int equal_count_higher_equal(
 
   // Step 3: Combine intra-warp suffix (excluding this lane) with suffix of
   // all later warps.
-  return (warp_suffix - local_equal) +
-         ((warp_id + 1 < kThreads / 32) ? storage.warp_sum[warp_id + 1] : 0);
+  return (warp_suffix - local_equal) + ((warp_id + 1 < kThreads / 32) ? storage.warp_sum[warp_id + 1] : 0);
 }
 
 // Warp-based threshold bin selection parameterised on histogram size.
@@ -225,12 +230,10 @@ __device__ __forceinline__ int equal_count_higher_equal(
 //          their intra-warp prefix to obtain the per-bin exclusive prefix
 //          sum, then search for the threshold in parallel.
 template <int n_bins, typename SharedStorage>
-__device__ __forceinline__ void choose_threshold_parallel(
-    SharedStorage& storage, int thread) {
+__device__ __forceinline__ void choose_threshold_parallel(SharedStorage& storage, int thread) {
   constexpr int kWarps = kThreads / 32;
   constexpr int kOwningThreads = (kThreads < n_bins) ? kThreads : n_bins;
-  constexpr int kItemsPerThread =
-      (kThreads <= n_bins) ? (n_bins / kThreads) : 0;
+  constexpr int kItemsPerThread = (kThreads <= n_bins) ? (n_bins / kThreads) : 0;
 
   int const lane_id = thread & 31;
   int const warp_id = thread >> 5;
@@ -306,8 +309,7 @@ __device__ __forceinline__ void choose_threshold_parallel(
     for (int i = 0; i < kItemsPerThread; ++i) {
       prefix_sum += orig[i];
       int const count_greater = total - prefix_sum;
-      if (count_greater < storage.remain &&
-          count_greater + orig[i] >= storage.remain) {
+      if (count_greater < storage.remain && count_greater + orig[i] >= storage.remain) {
         local_threshold = thread * kItemsPerThread + i;
         local_count_greater = count_greater;
       }
@@ -316,8 +318,7 @@ __device__ __forceinline__ void choose_threshold_parallel(
     if (owns_bin) {
       prefix_sum += orig[0];
       int const count_greater = total - prefix_sum;
-      if (count_greater < storage.remain &&
-          count_greater + orig[0] >= storage.remain) {
+      if (count_greater < storage.remain && count_greater + orig[0] >= storage.remain) {
         local_threshold = thread;
         local_count_greater = count_greater;
       }
@@ -334,10 +335,19 @@ __device__ __forceinline__ void choose_threshold_parallel(
 
 // Selector kernel: 3 rounds [11, 11, 10].
 __global__ void dsa_radix_selector_kernel(
-    float const* scores, int64_t const* query_positions,
-    int const* block_table, int* region_output, int* start_output, int heads,
-    int regions, int topk, int region_block, int page_size,
-    int block_table_stride, int block_table_length, bool packed) {
+    float const* scores,
+    int64_t const* query_positions,
+    int const* block_table,
+    int* region_output,
+    int* start_output,
+    int heads,
+    int regions,
+    int topk,
+    int region_block,
+    int page_size,
+    int block_table_stride,
+    int block_table_length,
+    bool packed) {
   extern __shared__ char raw_shared[];
   auto& storage = *reinterpret_cast<DsaRadixShared*>(raw_shared);
   int const work = blockIdx.x;
@@ -345,8 +355,7 @@ __global__ void dsa_radix_selector_kernel(
   int const head = work - request * heads;
   int const thread = threadIdx.x;
   int const output_width = topk + 1;
-  int const current = min(
-      max(int(query_positions[request]), 0) / region_block, regions - 1);
+  int const current = min(max(int(query_positions[request]), 0) / region_block, regions - 1);
   int const target = min(topk, current);
   float const* score_row = scores + (request * heads + head) * regions;
 
@@ -366,16 +375,38 @@ __global__ void dsa_radix_selector_kernel(
   // If all history is kept, skip the score reads and let the scoring stage skip those rows.
   if (current <= topk) {
     for (int region = thread; region < current; region += kThreads) {
-      store_region(region, region, request, head, heads, output_width,
-                   block_table, block_table_stride, block_table_length,
-                   page_size / region_block, region_block, packed,
-                   region_output, start_output);
+      store_region(
+          region,
+          region,
+          request,
+          head,
+          heads,
+          output_width,
+          block_table,
+          block_table_stride,
+          block_table_length,
+          page_size / region_block,
+          region_block,
+          packed,
+          region_output,
+          start_output);
     }
     if (thread == 0) {
-      store_region(current, topk, request, head, heads, output_width,
-                   block_table, block_table_stride, block_table_length,
-                   page_size / region_block, region_block, packed,
-                   region_output, start_output);
+      store_region(
+          current,
+          topk,
+          request,
+          head,
+          heads,
+          output_width,
+          block_table,
+          block_table_stride,
+          block_table_length,
+          page_size / region_block,
+          region_block,
+          packed,
+          region_output,
+          start_output);
     }
     return;
   }
@@ -406,8 +437,7 @@ __global__ void dsa_radix_selector_kernel(
   if (smem_count > 0) {
     // Simple scalar load path (instead of cp.async) to verify correctness
     // independent of async copy alignment / behavior.
-    for (int smem_region = thread; smem_region < smem_count;
-         smem_region += kThreads) {
+    for (int smem_region = thread; smem_region < smem_count; smem_region += kThreads) {
       int const global_region = kRegisterCacheRegions + smem_region;
       storage.score_buffer[smem_region] = score_row[global_region];
     }
@@ -419,8 +449,8 @@ __global__ void dsa_radix_selector_kernel(
 #pragma unroll
   for (int round = 0; round < kNumSelectorRounds; ++round) {
     int const n_bins = (round < 2) ? kCoarseRadix : kRadix;
-    int const bits   = (round < 2) ? 11 : 10;
-    int const shift  = (round < 2) ? (32 - (round + 1) * 11) : 0;
+    int const bits = (round < 2) ? 11 : 10;
+    int const shift = (round < 2) ? (32 - (round + 1) * 11) : 0;
     uint32_t const bin_mask = (1u << bits) - 1u;
 
     for (int bin = thread; bin < n_bins; bin += kThreads) {
@@ -443,11 +473,9 @@ __global__ void dsa_radix_selector_kernel(
         }
       }
       // Histogram from smem cache (strided).
-      for (int smem_region = thread; smem_region < smem_count;
-           smem_region += kThreads) {
+      for (int smem_region = thread; smem_region < smem_count; smem_region += kThreads) {
         int const region = kRegisterCacheRegions + smem_region;
-        uint32_t const key = ordered_score(
-            storage.score_buffer[smem_region], region);
+        uint32_t const key = ordered_score(storage.score_buffer[smem_region], region);
         if ((key & prefix_mask) == prefix_value) {
           atomicAdd(&storage.histogram[int((key >> shift) & bin_mask)], 1);
         }
@@ -471,9 +499,7 @@ __global__ void dsa_radix_selector_kernel(
     if (thread == 0 && storage.remain > 0) {
       uint32_t const round_mask = bin_mask << shift;
       storage.prefix_mask |= round_mask;
-      storage.prefix_value =
-          (storage.prefix_value & ~round_mask) |
-          (uint32_t(storage.threshold) << shift);
+      storage.prefix_value = (storage.prefix_value & ~round_mask) | (uint32_t(storage.threshold) << shift);
       storage.selected_base += storage.count_greater;
       storage.remain -= storage.count_greater;
     }
@@ -505,18 +531,27 @@ __global__ void dsa_radix_selector_kernel(
     }
     if (__any_sync(0xFFFFFFFF, staged_count == kThreadStaging)) {
       int warp_exclusive = 0;
-      int const base_slot =
-          claim_warp_output_slots(staged_count, thread, storage,
-                                  warp_exclusive);
+      int const base_slot = claim_warp_output_slots(staged_count, thread, storage, warp_exclusive);
 #pragma unroll
       for (int i = 0; i < kThreadStaging; ++i) {
         if (i < staged_count) {
           int const slot = base_slot + warp_exclusive + i;
           if (slot < storage.selected_base) {
-            store_region(staged_regions[i], slot, request, head, heads,
-                         output_width, block_table, block_table_stride,
-                         block_table_length, page_size / region_block,
-                         region_block, packed, region_output, start_output);
+            store_region(
+                staged_regions[i],
+                slot,
+                request,
+                head,
+                heads,
+                output_width,
+                block_table,
+                block_table_stride,
+                block_table_length,
+                page_size / region_block,
+                region_block,
+                packed,
+                region_output,
+                start_output);
           }
         }
       }
@@ -526,17 +561,27 @@ __global__ void dsa_radix_selector_kernel(
 
   auto flush_staged = [&]() {
     int warp_exclusive = 0;
-    int const base_slot =
-        claim_warp_output_slots(staged_count, thread, storage, warp_exclusive);
+    int const base_slot = claim_warp_output_slots(staged_count, thread, storage, warp_exclusive);
 #pragma unroll
     for (int i = 0; i < kThreadStaging; ++i) {
       if (i < staged_count) {
         int const slot = base_slot + warp_exclusive + i;
         if (slot < storage.selected_base) {
-          store_region(staged_regions[i], slot, request, head, heads,
-                       output_width, block_table, block_table_stride,
-                       block_table_length, page_size / region_block,
-                       region_block, packed, region_output, start_output);
+          store_region(
+              staged_regions[i],
+              slot,
+              request,
+              head,
+              heads,
+              output_width,
+              block_table,
+              block_table_stride,
+              block_table_length,
+              page_size / region_block,
+              region_block,
+              packed,
+              region_output,
+              start_output);
         }
       }
     }
@@ -564,8 +609,7 @@ __global__ void dsa_radix_selector_kernel(
         int const smem_region = thread + iter * kThreads;
         bool const valid = (smem_region < smem_count);
         int const region = kRegisterCacheRegions + smem_region;
-        float const raw =
-            valid ? storage.score_buffer[smem_region] : 0.0f;
+        float const raw = valid ? storage.score_buffer[smem_region] : 0.0f;
         process_region_for_scatter(region, raw, valid);
       }
     }
@@ -582,25 +626,32 @@ __global__ void dsa_radix_selector_kernel(
   }
 
   flush_staged();
-  int const higher_equal =
-      equal_count_higher_equal(local_equal, thread, storage);
-  int const local_take =
-      min(local_equal, max(storage.remain - higher_equal, 0));
+  int const higher_equal = equal_count_higher_equal(local_equal, thread, storage);
+  int const local_take = min(local_equal, max(storage.remain - higher_equal, 0));
   int emitted = 0;
 
   if (use_hybrid_cache) {
     // Tie-breaking from register cache (reverse order, deterministic).
-    for (int i = kRegisterCachePerThread - 1; i >= 0 && emitted < local_take;
-         --i) {
+    for (int i = kRegisterCachePerThread - 1; i >= 0 && emitted < local_take; --i) {
       int const region = thread * kRegisterCachePerThread + i;
-      if (region < register_count &&
-          ordered_score(register_cache[i], region) == threshold_key) {
+      if (region < register_count && ordered_score(register_cache[i], region) == threshold_key) {
         int const slot = storage.selected_base + higher_equal + emitted;
         if (slot < topk) {
-          store_region(region, slot, request, head, heads, output_width,
-                       block_table, block_table_stride, block_table_length,
-                       page_size / region_block, region_block, packed,
-                       region_output, start_output);
+          store_region(
+              region,
+              slot,
+              request,
+              head,
+              heads,
+              output_width,
+              block_table,
+              block_table_stride,
+              block_table_length,
+              page_size / region_block,
+              region_block,
+              packed,
+              region_output,
+              start_output);
         }
         ++emitted;
       }
@@ -613,14 +664,24 @@ __global__ void dsa_radix_selector_kernel(
       for (int n = max_n; n >= 0 && emitted < local_take; --n) {
         int const smem_region = thread + n * kThreads;
         int const region = kRegisterCacheRegions + smem_region;
-        if (ordered_score(storage.score_buffer[smem_region], region) ==
-            threshold_key) {
+        if (ordered_score(storage.score_buffer[smem_region], region) == threshold_key) {
           int const slot = storage.selected_base + higher_equal + emitted;
           if (slot < topk) {
-            store_region(region, slot, request, head, heads, output_width,
-                         block_table, block_table_stride, block_table_length,
-                         page_size / region_block, region_block, packed,
-                         region_output, start_output);
+            store_region(
+                region,
+                slot,
+                request,
+                head,
+                heads,
+                output_width,
+                block_table,
+                block_table_stride,
+                block_table_length,
+                page_size / region_block,
+                region_block,
+                packed,
+                region_output,
+                start_output);
           }
           ++emitted;
         }
@@ -629,15 +690,25 @@ __global__ void dsa_radix_selector_kernel(
   } else {
     int const begin = int((int64_t(current) * thread) / kThreads);
     int const end = int((int64_t(current) * (thread + 1)) / kThreads);
-    for (int region = end - 1; region >= begin && emitted < local_take;
-         --region) {
+    for (int region = end - 1; region >= begin && emitted < local_take; --region) {
       if (ordered_score(score_src[region], region) == threshold_key) {
         int const slot = storage.selected_base + higher_equal + emitted;
         if (slot < topk) {
-          store_region(region, slot, request, head, heads, output_width,
-                       block_table, block_table_stride, block_table_length,
-                       page_size / region_block, region_block, packed,
-                       region_output, start_output);
+          store_region(
+              region,
+              slot,
+              request,
+              head,
+              heads,
+              output_width,
+              block_table,
+              block_table_stride,
+              block_table_length,
+              page_size / region_block,
+              region_block,
+              packed,
+              region_output,
+              start_output);
         }
         ++emitted;
       }
@@ -645,18 +716,35 @@ __global__ void dsa_radix_selector_kernel(
   }
 
   if (thread == 0) {
-    store_region(current, topk, request, head, heads, output_width,
-                 block_table, block_table_stride, block_table_length,
-                 page_size / region_block, region_block, packed,
-                 region_output, start_output);
+    store_region(
+        current,
+        topk,
+        request,
+        head,
+        heads,
+        output_width,
+        block_table,
+        block_table_stride,
+        block_table_length,
+        page_size / region_block,
+        region_block,
+        packed,
+        region_output,
+        start_output);
   }
 }
 
 // Chunk kernel: 3 rounds [11, 11, 10] (same as selector).
 __global__ void dsa_radix_chunk_kernel(
-    float const* scores, int64_t const* query_positions,
-    int* candidate_output, int heads, int regions, int topk, int region_block,
-    int num_chunks, int candidate_stride) {
+    float const* scores,
+    int64_t const* query_positions,
+    int* candidate_output,
+    int heads,
+    int regions,
+    int topk,
+    int region_block,
+    int num_chunks,
+    int candidate_stride) {
   extern __shared__ char raw_shared[];
   auto& storage = *reinterpret_cast<DsaRadixShared*>(raw_shared);
   int const chunk_work = blockIdx.x;
@@ -665,15 +753,13 @@ __global__ void dsa_radix_chunk_kernel(
   int const request = work / heads;
   int const head = work - request * heads;
   int const thread = threadIdx.x;
-  int const current = min(
-      max(int(query_positions[request]), 0) / region_block, regions - 1);
+  int const current = min(max(int(query_positions[request]), 0) / region_block, regions - 1);
   int const chunk_begin = chunk * kStreamingChunkRegions;
   int const chunk_end = min(chunk_begin + kStreamingChunkRegions, current);
   int const valid_length = max(chunk_end - chunk_begin, 0);
   int const target = min(topk, valid_length);
   float const* score_row = scores + work * regions;
-  int* output_row =
-      candidate_output + work * candidate_stride + chunk * topk;
+  int* output_row = candidate_output + work * candidate_stride + chunk * topk;
 
   for (int slot = thread; slot < topk; slot += kThreads) {
     output_row[slot] = -1;
@@ -691,8 +777,8 @@ __global__ void dsa_radix_chunk_kernel(
 #pragma unroll
   for (int round = 0; round < kNumSelectorRounds; ++round) {
     int const n_bins = (round < 2) ? kCoarseRadix : kRadix;
-    int const bits   = (round < 2) ? 11 : 10;
-    int const shift  = (round < 2) ? (32 - (round + 1) * 11) : 0;
+    int const bits = (round < 2) ? 11 : 10;
+    int const shift = (round < 2) ? (32 - (round + 1) * 11) : 0;
     uint32_t const bin_mask = (1u << bits) - 1u;
 
     for (int bin = thread; bin < n_bins; bin += kThreads) {
@@ -702,8 +788,7 @@ __global__ void dsa_radix_chunk_kernel(
 
     uint32_t const prefix_value = storage.prefix_value;
     uint32_t const prefix_mask = storage.prefix_mask;
-    for (int region = chunk_begin + thread; region < chunk_end;
-         region += kThreads) {
+    for (int region = chunk_begin + thread; region < chunk_end; region += kThreads) {
       uint32_t const key = ordered_score(score_row[region], region);
       if ((key & prefix_mask) == prefix_value) {
         atomicAdd(&storage.histogram[int((key >> shift) & bin_mask)], 1);
@@ -720,19 +805,15 @@ __global__ void dsa_radix_chunk_kernel(
     if (thread == 0 && storage.remain > 0) {
       uint32_t const round_mask = bin_mask << shift;
       storage.prefix_mask |= round_mask;
-      storage.prefix_value =
-          (storage.prefix_value & ~round_mask) |
-          (uint32_t(storage.threshold) << shift);
+      storage.prefix_value = (storage.prefix_value & ~round_mask) | (uint32_t(storage.threshold) << shift);
       storage.selected_base += storage.count_greater;
       storage.remain -= storage.count_greater;
     }
     __syncthreads();
   }
 
-  int const begin =
-      chunk_begin + int((int64_t(valid_length) * thread) / kThreads);
-  int const end =
-      chunk_begin + int((int64_t(valid_length) * (thread + 1)) / kThreads);
+  int const begin = chunk_begin + int((int64_t(valid_length) * thread) / kThreads);
+  int const end = chunk_begin + int((int64_t(valid_length) * (thread + 1)) / kThreads);
   uint32_t const threshold_key = storage.prefix_value;
   int local_equal = 0;
   if (thread == 0) {
@@ -754,9 +835,7 @@ __global__ void dsa_radix_chunk_kernel(
     // convergent even when only a subset of lanes found a greater region.
     if (__any_sync(0xFFFFFFFF, staged_count == kThreadStaging)) {
       int warp_exclusive = 0;
-      int const base_slot =
-          claim_warp_output_slots(staged_count, thread, storage,
-                                  warp_exclusive);
+      int const base_slot = claim_warp_output_slots(staged_count, thread, storage, warp_exclusive);
 #pragma unroll
       for (int i = 0; i < kThreadStaging; ++i) {
         if (i < staged_count) {
@@ -771,8 +850,7 @@ __global__ void dsa_radix_chunk_kernel(
   }
   {
     int warp_exclusive = 0;
-    int const base_slot =
-        claim_warp_output_slots(staged_count, thread, storage, warp_exclusive);
+    int const base_slot = claim_warp_output_slots(staged_count, thread, storage, warp_exclusive);
 #pragma unroll
     for (int i = 0; i < kThreadStaging; ++i) {
       if (i < staged_count) {
@@ -783,13 +861,10 @@ __global__ void dsa_radix_chunk_kernel(
       }
     }
   }
-  int const higher_equal =
-      equal_count_higher_equal(local_equal, thread, storage);
-  int const local_take =
-      min(local_equal, max(storage.remain - higher_equal, 0));
+  int const higher_equal = equal_count_higher_equal(local_equal, thread, storage);
+  int const local_take = min(local_equal, max(storage.remain - higher_equal, 0));
   int emitted = 0;
-  for (int region = end - 1; region >= begin && emitted < local_take;
-       --region) {
+  for (int region = end - 1; region >= begin && emitted < local_take; --region) {
     if (ordered_score(score_row[region], region) == threshold_key) {
       int const slot = storage.selected_base + higher_equal + emitted;
       if (slot < topk) {
@@ -802,11 +877,21 @@ __global__ void dsa_radix_chunk_kernel(
 
 // Merge kernel: 4 rounds [11 score, 11 score, 10 score, 10 region].
 __global__ void dsa_radix_merge_kernel(
-    float const* scores, int64_t const* query_positions,
-    int const* candidate_input, int candidate_stride,
-    int const* block_table, int* region_output, int* start_output, int heads,
-    int regions, int topk, int region_block, int page_size,
-    int block_table_stride, int block_table_length, int num_chunks,
+    float const* scores,
+    int64_t const* query_positions,
+    int const* candidate_input,
+    int candidate_stride,
+    int const* block_table,
+    int* region_output,
+    int* start_output,
+    int heads,
+    int regions,
+    int topk,
+    int region_block,
+    int page_size,
+    int block_table_stride,
+    int block_table_length,
+    int num_chunks,
     bool packed) {
   extern __shared__ char raw_shared[];
   auto& storage = *reinterpret_cast<DsaMergeRadixShared*>(raw_shared);
@@ -815,8 +900,7 @@ __global__ void dsa_radix_merge_kernel(
   int const head = work - request * heads;
   int const thread = threadIdx.x;
   int const output_width = topk + 1;
-  int const current = min(
-      max(int(query_positions[request]), 0) / region_block, regions - 1);
+  int const current = min(max(int(query_positions[request]), 0) / region_block, regions - 1);
   int const target = min(topk, current);
   int const candidate_count = num_chunks * topk;
   float const* score_row = scores + work * regions;
@@ -840,16 +924,38 @@ __global__ void dsa_radix_merge_kernel(
   // A capacity above 16384 can still hold short history. Do not read uncomputed scores or candidates.
   if (current <= topk) {
     for (int region = thread; region < current; region += kThreads) {
-      store_region(region, region, request, head, heads, output_width,
-                   block_table, block_table_stride, block_table_length,
-                   page_size / region_block, region_block, packed,
-                   region_output, start_output);
+      store_region(
+          region,
+          region,
+          request,
+          head,
+          heads,
+          output_width,
+          block_table,
+          block_table_stride,
+          block_table_length,
+          page_size / region_block,
+          region_block,
+          packed,
+          region_output,
+          start_output);
     }
     if (thread == 0) {
-      store_region(current, topk, request, head, heads, output_width,
-                   block_table, block_table_stride, block_table_length,
-                   page_size / region_block, region_block, packed,
-                   region_output, start_output);
+      store_region(
+          current,
+          topk,
+          request,
+          head,
+          heads,
+          output_width,
+          block_table,
+          block_table_stride,
+          block_table_length,
+          page_size / region_block,
+          region_block,
+          packed,
+          region_output,
+          start_output);
     }
     return;
   }
@@ -861,13 +967,21 @@ __global__ void dsa_radix_merge_kernel(
     bool const score_round = round < 3;
     int n_bins, bits, shift;
     if (round == 0) {
-      n_bins = kCoarseRadix; bits = 11; shift = 21;  // score [31:21]
+      n_bins = kCoarseRadix;
+      bits = 11;
+      shift = 21;  // score [31:21]
     } else if (round == 1) {
-      n_bins = kCoarseRadix; bits = 11; shift = 10;  // score [20:10]
+      n_bins = kCoarseRadix;
+      bits = 11;
+      shift = 10;  // score [20:10]
     } else if (round == 2) {
-      n_bins = kRadix; bits = 10; shift = 0;         // score [9:0]
+      n_bins = kRadix;
+      bits = 10;
+      shift = 0;  // score [9:0]
     } else {
-      n_bins = kRadix; bits = 10; shift = 22;        // region [31:22]
+      n_bins = kRadix;
+      bits = 10;
+      shift = 22;  // region [31:22]
     }
     uint32_t const bin_mask = (1u << bits) - 1u;
 
@@ -904,13 +1018,11 @@ __global__ void dsa_radix_merge_kernel(
       if (score_round) {
         storage.score_prefix_mask |= round_mask;
         storage.score_prefix_value =
-            (storage.score_prefix_value & ~round_mask) |
-            (uint32_t(storage.threshold) << shift);
+            (storage.score_prefix_value & ~round_mask) | (uint32_t(storage.threshold) << shift);
       } else {
         storage.region_prefix_mask |= round_mask;
         storage.region_prefix_value =
-            (storage.region_prefix_value & ~round_mask) |
-            (uint32_t(storage.threshold) << shift);
+            (storage.region_prefix_value & ~round_mask) | (uint32_t(storage.threshold) << shift);
       }
       storage.selected_base += storage.count_greater;
       storage.remain -= storage.count_greater;
@@ -928,26 +1040,46 @@ __global__ void dsa_radix_merge_kernel(
     int const region = candidate_row[index];
     if (region < 0 || region >= current) continue;
     uint32_t const score_key = ordered_score(score_row[region], region);
-    bool const selected =
-        score_key > threshold_score ||
-        (score_key == threshold_score &&
-         static_cast<uint32_t>(region) >= threshold_region);
+    bool const selected = score_key > threshold_score ||
+                          (score_key == threshold_score && static_cast<uint32_t>(region) >= threshold_region);
     if (selected) {
       int const slot = atomicAdd(&storage.output_counter, 1);
       if (slot < target) {
-        store_region(region, slot, request, head, heads, output_width,
-                     block_table, block_table_stride, block_table_length,
-                     page_size / region_block, region_block, packed,
-                     region_output, start_output);
+        store_region(
+            region,
+            slot,
+            request,
+            head,
+            heads,
+            output_width,
+            block_table,
+            block_table_stride,
+            block_table_length,
+            page_size / region_block,
+            region_block,
+            packed,
+            region_output,
+            start_output);
       }
     }
   }
 
   if (thread == 0) {
-    store_region(current, topk, request, head, heads, output_width,
-                 block_table, block_table_stride, block_table_length,
-                 page_size / region_block, region_block, packed,
-                 region_output, start_output);
+    store_region(
+        current,
+        topk,
+        request,
+        head,
+        heads,
+        output_width,
+        block_table,
+        block_table_stride,
+        block_table_length,
+        page_size / region_block,
+        region_block,
+        packed,
+        region_output,
+        start_output);
   }
 }
 
@@ -960,8 +1092,11 @@ void dsa_radix_select(
     const tvm::ffi::TensorView block_table,
     const tvm::ffi::TensorView candidate_workspace,
     const tvm::ffi::TensorView region_output,
-    const tvm::ffi::TensorView start_output, int64_t region_block,
-    int64_t page_size, int64_t topk, bool packed) {
+    const tvm::ffi::TensorView start_output,
+    int64_t region_block,
+    int64_t page_size,
+    int64_t topk,
+    bool packed) {
   using namespace host;
 
   auto S_query = SymbolicSize{"query"};
@@ -972,39 +1107,23 @@ void dsa_radix_select(
   auto S_capacity = SymbolicSize{"capacity"};
   auto device = SymbolicDevice{};
   device.set_options<kDLCUDA>();
-  TensorMatcher({S_query, S_heads, S_regions})
-      .with_dtype<float>()
-      .with_device(device)
-      .verify(scores);
-  TensorMatcher({S_query})
-      .with_dtype<int64_t>()
-      .with_device(device)
-      .verify(query_positions);
+  TensorMatcher({S_query, S_heads, S_regions}).with_dtype<float>().with_device(device).verify(scores);
+  TensorMatcher({S_query}).with_dtype<int64_t>().with_device(device).verify(query_positions);
   if (block_table.dim() == 1) {
-    TensorMatcher({S_pages})
-        .with_dtype<int32_t>()
-        .with_device(device)
-        .verify(block_table);
+    TensorMatcher({S_pages}).with_dtype<int32_t>().with_device(device).verify(block_table);
   } else {
-    TensorMatcher({S_query, S_pages})
-        .with_dtype<int32_t>()
-        .with_device(device)
-        .verify(block_table);
+    TensorMatcher({S_query, S_pages}).with_dtype<int32_t>().with_device(device).verify(block_table);
   }
-  TensorMatcher({S_query, S_heads, S_capacity})
-      .with_dtype<int32_t>()
-      .with_device(device)
-      .verify(candidate_workspace);
+  TensorMatcher({S_query, S_heads, S_capacity}).with_dtype<int32_t>().with_device(device).verify(candidate_workspace);
   TensorMatcher({S_query, S_heads, topk + 1})
       .with_dtype<int32_t>()
       .with_device(device)
       .verify(region_output)
       .verify(start_output);
-  CHECK_HOST(region_block > 0 && page_size >= region_block &&
-             page_size % region_block == 0)
+  CHECK_HOST(region_block > 0 && page_size >= region_block && page_size % region_block == 0)
       << "invalid Step5 DSA region/page geometry";
-  CHECK_HOST(topk > 0 && topk <= 1024 && S_regions.unwrap() > 0 &&
-             S_regions.unwrap() <= std::numeric_limits<int>::max())
+  CHECK_HOST(
+      topk > 0 && topk <= 1024 && S_regions.unwrap() > 0 && S_regions.unwrap() <= std::numeric_limits<int>::max())
       << "invalid Step5 DSA radix top-k geometry";
 
   int const query_rows = static_cast<int>(S_query.unwrap());
@@ -1013,58 +1132,65 @@ void dsa_radix_select(
   int const candidate_stride = static_cast<int>(candidate_workspace.size(2));
   // A rank-2 block table holds one row of pages per query token (MTP draft
   // batching); rank-1 shares a single row across the batch, hence stride 0.
-  int const block_table_stride =
-      block_table.dim() == 2 ? static_cast<int>(block_table.stride(0)) : 0;
-  int const block_table_length =
-      static_cast<int>(block_table.size(block_table.dim() - 1));
+  int const block_table_stride = block_table.dim() == 2 ? static_cast<int>(block_table.stride(0)) : 0;
+  int const block_table_length = static_cast<int>(block_table.size(block_table.dim() - 1));
   hggcStream_t stream = LaunchKernel::resolve_device(scores.device());
 
   // Request extra shared memory for the 4096-bin histogram.
   constexpr size_t kSelectorSmem = sizeof(DsaRadixShared);
   constexpr size_t kMergeSmem = sizeof(DsaMergeRadixShared);
-  static_assert(kSelectorSmem <= 48 * 1024,
-                "selector shared memory exceeds default 48KB limit");
-  static_assert(kMergeSmem <= 48 * 1024,
-                "merge shared memory exceeds default 48KB limit");
+  static_assert(kSelectorSmem <= 48 * 1024, "selector shared memory exceeds default 48KB limit");
+  static_assert(kMergeSmem <= 48 * 1024, "merge shared memory exceeds default 48KB limit");
   // Both structs fit within the default 48KB dynamic shared memory limit,
   // so no a dynamic shared-memory attribute is needed.
 
   if (regions <= kStreamingChunkRegions) {
-    dsa_radix_selector_kernel<<<query_rows * heads, kThreads, kSelectorSmem,
-                                stream>>>(
+    dsa_radix_selector_kernel<<<query_rows * heads, kThreads, kSelectorSmem, stream>>>(
         static_cast<const float*>(scores.data_ptr()),
         static_cast<const int64_t*>(query_positions.data_ptr()),
         static_cast<const int*>(block_table.data_ptr()),
         static_cast<int*>(region_output.data_ptr()),
-        static_cast<int*>(start_output.data_ptr()), heads, regions,
-        static_cast<int>(topk), static_cast<int>(region_block),
-        static_cast<int>(page_size), block_table_stride, block_table_length,
+        static_cast<int*>(start_output.data_ptr()),
+        heads,
+        regions,
+        static_cast<int>(topk),
+        static_cast<int>(region_block),
+        static_cast<int>(page_size),
+        block_table_stride,
+        block_table_length,
         packed);
   } else {
-    int const num_chunks =
-        (regions + kStreamingChunkRegions - 1) / kStreamingChunkRegions;
+    int const num_chunks = (regions + kStreamingChunkRegions - 1) / kStreamingChunkRegions;
     CHECK_HOST(int64_t(num_chunks) * topk <= candidate_stride)
         << "candidate workspace is too small for Step5 DSA multi-CTA radix: "
-        << "need " << int64_t(num_chunks) * topk << ", got "
-        << candidate_stride;
-    dsa_radix_chunk_kernel<<<query_rows * heads * num_chunks, kThreads,
-                             kSelectorSmem, stream>>>(
+        << "need " << int64_t(num_chunks) * topk << ", got " << candidate_stride;
+    dsa_radix_chunk_kernel<<<query_rows * heads * num_chunks, kThreads, kSelectorSmem, stream>>>(
         static_cast<const float*>(scores.data_ptr()),
         static_cast<const int64_t*>(query_positions.data_ptr()),
-        static_cast<int*>(candidate_workspace.data_ptr()), heads, regions,
-        static_cast<int>(topk), static_cast<int>(region_block), num_chunks,
+        static_cast<int*>(candidate_workspace.data_ptr()),
+        heads,
+        regions,
+        static_cast<int>(topk),
+        static_cast<int>(region_block),
+        num_chunks,
         candidate_stride);
-    dsa_radix_merge_kernel<<<query_rows * heads, kThreads, kMergeSmem,
-                             stream>>>(
+    dsa_radix_merge_kernel<<<query_rows * heads, kThreads, kMergeSmem, stream>>>(
         static_cast<const float*>(scores.data_ptr()),
         static_cast<const int64_t*>(query_positions.data_ptr()),
-        static_cast<int*>(candidate_workspace.data_ptr()), candidate_stride,
+        static_cast<int*>(candidate_workspace.data_ptr()),
+        candidate_stride,
         static_cast<const int*>(block_table.data_ptr()),
         static_cast<int*>(region_output.data_ptr()),
-        static_cast<int*>(start_output.data_ptr()), heads, regions,
-        static_cast<int>(topk), static_cast<int>(region_block),
-        static_cast<int>(page_size), block_table_stride, block_table_length,
-        num_chunks, packed);
+        static_cast<int*>(start_output.data_ptr()),
+        heads,
+        regions,
+        static_cast<int>(topk),
+        static_cast<int>(region_block),
+        static_cast<int>(page_size),
+        block_table_stride,
+        block_table_length,
+        num_chunks,
+        packed);
   }
   CHECK_CUDA(hggcGetLastError()) << "Step5 DSA radix launch failed";
 }

@@ -1396,9 +1396,7 @@ class Step5DecoderLayer(nn.Module):
                 # the attention-TP sum: with attention CP the full-TP group
                 # replicates each partial across the CP pair and would double
                 # the summed output.
-                dense_tp_size=None
-                if is_moe
-                else get_parallel().attn_tp_size,
+                dense_tp_size=None if is_moe else get_parallel().attn_tp_size,
             ),
         )
 
@@ -1598,10 +1596,14 @@ class Step5Model(nn.Module):
             residual_batch.start(forward_batch)
         else:
             if pp_proxy_tensors is None:
-                raise ValueError("Step5 non-first pipeline stage requires proxy tensors")
-            hidden_states = self.layers[
-                self.start_layer
-            ].attn_boundary.from_pp(pp_proxy_tensors, forward_batch).bfloat16()
+                raise ValueError(
+                    "Step5 non-first pipeline stage requires proxy tensors"
+                )
+            hidden_states = (
+                self.layers[self.start_layer]
+                .attn_boundary.from_pp(pp_proxy_tensors, forward_batch)
+                .bfloat16()
+            )
         for layer_id in range(self.start_layer, self.end_layer):
             hidden_states = self.layers[layer_id](
                 positions=positions,
