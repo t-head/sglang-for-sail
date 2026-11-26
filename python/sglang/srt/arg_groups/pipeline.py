@@ -300,6 +300,15 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(handle_moe_kernel_config, server_args)
     run_hook(handle_a2a_moe, server_args)
+
+    # The A2A pass above may expand ep_size to tp_size (DeepEP and the other
+    # EP-spanning backends); re-check the CP-TP group-sharing EP admission
+    # against that resolved topology so auto-expansion cannot bypass it.
+    from sglang.srt.arg_groups.cp_tp_group_sharing_hook import (
+        validate_cp_tp_group_sharing_final_ep,
+    )
+
+    run_hook(validate_cp_tp_group_sharing_final_ep, server_args)
     run_hook(handle_shared_experts_tp, server_args)
     run_hook(handle_eplb_and_dispatch, server_args)
     run_hook(handle_expert_distribution_metrics, server_args)

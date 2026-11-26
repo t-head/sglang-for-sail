@@ -163,13 +163,81 @@ def get_qsa_pending_state_indices(req: Req) -> np.ndarray:
     return np.array([int(req_pool_idx)], dtype=np.int32)
 
 
+def dsa_cp_prefix_cache_enabled() -> bool:
+    """Experimental switch: keep the radix cache on under PD DSA prefill CP."""
+    return envs.SGLANG_DSA_CP_PREFIX_CACHE.get()
+
+
+def supports_dsa_cp_prefix_cache() -> bool:
+    """Whether the deployment is the supported DSA prefill-CP scenario.
+
+    Prefill workers only: the geometry this feature un-bypasses is validated
+    by the prefill builder, and decode-side radix reuse is owned by
+    --disaggregation-decode-enable-radix-cache, so the opt-in must not remove
+    a decode worker's existing bypass.
+    Only interleave CP is supported: the CP KV/indexer pools then hold a full
+    logical-order copy on every rank, so prefix pages are readable by the
+    existing DSA indexer/attention paths and no CP-aware resharding is needed.
+    """
+    parallel = get_parallel()
+    return (
+        get_disagg().disaggregation_mode == "prefill"
+        and parallel.enable_prefill_cp
+        # A CP width of one computes no CP shards at all, and the runtime
+        # alignment guard keys off that same width (dsa/utils.py:
+        # is_dsa_enable_prefill_cp returns False for attn_cp_size <= 1).
+        # Un-bypassing without it would keep the radix cache on while the
+        # alignment guard is inert, so the feature marker would not imply
+        # the protection it documents.
+        and parallel.attn_cp_size > 1
+        and parallel.cp_strategy == "interleave"
+    )
+
+
+def require_dsa_cp_hicache_layout(
+    *,
+    cache_layer_split: bool,
+    hicache_layout: Optional[str],
+    hicache_io_backend: Optional[str],
+) -> None:
+    """Reject a DSA prefill-CP prefix-cache deployment whose HiCache layout the
+    layer-split pools cannot serve.
+
+    With ``--enable-dsa-cache-layer-split`` a layer's KV lives on one owner rank
+    and is read by the others through the broadcast scratch buffer. The host
+    (L2/L3) side must therefore index rows per layer: a page-oriented layout or
+    the direct I/O backend would address host rows by page, which does not line
+    up with per-layer ownership. This mirrors the constraint established on the
+    0.5.21 line (GLM-5.3 checkpoint under test) instead of failing later inside
+    the indexer.
+
+    Only checked when the experimental opt-in is active, so a deployment that
+    keeps bypassing the radix cache is unaffected.
+    """
+    if not cache_layer_split or hicache_layout is None:
+        return
+    if hicache_layout != "layer_first" or hicache_io_backend != "kernel":
+        raise ValueError(
+            "SGLANG_DSA_CP_PREFIX_CACHE=1 with --enable-dsa-cache-layer-split "
+            "requires HiCache layer_first layout and kernel I/O; got "
+            f"hicache_mem_layout={hicache_layout!r}, "
+            f"hicache_io_backend={hicache_io_backend!r}."
+        )
+
+
 def should_bypass_dsa_cp_prefix_cache(*, is_dsa: bool = True) -> bool:
     """Whether PD DSA prefill CP must bypass the legacy radix cache."""
-    return (
-        is_dsa
-        and get_disagg().disaggregation_mode != "null"
-        and get_parallel().enable_prefill_cp
-    )
+    if not is_dsa:
+        return False
+    parallel = get_parallel()
+    if get_disagg().disaggregation_mode == "null" or not parallel.enable_prefill_cp:
+        # Not the PD prefill-CP scenario at all: today's behavior (no bypass).
+        return False
+    if dsa_cp_prefix_cache_enabled() and supports_dsa_cp_prefix_cache():
+        # Experimental un-bypass. Everything else (e.g. a non-interleave
+        # strategy) keeps bypassing the radix cache.
+        return False
+    return True
 
 
 class DisaggregationMode(Enum):

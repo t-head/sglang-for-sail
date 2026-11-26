@@ -58,6 +58,7 @@ from sglang.kernels.ops.quantization.dsa_quant_k_cache import quantize_k_cache
 from sglang.srt.configs.model_config import (
     get_dsa_index_kpool,
 )
+from sglang.srt.disaggregation.utils import supports_dsa_cp_prefix_cache
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dsa_backend_kpool import (
@@ -1365,6 +1366,11 @@ class DeepseekSparseAttnBackend(
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
+        reset_page_broadcast = getattr(
+            self.token_to_kv_pool, "reset_batch_page_broadcast", None
+        )
+        if reset_page_broadcast is not None:
+            reset_page_broadcast()
         batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
 
@@ -1393,6 +1399,20 @@ class DeepseekSparseAttnBackend(
             self._kv_shard_pool, self.req_to_token, forward_batch
         )
         indexer_logical_page_table = None
+        # Build the union before InterleaveCPStrategy discards requests with
+        # no local query rows. Draft/verify, pooled-indexer and graph paths
+        # retain the original full transport until separately validated.
+        begin_page_broadcast = getattr(
+            self.token_to_kv_pool, "begin_batch_page_broadcast", None
+        )
+        if (
+            begin_page_broadcast is not None
+            and forward_batch.forward_mode.is_extend()
+            and can_dsa_prefill_cp_interleave(forward_batch)
+            and self.real_page_size == 64
+            and self.dsa_index_kpool == 1
+        ):
+            begin_page_broadcast(page_table, cache_seqlens_int32)
 
         page_table_1_flattened = None
         topk_indices_offset = None
@@ -1545,6 +1565,39 @@ class DeepseekSparseAttnBackend(
                 else None
             )
             if strategy is not None:
+                if use_kpool and supports_dsa_cp_prefix_cache():
+                    # A reused prefix must end on a kpool boundary. The compress
+                    # tail buffer is per-request, so a partial pool belonging to
+                    # the shared prefix is invisible to this request's pooled
+                    # top-k read: the indexer would silently drop candidates.
+                    # The admission gate enforces this; this is the last line of
+                    # defence before the reads below.
+                    kpool = max(1, int(self.dsa_index_kpool))
+                    for seq_len_i, ext_i in zip(
+                        indexer_seq_lens_cpu, extend_seq_lens_cpu, strict=True
+                    ):
+                        prefix_len = int(seq_len_i) - int(ext_i)
+                        assert prefix_len >= 0 and prefix_len % kpool == 0, (
+                            "DSA prefill CP prefix reuse is not kpool-aligned: "
+                            f"indexer_seq_len={int(seq_len_i)} "
+                            f"extend_len={int(ext_i)} prefix_len={prefix_len} "
+                            f"index_kpool={kpool}"
+                        )
+                    # Writes must cover only the new tokens: shared prefix
+                    # pages are read-only for this request (no cross-request
+                    # corruption through the CP full-copy pools). TBO pads
+                    # out_cache_loc up to the attn-tp multiple, so compare
+                    # against the unpadded token count and allow the pad slack.
+                    out_cache_loc = forward_batch.out_cache_loc
+                    if out_cache_loc is not None:
+                        # Host-side token count only: num_token_non_padded is a
+                        # GPU scalar and reading it would sync every layer. The
+                        # >= check tolerates the TBO pad-up to attn-tp multiple.
+                        expected = sum(int(x) for x in extend_seq_lens_cpu)
+                        assert out_cache_loc.shape[0] >= expected, (
+                            "out_cache_loc shorter than the new tokens "
+                            f"({out_cache_loc.shape[0]} < {expected})"
+                        )
                 seqlens_expanded = strategy.shard_local_tokens(seqlens_expanded)
                 extend_seq_lens_cpu, extend_seq_lens, bs_idx_cpu, bs_idx = (
                     strategy.shard_per_request(extend_seq_lens_cpu, extend_seq_lens)
@@ -1552,6 +1605,21 @@ class DeepseekSparseAttnBackend(
                 indexer_seq_lens_cpu = indexer_seq_lens_cpu[bs_idx_cpu]
                 indexer_seq_lens = indexer_seq_lens[bs_idx]
                 cache_seqlens_int32 = cache_seqlens_int32[bs_idx]
+                # Prefix accounting under CP: the indexer reads the full
+                # sequence (prefix + this rank's extend rows) from the pool, so
+                # the per-request sequence length must never be shorter than
+                # the rank-local extend length it has to cover.
+                if len(indexer_seq_lens_cpu) != 0:
+                    _seq_lens_per_req = indexer_seq_lens_cpu.tolist()
+                    assert all(
+                        int(total) >= int(local_extend)
+                        for total, local_extend in zip(
+                            _seq_lens_per_req, extend_seq_lens_cpu
+                        )
+                    ), (
+                        "DSA prefill CP: seq_lens must be >= local extend lens "
+                        f"({_seq_lens_per_req} vs {list(extend_seq_lens_cpu)})"
+                    )
                 cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
                 max_seqlen_k = (
                     int(indexer_seq_lens_cpu.max().item() + draft_token_num)
@@ -2128,6 +2196,11 @@ class DeepseekSparseAttnBackend(
         also call this directly via _apply_cuda_graph_metadata when they
         need to pass out_cache_loc / actual_forward_mode explicitly.
         """
+        reset_page_broadcast = getattr(
+            self.token_to_kv_pool, "reset_batch_page_broadcast", None
+        )
+        if reset_page_broadcast is not None:
+            reset_page_broadcast()
         if bs not in self.decode_cuda_graph_metadata:
             self._build_forward_metadata_cuda_graph(
                 bs,
@@ -2449,6 +2522,11 @@ class DeepseekSparseAttnBackend(
             precomputed: Precomputed metadata to copy from
             forward_mode: Forward mode
         """
+        reset_page_broadcast = getattr(
+            self.token_to_kv_pool, "reset_batch_page_broadcast", None
+        )
+        if reset_page_broadcast is not None:
+            reset_page_broadcast()
         self.set_dsa_prefill_impl(forward_batch=None)
 
         metadata = self.decode_cuda_graph_metadata[bs]
@@ -2622,10 +2700,12 @@ class DeepseekSparseAttnBackend(
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         else:
             if topk_transform_method == TopkTransformMethod.RAGGED:
-                if topk_indices is not None:
-                    topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
                 topk_indices_offset = metadata.topk_indices_offset
                 assert topk_indices_offset is not None
+                # Offsets describe real queries; CP padding has no KV offsets.
+                real_topk_rows = topk_indices_offset.shape[0]
+                assert real_topk_rows <= topk_indices.shape[0] <= q_nope.shape[0]
+                topk_indices = topk_indices[:real_topk_rows]
                 mask = topk_indices != -1
                 topk_indices_offset = (
                     topk_indices_offset.unsqueeze(1)
@@ -2635,6 +2715,7 @@ class DeepseekSparseAttnBackend(
                 topk_indices = torch.where(
                     mask, topk_indices + topk_indices_offset, topk_indices
                 )
+                topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
             elif topk_transform_method == TopkTransformMethod.PAGED:
                 assert metadata.dsa_extend_seq_lens_list is not None
                 page_table_1 = transform_index_page_table_prefill(

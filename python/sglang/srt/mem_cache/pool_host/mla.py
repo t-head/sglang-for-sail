@@ -704,6 +704,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         is_draft: bool = False,
     ):
         assert not self._is_dummy, "load on a dummy (non-src MLA) host pool"
+        # Every CP rank may have a scratch copy of this layer, even when
+        # only the owner will actually submit an H2D transfer.
+        if not is_draft and self._is_device_layer_sharded(device_pool):
+            device_pool.invalidate_kv_buffer_for_layer(
+                device_pool.start_layer + layer_id
+            )
         if not is_draft and layer_id not in self._target_layer_indices:
             return
         host_indices = maybe_dcp_kernel_indices(

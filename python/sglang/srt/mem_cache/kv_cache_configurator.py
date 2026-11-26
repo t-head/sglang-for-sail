@@ -2432,6 +2432,15 @@ class KVCacheConfigurator:
             PoolCls = LayerSplitDSATokenToKVPool
             pool_kwargs["layer_shard_rank"] = dsa_cp_layer_shard_rank
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
+            from sglang.kernels.ops.attention.dsa.triton_kernel import (
+                is_fp4_indexer_cache_enabled,
+            )
+
+            pool_kwargs["use_fp4_indexer"] = (
+                current_platform.is_sail()
+                and get_dsa_index_kpool(self.model_config.hf_config) == 1
+                and is_fp4_indexer_cache_enabled()
+            )
         else:
             PoolCls = dsa_pool_class
             from sglang.kernels.ops.attention.dsa.triton_kernel import (
