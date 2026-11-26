@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Run the two registered single-device PPU smoke files."""
+"""Run the registered single-device PPU model, numerical and benchmark files."""
 
 from pathlib import Path
 
@@ -8,6 +8,8 @@ from sglang.test.ci.ci_register import HWBackend, collect_tests
 FILES = (
     "test/registered/core/test_basic_sanity_eagle3.py",
     "test/registered/core/test_basic_sanity_dflash.py",
+    "test/registered/kernels/ops/attention/test_flashkda_replayssm_ppu.py",
+    "test/registered/kernels/benchmark/attention/bench_flashkda_replayssm_ppu.py",
 )
 SUITE = "stage-a-test-1-gpu-ppu"
 
@@ -24,7 +26,8 @@ def select_tests(repo):
     ]
     if len(tests) != len(paths) or {test.filename for test in tests} != paths:
         raise ValueError(
-            "both speculative smoke files must be registered for the PPU lane"
+            "all selected model, numerical and benchmark files must be registered "
+            "for the PPU lane"
         )
     return tests
 

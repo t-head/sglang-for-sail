@@ -342,6 +342,7 @@ POSITIONAL_FIELD_ORDER = (
     "enforce_shared_experts_fusion",
     "max_mamba_cache_size",
     "mamba_ssm_dtype",
+    "mamba_ssm_accum_dtype",
     "mamba_max_states_per_path",
     "enable_mamba_cache_stochastic_rounding",
     "mamba_cache_philox_rounds",

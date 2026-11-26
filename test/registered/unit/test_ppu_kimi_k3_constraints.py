@@ -1,5 +1,6 @@
 """CPU checks for PPU-only Kimi-K3 backend restrictions."""
 
+import argparse
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch, sentinel
@@ -9,6 +10,7 @@ import torch
 
 from sglang.kernels.jit.utils import arch as jit_arch
 from sglang.kernels.ops.attention import kda_fused_decode
+from sglang.srt.arg_groups import attention_hook
 from sglang.srt.arg_groups import overrides as overrides_module
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear import kda_backend
@@ -18,7 +20,8 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16_moe import (
     CompressedTensorsWNA16DeepGemmMoE,
 )
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, override_platform
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -48,6 +51,119 @@ class TestPpuKimiK3Constraints(CustomTestCase):
         self.assertIs(dispatcher.decode_kernel, triton_kernel)
         self.assertIs(dispatcher.extend_kernel, triton_kernel)
         self.assertIs(dispatcher.verify_kernel, triton_kernel)
+
+    def test_kda_dispatcher_uses_one_external_flashkda_kernel(self):
+        triton_kernel = SimpleNamespace(supports_packed_decode=False)
+        external_kernel = object()
+        with (
+            patch.object(kda_backend, "is_sail", return_value=True),
+            patch.object(kda_backend, "is_ppu_flashkda_supported", return_value=True),
+            patch.object(kda_backend, "TritonKDAKernel", return_value=triton_kernel),
+            patch.object(
+                kda_flashkda, "PPUFlashKDAKernel", return_value=external_kernel
+            ) as kernel_class,
+            patch.object(kda_backend, "rank0_log"),
+        ):
+            dispatcher = kda_backend.KDAKernelDispatcher(
+                LinearAttnKernelBackend.FLASHKDA,
+                LinearAttnKernelBackend.FLASHKDA,
+                LinearAttnKernelBackend.FLASHKDA,
+                explicit_flashkda_prefill=True,
+            )
+
+        self.assertIs(dispatcher.decode_kernel, external_kernel)
+        self.assertIs(dispatcher.extend_kernel, external_kernel)
+        self.assertIs(dispatcher.verify_kernel, external_kernel)
+        kernel_class.assert_called_once_with()
+
+    def test_ppu_flashkda_arguments_parse_on_cpu(self):
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        args = parser.parse_args(
+            [
+                "--mamba-ssm-accum-dtype",
+                "float32",
+                "--linear-attn-decode-backend",
+                "flashkda",
+                "--linear-attn-prefill-backend",
+                "flashkda",
+                "--linear-attn-verify-backend",
+                "flashkda",
+            ]
+        )
+        self.assertEqual(args.mamba_ssm_accum_dtype, "float32")
+        self.assertEqual(args.linear_attn_decode_backend, "flashkda")
+        self.assertEqual(args.linear_attn_prefill_backend, "flashkda")
+        self.assertEqual(args.linear_attn_verify_backend, "flashkda")
+
+    def test_replayssm_mode_is_validated_at_startup(self):
+        with envs.SGLANG_USE_PPU_KDA_REPLAYSSM.override("invalid"):
+            with self.assertRaisesRegex(ValueError, "off, native, or flashkda"):
+                attention_hook.handle_linear_attn_backend(
+                    ServerArgs(model_path="dummy")
+                )
+        with envs.SGLANG_USE_PPU_KDA_REPLAYSSM.override("native"):
+            with self.assertRaisesRegex(ValueError, "enable-linear-replayssm-spec"):
+                attention_hook.handle_linear_attn_backend(
+                    ServerArgs(model_path="dummy")
+                )
+
+    def test_native_replayssm_rejects_long_windows_at_startup(self):
+        args = ServerArgs(
+            model_path="dummy",
+            speculative_algorithm="NEXTN",
+            enable_linear_replayssm_spec=True,
+            linear_replayssm_cache_len=17,
+            mamba_ssm_dtype="float32",
+        )
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["KimiK3LinearForCausalLM"],
+                linear_attn_config={"kda_layers": [0], "gate_lower_bound": -5.0},
+            )
+        )
+        with (
+            envs.SGLANG_USE_PPU_KDA_REPLAYSSM.override("native"),
+            override_platform(is_ppu=True, device_sm=89, is_sm100=False),
+            patch.object(attention_hook, "model_config_of", return_value=model_config),
+            patch(
+                "sglang.srt.configs.hybrid_arch.hybrid_kda_config",
+                return_value=SimpleNamespace(
+                    kda_lower_bound=-5.0, linear_attn_config={}
+                ),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "between 1 and 16"):
+                attention_hook.handle_linear_attn_backend(args)
+
+    def test_flashkda_abi_is_checked_at_startup_and_default_off_stays_lazy(self):
+        args = ServerArgs(
+            model_path="dummy",
+            linear_attn_decode_backend="flashkda",
+            enable_linear_replayssm_spec=True,
+            speculative_algorithm="NEXTN",
+        )
+        incomplete = SimpleNamespace(
+            DECODE_SUPPORTS_LOWER_BOUND=True,
+            SUPPORTS_BF16_STATE_ACCUMULATION=True,
+            verify_strided=lambda *args: None,
+            verify_replayssm=None,
+        )
+        with (
+            envs.SGLANG_USE_PPU_KDA_REPLAYSSM.override("flashkda"),
+            override_platform(is_ppu=True, device_sm=89, is_sm100=False),
+            patch.object(kda_flashkda, "_load_flash_kda", return_value=incomplete),
+        ):
+            with self.assertRaisesRegex(ValueError, "verify_replayssm ABI"):
+                attention_hook.handle_linear_attn_backend(args)
+
+        with (
+            envs.SGLANG_USE_PPU_KDA_REPLAYSSM.override("off"),
+            override_platform(is_ppu=True, device_sm=89, is_sm100=False),
+            patch.object(kda_flashkda, "_load_flash_kda") as load_flash_kda,
+        ):
+            attention_hook.handle_linear_attn_backend(ServerArgs(model_path="dummy"))
+            load_flash_kda.assert_not_called()
 
     def test_ppu_disables_pdl(self):
         with patch.object(jit_arch, "is_sail_runtime", return_value=True):

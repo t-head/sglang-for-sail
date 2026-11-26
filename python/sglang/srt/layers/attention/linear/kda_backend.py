@@ -23,6 +23,7 @@ from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKerne
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
+    is_ppu_flashkda_supported,
     select_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -149,22 +150,39 @@ class KDAKernelDispatcher:
         decode_backend: LinearAttnKernelBackend,
         prefill_backend: LinearAttnKernelBackend,
         verify_backend: LinearAttnKernelBackend,
+        *,
+        explicit_flashkda_prefill: bool = False,
     ):
+        flashkda_kernel = None
+        if (
+            explicit_flashkda_prefill
+            or decode_backend.is_flashkda()
+            or verify_backend.is_flashkda()
+        ) and is_ppu_flashkda_supported():
+            from sglang.srt.layers.attention.linear.kernels.kda_flashkda import (
+                PPUFlashKDAKernel,
+            )
+
+            flashkda_kernel = PPUFlashKDAKernel()
+
         if is_sail():
+            recurrent_backends = {LinearAttnKernelBackend.TRITON}
+            if flashkda_kernel is not None:
+                recurrent_backends.add(LinearAttnKernelBackend.FLASHKDA)
             if (
-                not decode_backend.is_triton()
+                decode_backend not in recurrent_backends
                 or not (prefill_backend.is_triton() or prefill_backend.is_flashkda())
-                or not verify_backend.is_triton()
+                or verify_backend not in recurrent_backends
             ):
-                rank0_log(
-                    "SAIL KDA only supports fused decode and FlashKDA prefill; "
-                    "using Triton for unsupported backends."
-                )
-            decode_backend = LinearAttnKernelBackend.TRITON
+                rank0_log("SAIL KDA is using Triton for unsupported backends.")
+            if decode_backend not in recurrent_backends:
+                decode_backend = LinearAttnKernelBackend.TRITON
             if not prefill_backend.is_flashkda():
                 prefill_backend = LinearAttnKernelBackend.TRITON
-            verify_backend = LinearAttnKernelBackend.TRITON
+            if verify_backend not in recurrent_backends:
+                verify_backend = LinearAttnKernelBackend.TRITON
 
+        self.decode_backend = decode_backend
         self.verify_backend = verify_backend
         self.prefill_backend = prefill_backend
         triton_kernel = TritonKDAKernel()
@@ -189,6 +207,8 @@ class KDAKernelDispatcher:
 
         if decode_backend.is_triton():
             self.decode_kernel = triton_kernel
+        elif decode_backend.is_flashkda() and flashkda_kernel is not None:
+            self.decode_kernel = flashkda_kernel
         elif decode_backend.is_helion():
             assert helion_kernel is not None
             self.decode_kernel = helion_kernel
@@ -212,19 +232,23 @@ class KDAKernelDispatcher:
         else:
             raise ValueError(
                 f"Unsupported KDA decode backend: {decode_backend}. "
-                "KDA supports 'triton', 'helion', 'cutedsl', or 'flashinfer'."
+                "KDA supports 'triton', 'helion', 'cutedsl', 'flashinfer', or "
+                "'flashkda'."
             )
 
         # target_verify kernel, selected via --linear-attn-verify-backend (defaults
-        # to follow decode: flashinfer -> recurrent_kda, else triton).
+        # to follow a supported recurrent decode backend, else triton).
         #   triton: fused chain + tree (retrieve_parent_token) verify; the reference
         #     the KDA correctness tests assert against.
         #   flashinfer: recurrent_kda (SM100, chain only); reuses the decode kernel
         #     when decode is also flashinfer.
+        #   flashkda: external PPU SM89 dense chain verify.
         #   helion: recurrent chain + tree verify with per-candidate snapshots.
         #   nv_cutedsl: fused Kimi-K3/DSpARK dense verify.
         if verify_backend.is_triton():
             self.verify_kernel = triton_kernel
+        elif verify_backend.is_flashkda() and flashkda_kernel is not None:
+            self.verify_kernel = flashkda_kernel
         elif verify_backend.is_helion():
             assert helion_kernel is not None
             self.verify_kernel = helion_kernel
@@ -250,7 +274,8 @@ class KDAKernelDispatcher:
         else:
             raise ValueError(
                 f"Unsupported KDA verify backend: {verify_backend}. "
-                "KDA verify supports 'triton', 'helion', 'nv_cutedsl', or 'flashinfer'."
+                "KDA verify supports 'triton', 'helion', 'nv_cutedsl', "
+                "'flashinfer', or 'flashkda'."
             )
 
         if prefill_backend.is_triton():
@@ -263,7 +288,11 @@ class KDAKernelDispatcher:
                 FlashKDAKernel,
             )
 
-            self.extend_kernel = FlashKDAKernel()
+            self.extend_kernel = (
+                flashkda_kernel
+                if explicit_flashkda_prefill and flashkda_kernel is not None
+                else FlashKDAKernel()
+            )
         elif prefill_backend.is_flashinfer():
             if not is_cuda():
                 raise ValueError("KDA FlashInfer prefill backend requires CUDA")
@@ -585,7 +614,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 "(EAGLE tree verify / retrieve_parent_token is unsupported)."
             )
         self.kernel_dispatcher = KDAKernelDispatcher(
-            decode_backend, prefill_backend, verify_backend
+            decode_backend,
+            prefill_backend,
+            verify_backend,
+            explicit_flashkda_prefill=(
+                get_exec().mamba.linear_attn_prefill_backend == "flashkda"
+            ),
         )
         if prefill_backend.is_flashinfer():
             _validate_flashinfer_kda_prefill(
@@ -831,9 +865,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     build_flashinfer_kda_checkpoint_plan,
                 )
 
-                assert self._has_cpu_prefill_track_metadata(forward_batch), (
-                    "FlashInfer KDA checkpoints require host prefill tracking metadata"
-                )
+                assert self._has_cpu_prefill_track_metadata(
+                    forward_batch
+                ), "FlashInfer KDA checkpoints require host prefill tracking metadata"
                 build_flashinfer_kda_checkpoint_plan(
                     forward_batch,
                     self.forward_metadata,
@@ -960,7 +994,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # the output-norm gate for this forward (attempt-and-verify stash,
         # see kimi_k3.py) and the shapes are covered; the model applies the
         # norm itself whenever the stash is left unconsumed.
-        if replayssm_d is None:
+        if (
+            replayssm_d is None
+            and not self.kernel_dispatcher.decode_backend.is_flashkda()
+        ):
             fused_static = getattr(layer, "_k3_fused_decode_args", None)
             onorm_gate = getattr(layer, "_k3_onorm_gate", None)
             if (
@@ -1266,6 +1303,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             ),
             track_state=h_track_buf,
             track_chunk_idx=(track_chunk_idx if h_track_buf is not None else None),
+            state_chunk_size=self.mamba_chunk_size,
             state_checkpoint_cu_starts=self.forward_metadata.state_checkpoint_cu_starts,
             num_state_checkpoints=self.forward_metadata.num_state_checkpoints,
             state_checkpoint_every_n_tokens=(
@@ -1342,8 +1380,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # fold replace the per-step snapshots). Pass None to the verify kernel so it
         # skips the write (CACHE_INTERMEDIATE_STATES=False); the output is unaffected.
         replayssm_rawv = getattr(mamba_cache_params, "replayssm_rawv", None)
-        replayssm_on = replayssm_rawv is not None
-        if intermediate_state_cache is None and not replayssm_on:
+        native_correction = mamba_cache_params.replayssm_correction
+        if (
+            intermediate_state_cache is None
+            and replayssm_rawv is None
+            and native_correction is None
+        ):
             raise RuntimeError(
                 "KDA target_verify requires a speculative mamba cache "
                 "(MambaPool.SpeculativeState); none found."
@@ -1358,7 +1400,18 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # commit_lens of them (absorb overflow is bounded in-kernel).
         replayssm_rawk = replayssm_g = replayssm_beta = None
         ring_kwargs = {}
-        if replayssm_on:
+        if native_correction is not None:
+            if envs.SGLANG_USE_PPU_KDA_REPLAYSSM.get() == "native":
+                ring_kwargs["native_replayssm"] = True
+            else:
+                ring_kwargs.update(
+                    native_correction=native_correction,
+                    native_key=mamba_cache_params.replayssm_normkey,
+                    native_decay=mamba_cache_params.replayssm_decay,
+                )
+            if not self.kernel_dispatcher.verify_backend.is_flashkda():
+                ring_kwargs["native_replayssm"] = True
+        elif replayssm_rawv is not None:
             replayssm_rawk = mamba_cache_params.replayssm_rawk
             replayssm_g = mamba_cache_params.replayssm_g
             replayssm_beta = mamba_cache_params.replayssm_beta
@@ -1535,40 +1588,70 @@ class KDAAttnBackend(MambaAttnBackendBase):
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
+        if a.ndim == 2:
+            a = a.unsqueeze(0)
+        if a.ndim == 3:
+            a = a.unflatten(-1, (-1, layer.head_k_dim))
 
-        core_attn_out = self.kernel_dispatcher.target_verify(
-            A_log=layer.A_log,
-            dt_bias=layer.dt_bias,
-            q=q,
-            k=k,
-            v=v,
-            a=a,
-            b=b,
-            ssm_states=ssm_states,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            intermediate_states_buffer=intermediate_state_cache,
-            intermediate_state_indices=intermediate_state_indices,
-            cache_steps=draft_token_num,
-            retrieve_parent_token=retrieve_parent_token,
-            lower_bound=layer.lower_bound,
-            **ring_kwargs,
-            **(
-                dict(
-                    zip(
-                        ("fused_accept_state_indices", "fused_accept_num_accepted"),
-                        self._fused_accept_indices(
-                            cache_indices=cache_indices,
-                            query_start_loc=query_start_loc,
-                            intermediate_state_cache=intermediate_state_cache,
-                            draft_token_num=draft_token_num,
-                        ),
+        if ring_kwargs.pop("native_replayssm", False):
+            if ragged_layout is not None:
+                raise ValueError("Native PPU ReplaySSM requires dense linear verify")
+            from sglang.kernels.ops.attention.linear.kda_replayssm_ppu import (
+                target_verify_kda_replayssm_ppu,
+            )
+
+            core_attn_out = target_verify_kda_replayssm_ppu(
+                q=q,
+                k=k,
+                v=v,
+                a=a,
+                b=b,
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                correction=native_correction,
+                key=mamba_cache_params.replayssm_normkey,
+                decay=mamba_cache_params.replayssm_decay,
+                lower_bound=layer.lower_bound,
+                retrieve_parent_token=retrieve_parent_token,
+            )
+        else:
+            if self.kernel_dispatcher.verify_backend.is_flashkda():
+                ring_kwargs["is_ragged_verify"] = ragged_layout is not None
+            core_attn_out = self.kernel_dispatcher.target_verify(
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                q=q,
+                k=k,
+                v=v,
+                a=a,
+                b=b,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                intermediate_states_buffer=intermediate_state_cache,
+                intermediate_state_indices=intermediate_state_indices,
+                cache_steps=draft_token_num,
+                retrieve_parent_token=retrieve_parent_token,
+                lower_bound=layer.lower_bound,
+                **ring_kwargs,
+                **(
+                    dict(
+                        zip(
+                            ("fused_accept_state_indices", "fused_accept_num_accepted"),
+                            self._fused_accept_indices(
+                                cache_indices=cache_indices,
+                                query_start_loc=query_start_loc,
+                                intermediate_state_cache=intermediate_state_cache,
+                                draft_token_num=draft_token_num,
+                            ),
+                        )
                     )
-                )
-                if self.accept_lens_pool is not None
-                else {}
-            ),
-        )
+                    if self.accept_lens_pool is not None
+                    else {}
+                ),
+            )
         if dense_token_indices is not None:
             # Kernel output is empty-allocated and the capped qsl skips the
             # uncovered tail rows; zero them so discarded pad hidden states
@@ -1847,6 +1930,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_rawv: Optional[torch.Tensor],
     ) -> bool:
         """Check the fused dense KDA verify contract for PLA or CuTe DSL."""
+        if self.kernel_dispatcher.verify_backend.is_flashkda():
+            return False
         use_pla = is_sail() and envs.SGLANG_SAIL_PLA_CUDA.get()
         if not use_pla:
             if (

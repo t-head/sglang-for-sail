@@ -83,6 +83,21 @@ register_kernel(
         ),
     )
 )
+for _fn in (
+    "target_verify_kda_replayssm_ppu",
+    "commit_kda_replayssm_ppu",
+):
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.attention.linear.kda_replayssm_ppu:{_fn}",
+            capabilities=frozenset(
+                {CapabilityRequirement.sail(min_sm=(8, 9), max_sm=(8, 9))}
+            ),
+        )
+    )
+del _fn
 register_kernel(
     KernelSpec(
         op="attention.indexer_q_quant_head_gate",

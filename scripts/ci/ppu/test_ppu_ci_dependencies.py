@@ -15,6 +15,7 @@ ADDITIONS = {
     "latex2sympy2-extended": "1.11.0",
     "antlr4-python3-runtime": "4.9.3",
     "editdistance": "0.8.1",
+    "flash-kda": "0.0.1+0dfef21",
 }
 WHEELS = {
     "sailify": "sailify-1.0.0-py3-none-any.whl",
@@ -23,6 +24,7 @@ WHEELS = {
     "latex2sympy2-extended": "latex2sympy2_extended-1.11.0-py3-none-any.whl",
     "antlr4-python3-runtime": "antlr4_python3_runtime-4.9.3-1-py3-none-any.whl",
     "editdistance": "editdistance-0.8.1-cp312-cp312-linux_x86_64.whl",
+    "flash-kda": "flash_kda-0.0.1+0dfef21-cp312-cp312-linux_x86_64.whl",
 }
 
 

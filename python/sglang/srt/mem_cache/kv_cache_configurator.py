@@ -3461,10 +3461,13 @@ class KVCacheConfigurator:
                 record_len = max_draft_tokens
             else:
                 record_len = get_exec().mamba.linear_replayssm_cache_len
-            replayssm_ring_per_req = (
-                config.mamba2_cache_params.replayssm_ring_bytes_per_req(
-                    record_len=record_len
-                )
+            from sglang.srt.configs.mamba_utils import ppu_flashkda_replayssm_layout
+
+            cache_params = config.mamba2_cache_params
+            flashkda_layout = ppu_flashkda_replayssm_layout(cache_params, record_len)
+            replayssm_ring_per_req = cache_params.replayssm_ring_bytes_per_req(
+                record_len=record_len,
+                flashkda_layout=flashkda_layout,
             )
         else:
             replayssm_ring_per_req = 0
