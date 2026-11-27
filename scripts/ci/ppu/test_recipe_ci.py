@@ -2796,6 +2796,7 @@ def _sample_sglang_parser() -> argparse.ArgumentParser:
         "--base-gpu-id",
         "--gpu-id-step",
         "--moe-dp-size",
+        "--moe-data-parallel-size",
         "--dcp-size",
         "--decode-context-parallel-size",
         "--shared-experts-tp-size",
@@ -2834,6 +2835,7 @@ def _sample_sglang_parser() -> argparse.ArgumentParser:
         "--enable-multi-layer-eagle",
         "--min-free-slots-delay",
         "--enable-pd-role-switch",
+        "--enable-pdmux",
         "--enable-hisparse",
         "--disaggregation-decode-enable-radix-cache",
         "--enable-hierarchical-cache",
@@ -4265,7 +4267,7 @@ class PresetCatalogContractTest(unittest.TestCase):
             ["--disaggregation-decode-allocation-policy", "prefill_complete"]
         )
         with self.assertRaisesRegex(
-            ValidationError, "requires --tp-size \\(8\\) == --attn-dp-size \\(1\\)"
+            ValidationError, "requires --tp-size \\(8\\) == effective attention DP"
         ):
             validate_serving_recipe_structure(
                 bad_prefill_complete, context="bad_prefill_complete"
@@ -4440,6 +4442,9 @@ class PresetCatalogContractTest(unittest.TestCase):
         for cred_flag in (
             ["--api-key", sentinel],
             [f"--api-key={sentinel}"],
+            ["--api-ke", sentinel],
+            [f"--api-ke={sentinel}"],
+            ["--router-token", sentinel],
             ["--admin-api-key", sentinel],
             ["--ssl-keyfile-password", sentinel],
         ):
@@ -4451,13 +4456,14 @@ class PresetCatalogContractTest(unittest.TestCase):
                 validate_serving_recipe_structure(bad_cred, context="bad_cred")
             self.assertNotIn(sentinel, str(ctx.exception))
 
-        bad_cred_env = copy.deepcopy(glm_doc)
-        bad_cred_env["variants"]["fp8"]["extra_env"]["SGLANG_ADMIN_API_KEY"] = sentinel
-        with self.assertRaisesRegex(
-            ValidationError, "credential/secret env .* is forbidden"
-        ) as env_ctx:
-            validate_serving_recipe_structure(bad_cred_env, context="bad_cred_env")
-        self.assertNotIn(sentinel, str(env_ctx.exception))
+        for env_key in ("SGLANG_ADMIN_API_KEY", "MC_TOKEN", "SGLANG_TOKEN"):
+            bad_cred_env = copy.deepcopy(glm_doc)
+            bad_cred_env["variants"]["fp8"]["extra_env"][env_key] = sentinel
+            with self.assertRaisesRegex(
+                ValidationError, "credential/secret env .* is forbidden"
+            ) as env_ctx:
+                validate_serving_recipe_structure(bad_cred_env, context="bad_cred_env")
+            self.assertNotIn(sentinel, str(env_ctx.exception))
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -4478,6 +4484,176 @@ class PresetCatalogContractTest(unittest.TestCase):
                     ValidationError, "credential/secret CLI flag .* is forbidden"
                 ):
                     render_ci_matrix_markdown()
+
+        # 6. Round-1 consumer-edge closures: MoE-DP long alias, EAGLE3/PP_SPEC=on, PD DCP, and direct worker gate.
+        bad_moe_dp_long = copy.deepcopy(bad_moe_dp)
+        long_args = bad_moe_dp_long["presets"]["decode_ep"]["args"]
+        long_args[long_args.index("--moe-dp-size")] = "--moe-data-parallel-size"
+        with self.assertRaisesRegex(
+            ValidationError,
+            "--ep-size \\* --moe-dp-size \\(32 \\* 2\\) must not exceed",
+        ):
+            validate_serving_recipe_structure(
+                bad_moe_dp_long, context="bad_moe_dp_long"
+            )
+        ok_moe_dp_long = copy.deepcopy(bad_moe_dp_long)
+        ok_long_args = ok_moe_dp_long["presets"]["decode_ep"]["args"]
+        ok_long_args[ok_long_args.index("--ep-size") + 1] = "16"
+        validate_serving_recipe_structure(ok_moe_dp_long, context="ok_moe_dp_long")
+
+        bad_eagle3_pp = copy.deepcopy(ok_pp_nospec)
+        bad_eagle3_pp["presets"]["decode_ep"]["args"].extend(
+            ["--speculative-algorithm", "EAGLE3"]
+        )
+        with self.assertRaisesRegex(
+            ValidationError, "does not support --speculative-algorithm 'EAGLE3'"
+        ):
+            validate_serving_recipe_structure(bad_eagle3_pp, context="bad_eagle3_pp")
+
+        bad_pp_spec_on = copy.deepcopy(bad_pp_spec)
+        bad_pp_spec_on["presets"]["decode_ep"]["args"][
+            bad_pp_spec_on["presets"]["decode_ep"]["args"].index("--attn-dp-size") + 1
+        ] = "1"
+        bad_pp_spec_on["presets"]["decode_ep"]["args"].remove("--enable-dp-lm-head")
+        bad_pp_spec_on["presets"]["decode_ep"]["env"]["SGLANG_ENABLE_PP_SPEC"] = "on"
+        with self.assertRaisesRegex(
+            ValidationError, "SGLANG_ENABLE_PP_SPEC must be a valid SGLang boolean"
+        ):
+            validate_serving_recipe_structure(bad_pp_spec_on, context="bad_pp_spec_on")
+        ok_pp_spec_one = copy.deepcopy(bad_pp_spec_on)
+        ok_pp_spec_one["presets"]["decode_ep"]["env"]["SGLANG_ENABLE_PP_SPEC"] = "1"
+        validate_serving_recipe_structure(ok_pp_spec_one, context="ok_pp_spec_one")
+
+        dsv41_doc = _load_yaml(
+            REPO_ROOT / "test/ppu/recipes/deepseek-ai/DeepSeek-V4.1-Flash.yaml"
+        )
+        dsv_dcp = copy.deepcopy(dsv41_doc)
+        dsv_dcp["presets"] = {
+            "pd_prefill": copy.deepcopy(glm_doc["presets"]["pd_prefill"]),
+            "pd_decode": copy.deepcopy(glm_doc["presets"]["pd_decode"]),
+        }
+        dsv_dcp["presets"]["pd_prefill"]["select"] = {"features": {}}
+        dsv_dcp["presets"]["pd_decode"]["select"] = {"features": {}}
+        dsv_dcp["presets"]["pd_decode"]["args"] = [
+            "--disaggregation-mode",
+            "decode",
+            "--disaggregation-transfer-backend",
+            "mooncake",
+            "--disaggregation-ib-device",
+            "{ib_devices}",
+        ]
+        bad_dcp_2_to_1 = copy.deepcopy(dsv_dcp)
+        bad_dcp_2_to_1["presets"]["pd_prefill"]["args"].extend(["--dcp-size", "2"])
+        with self.assertRaisesRegex(
+            ValidationError, "unsupported PD DCP topology \\(2 -> 1\\)"
+        ):
+            validate_serving_recipe_structure(bad_dcp_2_to_1, context="bad_dcp_2_to_1")
+
+        ok_dcp_1_to_2 = copy.deepcopy(dsv_dcp)
+        ok_dcp_1_to_2["presets"]["pd_decode"]["args"].extend(["--dcp-size", "2"])
+        validate_serving_recipe_structure(ok_dcp_1_to_2, context="ok_dcp_1_to_2")
+
+        ok_dcp_2_to_2 = copy.deepcopy(bad_dcp_2_to_1)
+        ok_dcp_2_to_2["presets"]["pd_decode"]["args"].extend(["--dcp-size", "2"])
+        validate_serving_recipe_structure(ok_dcp_2_to_2, context="ok_dcp_2_to_2")
+
+        qwen_doc = _load_yaml(REPO_ROOT / "test/ppu/recipes/Qwen/Qwen3.8-27B.yaml")
+        bad_non_mla_dcp = copy.deepcopy(qwen_doc)
+        bad_non_mla_dcp["variants"]["default"]["hardware"] = "zhenwu_m890"
+        bad_non_mla_dcp["presets"] = {
+            "pd_prefill": {
+                "hardware": "zhenwu_m890",
+                "topology": {
+                    "kind": "pd_disagg",
+                    "nodes": 1,
+                    "devices_per_node": 2,
+                    "role": "prefill",
+                },
+                "tp": 2,
+                "args": [
+                    "--disaggregation-mode",
+                    "prefill",
+                    "--disaggregation-transfer-backend",
+                    "mooncake",
+                    "--disaggregation-ib-device",
+                    "{ib_devices}",
+                    "--disaggregation-bootstrap-port",
+                    "{kv_port}",
+                ],
+                "env": {
+                    "MOONCAKE_PROTOCOL": "rdma",
+                    "SGLANG_HOST_IP": "{kv_ip}",
+                },
+            },
+            "pd_decode": {
+                "hardware": "zhenwu_m890",
+                "topology": {
+                    "kind": "pd_disagg",
+                    "nodes": 1,
+                    "devices_per_node": 2,
+                    "role": "decode",
+                },
+                "tp": 2,
+                "args": [
+                    "--dcp-size",
+                    "2",
+                    "--disaggregation-mode",
+                    "decode",
+                    "--disaggregation-transfer-backend",
+                    "mooncake",
+                    "--disaggregation-ib-device",
+                    "{ib_devices}",
+                ],
+                "env": {
+                    "MOONCAKE_PROTOCOL": "rdma",
+                    "SGLANG_HOST_IP": "{kv_ip}",
+                },
+            },
+        }
+        with self.assertRaisesRegex(
+            ValidationError, "requires an MLA or hybrid-MLA model backend"
+        ):
+            validate_serving_recipe_structure(
+                bad_non_mla_dcp, context="bad_non_mla_dcp"
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shutil.copytree(REPO_ROOT / "test/ppu", root / "test/ppu")
+            results_dir = root / "artifacts/results"
+            results_dir.mkdir(parents=True)
+            glm_rec_file = root / "test/ppu/recipes/zai-org/GLM-5.3.yaml"
+            rec_doc = _load_yaml(glm_rec_file)
+            rec_doc["presets"]["decode_ep"]["topology"] = {
+                "kind": "multi_node_ep",
+                "nodes": 2,
+                "devices_per_node": 4,
+            }
+            rec_doc["presets"]["decode_ep"]["tp"] = 8
+            ep_a = rec_doc["presets"]["decode_ep"]["args"]
+            ep_a[ep_a.index("--attn-dp-size") + 1] = "8"
+            ep_a[ep_a.index("--nnodes") + 1] = "2"
+            glm_rec_file.write_text(yaml.safe_dump(rec_doc, sort_keys=False))
+            pol_file = root / "test/ppu/policy/models/glm-5.3.yaml"
+            for bad_preset in ("pd_decode", "decode_ep"):
+                pol_doc = _load_yaml(pol_file)
+                pol_doc["tiers"] = {"fast_sanity": pol_doc["tiers"]["fast_sanity"]}
+                pol_doc["tiers"]["fast_sanity"]["preset"] = bad_preset
+                pol_file.write_text(yaml.safe_dump(pol_doc, sort_keys=False))
+                with (
+                    patch.dict(os.environ, {"RECIPE_PPU_COUNT": "8"}, clear=False),
+                    patch("ppu_recipe.REPO_ROOT", root),
+                    patch("recipe_runner.REPO_ROOT", root),
+                    patch("recipe_runner.RESULTS", results_dir),
+                    patch("recipe_runner.cached_model_path") as mock_cache,
+                    patch("recipe_runner.server") as mock_srv,
+                ):
+                    with self.assertRaisesRegex(
+                        ValueError, "unsupported single-node worker topology"
+                    ):
+                        run(pol_file, "fast_sanity", 0.0)
+                    mock_cache.assert_not_called()
+                    mock_srv.assert_not_called()
 
 
 if __name__ == "__main__":

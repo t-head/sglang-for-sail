@@ -17,7 +17,14 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
-from ppu_recipe import GSM8K_GOLDEN_BAND_ABS, REPO_ROOT, _load_yaml, resolve_recipe
+from ppu_recipe import (
+    GSM8K_GOLDEN_BAND_ABS,
+    REPO_ROOT,
+    _compute_launched_gpu_ids,
+    _load_yaml,
+    _parse_flag_entries,
+    resolve_recipe,
+)
 
 HOST = "http://127.0.0.1:9985"
 MODEL = "recipe-model"
@@ -459,6 +466,28 @@ def run(policy_path, tier, queue_s):
     recipe = REPO_ROOT / policy["recipe"]
     assets = RESULTS.parent / "assets.json"
     effective = resolve_recipe(recipe, policy_path=policy_path, tier=tier)
+    expected_width = int(os.environ.get("RECIPE_PPU_COUNT", "8"))
+    eff_topo = effective["topology"]
+    eff_dp = max(int(effective.get("dp_size", 1)), 1)
+    eff_launched = _compute_launched_gpu_ids(
+        _parse_flag_entries(list(effective["flags"])),
+        dp_val=eff_dp,
+        tp_val=max(int(effective["ppu_count"]) // eff_dp, 1),
+        pp_val=1,
+        topo_nodes=int(eff_topo["nodes"]),
+        context=policy_path.stem,
+    )
+    if eff_topo["kind"] != "single_node" or eff_topo["nodes"] != 1:
+        raise ValueError(
+            f"unsupported single-node worker topology for policy {policy_path.stem}"
+        )
+    if (
+        eff_topo["devices_per_node"] != expected_width
+        or int(effective["ppu_count"]) != expected_width
+        or expected_width not in {2, 4, 8, 16}
+        or eff_launched != list(range(expected_width))
+    ):
+        raise ValueError("incorrect recipe identity or device width")
     revision = os.environ.get("PPU_CI_HF_MODEL_REVISION")
     revision_repo = os.environ.get("PPU_CI_HF_MODEL_REVISION_REPO")
     if (

@@ -119,12 +119,24 @@ FORBIDDEN_CREDENTIAL_FLAGS = frozenset(
         "--ssl-keyfile-password",
     }
 )
+_ABBREV_CREDENTIAL_TARGETS: tuple[str, ...] = tuple(sorted(FORBIDDEN_CREDENTIAL_FLAGS))
+_NON_CREDENTIAL_TOKEN_SUFFIXES: tuple[str, ...] = (
+    "-bos-token",
+    "-eos-token",
+    "-max-token",
+    "-min-token",
+    "-num-token",
+    "-pad-token",
+    "-stop-token",
+    "-unk-token",
+)
 _CREDENTIAL_FLAG_RE = re.compile(
-    r"^--(?:[a-z0-9-]+-)?(?:api-key|password|passwd|secret|access-token|auth-token|hf-token|private-key)s?$",
+    r"^--(?:[a-z0-9-]+-)?(?:api-key|password|passwd|secret|access-token|auth-token|hf-token|private-key|certfile|keyfile|ca-certs)s?$",
     re.I,
 )
 _CREDENTIAL_ENV_RE = re.compile(
-    r"(?:^|_)(?:API_KEY|PASSWORD|PASSWD|SECRET|ACCESS_TOKEN|AUTH_TOKEN|HF_TOKEN|HUB_TOKEN|PRIVATE_KEY)S?$",
+    r"(?:^|_)(?:API_KEY|PASSWORD|PASSWD|SECRET|ACCESS_TOKEN|AUTH_TOKEN|HF_TOKEN|HUB_TOKEN|PRIVATE_KEY)S?$"
+    r"|(?:^|_)TOKEN$",
     re.I,
 )
 EXTERNAL_ENV_PREFIXES = ("DG_", "HGGC_")
@@ -783,15 +795,60 @@ def _parse_nonneg_int_flag(
 
 def _is_credential_flag(flag: str) -> bool:
     opt = flag.split("=", 1)[0].strip().lower()
-    return opt in FORBIDDEN_CREDENTIAL_FLAGS or bool(_CREDENTIAL_FLAG_RE.fullmatch(opt))
+    if opt in FORBIDDEN_CREDENTIAL_FLAGS or _CREDENTIAL_FLAG_RE.fullmatch(opt):
+        return True
+    if opt == "--token" or (
+        opt.endswith("-token") and not opt.endswith(_NON_CREDENTIAL_TOKEN_SUFFIXES)
+    ):
+        return True
+    if len(opt) >= 5 and any(
+        target.startswith(opt) for target in _ABBREV_CREDENTIAL_TARGETS
+    ):
+        return True
+    return False
 
 
 def _is_credential_env(name: str) -> bool:
     return bool(_CREDENTIAL_ENV_RE.search(name.strip()))
 
 
-def _env_is_truthy(server_env: Mapping[str, str], key: str) -> bool:
-    return server_env.get(key, "").strip().lower() in {"1", "true", "yes", "y", "on"}
+def _parse_sglang_env_bool(
+    server_env: Mapping[str, str],
+    key: str,
+    *,
+    default: bool = False,
+    context: str,
+) -> bool:
+    """Parse boolean env var matching SGLang ``EnvBool.parse`` exactly."""
+    if key not in server_env:
+        return default
+    raw = server_env[key]
+    lowered = raw.lower()
+    if lowered in {"true", "1", "yes", "y"}:
+        return True
+    if lowered in {"false", "0", "no", "n"}:
+        return False
+    raise ValidationError(
+        f"{context}: env {key} must be a valid SGLang boolean "
+        f"(true/1/yes/y or false/0/no/n), got {raw!r}"
+    )
+
+
+def _runtime_prefill_complete_uses_legacy_dp_attention() -> bool:
+    """Detect whether the candidate SGLang branch checks ``enable_dp_attention`` in ``_validate_prefill_complete``."""
+    hook_path = (
+        Path(__file__).resolve().parents[3]
+        / "python"
+        / "sglang"
+        / "srt"
+        / "arg_groups"
+        / "pd_disaggregation_hook.py"
+    )
+    try:
+        src = hook_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return "cfg.dp_size if cfg.enable_dp_attention else 1" in src
 
 
 _DSA_MODEL_PREFIXES: tuple[str, ...] = (
@@ -800,6 +857,39 @@ _DSA_MODEL_PREFIXES: tuple[str, ...] = (
     "deepseek-ai/deepseek-v3.2",
     "t-head/deepseek-v3.2",
 )
+_MLA_MODEL_PREFIXES: tuple[str, ...] = (
+    *_DSA_MODEL_PREFIXES,
+    "deepseek-ai/deepseek-v3",
+    "deepseek-ai/deepseek-v4",
+    "t-head/deepseek-v3",
+    "t-head/deepseek-v4",
+    "moonshotai/kimi-k2",
+    "t-head/kimi-k2",
+)
+
+
+def _is_mla_model(
+    model_id: str | None,
+    hf_model_id: str | None,
+    entries: Sequence[tuple[str, str | None, bool]],
+) -> bool:
+    """Return True when the target model uses an MLA or hybrid-MLA KV pool."""
+    if _is_deepseek_dsa_model(model_id, hf_model_id, entries):
+        return True
+    for candidate in (model_id, hf_model_id):
+        if isinstance(candidate, str):
+            lowered = candidate.strip().lower()
+            if any(lowered.startswith(prefix) for prefix in _MLA_MODEL_PREFIXES):
+                return True
+    for attn_flag in (
+        "--attention-backend",
+        "--prefill-attention-backend",
+        "--decode-attention-backend",
+    ):
+        val = (_flag_value(entries, attn_flag) or "").strip().lower()
+        if val in {"dsv4", "dsa", "nsa", "flashmla", "trtllm_mla"}:
+            return True
+    return False
 
 
 def _is_deepseek_dsa_model(
@@ -1089,7 +1179,9 @@ def _compute_effective_parallel_geometry(
     )
     moe_dp_val = (
         _parse_pos_int_flag(
-            "--moe-dp-size", _flag_value(entries, "--moe-dp-size"), context=context
+            "--moe-dp-size",
+            _flag_value(entries, "--moe-dp-size", "--moe-data-parallel-size"),
+            context=context,
         )
         or 1
     )
@@ -1170,6 +1262,17 @@ def _compute_effective_parallel_geometry(
             f"divisible by --shared-experts-tp-size ({shared_experts_tp})"
         )
 
+    if dcp_val > 1:
+        if enable_prefill_cp:
+            raise ValidationError(
+                f"{context}: --dcp-size > 1 ({dcp_val}) does not support --enable-prefill-cp"
+            )
+        if tp_val % dcp_val != 0 or attn_tp_val % dcp_val != 0:
+            raise ValidationError(
+                f"{context}: attention TP size ({attn_tp_val}) and --tp-size ({tp_val}) "
+                f"must be divisible by --dcp-size ({dcp_val})"
+            )
+
     return {
         "dp_size": dp_val,
         "tp_size": tp_val,
@@ -1183,6 +1286,7 @@ def _compute_effective_parallel_geometry(
         "enable_prefill_cp": enable_prefill_cp,
         "enable_kv_cache_sharding": "--enable-kv-cache-sharding" in flag_names,
         "is_dsa": is_dsa,
+        "is_mla": _is_mla_model(model_id, hf_model_id, entries),
     }
 
 
@@ -1224,10 +1328,10 @@ def _validate_pp_and_speculative_compat(
             f"{context}: --pp-size > 1 ({pp_val}) is incompatible with --enable-multi-layer-eagle"
         )
     disagg_mode = (_flag_value(entries, "--disaggregation-mode") or "null").strip()
-    pp_spec = _env_is_truthy(server_env, "SGLANG_ENABLE_PP_SPEC")
-    algo_norm = (
-        "EAGLE" if spec_algo.upper() in {"NEXTN", "EAGLE3"} else spec_algo.upper()
+    pp_spec = _parse_sglang_env_bool(
+        server_env, "SGLANG_ENABLE_PP_SPEC", default=False, context=context
     )
+    algo_norm = "EAGLE" if spec_algo.upper() == "NEXTN" else spec_algo.upper()
     if algo_norm in {"DSPARK", "DFLASH"}:
         if disagg_mode != "prefill" or pp_spec:
             raise ValidationError(
@@ -1590,11 +1694,16 @@ def _validate_resolved_topology_and_placeholders(
                     f"requires --pp-size 1, --attn-cp-size 1, and --dcp-size 1, got "
                     f"pp={geom['pp_size']}, attn_cp={geom['attn_cp_size']}, dcp={geom['dcp_size']}"
                 )
-            if geom["tp_size"] != geom["attn_dp_size"]:
+            eff_pc_attn_dp = (
+                1
+                if _runtime_prefill_complete_uses_legacy_dp_attention()
+                else geom["attn_dp_size"]
+            )
+            if geom["tp_size"] != eff_pc_attn_dp:
                 raise ValidationError(
                     f"{context}: --disaggregation-decode-allocation-policy 'prefill_complete' "
-                    f"requires --tp-size ({geom['tp_size']}) == --attn-dp-size ({geom['attn_dp_size']}) "
-                    f"(attention TP must be 1)"
+                    f"requires --tp-size ({geom['tp_size']}) == effective attention DP "
+                    f"({eff_pc_attn_dp}) on this SGLang branch (attention TP must be 1)"
                 )
             if (
                 _flag_value(entries, "--decoupled-spec-role") or "null"
@@ -1605,6 +1714,7 @@ def _validate_resolved_topology_and_placeholders(
             bad_pc_flags = sorted(
                 flag_names
                 & {
+                    "--enable-pdmux",
                     "--enable-pd-role-switch",
                     "--encoder-only",
                     "--language-only",
@@ -1652,9 +1762,14 @@ def _validate_resolved_topology_and_placeholders(
                     raise ValidationError(
                         f"{context}: pd_prefill with 'prefill_complete' and HiCache requires --hicache-write-policy 'write_back'"
                     )
-            if _env_is_truthy(
-                server_env, "SGLANG_DISAGG_STAGING_BUFFER"
-            ) or _env_is_truthy(server_env, "SGLANG_RUST_SERVER"):
+            if _parse_sglang_env_bool(
+                server_env,
+                "SGLANG_DISAGG_STAGING_BUFFER",
+                default=False,
+                context=context,
+            ) or _parse_sglang_env_bool(
+                server_env, "SGLANG_RUST_SERVER", default=False, context=context
+            ):
                 raise ValidationError(
                     f"{context}: 'prefill_complete' is incompatible with SGLANG_DISAGG_STAGING_BUFFER and SGLANG_RUST_SERVER"
                 )
@@ -2197,17 +2312,35 @@ def _validate_pd_disagg_pair(
             f"{context}: pd_prefill attention TP ({p_attn_tp}) and pd_decode attention TP "
             f"({d_attn_tp}) must be integer multiples"
         )
-    if d_geom["dcp_size"] > 1:
-        if p_geom["attn_cp_size"] > 1:
+    p_dcp = int(p_geom["dcp_size"])
+    d_dcp = int(d_geom["dcp_size"])
+    if p_dcp != d_dcp and p_dcp != 1:
+        raise ValidationError(
+            f"{context}: unsupported PD DCP topology ({p_dcp} -> {d_dcp}); "
+            f"pd_prefill --dcp-size > 1 requires matching pd_decode --dcp-size"
+        )
+    if p_dcp > 1 or d_dcp > 1:
+        if p_dcp == d_dcp and p_attn_tp != d_attn_tp:
             raise ValidationError(
-                f"{context}: pd_decode --dcp-size > 1 ({d_geom['dcp_size']}) is incompatible "
-                f"with pd_prefill --attn-cp-size > 1 ({p_geom['attn_cp_size']})"
+                f"{context}: PD peers with matching --dcp-size ({p_dcp}) require "
+                f"equal attention TP sizes, got prefill={p_attn_tp} vs decode={d_attn_tp}"
             )
-        if p_geom["enable_kv_cache_sharding"]:
-            raise ValidationError(
-                f"{context}: pd_decode --dcp-size > 1 ({d_geom['dcp_size']}) is incompatible "
-                f"with pd_prefill --enable-kv-cache-sharding"
-            )
+        if d_dcp > 1:
+            if not d_geom["is_mla"]:
+                raise ValidationError(
+                    f"{context}: pd_decode --dcp-size > 1 ({d_dcp}) requires an MLA or "
+                    f"hybrid-MLA model backend"
+                )
+            if p_geom["attn_cp_size"] > 1:
+                raise ValidationError(
+                    f"{context}: pd_decode --dcp-size > 1 ({d_dcp}) is incompatible "
+                    f"with pd_prefill --attn-cp-size > 1 ({p_geom['attn_cp_size']})"
+                )
+            if p_geom["enable_kv_cache_sharding"]:
+                raise ValidationError(
+                    f"{context}: pd_decode --dcp-size > 1 ({d_dcp}) is incompatible "
+                    f"with pd_prefill --enable-kv-cache-sharding"
+                )
 
     p_nodes = int(prefill_res["topology"]["nodes"])
     d_nodes = int(decode_res["topology"]["nodes"])
