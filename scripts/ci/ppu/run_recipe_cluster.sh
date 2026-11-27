@@ -200,7 +200,7 @@ keys = ["TIER", "PPU_CI_SOURCE_SHA", "PPU_CI_WORKER_ARTIFACT_DIR"]
 if os.environ["TIER"] == "legacy":
     keys += [
         "PPU_CI_TARGET_MODEL_PATH", "PPU_CI_EAGLE3_MODEL_PATH",
-        "PPU_CI_DFLASH_MODEL_PATH", "PPU_CI_EVAL_CACHE",
+        "PPU_CI_DFLASH_MODEL_PATH", "PPU_CI_EVAL_CACHE", "PPU_CI_FP8_ONLY",
     ]
 else:
     keys += [

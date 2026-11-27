@@ -53,6 +53,21 @@ class TestPPUCISuite(unittest.TestCase):
             ["core/test_basic_sanity_eagle3.py", "core/test_basic_sanity_dflash.py"],
         )
 
+    def test_fp8_suite_contains_numerical_test_and_benchmark(self):
+        registered = RUNNER.parent / "registered"
+        with patch.dict(os.environ, {"PPU_CI_FP8_ONLY": "1"}):
+            ppu_tests = select_tests(RUNNER.parent.parent)
+        self.assertCountEqual(
+            [
+                Path(test.filename).relative_to(registered).as_posix()
+                for test in ppu_tests
+            ],
+            [
+                "kernels/ops/moe/test_fp8_mega_moe_ppu.py",
+                "kernels/benchmark/moe/bench_fp8_mega_moe_ppu.py",
+            ],
+        )
+
     def test_runtime_requires_both_sanity_files_to_pass(self):
         source = Path(__file__).with_name("build_and_test.sh").read_text()
         marker = 'cd "$artifacts"\n'
@@ -161,7 +176,10 @@ class TestPPUCIWorkflow(unittest.TestCase):
 
     def test_cluster_jobs_use_fresh_approval_and_thead_cpu_runner(self):
         for name, cluster_jobs in (
-            ("pr-test-ppu", ("ppu-cluster-config", "ppu-legacy-sanity")),
+            (
+                "pr-test-ppu",
+                ("ppu-cluster-config", "ppu-legacy-sanity", "ppu-fp8-sanity"),
+            ),
             ("nightly-test-ppu", ("cluster-preflight", "recipe-sanity")),
         ):
             with self.subTest(workflow=name):
@@ -193,10 +211,11 @@ class TestPPUCIWorkflow(unittest.TestCase):
             self.assertCountEqual(
                 self.jobs[job]["needs"], ["check-changes", "ppu-ci-selftest"]
             )
-        self.assertCountEqual(
-            self.jobs["ppu-legacy-sanity"]["needs"],
-            ["check-changes", "pr-gate", "ppu-build", "ppu-cluster-config"],
-        )
+        for name in ("ppu-legacy-sanity", "ppu-fp8-sanity"):
+            self.assertCountEqual(
+                self.jobs[name]["needs"],
+                ["check-changes", "pr-gate", "ppu-build", "ppu-cluster-config"],
+            )
         self.assertCountEqual(
             self.jobs["pr-test-ppu-finish"]["needs"],
             [
@@ -205,6 +224,7 @@ class TestPPUCIWorkflow(unittest.TestCase):
                 "ppu-ci-selftest",
                 "ppu-build",
                 "ppu-cluster-config",
+                "ppu-fp8-sanity",
                 "ppu-fast-sanity",
             ],
         )
@@ -225,7 +245,7 @@ class TestPPUCIWorkflow(unittest.TestCase):
         self.assertIn(
             "github.event.pull_request.head.sha", check["outputs"]["source-sha"]
         )
-        for name in ("ppu-build", "ppu-legacy-sanity"):
+        for name in ("ppu-build", "ppu-legacy-sanity", "ppu-fp8-sanity"):
             with self.subTest(job=name):
                 job = self.jobs[name]
                 checkout = next(
@@ -268,6 +288,22 @@ class TestPPUCIWorkflow(unittest.TestCase):
         self.assertIn(
             "exec bash scripts/ci/ppu/run_recipe_cluster.sh", steps["cluster"]["run"]
         )
+
+    def test_fp8_sanity_is_sm89_only_and_runs_with_recipe_ci(self):
+        job = self.jobs["ppu-fp8-sanity"]
+        self.assertEqual(job["env"]["PPU_CI_BOARD"], "ZW-M890P")
+        self.assertEqual(job["env"]["PPU_CI_FP8_ONLY"], "1")
+        self.assertIn("inputs.run_legacy_sanity != true", job["if"])
+        self.assertIn("inputs.preflight_only != true", job["if"])
+        uploads = [
+            step
+            for step in job["steps"]
+            if step.get("uses", "").startswith("actions/upload-artifact@")
+        ]
+        self.assertEqual(len(uploads), 1)
+        self.assertEqual(uploads[0]["with"]["path"], "ppu-public/legacy.json")
+        cluster = RUNNER.parent.parent / "scripts/ci/ppu/run_recipe_cluster.sh"
+        self.assertIn('"PPU_CI_FP8_ONLY"', cluster.read_text())
 
     def test_legacy_mode_is_explicit_and_separate_from_recipe_ci(self):
         path = RUNNER.parent.parent / ".github/workflows/pr-test-ppu.yml"

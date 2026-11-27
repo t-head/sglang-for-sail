@@ -430,13 +430,14 @@ class TestPrepareServerArgs(CustomTestCase):
             ):
                 validate_mega_moe_token_budget(args, "Qwen3MoeForCausalLM")
 
-    def test_minimax_megamoe_eager_and_prefill_graph_capacity(self):
+    def test_ppu_fp8_megamoe_eager_and_prefill_graph_capacity(self):
         from sglang.srt.arg_groups import mega_moe_hook as hook
         from sglang.srt.environ import envs
 
-        for architecture in (
-            "MiniMaxM3SparseForCausalLM",
-            "MiniMaxM3SparseForConditionalGeneration",
+        for architecture, channelwise_fp8 in (
+            ("MiniMaxM3SparseForCausalLM", False),
+            ("MiniMaxM3SparseForConditionalGeneration", False),
+            ("Glm5NextForConditionalGeneration", True),
         ):
             cfg = SimpleNamespace(
                 moe_a2a_backend="megamoe",
@@ -464,21 +465,48 @@ class TestPrepareServerArgs(CustomTestCase):
                 envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(64),
             ):
                 with self.assertRaisesRegex(ValueError, "max-running-requests"):
-                    hook.validate_mega_moe_token_budget(None, architecture)
+                    hook.validate_mega_moe_token_budget(
+                        None, architecture, ppu_channelwise_fp8=channelwise_fp8
+                    )
                 cfg.max_running_requests = 65
                 with self.assertRaisesRegex(ValueError, "largest decode"):
-                    hook.validate_mega_moe_token_budget(None, architecture)
+                    hook.validate_mega_moe_token_budget(
+                        None, architecture, ppu_channelwise_fp8=channelwise_fp8
+                    )
                 cfg.max_running_requests = 64
-                hook.validate_mega_moe_token_budget(None, architecture)
+                hook.validate_mega_moe_token_budget(
+                    None, architecture, ppu_channelwise_fp8=channelwise_fp8
+                )
                 cfg.max_prefill_tokens = 65
                 with self.assertRaisesRegex(ValueError, "required_per_rank=65"):
-                    hook.validate_mega_moe_token_budget(None, architecture)
+                    hook.validate_mega_moe_token_budget(
+                        None, architecture, ppu_channelwise_fp8=channelwise_fp8
+                    )
                 cfg.max_prefill_tokens = 64
                 cfg.cuda_graph_config.prefill = SimpleNamespace(
                     backend="full", max_bs=32, bs=[32, 65]
                 )
                 with self.assertRaisesRegex(ValueError, "required_per_rank=65"):
-                    hook.validate_mega_moe_token_budget(None, architecture)
+                    hook.validate_mega_moe_token_budget(
+                        None, architecture, ppu_channelwise_fp8=channelwise_fp8
+                    )
+
+    def test_ppu_channelwise_fp8_requires_eager_for_glm_and_minimax(self):
+        from sglang.srt.arg_groups import mega_moe_hook as hook
+
+        cfg = SimpleNamespace(
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(backend=Backend.DISABLED),
+                decode=SimpleNamespace(backend=Backend.DISABLED),
+            )
+        )
+        with override_platform(is_ppu=True, device_sm=89):
+            hook._validate_ppu_channelwise_fp8_eager(cfg, True)
+            cfg.cuda_graph_config.decode.backend = Backend.FULL
+            with self.assertRaisesRegex(ValueError, "requires eager execution"):
+                hook._validate_ppu_channelwise_fp8_eager(cfg, True)
+            # GLM MXFP4 and other MegaMoE precisions retain graph support.
+            hook._validate_ppu_channelwise_fp8_eager(cfg, False)
 
     def test_megamoe_token_budget_uses_resolved_dp_chunked_prefill(self):
         from sglang.srt.arg_groups.mega_moe_hook import validate_mega_moe_token_budget
