@@ -32,6 +32,12 @@ Examples: [Fix] attention: Fix KV cache indexing; [Perf] [AMD] flash-attn: Optim
 - [ ] Provide accuracy and speed benchmark results according to [Test the accuracy](https://docs.sglang.io/developer_guide/contribution_guide.html#test-the-accuracy) and [Benchmark the speed](https://docs.sglang.io/developer_guide/contribution_guide.html#benchmark-the-speed).
 - [ ] Follow the SGLang code style [guidance](https://docs.sglang.io/developer_guide/contribution_guide.html#code-style-guidance).
 
+## Model Recipe Sign-off (required when touching `test/ppu/` or model tests)
+
+- [ ] **Preserved capabilities & intentional `Resolved Command Diff`**: Required serving capabilities (topology/parallelism, quantization/KV dtype, tool-call & reasoning parsers, speculative decoding) are preserved, and every `base -> head` change in CI's `Resolved Command Diff` is intentional.
+- [ ] **Behavioral assertion beyond `HTTP 200`**: Verified non-empty generation (`content` or `reasoning_content`), complete SSE `[DONE]` framing, and/or bounded GSM8K accuracy.
+- [ ] **Legacy deduplication & verification links**: Updated `replaces_legacy_cases`, ran `ppu_recipe.py validate --all` + `render-matrix --check` (canonical files under `test/ppu/recipes/*.yaml` only), and linked verification evidence.
+
 ## Review and Merge Process
 
 1. Ping Merge Oncalls to start the process. See the [PR Merge Process](https://github.com/sgl-project/sglang/blob/main/.github/MAINTAINER.md#pull-request-merge-process).

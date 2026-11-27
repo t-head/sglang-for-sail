@@ -6,24 +6,31 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
+import difflib
 import hashlib
 import importlib
 import json
 import math
 import os
+import posixpath
 import re
 import shlex
+import subprocess
 import sys
-from collections.abc import Mapping, Sequence
+import tempfile
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_RECIPES_ROOT = REPO_ROOT / "test" / "ppu" / "recipes"
-DEFAULT_POLICY_ROOT = REPO_ROOT / "test" / "ppu" / "policy"
+_RECIPES_REL = Path("test") / "ppu" / "recipes"
+_POLICY_REL = Path("test") / "ppu" / "policy"
+DEFAULT_RECIPES_ROOT = REPO_ROOT / _RECIPES_REL
+DEFAULT_POLICY_ROOT = REPO_ROOT / _POLICY_REL
 DEFAULT_MATRIX_DOC = REPO_ROOT / "test" / "ppu" / "README.md"
 DEFAULT_AUTHORING_DOC = REPO_ROOT / "test" / "ppu" / "AUTHORING.md"
 GSM8K_GOLDEN_BAND_ABS = 0.02
@@ -31,6 +38,36 @@ GSM8K_GOLDEN_BAND_ABS = 0.02
 SERVING_SCHEMA = "ppu-serving/v1"
 DATASET_SCHEMA = "ppu-dataset/v1"
 POLICY_SCHEMA = "ppu-test-policy/v1"
+VARIANT_ISOLATED_FIELDS = (
+    "assets",
+    "hf_model_id",
+    "golden_model_key",
+    "served_name",
+)
+_STRAY_SERVING_SCHEMA_RE = re.compile(
+    r"""(?:^\s*|[{\[,]\s*)['"]?schema_version['"]?\s*:\s*(['"]?)([^\r\n#,}\]]+?)\1(?=\s*(?:[,}\]]|#|$))""",
+    re.MULTILINE,
+)
+_YAML_ESCAPE_RE = re.compile(
+    r"\\(?:u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8})|x([0-9a-fA-F]{2}))"
+)
+_STRAY_SCAN_PRUNE_DIRS = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".mypy_cache",
+        ".nox",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".tox",
+        "__pycache__",
+        "build",
+        "dist",
+        "node_modules",
+        "target",
+        "venv",
+    }
+)
 POLICY_TIERS = frozenset({"fast_sanity", "model_sanity", "nightly", "release"})
 SUPPORTED_HARDWARE = frozenset({"zhenwu_m890", "zhenwu_810e"})
 _M890_PRECISION_RE = re.compile(
@@ -1205,6 +1242,98 @@ def _validate_resolved_topology_and_placeholders(
     return sub_flags, sub_env
 
 
+def _validate_assets_map_variant_isolation(
+    ppu_blk: Mapping[str, Any],
+    model_blk: Mapping[str, Any],
+    variants_blk: Mapping[str, Any],
+    assets_map: Mapping[str, str],
+    *,
+    context: str,
+) -> None:
+    """Reject multi-variant assets_map collisions that merge distinct variants into one checkpoint."""
+    if not assets_map or len(variants_blk) <= 1:
+        return
+    top_id = _effective_variant_identity(ppu_blk, model_blk, {})
+    eff_ids = {
+        vn: _effective_variant_identity(ppu_blk, model_blk, vc)
+        for vn, vc in variants_blk.items()
+    }
+
+    def _canonicalize_ckpt_ref(raw: str) -> str:
+        val = raw.strip()
+        if not val:
+            return val
+        norm = posixpath.normpath(val)
+        if norm.startswith("//") and not norm.startswith("///"):
+            norm = "/" + norm.lstrip("/")
+        if os.path.exists(norm):
+            return os.path.realpath(norm)
+        return norm
+
+    def _resolved_ckpt(ident: Mapping[str, Any]) -> str:
+        asset_key = ident["assets"]["model"]
+        return _canonicalize_ckpt_ref(assets_map.get(asset_key, ident["hf_model_id"]))
+
+    top_asset = top_id["assets"]["model"]
+    top_ckpt = _resolved_ckpt(top_id)
+    for vname, vcfg in variants_blk.items():
+        if vname == "default":
+            continue
+        exempt = set(vcfg.get("allow_shared_fields", []))
+        if "assets" in exempt:
+            continue
+        vid = eff_ids[vname]
+        v_asset = vid["assets"]["model"]
+        v_ckpt = _resolved_ckpt(vid)
+        if (v_asset in assets_map or top_asset in assets_map) and v_ckpt == top_ckpt:
+            raise ValidationError(
+                f"{context}.variants.{vname}: assets_map resolves model asset {_safe_diag_repr(v_asset)} "
+                f"to {_safe_diag_repr(v_ckpt)}, colliding with default/top-level checkpoint "
+                "(use distinct mapped paths or declare allow_shared_fields: [assets])"
+            )
+        for other_name, other_id in eff_ids.items():
+            if other_name == vname:
+                continue
+            o_asset = other_id["assets"]["model"]
+            o_ckpt = _resolved_ckpt(other_id)
+            if (v_asset in assets_map or o_asset in assets_map) and v_ckpt == o_ckpt:
+                target = (
+                    "default/top-level checkpoint"
+                    if other_name == "default"
+                    else f"variant {other_name!r}"
+                )
+                raise ValidationError(
+                    f"{context}.variants.{vname}: assets_map resolves model asset {_safe_diag_repr(v_asset)} "
+                    f"to {_safe_diag_repr(v_ckpt)}, colliding with {target} "
+                    "(use distinct mapped paths or declare allow_shared_fields: [assets])"
+                )
+
+
+def _effective_variant_identity(
+    ppu_blk: Mapping[str, Any],
+    model_blk: Mapping[str, Any],
+    var_blk: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Compute effective runtime asset/model identity using resolver fallback order."""
+    eff_assets = {**ppu_blk["assets"], **(var_blk.get("assets") or {})}
+    asset_name = eff_assets["model"]
+    hf_model_id = (
+        var_blk.get("hf_model_id")
+        or ppu_blk.get("hf_model_id")
+        or model_blk["model_id"]
+    )
+    served_name = var_blk.get("served_name") or ppu_blk.get("served_name") or asset_name
+    golden_model_key = (
+        var_blk.get("golden_model_key") or ppu_blk.get("golden_model_key") or asset_name
+    )
+    return {
+        "assets": eff_assets,
+        "hf_model_id": hf_model_id,
+        "served_name": served_name,
+        "golden_model_key": golden_model_key,
+    }
+
+
 def _resolve_recipe_from_doc(
     recipe: Mapping[str, Any],
     *,
@@ -1422,24 +1551,21 @@ def _resolve_recipe_from_doc(
 
     # 7. assets-map + runtime endpoint injection
     assets_map = _load_assets_map(assets_map_path)
-    eff_assets = {**ppu_blk["assets"], **var_blk.get("assets", {})}
-    asset_name = eff_assets["model"]
-    hf_model_id = (
-        var_blk.get("hf_model_id")
-        or ppu_blk.get("hf_model_id")
-        or model_blk["model_id"]
+    _validate_assets_map_variant_isolation(
+        ppu_blk,
+        model_blk,
+        variants_blk,
+        assets_map,
+        context=recipe_label,
     )
+    eff_identity = _effective_variant_identity(ppu_blk, model_blk, var_blk)
+    eff_assets = eff_identity["assets"]
+    asset_name = eff_assets["model"]
+    hf_model_id = eff_identity["hf_model_id"]
     resolved_model = assets_map.get(asset_name, hf_model_id)
     resolved_tokenizer = assets_map.get(eff_assets["tokenizer"], resolved_model)
-    effective_served_name = (
-        served_model_name
-        or var_blk.get("served_name")
-        or ppu_blk.get("served_name")
-        or asset_name
-    )
-    golden_model_key = (
-        var_blk.get("golden_model_key") or ppu_blk.get("golden_model_key") or asset_name
-    )
+    effective_served_name = served_model_name or eff_identity["served_name"]
+    golden_model_key = eff_identity["golden_model_key"]
 
     flags_only = _render_entries(ordered)
     argv = [
@@ -1698,6 +1824,25 @@ def _scan_text(text: str, *, context: str, allow_loopback: bool = False) -> list
             continue
         findings.append(f"{context}: matched ipv4_literal")
     return findings
+
+
+def _safe_diag_repr(value: str) -> str:
+    """Return ``repr(value)`` unless ``value`` contains sensitive text, else ``'<redacted>'``."""
+    if _scan_text(value, context="diag", allow_loopback=True):
+        return "<redacted>"
+    return repr(value)
+
+
+def _redact_error_text(text: str) -> str:
+    """Scrub secret tokens, internal domains, prohibited tokens, and private IPs from error text."""
+    scrubbed = text
+    for label, pattern in _SENSITIVE_PATTERNS:
+        if label != "local_path":
+            scrubbed = pattern.sub("<redacted>", scrubbed)
+    return _IPV4_RE.sub(
+        lambda m: m.group(0) if m.group(0) == "127.0.0.1" else "<redacted-ip>",
+        scrubbed,
+    )
 
 
 def _walk_strings(obj: Any, prefix: str = "") -> list[tuple[str, str]]:
@@ -1995,10 +2140,26 @@ def validate_serving_recipe_structure(
                 "hf_model_id",
                 "golden_model_key",
                 "served_name",
+                "allow_shared_fields",
             },
             required={"precision"},
             context=f"{context}.variants.{vname}",
         )
+        if "allow_shared_fields" in vcfg:
+            shared = _check_str_list(
+                vcfg["allow_shared_fields"],
+                context=f"{context}.variants.{vname}.allow_shared_fields",
+            )
+            unknown_shared = sorted(set(shared) - set(VARIANT_ISOLATED_FIELDS))
+            if unknown_shared:
+                raise ValidationError(
+                    f"{context}.variants.{vname}.allow_shared_fields has unsupported field(s): "
+                    f"{', '.join(unknown_shared)}"
+                )
+            if len(shared) != len(set(shared)):
+                raise ValidationError(
+                    f"{context}.variants.{vname}.allow_shared_fields must not contain duplicates"
+                )
         compat_hw = _variant_compatible_hardware(
             vcfg, context=f"{context}.variants.{vname}"
         )
@@ -2040,6 +2201,77 @@ def validate_serving_recipe_structure(
             external_env=external_env,
             context=f"{context}.variants.{vname}.extra_env",
         )
+
+    if len(variants_blk) > 1:
+        top_id = _effective_variant_identity(ppu, model, {})
+        eff_ids = {
+            vn: _effective_variant_identity(ppu, model, vc)
+            for vn, vc in variants_blk.items()
+        }
+        for vname, vcfg in variants_blk.items():
+            if vname == "default":
+                continue
+            exempt = set(vcfg.get("allow_shared_fields", []))
+            vid = eff_ids[vname]
+            if "assets" not in exempt:
+                if "assets" not in vcfg:
+                    raise ValidationError(
+                        f"{context}.variants.{vname}: multi-variant recipe requires explicit "
+                        f"'assets' on non-default variant {vname!r} "
+                        "(or declare allow_shared_fields: [assets])"
+                    )
+                v_model_asset = vid["assets"]["model"]
+                if v_model_asset == top_id["assets"]["model"]:
+                    raise ValidationError(
+                        f"{context}.variants.{vname}.assets.model ({_safe_diag_repr(v_model_asset)}) "
+                        "duplicates default/top-level value "
+                        "(set distinct assets or declare allow_shared_fields: [assets])"
+                    )
+                for other_name, other_id in eff_ids.items():
+                    if other_name == vname:
+                        continue
+                    if v_model_asset == other_id["assets"]["model"]:
+                        target = (
+                            "default/top-level value"
+                            if other_name == "default"
+                            else f"variant {other_name!r}"
+                        )
+                        raise ValidationError(
+                            f"{context}.variants.{vname}.assets.model ({_safe_diag_repr(v_model_asset)}) "
+                            f"duplicates {target} "
+                            "(set distinct assets or declare allow_shared_fields: [assets])"
+                        )
+
+            for field in ("hf_model_id", "golden_model_key", "served_name"):
+                if field in exempt:
+                    continue
+                if field not in vcfg:
+                    raise ValidationError(
+                        f"{context}.variants.{vname}: multi-variant recipe requires explicit "
+                        f"{field!r} on non-default variant {vname!r} "
+                        f"(or declare allow_shared_fields: [{field}])"
+                    )
+                val = vid[field]
+                if val == top_id[field]:
+                    raise ValidationError(
+                        f"{context}.variants.{vname}.{field} ({_safe_diag_repr(val)}) duplicates "
+                        f"default/top-level value (set distinct {field} or declare "
+                        f"allow_shared_fields: [{field}])"
+                    )
+                for other_name, other_id in eff_ids.items():
+                    if other_name == vname:
+                        continue
+                    if val == other_id[field]:
+                        target = (
+                            "default/top-level value"
+                            if other_name == "default"
+                            else f"variant {other_name!r}"
+                        )
+                        raise ValidationError(
+                            f"{context}.variants.{vname}.{field} ({_safe_diag_repr(val)}) duplicates "
+                            f"{target} (set distinct {field} or declare "
+                            f"allow_shared_fields: [{field}])"
+                        )
 
     for hname, hcfg in recipe.get("hardware_overrides", {}).items():
         if hname not in SUPPORTED_HARDWARE:
@@ -2746,17 +2978,181 @@ def _collect_all_recipe_flag_sets(
     return sets
 
 
+def _recipes_root(repo_root: Path | None = None) -> Path:
+    return (repo_root or REPO_ROOT) / _RECIPES_REL
+
+
+def _policy_root(repo_root: Path | None = None) -> Path:
+    return (repo_root or REPO_ROOT) / _POLICY_REL
+
+
+def _is_canonical_recipe_path(path: Path, *, repo_root: Path) -> bool:
+    abs_path = path.resolve()
+    recipes_root = _recipes_root(repo_root).resolve()
+    return (
+        abs_path.is_relative_to(recipes_root)
+        and abs_path.suffix == ".yaml"
+        and not abs_path.name.startswith(".")
+    )
+
+
+def _iter_repo_yaml_files(repo_root: Path) -> list[Path]:
+    root = repo_root.resolve()
+    if (root / ".git").exists():
+        proc = subprocess.run(
+            [
+                "git",
+                "-c",
+                f"safe.directory={root}",
+                "-C",
+                str(root),
+                "ls-files",
+                "-z",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "--",
+                "*.yaml",
+                "*.yml",
+                ":(glob)**/*.yaml",
+                ":(glob)**/*.yml",
+            ],
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode == 0:
+            found: list[Path] = []
+            for raw in proc.stdout.split(b"\0"):
+                if not raw:
+                    continue
+                candidate = root / os.fsdecode(raw)
+                if candidate.is_file():
+                    found.append(candidate)
+            return sorted(set(found))
+
+    walked: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(
+            d
+            for d in dirnames
+            if d not in _STRAY_SCAN_PRUNE_DIRS and not d.startswith(".venv")
+        )
+        for fname in sorted(filenames):
+            if fname.endswith((".yaml", ".yml")):
+                candidate = Path(dirpath) / fname
+                if candidate.is_file():
+                    walked.append(candidate)
+    return walked
+
+
+def _unescape_yaml_scalar_text(raw: str) -> str:
+    return _YAML_ESCAPE_RE.sub(
+        lambda m: chr(int(m.group(1) or m.group(2) or m.group(3), 16)),
+        raw,
+    )
+
+
+def _text_has_stray_serving_schema(text: str) -> bool:
+    for match in _STRAY_SERVING_SCHEMA_RE.finditer(text):
+        raw_val = match.group(2).strip()
+        if len(raw_val) >= 2 and raw_val[0] == raw_val[-1] and raw_val[0] in {"'", '"'}:
+            raw_val = raw_val[1:-1]
+        if (
+            raw_val == SERVING_SCHEMA
+            or _unescape_yaml_scalar_text(raw_val) == SERVING_SCHEMA
+        ):
+            return True
+    return False
+
+
+def _mapping_node_has_serving_schema(
+    node: yaml.Node,
+    seen: set[int] | None = None,
+) -> bool:
+    if not isinstance(node, yaml.MappingNode):
+        return False
+    visited = seen if seen is not None else set()
+    node_id = id(node)
+    if node_id in visited:
+        return False
+    visited.add(node_id)
+    for k_node, v_node in node.value:
+        if (
+            isinstance(k_node, yaml.ScalarNode)
+            and k_node.value == "schema_version"
+            and isinstance(v_node, yaml.ScalarNode)
+            and v_node.value == SERVING_SCHEMA
+        ):
+            return True
+        if (
+            isinstance(k_node, yaml.ScalarNode)
+            and k_node.tag == "tag:yaml.org,2002:merge"
+        ):
+            if isinstance(
+                v_node, yaml.MappingNode
+            ) and _mapping_node_has_serving_schema(v_node, visited):
+                return True
+            if isinstance(v_node, yaml.SequenceNode) and any(
+                _mapping_node_has_serving_schema(item, visited) for item in v_node.value
+            ):
+                return True
+    return False
+
+
+def scan_stray_serving_recipes(repo_root: Path | None = None) -> list[Path]:
+    """Fail closed if any ``ppu-serving/v1`` YAML exists outside ``test/ppu/recipes/*.yaml``."""
+    root = (repo_root or REPO_ROOT).resolve()
+    stray: list[Path] = []
+    for path in _iter_repo_yaml_files(root):
+        if _is_canonical_recipe_path(path, repo_root=root):
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        matched = False
+        try:
+            for doc_node in yaml.compose_all(text):
+                if doc_node is not None and _mapping_node_has_serving_schema(doc_node):
+                    matched = True
+                    break
+        except yaml.YAMLError:
+            for chunk in re.split(r"(?m)^(?:---|\.\.\.)(?=$|[\s#])", text):
+                try:
+                    doc_node = yaml.compose(chunk)
+                except yaml.YAMLError:
+                    continue
+                if doc_node is not None and _mapping_node_has_serving_schema(doc_node):
+                    matched = True
+                    break
+        if not matched and _text_has_stray_serving_schema(text):
+            matched = True
+        if matched:
+            stray.append(path)
+    if stray:
+        rels = ", ".join(
+            p.resolve().relative_to(root).as_posix() for p in sorted(stray)
+        )
+        raise ValidationError(
+            f"stray {SERVING_SCHEMA!r} recipe file(s) outside {_RECIPES_REL.as_posix()}/*.yaml: "
+            f"{rels}"
+        )
+    return []
+
+
 def validate_paths(
     paths: list[Path],
     *,
     sglang_parser_mode: str = "auto",
     parser: argparse.ArgumentParser | None = None,
     allow_internal_visibility: bool = False,
+    check_repo_stray_recipes: bool = False,
 ) -> dict[str, Any]:
     """Validate recipe, dataset, and policy YAML files."""
     if sglang_parser_mode not in {"auto", "required", "skip"}:
         raise ValidationError(f"invalid sglang_parser_mode: {sglang_parser_mode!r}")
 
+    if check_repo_stray_recipes:
+        scan_stray_serving_recipes(REPO_ROOT)
+
+    repo_root_res = REPO_ROOT.resolve()
     recipe_items: list[tuple[Path, dict[str, Any]]] = []
     validated: list[str] = []
 
@@ -2764,6 +3160,14 @@ def validate_paths(
         doc = _load_yaml(path)
         schema = doc.get("schema_version")
         if schema == SERVING_SCHEMA:
+            abs_path = path.resolve()
+            if abs_path.is_relative_to(repo_root_res) and not _is_canonical_recipe_path(
+                abs_path, repo_root=repo_root_res
+            ):
+                raise ValidationError(
+                    f"{path}: {SERVING_SCHEMA!r} files inside repository must reside under "
+                    f"{_RECIPES_REL.as_posix()}/*.yaml"
+                )
             validate_serving_recipe_structure(
                 doc,
                 context=str(path),
@@ -2819,12 +3223,9 @@ def validate_paths(
     }
 
 
-def _discover_default_paths() -> list[Path]:
+def _discover_default_paths(repo_root: Path | None = None) -> list[Path]:
     paths: list[Path] = []
-    for root in (
-        REPO_ROOT / "test" / "ppu" / "recipes",
-        REPO_ROOT / "test" / "ppu" / "policy",
-    ):
+    for root in (_recipes_root(repo_root), _policy_root(repo_root)):
         if root.is_dir():
             paths.extend(
                 sorted(p for p in root.rglob("*.yaml") if not p.name.startswith("."))
@@ -2841,8 +3242,12 @@ def _md_cell(value: str) -> str:
 
 
 def _md_code(value: str) -> str:
-    if "`" in value:
-        return f"`` {value} ``"
+    longest = max(
+        (len(match.group(0)) for match in re.finditer(r"`+", value)), default=0
+    )
+    if longest:
+        fence = "`" * (longest + 1)
+        return f"{fence} {value} {fence}"
     return f"`{value}`"
 
 
@@ -3257,6 +3662,400 @@ def render_ci_matrix_markdown(*, base_dir: Path | None = None) -> str:
     return "\n".join(lines) + "\n"
 
 
+@contextlib.contextmanager
+def _clean_diff_env() -> Iterator[None]:
+    """Strip host cache/framework variables so diff resolution is deterministic."""
+    prefixes = (
+        "HF_",
+        "HUGGINGFACE_",
+        "TRANSFORMERS_",
+        "PPU_",
+        "VLLM_",
+        "SGLANG_",
+        "NCCL_",
+        "MC_",
+        "MOONCAKE_",
+    )
+    saved = {k: os.environ.pop(k) for k in list(os.environ) if k.startswith(prefixes)}
+    try:
+        yield
+    finally:
+        os.environ.update(saved)
+
+
+def _run_git(repo_root: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
+    root = repo_root.resolve()
+    return subprocess.run(
+        ["git", "-c", f"safe.directory={root}", "-C", str(root), *args],
+        capture_output=True,
+        check=False,
+    )
+
+
+def _resolve_git_merge_base(
+    repo_root: Path,
+    base_ref: str,
+    head_ref: str | None = None,
+    *,
+    use_merge_base: bool = True,
+) -> str:
+    head_target = head_ref or "HEAD"
+    if use_merge_base:
+        mb = _run_git(repo_root, "merge-base", base_ref, head_target)
+        if mb.returncode == 0 and mb.stdout.strip():
+            return os.fsdecode(mb.stdout.strip())
+    rev = _run_git(repo_root, "rev-parse", "--verify", f"{base_ref}^{{tree}}")
+    if rev.returncode != 0:
+        err = os.fsdecode(rev.stderr).strip()
+        raise ValidationError(f"git ref {base_ref!r} not found: {err}")
+    return base_ref
+
+
+def _materialize_git_tree_snapshot(repo_root: Path, ref: str, dest_root: Path) -> None:
+    verify = _run_git(repo_root, "rev-parse", "--verify", f"{ref}^{{tree}}")
+    if verify.returncode != 0:
+        err = os.fsdecode(verify.stderr).strip()
+        raise ValidationError(f"git ref {ref!r} not found: {err}")
+    ls = _run_git(
+        repo_root,
+        "ls-tree",
+        "-r",
+        "-z",
+        "--name-only",
+        ref,
+        "--",
+        _RECIPES_REL.as_posix(),
+        _POLICY_REL.as_posix(),
+    )
+    if ls.returncode != 0:
+        err = os.fsdecode(ls.stderr).strip()
+        raise ValidationError(f"failed to list recipe/policy tree at {ref!r}: {err}")
+    rel_paths = [os.fsdecode(p) for p in ls.stdout.split(b"\0") if p]
+    if not rel_paths:
+        return
+    for rel in rel_paths:
+        show = _run_git(repo_root, "show", f"{ref}:{rel}")
+        if show.returncode != 0:
+            err = os.fsdecode(show.stderr).strip()
+            raise ValidationError(f"failed to read {ref}:{rel}: {err}")
+        out_path = dest_root / rel
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(show.stdout)
+
+
+def _snapshot_yaml_map(snapshot_root: Path) -> dict[str, bytes]:
+    files: dict[str, bytes] = {}
+    for rel_dir in (_RECIPES_REL, _POLICY_REL):
+        root = snapshot_root / rel_dir
+        if not root.is_dir():
+            continue
+        for path in sorted(root.rglob("*")):
+            if (
+                path.is_file()
+                and path.suffix in {".yaml", ".yml"}
+                and not path.name.startswith(".")
+            ):
+                rel = path.relative_to(snapshot_root).as_posix()
+                files[rel] = path.read_bytes()
+    return files
+
+
+def _collect_resolved_diff_entries(
+    snapshot_root: Path, *, strict: bool
+) -> dict[tuple[str, str], dict[str, Any]]:
+    entries: dict[tuple[str, str], dict[str, Any]] = {}
+    gate_tiers_by_key: dict[tuple[str, str, str, str | None], set[str]] = {}
+    recipes_dir = _recipes_root(snapshot_root)
+    policy_models_dir = _policy_root(snapshot_root) / "models"
+
+    with _clean_diff_env():
+        if policy_models_dir.is_dir():
+            for pol_path in sorted(
+                p
+                for p in policy_models_dir.glob("*.yaml")
+                if not p.name.startswith(".")
+            ):
+                pol_rel = pol_path.relative_to(snapshot_root).as_posix()
+                slug = pol_path.stem
+                try:
+                    pol_doc = _load_yaml(pol_path)
+                    if strict:
+                        validate_policy_structure(
+                            pol_doc, context=pol_rel, base_dir=snapshot_root
+                        )
+                    rec_rel = str(pol_doc["recipe"])
+                    rec_path = snapshot_root / rec_rel
+                    rec_doc = _load_yaml(rec_path)
+                    if rec_doc.get("ppu", {}).get("framework") != "sglang":
+                        continue
+                    tiers_blk = pol_doc.get("tiers") or {}
+                    for tier_name in sorted(tiers_blk):
+                        if tier_name not in {"fast_sanity", "model_sanity"}:
+                            continue
+                        resolved = _resolve_recipe_from_doc(
+                            rec_doc,
+                            recipe_label=rec_rel,
+                            policy=pol_doc,
+                            policy_label=pol_rel,
+                            tier=tier_name,
+                        )
+                        gate_key = (
+                            rec_rel,
+                            resolved["variant"],
+                            resolved["hardware"],
+                            resolved["preset"],
+                        )
+                        gate_tiers_by_key.setdefault(gate_key, set()).add(tier_name)
+                        env = dict(resolved.get("server_env", {}))
+                        entries[("policy", f"{slug}:{tier_name}")] = {
+                            "label": f"policy:{slug}",
+                            "tier": tier_name,
+                            "argv": list(resolved["argv"]),
+                            "env": dict(sorted(env.items())),
+                        }
+                except ValidationError as exc:
+                    if strict:
+                        raise
+                    entries[("policy", f"{slug}:error")] = {
+                        "label": f"policy:{slug}",
+                        "tier": "invalid",
+                        "argv": [f"<unresolved: {_redact_error_text(str(exc))}>"],
+                        "env": {},
+                    }
+
+        if recipes_dir.is_dir():
+            for rec_path in sorted(
+                (p for p in recipes_dir.rglob("*.yaml") if not p.name.startswith(".")),
+                key=lambda p: p.relative_to(snapshot_root).as_posix(),
+            ):
+                rec_rel = rec_path.relative_to(snapshot_root).as_posix()
+                try:
+                    rec_doc = _load_yaml(rec_path)
+                    if (
+                        rec_doc.get("schema_version") != SERVING_SCHEMA
+                        or rec_doc.get("ppu", {}).get("framework") != "sglang"
+                    ):
+                        continue
+                    for item in iter_recipe_catalog_entries(rec_path, rec_doc):
+                        resolved = item["resolved"]
+                        gate_key = (
+                            rec_rel,
+                            item["variant"],
+                            item["hardware"],
+                            item["preset"],
+                        )
+                        tiers = sorted(gate_tiers_by_key.get(gate_key, set()))
+                        tier_str = ",".join(tiers) if tiers else "catalog"
+                        preset_name = item["preset"] or "baseline"
+                        target_id = f"{rec_rel} ({item['variant']}, {item['hardware']}, {preset_name})"
+                        env = dict(resolved.get("server_env", {}))
+                        entries[("recipe", target_id)] = {
+                            "label": target_id,
+                            "tier": tier_str,
+                            "argv": list(resolved["argv"]),
+                            "env": dict(sorted(env.items())),
+                        }
+                except ValidationError as exc:
+                    if strict:
+                        raise
+                    entries[("recipe", f"{rec_rel} (error)")] = {
+                        "label": rec_rel,
+                        "tier": "invalid",
+                        "argv": [f"<unresolved: {_redact_error_text(str(exc))}>"],
+                        "env": {},
+                    }
+    return entries
+
+
+def _group_argv_units(argv: list[str]) -> list[str]:
+    units: list[str] = []
+    idx = 0
+    while idx < len(argv):
+        tok = argv[idx]
+        if (
+            tok.startswith("-")
+            and "=" not in tok
+            and idx + 1 < len(argv)
+            and not argv[idx + 1].startswith("-")
+        ):
+            units.append(shlex.join([tok, argv[idx + 1]]))
+            idx += 2
+        else:
+            units.append(shlex.quote(tok))
+            idx += 1
+    return units
+
+
+def _format_argv_diff(base_argv: list[str] | None, head_argv: list[str] | None) -> str:
+    if base_argv is None and head_argv is None:
+        return "—"
+    if base_argv is None:
+        assert head_argv is not None
+        return _md_code("+ " + shlex.join(head_argv))
+    if head_argv is None:
+        return _md_code("- " + shlex.join(base_argv))
+    if base_argv == head_argv:
+        return "unchanged"
+    base_units = _group_argv_units(base_argv)
+    head_units = _group_argv_units(head_argv)
+    matcher = difflib.SequenceMatcher(a=base_units, b=head_units)
+    delta_parts: list[str] = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag in {"replace", "delete"}:
+            delta_parts.append("- " + " ".join(base_units[i1:i2]))
+        if tag in {"replace", "insert"}:
+            delta_parts.append("+ " + " ".join(head_units[j1:j2]))
+    delta_parts.append("head: " + shlex.join(head_argv))
+    return _md_cell("\n".join(_md_code(part) for part in delta_parts))
+
+
+def _format_env_diff(
+    base_env: dict[str, str] | None, head_env: dict[str, str] | None
+) -> str:
+    b_env = base_env or {}
+    h_env = head_env or {}
+    if b_env == h_env:
+        return "—"
+    parts: list[str] = []
+    for key in sorted(set(b_env) | set(h_env)):
+        if key not in h_env:
+            parts.append(_md_code(f"- {key}={b_env[key]}"))
+        elif key not in b_env:
+            parts.append(_md_code(f"+ {key}={h_env[key]}"))
+        elif b_env[key] != h_env[key]:
+            parts.append(_md_code(f"- {key}={b_env[key]}"))
+            parts.append(_md_code(f"+ {key}={h_env[key]}"))
+    return _md_cell("\n".join(parts)) if parts else "—"
+
+
+def render_resolved_diff_markdown(
+    *,
+    base_ref: str | None = None,
+    head_ref: str | None = None,
+    base_root: Path | None = None,
+    head_root: Path | None = None,
+    repo_root: Path | None = None,
+    use_merge_base: bool = True,
+    only_when_changed: bool = False,
+    include_signoff_hint: bool = False,
+) -> str:
+    """Render a Markdown table of ``base -> head`` resolved ``argv``, ``env``, and ``tier`` changes."""
+    if (base_ref is None) == (base_root is None):
+        raise ValidationError("specify exactly one of base_ref or base_root")
+    if head_ref is not None and head_root is not None:
+        raise ValidationError("specify at most one of head_ref or head_root")
+
+    active_repo = (repo_root or REPO_ROOT).resolve()
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        if base_ref is not None:
+            resolved_base_ref = _resolve_git_merge_base(
+                active_repo, base_ref, head_ref, use_merge_base=use_merge_base
+            )
+            eff_base_root = tmp_path / "base"
+            eff_base_root.mkdir()
+            _materialize_git_tree_snapshot(
+                active_repo, resolved_base_ref, eff_base_root
+            )
+        else:
+            assert base_root is not None
+            eff_base_root = base_root.resolve()
+
+        if head_ref is not None:
+            eff_head_root = tmp_path / "head"
+            eff_head_root.mkdir()
+            _materialize_git_tree_snapshot(active_repo, head_ref, eff_head_root)
+        elif head_root is not None:
+            eff_head_root = head_root.resolve()
+        else:
+            eff_head_root = active_repo
+
+        base_files = _snapshot_yaml_map(eff_base_root)
+        head_files = _snapshot_yaml_map(eff_head_root)
+        changed_files = sorted(
+            path
+            for path in (set(base_files) | set(head_files))
+            if base_files.get(path) != head_files.get(path)
+        )
+        if only_when_changed and not changed_files:
+            return ""
+
+        base_entries = _collect_resolved_diff_entries(eff_base_root, strict=False)
+        head_entries = _collect_resolved_diff_entries(eff_head_root, strict=True)
+
+    rows: list[list[str]] = []
+    for key in sorted(set(base_entries) | set(head_entries)):
+        b_item = base_entries.get(key)
+        h_item = head_entries.get(key)
+        if (
+            b_item is not None
+            and h_item is not None
+            and b_item["tier"] == h_item["tier"]
+            and b_item["argv"] == h_item["argv"]
+            and b_item["env"] == h_item["env"]
+        ):
+            continue
+        label = (h_item or b_item)["label"]  # type: ignore[index]
+        b_tier = b_item["tier"] if b_item is not None else "—"
+        h_tier = h_item["tier"] if h_item is not None else "—"
+        tier_cell = (
+            _md_code(h_tier)
+            if b_tier == h_tier
+            else f"{_md_code(b_tier)} -> {_md_code(h_tier)}"
+        )
+        rows.append(
+            [
+                _md_code(label),
+                tier_cell,
+                _format_argv_diff(
+                    b_item["argv"] if b_item is not None else None,
+                    h_item["argv"] if h_item is not None else None,
+                ),
+                _format_env_diff(
+                    b_item["env"] if b_item is not None else None,
+                    h_item["env"] if h_item is not None else None,
+                ),
+            ]
+        )
+
+    lines = ["## Resolved Command Diff (base -> head)", ""]
+    if changed_files:
+        files_summary = ", ".join(_md_code(p) for p in changed_files)
+        lines.append(f"Changed recipe/policy files: {files_summary}")
+        lines.append("")
+    if rows:
+        lines.extend(
+            _render_md_table(
+                ["Target", "Tier (base -> head)", "Argv Changes", "Env Changes"],
+                rows,
+            )
+        )
+    else:
+        lines.append(
+            f"_No resolved argv, env, or tier changes across {len(head_entries)} expanded target(s)._"
+        )
+
+    if include_signoff_hint:
+        lines.extend(
+            [
+                "",
+                "### Model Recipe Sign-off Checklist",
+                "",
+                "- [ ] **Preserved capabilities & intentional command diff**: Required serving capabilities (topology/parallelism, quantization/KV dtype, tool-call & reasoning parsers, speculative decoding) are preserved, and every `base -> head` change above is intentional.",
+                "- [ ] **Behavioral assertion beyond HTTP 200**: Verified non-empty generation (`content` or `reasoning_content`), complete SSE `[DONE]` framing, and/or bounded GSM8K accuracy.",
+                "- [ ] **Legacy deduplication & verification links**: Updated `replaces_legacy_cases`, ran `ppu_recipe.py validate --all` + `render-matrix --check`, and linked verification evidence.",
+            ]
+        )
+
+    output = "\n".join(lines) + "\n"
+    findings = _scan_text(output, context="resolved_command_diff", allow_loopback=True)
+    if findings:
+        raise ValidationError(
+            "redaction gate blocked diff output: " + "; ".join(findings)
+        )
+    return output
+
+
 def _parse_layer_override_cli(raw: str) -> int | None:
     lowered = raw.strip().lower()
     if lowered in {"none", "null", "full"}:
@@ -3320,6 +4119,19 @@ def main(argv: list[str] | None = None) -> int:
         help="Exit non-zero if the target Markdown doc is missing or out of date",
     )
 
+    diff_cmd = sub.add_parser(
+        "diff",
+        help="Render a Markdown diff of resolved argv, env, and tier between base and head",
+    )
+    diff_cmd.add_argument("--base-ref", default=None)
+    diff_cmd.add_argument("--head-ref", default=None)
+    diff_cmd.add_argument("--base-root", type=Path, default=None)
+    diff_cmd.add_argument("--head-root", type=Path, default=None)
+    diff_cmd.add_argument("--no-merge-base", action="store_true")
+    diff_cmd.add_argument("--only-when-changed", action="store_true")
+    diff_cmd.add_argument("--include-signoff-hint", action="store_true")
+    diff_cmd.add_argument("--output", type=Path, default=None)
+
     args = parser.parse_args(argv)
     try:
         if args.command == "resolve":
@@ -3340,6 +4152,22 @@ def main(argv: list[str] | None = None) -> int:
                 served_model_name=args.served_model_name,
             )
             print(json.dumps(result, indent=2, ensure_ascii=False))
+            return 0
+
+        if args.command == "diff":
+            rendered = render_resolved_diff_markdown(
+                base_ref=args.base_ref,
+                head_ref=args.head_ref,
+                base_root=args.base_root,
+                head_root=args.head_root,
+                use_merge_base=not args.no_merge_base,
+                only_when_changed=args.only_when_changed,
+                include_signoff_hint=args.include_signoff_hint,
+            )
+            if args.output is None:
+                print(rendered, end="")
+            else:
+                args.output.write_text(rendered, encoding="utf-8")
             return 0
 
         if args.command == "render-matrix":
@@ -3372,14 +4200,19 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         target_paths = list(args.paths)
-        if args.all or not target_paths:
+        check_stray = bool(args.all or not target_paths)
+        if check_stray:
             target_paths = _discover_default_paths()
         parser_mode = "required" if args.require_sglang_parser else args.sglang_parser
-        report = validate_paths(target_paths, sglang_parser_mode=parser_mode)
+        report = validate_paths(
+            target_paths,
+            sglang_parser_mode=parser_mode,
+            check_repo_stray_recipes=check_stray,
+        )
         print(json.dumps(report, indent=2, ensure_ascii=False))
         return 0
     except ValidationError as exc:
-        print(f"validation error: {exc}", file=sys.stderr)
+        print(f"validation error: {_redact_error_text(str(exc))}", file=sys.stderr)
         return 1
 
 
