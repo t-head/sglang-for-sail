@@ -1900,6 +1900,12 @@ class Envs:
     # candidate structure (block maxima, then only the kept blocks) instead of a
     # full-width pass. 0 restores the dense top-k for A/B.
     SGLANG_OPT_DSV41_TOPK_CANDIDATES = EnvBool(True)
+    # PPU V4.1 BF16 TopK v2 for sparse-table Prefill/Decode and full/paged
+    # DeepGEMM Decode; ragged Prefill uses it only without the DeepSelect wheel.
+    # Target verification is unchanged.
+    SGLANG_OPT_DSV41_TOPK_V2 = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_OPT_DSV41_DECODE_TOPK_V2"
+    )
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # Force the Q8KV8 sparse prefill on/off regardless of --dsv4-prefill-backend.

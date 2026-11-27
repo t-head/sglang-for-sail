@@ -28,8 +28,12 @@
 #include <cfloat>
 #include <cstdint>
 #include <limits>
+#include <type_traits>
 
-#if !defined(USE_ROCM)
+#if defined(SGL_TOPK_SCORE_BF16) && defined(SGL_SAIL)
+// PPU's Decode-only BF16 module never consumes a CUDA cluster plan.
+#define SUPPORT_CLUSTER 0
+#elif !defined(USE_ROCM)
 // currently only apply cluster for SM90 & SM100, SM120 has poor cluster performance
 #define SUPPORT_CLUSTER (SGL_CUDA_ARCH >= 900 && SGL_CUDA_ARCH < 1100)
 #else
@@ -50,6 +54,21 @@
 namespace sglang {
 
 namespace device::topk {
+
+#ifdef SGL_TOPK_SCORE_BF16
+inline namespace bf16_scores {
+using score_t = bf16_t;
+#else
+using score_t = float;
+#endif
+
+SGL_DEVICE float score_to_float(score_t value) {
+  if constexpr (std::is_same_v<score_t, float>) {
+    return value;
+  } else {
+    return __bfloat162float(value);
+  }
+}
 
 /// Hints that `value` is warp-uniform so it can live in a uniform register. The
 /// caller must already guarantee that: on ROCm this is the identity, since the
@@ -154,7 +173,7 @@ struct alignas(8) TieValue {
 // ---------------------------------------------------------------------------
 
 struct TopKProblem {
-  const float* __restrict__ in;
+  const score_t* __restrict__ in;
   int32_t* __restrict__ out;  // page_indices [topk]
   uint32_t topk;
   uint32_t seq_len;
@@ -460,6 +479,20 @@ struct TopKRadixBase : TopKConfig {
   static constexpr uint32_t kHistSize = 1 << kHistBits;
   using vec_t = AlignedVector<float, kVecSize>;
 
+  // Upstream #49102: widen BF16 values in registers, not in a full score copy.
+  SGL_DEVICE static void load_scores(vec_t& v, const score_t* in, int64_t vi) {
+    if constexpr (std::is_same_v<score_t, float>) {
+      v.load(in, vi);
+    } else {
+      AlignedVector<score_t, kVecSize> raw;
+      raw.load(in, vi);
+#pragma unroll
+      for (uint32_t j = 0; j < kVecSize; ++j) {
+        v[j] = score_to_float(raw[j]);
+      }
+    }
+  }
+
   struct Smem {
     uint32_t count_eq;
     uint32_t count_gt;
@@ -498,7 +531,7 @@ struct TopKRadixBase : TopKConfig {
   }
 
   template <uint32_t N = 1, typename F>
-  SGL_DEVICE static void for_each_input(const float* __restrict__ in, uint32_t seq_len, F&& fn) {
+  SGL_DEVICE static void for_each_input(const score_t* __restrict__ in, uint32_t seq_len, F&& fn) {
     constexpr auto kStride = N * kBlockSize;
     const auto tx = threadIdx.x;
     const auto num_full = seq_len / kVecSize;  // fully-in-bounds vectors
@@ -507,12 +540,12 @@ struct TopKRadixBase : TopKConfig {
     auto vi = N == 1 ? tx : (tx % kChunk) + blockIdx.y * kChunk + (tx / kChunk) * (N * kChunk);
     if (vi < num_full) {
       vec_t next_vec;
-      next_vec.load(in, vi);
+      load_scores(next_vec, in, vi);
 #pragma unroll 1
       do {
         const auto cur = next_vec;
         vi += kStride;
-        if (vi < num_full) next_vec.load(in, vi);
+        if (vi < num_full) load_scores(next_vec, in, vi);
         const auto base = (vi - kStride) * kVecSize;
 #pragma unroll
         for (uint32_t j = 0; j < kVecSize; ++j) {
@@ -525,7 +558,7 @@ struct TopKRadixBase : TopKConfig {
       const auto base = vi * kVecSize;
       if (base == seq_len) return;
       vec_t cur;
-      cur.load(in, vi);
+      load_scores(cur, in, vi);
 #pragma unroll
       for (uint32_t j = 0; j < kVecSize; ++j) {
         if (base + j < seq_len) fn(cur[j], base + j);
@@ -607,12 +640,12 @@ struct TopKRadixBase : TopKConfig {
       const auto num_vec = (seq_len + kVecSize - 1) / kVecSize;
       uint32_t vi = kBlockSize - 1 - tx;
       vec_t cur;
-      if (vi < num_vec) cur.load(problem.in, vi);
+      if (vi < num_vec) load_scores(cur, problem.in, vi);
 #pragma unroll 1
       while (vi < num_vec) {
         const auto next_vi = vi + kBlockSize;
         vec_t next;
-        if (next_vi < num_vec) next.load(problem.in, next_vi);
+        if (next_vi < num_vec) load_scores(next, problem.in, next_vi);
 #pragma unroll
         for (uint32_t j = 0; j < kVecSize; ++j) {
           if (vi * kVecSize + j < seq_len) fn(cur[j], vi * kVecSize + j);
@@ -708,7 +741,7 @@ struct TopKRegister : TopKRadixBase<12> {
 #pragma unroll
     for (uint32_t i = 0; i < kLocalVecs; ++i) {
       const auto vi = tx + kBlockSize * i;
-      if (vi < num_full) local_vecs[i].load(problem.in, vi);
+      if (vi < num_full) load_scores(local_vecs[i], problem.in, vi);
     }
 
     const auto tail_start = (problem.seq_len - 1) % kVecSize + 1;
@@ -840,7 +873,7 @@ struct TopKCandidate : TopKRadixBase<12> {
       const auto v = tx + kBlockSize * i;
       if (v >= num_vectors) break;
       const auto start = static_cast<uint32_t>(blocks[v >> 1]) * kBlockPositions + (v & 1u) * kVecSize;
-      local_vecs[i].load(problem.in, static_cast<int64_t>(start) / kVecSize);
+      load_scores(local_vecs[i], problem.in, static_cast<int64_t>(start) / kVecSize);
       if (start + kVecSize > seq_len) {
 #pragma unroll
         for (uint32_t j = 0; j < kVecSize; ++j) {
@@ -1176,6 +1209,10 @@ struct TopKCluster : TopKRadixBase<10> {
 };
 
 #endif  // !USE_ROCM
+
+#ifdef SGL_TOPK_SCORE_BF16
+}  // namespace bf16_scores
+#endif
 
 }  // namespace device::topk
 

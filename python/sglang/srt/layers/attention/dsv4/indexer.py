@@ -26,6 +26,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     top_k_per_row_prefill,
     top_k_per_row_prefill_bf16,
     topk_transform_paged,
+    topk_transform_paged_bf16_v2,
     topk_transform_paged_v2,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
@@ -622,6 +623,7 @@ def topk_transform_paged_from_metadata(
     *,
     rows: Optional[slice] = None,
     topk_metadata: Optional[torch.Tensor] = None,
+    use_bf16_v2: bool = False,
 ) -> None:
     """Pool slots into ``page_indices`` (``-1`` past the valid count) and, when given,
     positions into ``raw_indices``; ``metadata`` is a ``PagedIndexerMetadata``."""
@@ -637,7 +639,10 @@ def topk_transform_paged_from_metadata(
         out_raw_indices = raw_indices[rows] if raw_indices is not None else None
     if logits.dtype == torch.bfloat16:
         assert out_raw_indices is None
-        topk_transform_paged_bf16(
+        transform = (
+            topk_transform_paged_bf16_v2 if use_bf16_v2 else topk_transform_paged_bf16
+        )
+        transform(
             logits,
             seq_lens,
             page_table,

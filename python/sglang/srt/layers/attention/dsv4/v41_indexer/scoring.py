@@ -21,6 +21,7 @@ from sglang.kernels.ops.attention.dsv4.index_logits import flat_index_logits_til
 from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
+    topk_transform_ragged_bf16_v2,
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
@@ -304,11 +305,22 @@ def topk_ragged(
     offsets: torch.Tensor,
 ) -> None:
     """Top-k of each row's first ``lens`` columns plus ``offsets`` into ``out``,
-    ``-1`` padded, unordered: DeepSelect for bf16 logits, top-k v2 for fp32."""
+    ``-1`` padded, unordered. Preserve the DeepSelect wheel when available;
+    PPU can opt in to native BF16 v2 when the wheel is absent."""
     if logits.dtype == torch.bfloat16:
-        from sglang.kernels.ops.attention.deep_select import topk
+        from sglang.kernels.ops.attention import deep_select
 
-        topk(
+        if (
+            is_sail()
+            and envs.SGLANG_OPT_DSV41_TOPK_V2.get()
+            and not deep_select._wheel_available()
+        ):
+            topk_transform_ragged_bf16_v2(
+                logits, lens, out_offsets=offsets, out_indices=out
+            )
+            return
+
+        deep_select.topk(
             logits,
             out.shape[1],
             end=lens,
