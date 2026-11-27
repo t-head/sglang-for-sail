@@ -461,6 +461,7 @@ class DSV4AttnMetadata:
     c1_sparse_page_indices: Optional[torch.Tensor] = field(init=False, default=None)
     c1_sparse_raw_indices: Optional[torch.Tensor] = field(init=False, default=None)
     c2_out_loc: Optional[torch.Tensor] = None
+    c2_topk_lengths_raw: Optional[torch.Tensor] = None
     c2_topk_lengths_clamp1: Optional[torch.Tensor] = None
     c2_sparse_topk_lengths: Optional[torch.Tensor] = field(init=False, default=None)
     c2_sparse_page_indices: Optional[torch.Tensor] = field(init=False, default=None)
@@ -684,6 +685,7 @@ class DSV4AttnMetadata:
                 "c1_sparse_page_indices",
                 "c1_sparse_raw_indices",
                 "c2_out_loc",
+                "c2_topk_lengths_raw",
                 "c2_topk_lengths_clamp1",
                 "c2_sparse_topk_lengths",
                 "c2_sparse_page_indices",
@@ -732,6 +734,7 @@ class DSV4AttnMetadata:
             "c1_topk_lengths_clamp1",
             "c1_sparse_topk_lengths",
             "c2_out_loc",
+            "c2_topk_lengths_raw",
             "c2_topk_lengths_clamp1",
             "c2_sparse_topk_lengths",
             # Preserve graph-captured table addresses; refill c4 per layer.
@@ -820,8 +823,11 @@ class DSV4AttnMetadata:
         self.swa_page_indices = _pad_last_dim(self.swa_page_indices)
 
         if low_ratio_buffers is not None:
-            self.c1_out_loc, self.c1_topk_lengths_clamp1 = low_ratio_buffers[:2]
-            self.c2_out_loc, self.c2_topk_lengths_clamp1 = low_ratio_buffers[4:6]
+            self.c1_out_loc = low_ratio_buffers.c1_out_loc
+            self.c1_topk_lengths_clamp1 = low_ratio_buffers.c1_seq_lens
+            self.c2_out_loc = low_ratio_buffers.c2_out_loc
+            self.c2_topk_lengths_raw = low_ratio_buffers.c2_seq_lens_raw
+            self.c2_topk_lengths_clamp1 = low_ratio_buffers.c2_seq_lens
             return
         if 1 in self.low_ratios:
             self.c1_out_loc, self.c1_topk_lengths_clamp1 = (
@@ -835,6 +841,7 @@ class DSV4AttnMetadata:
                     2, self.seq_lens_casual, self.raw_out_loc
                 )
             )
+            self.c2_topk_lengths_raw = (self.seq_lens_casual // 2).to(torch.int32)
 
     # Cache-write locations stay in global logical order and are intentionally
     # excluded from CP reindexing.
@@ -852,6 +859,7 @@ class DSV4AttnMetadata:
         "c128_page_indices",
         "c128_topk_lengths_clamp1",
         "c1_topk_lengths_clamp1",
+        "c2_topk_lengths_raw",
         "c2_topk_lengths_clamp1",
     ]
     _CP_GLOBAL_FIELDS = [
@@ -940,12 +948,10 @@ class DSV4AttnMetadata:
         )
         if low_ratio_buffers is not None:
             assert not is_prefill and self.low_ratios == (1, 2)
-            self.c1_sparse_topk_lengths, self.c1_sparse_page_indices = (
-                low_ratio_buffers[2:4]
-            )
-            self.c2_sparse_topk_lengths, self.c2_sparse_page_indices = (
-                low_ratio_buffers[6:8]
-            )
+            self.c1_sparse_topk_lengths = low_ratio_buffers.c1_sparse_lens
+            self.c1_sparse_page_indices = low_ratio_buffers.c1_page_indices
+            self.c2_sparse_topk_lengths = low_ratio_buffers.c2_sparse_lens
+            self.c2_sparse_page_indices = low_ratio_buffers.c2_page_indices
             self.c1_flashmla_metadata = _create_flashmla_metadata()
             self.c2_flashmla_metadata = _create_flashmla_metadata()
             return
@@ -1330,12 +1336,16 @@ class DeepseekV4AttnBackend(
         self.has_c128: bool = 128 in self.present_ratios
         cfg = model_runner.model_config.hf_text_config
         self.is_dsv41: bool = getattr(cfg, "model_type", None) == "deepseek_v41"
+        self.index_n_heads = cfg.index_n_heads
+        self.index_head_dim = model_runner.model_config.index_head_dim
         self.prefill_candidates, self.decode_candidates = make_candidate_indexer(
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
             page_size=self.page_size,
             candidate_topk_blocks=getattr(cfg, "candidate_topk_blocks", 0),
             candidate_block_size=getattr(cfg, "candidate_block_size", 0),
+            index_n_heads=self.index_n_heads,
+            index_head_dim=self.index_head_dim,
         )
         self.full_topk_indexer = make_full_topk_indexer(
             token_to_kv_pool=self.token_to_kv_pool, req_to_token=self.req_to_token
@@ -1427,8 +1437,6 @@ class DeepseekV4AttnBackend(
         self.builds_verify_metadata_early = False
         # Ids of the captured verify metadata built that way; the bucket keeps them alive.
         self._early_verify_metadata_ids: set = set()
-        self.index_n_heads = model_runner.model_config.hf_text_config.index_n_heads
-        self.index_head_dim = model_runner.model_config.index_head_dim
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -1573,7 +1581,7 @@ class DeepseekV4AttnBackend(
             c_seq_lens = (
                 core_attn_metadata.c1_topk_lengths_clamp1
                 if compress_ratio == 1
-                else core_attn_metadata.c2_topk_lengths_clamp1
+                else core_attn_metadata.c2_topk_lengths_raw
             )
             # The low-ratio indexer-K pool pages at 64 slots, not page_size //
             # ratio, so the kernel needs a block table at that granularity.
@@ -4076,16 +4084,38 @@ class DeepseekV4AttnBackend(
         if layer.indexer is not None and layer.indexer.owns_k:
             indexer = layer.indexer
             if layer.indexer.use_int8:
-                from sglang.kernels.ops.attention.dsv4.int8_indexer import (
-                    store_int8_index_k,
-                )
+                if (
+                    latent.is_cuda
+                    and latent.dtype == torch.bfloat16
+                    and indexer.index_head_dim == 128
+                    and 0 <= indexer.rope_head_dim <= 128
+                    and indexer.rope_head_dim % 2 == 0
+                    and slots.dtype == torch.int64
+                ):
+                    from sglang.kernels.ops.attention.dsv4.int8_indexer import (
+                        store_index_k_norm_rope_int8,
+                    )
 
-                store_int8_index_k(
-                    layer.indexer.index_keys(latent, freqs),
-                    pool.get_index_k_with_scale_buffer(layer.layer_id),
-                    slots,
-                    pool.get_index_k_page_size(layer.compress_ratio),
-                )
+                    store_index_k_norm_rope_int8(
+                        indexer.forward_wk(latent),
+                        indexer.k_norm.weight,
+                        indexer.k_norm.eps,
+                        freqs,
+                        indexer.rope_head_dim,
+                        cache=pool.get_index_k_with_scale_buffer(layer.layer_id),
+                        loc=slots,
+                    )
+                else:
+                    from sglang.kernels.ops.attention.dsv4.int8_indexer import (
+                        store_int8_index_k,
+                    )
+
+                    store_int8_index_k(
+                        layer.indexer.index_keys(latent, freqs),
+                        pool.get_index_k_with_scale_buffer(layer.layer_id),
+                        slots,
+                        pool.get_index_k_page_size(layer.compress_ratio),
+                    )
             elif (
                 _is_sail
                 and latent.is_cuda

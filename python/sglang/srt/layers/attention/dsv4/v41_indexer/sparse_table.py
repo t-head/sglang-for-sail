@@ -1,6 +1,7 @@
-"""The candidate scheme carried by a DeepGEMM sparse table (SM100 or PPU SM89+): a source
-publishes its blocks with the schedule ``fp8_fp4_paged_sparse_mqa_logits`` needs,
-a consumer scores only those blocks out of the index-K pool."""
+"""The candidate scheme carried by a DeepGEMM sparse table (SM100 or PPU SM80+): a source
+publishes its blocks with the schedule ``fp8_fp4_paged_sparse_mqa_logits`` (FP4) or
+``int8_paged_sparse_mqa_logits`` (INT8) needs, and a consumer scores only those blocks out
+of the index-K pool."""
 
 from __future__ import annotations
 
@@ -39,6 +40,7 @@ from .scoring import (
     get_deep_gemm_decode_data,
     get_deep_gemm_prefill_data,
     get_index_k_cache,
+    get_low_ratio_index_k,
     quantize_index_q,
     score_tiles,
     topk_ragged,
@@ -143,9 +145,7 @@ class SparseTableBackend:
         )
         table = publish_prefill_table(
             data=data,
-            kv=self.token_to_kv_pool.get_low_ratio_index_k_fp4(
-                inputs.layer_id, data.k_slots
-            ),
+            kv=get_low_ratio_index_k(self.token_to_kv_pool, inputs, data.k_slots),
             index_page_table=expand_index_page_table(
                 inputs.kv_page_table[: data.num_rows],
                 full_page_size=self.page_size,
@@ -165,7 +165,7 @@ class SparseTableBackend:
         published: Optional[_SparsePrefillTable],
     ) -> None:
         inputs.reset_outputs()
-        data = get_deep_gemm_prefill_data(inputs)
+        data = get_deep_gemm_prefill_data(inputs, weights_dtype=torch.bfloat16)
         if data is None:
             return
         assert published is not None
@@ -178,6 +178,7 @@ class SparseTableBackend:
                 page_size=self.token_to_kv_pool.get_index_k_page_size(
                     inputs.compress_ratio
                 ),
+                use_int8=inputs.indexer.use_int8,
             ),
             out_positions=inputs.out_raw_indices[: data.num_rows],
         )
@@ -193,14 +194,22 @@ class SparseTableBackend:
             "must run under the same graph before its consumers"
         )
         indexer = inputs.indexer
-        q_fp4, q_sf = quantize_index_q(inputs.q)
-        rows = q_fp4.shape[0]
+        if indexer.use_int8:
+            from sglang.kernels.ops.attention.dsv4.int8_indexer import quantize_query
+
+            q_quant, weights = quantize_query(inputs.q, inputs.weights)
+            q_sf = None
+        else:
+            q_quant, q_sf = quantize_index_q(inputs.q)
+            weights = inputs.weights
+        rows = q_quant.shape[0]
         k_cache = get_index_k_cache(
             token_to_kv_pool=self.token_to_kv_pool,
             layer_id=inputs.layer_id,
             page_size=inputs.index_page_size,
+            use_int8=indexer.use_int8,
         )
-        logits = _prefill_table_logits(published, q_fp4, q_sf, inputs.weights, k_cache)
+        logits = _prefill_table_logits(published, q_quant, q_sf, weights, k_cache)
         topk = min(indexer.index_topk, published.blocks.shape[1] * CANDIDATE_BLOCK_SIZE)
 
         def transform(blocks: torch.Tensor, out: torch.Tensor) -> None:
@@ -276,6 +285,9 @@ class SparseTableBackend:
         seq_lens = metadata.compressed_seq_lens.reshape(-1)
         if isinstance(metadata.deep_gemm_metadata, list):
             return self._publish_decode_chunked(inputs, data, seq_lens)
+        req_indices = (
+            None if data.q_sf is None else getattr(metadata, "request_indices", None)
+        )
         q, lens, table = data.paged_logits_args(metadata)
         logits = deep_gemm_fp4_paged_mqa_logits(
             q,
@@ -285,7 +297,7 @@ class SparseTableBackend:
             table,
             metadata.deep_gemm_metadata,
             metadata.max_compressed_seq_len,
-            indices=metadata.request_indices,
+            indices=req_indices,
         )
         main_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(main_stream)
@@ -351,6 +363,9 @@ class SparseTableBackend:
         block_chunks = []
         phys_block_chunks = []
         valid_len_chunks = []
+        req_indices = (
+            None if data.q_sf is None else getattr(metadata, "request_indices", None)
+        )
         for rows, plan in metadata.row_chunks():
             q, lens, table = data.paged_logits_args(metadata, rows)
             logits = deep_gemm_fp4_paged_mqa_logits(
@@ -361,11 +376,7 @@ class SparseTableBackend:
                 table,
                 plan,
                 metadata.max_compressed_seq_len,
-                indices=(
-                    metadata.request_indices[rows]
-                    if metadata.request_indices is not None
-                    else None
-                ),
+                indices=(req_indices[rows] if req_indices is not None else None),
             )
             if logits.dtype == torch.bfloat16:
                 topk_transform_paged_bf16(
@@ -424,7 +435,9 @@ class SparseTableBackend:
         published: Optional[_SparseTable],
     ) -> None:
         assert published is not None
-        data = get_deep_gemm_decode_data(inputs, self.token_to_kv_pool)
+        data = get_deep_gemm_decode_data(
+            inputs, self.token_to_kv_pool, weights_dtype=torch.bfloat16
+        )
         torch.cuda.current_stream().wait_event(published.ready)
         logits = sparse_logits(
             data.q_fp4,
@@ -565,15 +578,15 @@ def publish_prefill_table(
 def _prefill_table_logits(
     table: _SparseTable,
     q_fp4: torch.Tensor,
-    q_sf: torch.Tensor,
+    q_sf: Optional[torch.Tensor],
     weights: torch.Tensor,
     k_cache: torch.Tensor,
 ) -> torch.Tensor:
     """Sparse logits of prefill rows (one query row each) over a table's blocks."""
-    rows, heads = q_sf.shape[0], q_sf.shape[1]
+    rows, heads, head_dim = q_fp4.shape
     return sparse_logits(
-        q_fp4.view(rows, 1, heads, 64),
-        q_sf.view(rows, 1, heads),
+        q_fp4.view(rows, 1, heads, head_dim),
+        q_sf.view(rows, 1, heads) if q_sf is not None else None,
         k_cache,
         weights.to(torch.bfloat16),
         table.schedule,

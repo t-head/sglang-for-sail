@@ -286,6 +286,7 @@ def _low_ratio_metadata(
     SPARSE1,
     PAGE1,
     OUT2,
+    LEN2_RAW,
     LEN2,
     SPARSE2,
     PAGE2,
@@ -296,10 +297,13 @@ def _low_ratio_metadata(
     row = tl.program_id(0)
     length = tl.load(LENS + row).to(tl.int32)
     loc = tl.load(LOC + row).to(tl.int64)
-    len1, len2 = tl.maximum(length, 1), tl.maximum(length >> 1, 1)
+    len1 = tl.maximum(length, 1)
+    len2_raw = length >> 1
+    len2 = tl.maximum(len2_raw, 1)
     tl.store(OUT1 + row, loc)
     tl.store(OUT2 + row, tl.where((length & 1) == 0, loc >> 1, -1))
     tl.store(LEN1 + row, len1)
+    tl.store(LEN2_RAW + row, len2_raw)
     tl.store(LEN2 + row, len2)
     tl.store(SPARSE1 + row, tl.minimum(len1, TOPK))
     tl.store(SPARSE2 + row, tl.minimum(len2, TOPK))
@@ -316,6 +320,7 @@ class LowRatioMetadata(NamedTuple):
     c1_sparse_lens: torch.Tensor
     c1_page_indices: torch.Tensor
     c2_out_loc: torch.Tensor
+    c2_seq_lens_raw: torch.Tensor
     c2_seq_lens: torch.Tensor
     c2_sparse_lens: torch.Tensor
     c2_page_indices: torch.Tensor
@@ -326,16 +331,17 @@ def build_low_ratio_metadata(seq_lens, out_loc, topk) -> LowRatioMetadata:
     rows = seq_lens.numel()
     kw = dict(device=seq_lens.device, dtype=torch.int32)
     padded = triton.cdiv(topk, 64) * 64
-    outputs = []
-    for _ in range(2):
-        outputs.extend(
-            [
-                torch.empty(rows, device=out_loc.device, dtype=torch.int64),
-                torch.empty(rows, **kw),
-                torch.empty(rows, **kw),
-                torch.empty((rows, padded), **kw),
-            ]
-        )
+    outputs = [
+        torch.empty(rows, device=out_loc.device, dtype=torch.int64),
+        torch.empty(rows, **kw),
+        torch.empty(rows, **kw),
+        torch.empty((rows, padded), **kw),
+        torch.empty(rows, device=out_loc.device, dtype=torch.int64),
+        torch.empty(rows, **kw),
+        torch.empty(rows, **kw),
+        torch.empty(rows, **kw),
+        torch.empty((rows, padded), **kw),
+    ]
     _low_ratio_metadata[(rows,)](
         seq_lens, out_loc, *outputs, topk, padded, triton.next_power_of_2(padded)
     )

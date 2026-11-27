@@ -50,10 +50,13 @@ def index_logits_dtype() -> torch.dtype:
 
 @functools.cache
 def index_weights_dtype() -> torch.dtype:
-    """DeepGEMM reduces in the head weights' dtype and takes bf16 weights only on
-    SM100 with bf16 logits."""
+    """DeepGEMM reduces in the head weights' dtype: bf16 on SAIL SM89+ (MXFP4)
+    and SM100 with bf16 logits; fp32 elsewhere (or index_logits_dtype() on SAIL
+    below SM89, where int8_*_mqa_logits infer output dtype from weights)."""
     if is_sail():
-        return torch.bfloat16
+        if get_device_sm() >= 89:
+            return torch.bfloat16
+        return index_logits_dtype()
     if index_logits_dtype() == torch.bfloat16 and _is_sm100():
         return torch.bfloat16
     return torch.float32
@@ -88,7 +91,7 @@ def flat_index_logits_rows_per_tile(
 
 def flat_index_logits_tiles(
     *,
-    q: tuple[torch.Tensor, torch.Tensor],
+    q: tuple[torch.Tensor, torch.Tensor] | torch.Tensor,
     kv: tuple[torch.Tensor, torch.Tensor],
     weights: torch.Tensor,
     starts: torch.Tensor,
@@ -100,9 +103,9 @@ def flat_index_logits_tiles(
     ``logits[i, j]`` scores query row ``rows.start + i`` against ``kv[starts + j]``,
     garbage past the row's ``lengths``; the width is ``max(context_lengths)``
     aligned to ``FLAT_LOGITS_WIDTH_ALIGN``."""
-    from deep_gemm import fp8_fp4_mqa_logits
-
-    rows = q[0].shape[0]
+    is_packed = isinstance(q, tuple)
+    q_tensor = q[0] if is_packed else q
+    rows = q_tensor.shape[0]
     width = ceil_align(max(context_lengths, default=0), FLAT_LOGITS_WIDTH_ALIGN)
     if rows == 0 or width == 0:
         return
@@ -115,15 +118,16 @@ def flat_index_logits_tiles(
         # tensor, so the planner's row accounting applies as-is.
         budget_bytes = max_logits_mb * 1024 * 1024
     rows_per_chunk = flat_index_logits_rows_per_tile(
-        rows, width, heads=q[0].shape[1], budget_bytes=budget_bytes
+        rows, width, heads=q_tensor.shape[1], budget_bytes=budget_bytes
     )
     weights = weights.to(index_weights_dtype())
     logits_dtype = index_logits_dtype()
     for offset in range(0, rows, rows_per_chunk):
         tile = slice(offset, min(offset + rows_per_chunk, rows))
         if is_sail():
+            q_tile = (q[0][tile], q[1][tile]) if is_packed else q[tile]
             logits = sail_mqa_logits(
-                (q[0][tile], q[1][tile]),
+                q_tile,
                 kv,
                 weights[tile],
                 starts[tile],
@@ -131,6 +135,8 @@ def flat_index_logits_tiles(
                 max_seqlen_k=width,
             )
         else:
+            from deep_gemm import fp8_fp4_mqa_logits
+
             logits = fp8_fp4_mqa_logits(
                 (q[0][tile], q[1][tile]),
                 kv,
@@ -145,7 +151,7 @@ def flat_index_logits_tiles(
 
 
 def deep_gemm_fp4_paged_mqa_logits(
-    q_fp4: Tuple[torch.Tensor, torch.Tensor],
+    q_fp4: Tuple[torch.Tensor, torch.Tensor] | torch.Tensor,
     k_cache: torch.Tensor,
     weights: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -155,20 +161,20 @@ def deep_gemm_fp4_paged_mqa_logits(
     *,
     indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """DeepGEMM paged fp4 logits; no hadamard, the reference does not apply one."""
-    from deep_gemm import fp8_fp4_paged_mqa_logits
-
+    """DeepGEMM paged fp4/int8 logits; no hadamard, the reference does not apply one."""
     if is_sail():
         return sail_paged_mqa_logits(
             q_fp4,
             k_cache,
-            weights,
+            weights.to(index_weights_dtype()),
             seq_lens,
             page_table,
             deep_gemm_metadata,
             max_seq_len,
             indices=indices,
         )
+    from deep_gemm import fp8_fp4_paged_mqa_logits
+
     sl = seq_lens.to(torch.int32)
     if sl.dim() == 1:
         sl = sl.unsqueeze(-1)
@@ -187,19 +193,34 @@ def deep_gemm_fp4_paged_mqa_logits(
 
 def sparse_logits(
     q_fp4: torch.Tensor,
-    q_sf: torch.Tensor,
+    q_sf: torch.Tensor | None,
     k_cache: torch.Tensor,
     weights: torch.Tensor,
     schedule: torch.Tensor,
     topk_blocks: int,
 ) -> torch.Tensor:
-    """bf16 logits ``[rows, topk_blocks * 8]`` of the published blocks: ``q_fp4``
-    ``[rows, 1, heads, 64]`` int8 with ``q_sf`` ``[rows, 1, heads]`` int32 (packed
-    ue8m0), ``k_cache`` ``[pages, page_size, 1, 68]`` uint8 whose page stride is
-    a multiple of 512 bytes, ``weights`` ``[rows, heads]`` bf16, ``schedule`` the
-    ``build_sparse_indexer_schedule`` of the ``topk_blocks`` published blocks."""
+    """bf16 logits ``[rows, topk_blocks * 8]`` of the published blocks.
+
+    For FP4 (``q_sf`` is not None): ``q_fp4`` ``[rows, 1, heads, 64]`` int8 with
+    ``q_sf`` ``[rows, 1, heads]`` int32 (packed ue8m0), ``k_cache``
+    ``[pages, page_size, 1, 68]`` uint8.
+    For INT8 (``q_sf`` is None, SAIL SM80): ``q_fp4`` ``[rows, 1, heads, 128]``
+    int8, ``k_cache`` ``[pages, page_size, 1, 132]`` uint8.
+    Both require ``k_cache`` page stride a multiple of 512 bytes, ``weights``
+    ``[rows, heads]`` bf16, and ``schedule`` from
+    ``build_sparse_indexer_schedule``."""
     import deep_gemm
 
+    if q_sf is None:
+        logits = deep_gemm.int8_paged_sparse_mqa_logits(
+            q_fp4.contiguous(),
+            k_cache,
+            weights.to(torch.bfloat16).contiguous(),
+            schedule,
+            topk_blocks,
+            CANDIDATE_BLOCK_SIZE,
+        )
+        return logits[:, : topk_blocks * CANDIDATE_BLOCK_SIZE]
     return deep_gemm.fp8_fp4_paged_sparse_mqa_logits(
         (q_fp4, q_sf),
         k_cache,

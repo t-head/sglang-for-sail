@@ -21,6 +21,7 @@ from .scoring import (
     PagedDecodeScores,
     decode_score_chunks,
     get_deep_gemm_prefill_data,
+    get_low_ratio_index_k,
     prefill_requests,
     score_tiles,
     select_decode,
@@ -171,9 +172,7 @@ class DenseBlocksBackend:
             return None
         selected, blocks = _publish_prefill_blocks(
             data=data,
-            kv=self.token_to_kv_pool.get_low_ratio_index_k_fp4(
-                inputs.layer_id, data.k_slots
-            ),
+            kv=get_low_ratio_index_k(self.token_to_kv_pool, inputs, data.k_slots),
             topk=inputs.indexer.index_topk,
             topk_blocks=self.topk_blocks,
             block_size=self.block_size,
@@ -193,9 +192,7 @@ class DenseBlocksBackend:
         assert published is not None
         selected = _consume_prefill_blocks(
             data=data,
-            kv=self.token_to_kv_pool.get_low_ratio_index_k_fp4(
-                inputs.layer_id, data.k_slots
-            ),
+            kv=get_low_ratio_index_k(self.token_to_kv_pool, inputs, data.k_slots),
             topk=inputs.indexer.index_topk,
             blocks=published.blocks,
             block_size=self.block_size,

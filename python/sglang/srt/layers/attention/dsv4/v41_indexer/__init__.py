@@ -36,6 +36,7 @@ __all__ = [
     "PrefillCandidates",
     "PrefillInputs",
     "has_dense_fp4_indexer",
+    "has_dense_int8_indexer",
     "is_sm100_or_newer",
     "make_candidate_indexer",
     "make_full_topk_indexer",
@@ -59,20 +60,29 @@ def has_dense_fp4_indexer() -> bool:
         return False
     try:
         import deep_gemm
-    except ImportError:
+    except (ImportError, OSError, RuntimeError):
         return False
     return hasattr(deep_gemm, "fp8_fp4_mqa_logits")
+
+
+@functools.cache
+def has_dense_int8_indexer() -> bool:
+    if not torch.cuda.is_available() or torch.version.cuda is None:
+        return False
+    try:
+        import deep_gemm
+    except (ImportError, OSError, RuntimeError):
+        return False
+    return callable(getattr(deep_gemm, "int8_mqa_logits", None))
 
 
 @functools.cache
 def _use_deep_gemm_prefill() -> bool:
     from sglang.srt.layers.attention.dsv4.indexer_quant import use_dsv41_int8_indexer
 
-    return (
-        not use_dsv41_int8_indexer()
-        and use_deep_gemm_fp4_indexer()
-        and has_dense_fp4_indexer()
-    )
+    if use_dsv41_int8_indexer():
+        return is_sail() and has_dense_int8_indexer()
+    return use_deep_gemm_fp4_indexer() and has_dense_fp4_indexer()
 
 
 def make_full_topk_indexer(
@@ -80,14 +90,11 @@ def make_full_topk_indexer(
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
     req_to_token: torch.Tensor,
 ) -> FullTopKIndexer:
-    from sglang.srt.layers.attention.dsv4.indexer_quant import use_dsv41_int8_indexer
-
     return FullTopKIndexer(
         token_to_kv_pool=token_to_kv_pool,
         req_to_token=req_to_token,
         use_deep_gemm_prefill=_use_deep_gemm_prefill(),
-        use_deep_gemm_decode=use_deep_gemm_fp4_indexer()
-        and not use_dsv41_int8_indexer(),
+        use_deep_gemm_decode=use_deep_gemm_fp4_indexer(),
     )
 
 
@@ -98,6 +105,8 @@ def make_candidate_indexer(
     page_size: int,
     candidate_topk_blocks: int,
     candidate_block_size: int,
+    index_n_heads: int | None = None,
+    index_head_dim: int | None = None,
 ) -> Tuple[PrefillCandidates, DecodeCandidates]:
     from sglang.srt.layers.attention.dsv4.indexer_quant import (
         use_dsv41_int8_indexer,
@@ -114,13 +123,52 @@ def make_candidate_indexer(
         candidate_block_size=candidate_block_size,
         use_deep_gemm_prefill=use_deep_gemm_prefill,
     )
-    # The sparse table path packs FP4 index-K; an INT8 pool stores 132-byte
-    # slots, and the dense backend dispatches on indexer.use_int8 itself.
-    if use_dsv41_int8_indexer():
-        return dense_blocks, dense_blocks
     # Without candidate blocks no layer is a candidate source or consumer.
-    supports_sparse = get_device_sm() >= 89 if is_sail() else is_sm100_or_newer()
+    # DeepGEMM's int8_paged_sparse_mqa_logits requires 810E (SM 8.0), H=32, D=128,
+    # and a 512-byte-aligned index-K page stride (page_size % 128 == 0).
+    if is_sail():
+        sm = get_device_sm()
+        if use_dsv41_int8_indexer():
+            supports_sparse = (
+                sm == 80
+                and index_n_heads in (None, 32)
+                and index_head_dim in (None, 128)
+            )
+            if supports_sparse and token_to_kv_pool is not None:
+                index_pools = getattr(token_to_kv_pool, "index_pools", None) or {}
+                for ratio in (1, 2):
+                    pool = index_pools.get(ratio)
+                    if pool is not None and (pool.page_size * 132) % 512 != 0:
+                        logger.warning(
+                            "INT8 sparse indexer requires a 512-byte-aligned "
+                            "page stride (got ratio=%d page_size=%d); falling "
+                            "back to dense blocks.",
+                            ratio,
+                            pool.page_size,
+                        )
+                        supports_sparse = False
+                        break
+        else:
+            supports_sparse = sm >= 89
+    else:
+        supports_sparse = is_sm100_or_newer() and not use_dsv41_int8_indexer()
     if not supports_sparse or candidate_topk_blocks <= 0:
+        return dense_blocks, dense_blocks
+    # SparseTableBackend requires block_size=8; DeepGEMM sparse metadata requires
+    # topk_blocks % 4 == 0, and sort_candidate_blocks / topk_transform_sparse cap
+    # topk_blocks at 2048.
+    if (
+        candidate_block_size != 8
+        or candidate_topk_blocks % 4 != 0
+        or candidate_topk_blocks > 2048
+    ):
+        logger.warning(
+            "Sparse candidate indexer requires block_size=8 and "
+            "topk_blocks in (0, 2048] divisible by 4 (got block_size=%d, "
+            "topk_blocks=%d); falling back to dense blocks.",
+            candidate_block_size,
+            candidate_topk_blocks,
+        )
         return dense_blocks, dense_blocks
 
     from sglang.srt.layers.deep_gemm_wrapper.configurer import (
@@ -143,7 +191,7 @@ def make_candidate_indexer(
         candidate_block_size=candidate_block_size,
     )
     # A CP rank's rows are an interleaved subset of the batch, and without the dense
-    # fp4 indexer prefill scores on torch: both keep the sparse table on decode only.
+    # indexer prefill scores on torch: both keep the sparse table on decode only.
     if not use_deep_gemm_prefill or get_parallel().attn_cp_size > 1:
         return dense_blocks, sparse_table
     return sparse_table, sparse_table

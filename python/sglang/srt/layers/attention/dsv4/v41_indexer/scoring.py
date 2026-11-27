@@ -50,18 +50,27 @@ def _deep_gemm_score_budget_bytes() -> int:
 
 
 class DeepGEMMDecodeData(msgspec.Struct, frozen=True):
-    q_fp4: torch.Tensor  # [rows, 1, heads, 64] int8, packed fp4
-    q_sf: torch.Tensor  # [rows, 1, heads] int32, packed ue8m0
+    q_fp4: (
+        torch.Tensor
+    )  # [rows, 1, heads, 64] int8 (FP4) or [rows, 1, heads, 128] int8 (INT8)
+    q_sf: Optional[
+        torch.Tensor
+    ]  # [rows, 1, heads] int32 packed ue8m0, or None for INT8
     weights: torch.Tensor  # [rows, heads] bf16/fp32 head weights
-    k_cache: torch.Tensor  # [pages, page_size, 1, 68] uint8, the layer's index-K pool
+    k_cache: (
+        torch.Tensor
+    )  # [pages, page_size, 1, 68 or 132] uint8, the layer's index-K pool
 
     def paged_logits_args(self, metadata, rows=slice(None)):
         """``(q, lengths, page_table)`` for ``deep_gemm_fp4_paged_mqa_logits`` over
         ``rows``, ``metadata.rows_per_request`` consecutive rows per request."""
         n = metadata.rows_per_request
-        q_fp4, q_sf = self.q_fp4[rows], self.q_sf[rows]
+        q_fp4 = self.q_fp4[rows]
         lens = metadata.compressed_seq_lens[rows]
         table = metadata.page_table[rows]
+        if self.q_sf is None:
+            return q_fp4, lens, table
+        q_sf = self.q_sf[rows]
         if n > 1 and not is_sail():
             heads = q_fp4.shape[2]
             q_fp4 = q_fp4.view(-1, n, heads, 64)
@@ -80,9 +89,11 @@ class DeepGEMMPrefillData(msgspec.Struct, frozen=True):
     lens_per_request: List[int]  # compressed positions at each request's newest token
     rows_per_request: List[int]  # query rows of each request
     compress_lens: torch.Tensor  # [rows] int32, compressed positions the row sees
-    q_fp4: torch.Tensor  # [rows, heads, 64] int8, packed fp4
-    q_sf: torch.Tensor  # [rows, heads] int32, packed ue8m0
-    weights: torch.Tensor  # [rows, heads] fp32 head weights
+    q_fp4: (
+        torch.Tensor
+    )  # [rows, heads, 64] int8 (FP4) or [rows, heads, 128] int8 (INT8)
+    q_sf: Optional[torch.Tensor]  # [rows, heads] int32 packed ue8m0, or None for INT8
+    weights: torch.Tensor  # [rows, heads] fp32/bf16 head weights
 
     @property
     def num_rows(self) -> int:
@@ -132,12 +143,24 @@ def get_index_k_cache(
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
     layer_id: int,
     page_size: int,
+    use_int8: bool = False,
 ) -> torch.Tensor:
-    """The layer's index-K pool as ``[pages, page_size, 1, 68]`` uint8."""
+    """The layer's index-K pool as ``[pages, page_size, 1, slot_bytes]`` uint8."""
     k_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
     assert k_cache.dim() == 2
-    # fp4: 64 payload + 4 scale per slot
-    return k_cache.view(k_cache.shape[0], page_size, 1, 68)
+    # fp4: 64 payload + 4 scale per slot; int8: 128 payload + 4 scale per slot
+    slot_bytes = 132 if use_int8 else 68
+    return k_cache.view(k_cache.shape[0], page_size, 1, slot_bytes)
+
+
+def get_low_ratio_index_k(
+    token_to_kv_pool: DeepSeekV4TokenToKVPool,
+    inputs: PrefillInputs,
+    k_slots: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if inputs.indexer.use_int8:
+        return token_to_kv_pool.get_low_ratio_index_k_int8(inputs.layer_id, k_slots)
+    return token_to_kv_pool.get_low_ratio_index_k_fp4(inputs.layer_id, k_slots)
 
 
 def _index_q_and_weights(
@@ -147,10 +170,56 @@ def _index_q_and_weights(
     q_lora: torch.Tensor,
     freqs_cis: torch.Tensor,
     positions: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """fp4 index queries ``[rows, heads, 64]`` int8 with ``[rows, heads]`` packed
-    ue8m0 scales, and fp32 head weights ``[rows, heads]``."""
+    weights_dtype: Optional[torch.dtype] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+    """Index queries and head weights:
+    - INT8: ``q`` ``[rows, heads, 128]`` int8, ``q_sf=None``, and ``weights``
+      ``[rows, heads]`` with per-head Q quant scales folded in.
+    - FP4: ``q`` ``[rows, heads, 64]`` int8, ``q_sf`` ``[rows, heads]`` packed
+      ue8m0 scales, and ``weights`` ``[rows, heads]``."""
     rows, heads = x.shape[0], indexer.n_local_heads
+    if indexer.use_int8:
+        from sglang.kernels.ops.attention.dsv4.int8_indexer import (
+            index_q_rope_int8_quant_weights,
+            quantize_query,
+        )
+
+        if weights_dtype is None:
+            from sglang.kernels.ops.attention.dsv4.index_logits import (
+                index_weights_dtype,
+            )
+
+            weights_dtype = index_weights_dtype()
+        if (
+            q_lora.is_cuda
+            and indexer.index_head_dim == 128
+            and 0 <= indexer.rope_head_dim <= 128
+            and indexer.rope_head_dim % 2 == 0
+        ):
+            q_raw, _ = indexer.wq_b(q_lora)
+            q_raw = q_raw.view(rows, heads, indexer.index_head_dim)
+            if q_raw.dtype == torch.bfloat16:
+                q_int8, weights = index_q_rope_int8_quant_weights(
+                    q_raw,
+                    freqs_cis,
+                    positions,
+                    indexer.rope_head_dim,
+                    indexer.head_weights_raw(x),
+                    indexer.head_weight_scale,
+                    weights_dtype=weights_dtype,
+                )
+                return q_int8, None, weights
+            from sglang.srt.layers.attention.dsv4.dsv41_sparse import rope_tail
+
+            q = (
+                rope_tail(q_raw, freqs_cis[positions], indexer.rope_head_dim)
+                if indexer.rope_head_dim > 0
+                else q_raw
+            )
+        else:
+            q = indexer.queries(q_lora, freqs_cis, positions=positions)
+        q_int8, weights = quantize_query(q, indexer.head_weights(x))
+        return q_int8, None, weights.to(weights_dtype)
     q, _ = indexer.wq_b(q_lora)
     q_fp4, q_sf, weights = index_q_rope_pack_weights(
         q.view(rows, heads, indexer.index_head_dim),
@@ -163,7 +232,10 @@ def _index_q_and_weights(
 
 
 def get_deep_gemm_decode_data(
-    inputs: DecodeInputs, token_to_kv_pool: DeepSeekV4TokenToKVPool
+    inputs: DecodeInputs,
+    token_to_kv_pool: DeepSeekV4TokenToKVPool,
+    *,
+    weights_dtype: Optional[torch.dtype] = None,
 ) -> DeepGEMMDecodeData:
     indexer = inputs.indexer
     # The kernel sums head scores locally, so the indexer heads must be replicated.
@@ -174,16 +246,18 @@ def get_deep_gemm_decode_data(
         q_lora=inputs.q_lora,
         freqs_cis=inputs.freqs_cis,
         positions=inputs.positions,
+        weights_dtype=weights_dtype,
     )
     bs = q_fp4.shape[0]
-    q_fp4 = q_fp4.view(bs, 1, indexer.n_local_heads, 64)
-    q_sf = q_sf.view(bs, 1, indexer.n_local_heads)
+    q_fp4 = q_fp4.view(bs, 1, indexer.n_local_heads, q_fp4.shape[-1])
+    if q_sf is not None:
+        q_sf = q_sf.view(bs, 1, indexer.n_local_heads)
 
-    # Index pool page (64 slots); metadata.page_table is expanded to match.
     k_cache = get_index_k_cache(
         token_to_kv_pool=token_to_kv_pool,
         layer_id=inputs.layer_id,
         page_size=inputs.paged_metadata.compressed_page_size,
+        use_int8=indexer.use_int8,
     )
     return DeepGEMMDecodeData(q_fp4, q_sf, weights, k_cache)
 
@@ -249,7 +323,11 @@ def prefill_index_plan(inputs: PrefillInputs) -> Optional[PrefillIndexPlan]:
     )
 
 
-def get_deep_gemm_prefill_data(inputs: PrefillInputs) -> Optional[DeepGEMMPrefillData]:
+def get_deep_gemm_prefill_data(
+    inputs: PrefillInputs,
+    *,
+    weights_dtype: Optional[torch.dtype] = None,
+) -> Optional[DeepGEMMPrefillData]:
     """None when the chunk has no row or no visible compressed position."""
     ratio = inputs.compress_ratio
     plans = inputs.index_plans
@@ -267,6 +345,7 @@ def get_deep_gemm_prefill_data(inputs: PrefillInputs) -> Optional[DeepGEMMPrefil
         q_lora=inputs.q_lora,
         freqs_cis=inputs.freqs_cis,
         positions=inputs.positions,
+        weights_dtype=weights_dtype,
     )
     return DeepGEMMPrefillData(
         k_slots=inputs.k_slots,
@@ -281,8 +360,9 @@ def get_deep_gemm_prefill_data(inputs: PrefillInputs) -> Optional[DeepGEMMPrefil
 
 
 def score_tiles(data: DeepGEMMPrefillData, kv: Tuple[torch.Tensor, torch.Tensor]):
+    q = data.q_fp4 if data.q_sf is None else (data.q_fp4, data.q_sf)
     yield from flat_index_logits_tiles(
-        q=(data.q_fp4, data.q_sf),
+        q=q,
         kv=kv,
         weights=data.weights,
         starts=data.request_starts,

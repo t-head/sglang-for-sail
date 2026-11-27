@@ -69,22 +69,31 @@ DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa or _is_
 
 def _supports_paged_sparse_mqa_logits() -> bool:
     if _is_sail:
-        if not ENABLE_JIT_DEEPGEMM or get_device_sm() < 89:
+        sm = get_device_sm()
+        # DeepGEMM's int8_paged_sparse_mqa_logits strictly requires capability 8.0 (810E).
+        if not ENABLE_JIT_DEEPGEMM or (sm != 80 and sm < 89):
             return False
-    elif not DEEPGEMM_BLACKWELL:
+        apis = (
+            "get_paged_sparse_mqa_logits_metadata",
+            (
+                "int8_paged_sparse_mqa_logits"
+                if sm == 80
+                else "fp8_fp4_paged_sparse_mqa_logits"
+            ),
+        )
+    elif DEEPGEMM_BLACKWELL:
+        apis = (
+            "get_paged_sparse_mqa_logits_metadata",
+            "fp8_fp4_paged_sparse_mqa_logits",
+        )
+    else:
         return False
     try:
         import deep_gemm
     except (ImportError, OSError, RuntimeError):
         return False
 
-    return all(
-        callable(getattr(deep_gemm, name, None))
-        for name in (
-            "get_paged_sparse_mqa_logits_metadata",
-            "fp8_fp4_paged_sparse_mqa_logits",
-        )
-    )
+    return all(callable(getattr(deep_gemm, name, None)) for name in apis)
 
 
 DEEPGEMM_PAGED_SPARSE_MQA_LOGITS = _supports_paged_sparse_mqa_logits()

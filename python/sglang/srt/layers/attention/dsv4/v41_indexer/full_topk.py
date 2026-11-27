@@ -22,6 +22,7 @@ from .scoring import (
     dense_prefill_topk,
     get_deep_gemm_decode_data,
     get_deep_gemm_prefill_data,
+    get_low_ratio_index_k,
     prefill_requests,
     select_decode,
     write_prefill,
@@ -69,9 +70,7 @@ class FullTopKIndexer:
         data = get_deep_gemm_prefill_data(inputs)
         if data is None:
             return
-        kv = self.token_to_kv_pool.get_low_ratio_index_k_fp4(
-            inputs.layer_id, data.k_slots
-        )
+        kv = get_low_ratio_index_k(self.token_to_kv_pool, inputs, data.k_slots)
         dense_prefill_topk(
             data,
             kv,
@@ -93,6 +92,9 @@ class FullTopKIndexer:
     def _deep_gemm_decode(self, inputs: DecodeInputs) -> None:
         data = get_deep_gemm_decode_data(inputs, self.token_to_kv_pool)
         metadata = inputs.paged_metadata
+        req_indices = (
+            None if data.q_sf is None else getattr(metadata, "request_indices", None)
+        )
         if isinstance(metadata.deep_gemm_metadata, list):
             topk_plans = metadata.topk_metadata_chunks
             assert not metadata.use_topk_v2 or topk_plans is not None
@@ -106,11 +108,7 @@ class FullTopKIndexer:
                     table,
                     plan,
                     metadata.max_compressed_seq_len,
-                    indices=(
-                        metadata.request_indices[rows]
-                        if metadata.request_indices is not None
-                        else None
-                    ),
+                    indices=(req_indices[rows] if req_indices is not None else None),
                 )
                 # TODO(dark): add bf16 topk
                 topk_transform_paged_from_metadata(
@@ -133,7 +131,7 @@ class FullTopKIndexer:
             table,
             metadata.deep_gemm_metadata,
             metadata.max_compressed_seq_len,
-            indices=metadata.request_indices,
+            indices=req_indices,
         )
         # TODO(dark): add bf16 topk
         topk_transform_paged_from_metadata(
