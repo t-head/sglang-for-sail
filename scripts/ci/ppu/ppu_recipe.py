@@ -213,23 +213,68 @@ _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 _AUTH_CLI_FLAGS = frozenset(
     {
         "--access-key",
+        "--admin-api-key",
         "--api-key",
         "--api-secret",
+        "--api-token",
         "--auth-token",
         "--bearer-token",
         "--client-secret",
         "--hf-token",
+        "--hicache-storage-backend-extra-config",
         "--passwd",
         "--password",
+        "--private-key",
         "--secret",
         "--secret-key",
+        "--ssl-keyfile-password",
         "--token",
+        "--unified-cache-external-linker-config",
+        "--watermark-config",
+        "--watermark-key",
+        "--watermark-key-b",
     }
 )
+_AUTH_CLI_FLAG_SUFFIXES = (
+    "-access-key",
+    "-api-key",
+    "-api-secret",
+    "-api-token",
+    "-auth-token",
+    "-bearer-token",
+    "-client-secret",
+    "-hf-token",
+    "-passwd",
+    "-password",
+    "-private-key",
+    "-secret",
+    "-secret-key",
+)
+_AUTH_CLI_ABBREV_PREFIXES = (
+    "--admin-api",
+    "--api-k",
+    "--hicache-storage-backend-e",
+    "--ssl-keyfile-p",
+    "--unified-cache-external-linker-c",
+    "--watermark-conf",
+    "--watermark-key",
+)
+
+
+def _is_auth_cli_flag(flag: str) -> bool:
+    norm = flag.lower().replace("_", "-")
+    return (
+        norm in _AUTH_CLI_FLAGS
+        or norm.endswith(_AUTH_CLI_FLAG_SUFFIXES)
+        or norm.startswith(_AUTH_CLI_ABBREV_PREFIXES)
+    )
+
+
 _SENSITIVE_ENV_KEY_RE = re.compile(
-    r"(?:^|_)(?:API_KEY|AUTH_TOKEN|BEARER_TOKEN|HF_TOKEN|ACCESS_KEY|SECRET_KEY|PRIVATE_KEY|PASSWORD|PASSWD|SECRET|TOKEN)$",
+    r"(?:^|_)(?:API_KEY|API_SECRET|API_TOKEN|AUTH_TOKEN|BEARER_TOKEN|CLIENT_SECRET|HF_TOKEN|ACCESS_KEY|SECRET_KEY|PRIVATE_KEY|PASSWORD|PASSWD|SECRET|TOKEN|WATERMARK_KEY|WATERMARK_KEY_B|WATERMARK_CONFIG|HICACHE_STORAGE_BACKEND_EXTRA_CONFIG|UNIFIED_CACHE_EXTERNAL_LINKER_CONFIG)$",
     re.I,
 )
+_CRED_VAL_PAT = r"(?:(?:[=:]\s*|[`'\"]?\s*,\s*[`'\"]?|\s+)(?:\{[^\r\n`|]*\}|'[^\r\n']*'|\"[^\r\n\"]*\"|[^\s,`'\";\]|]+))?"
 _SENSITIVE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("internal_domain", re.compile(r"\.(?:alibaba-inc\.com|eng\.t-head\.cn)\b", re.I)),
     ("internal_mirror", re.compile(r"\brsproxy\.cn\b", re.I)),
@@ -250,8 +295,11 @@ _SENSITIVE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
             r"|(?<![A-Za-z0-9_-])sk-(?:proj-|ant-|live-|test-|svcacct-)?[A-Za-z0-9_-]{12,}"
             r"|Authorization\s*:\s*Bearer\s+\S+"
             r"|\bBearer\s+[A-Za-z0-9._-]{8,}"
-            r"|(?<![A-Za-z0-9_-])--(?:api[-_]?key|auth[-_]?token|bearer[-_]?token|hf[-_]?token|access[-_]?key|secret[-_]?key|api[-_]?secret|client[-_]?secret|password|passwd|secret|token)(?=[=:,\s`'\"\]|]|$)(?:(?:[=:]\s*|[`'\"]?\s*,\s*[`'\"]?|\s+)[^\s,`'\";\]|]+)?"
-            r"|\b(?:API_KEY|AUTH_TOKEN|BEARER_TOKEN|HF_TOKEN|ACCESS_KEY|SECRET_KEY|PRIVATE_KEY|PASSWORD|PASSWD|CLIENT_SECRET)\s*=\s*\S+"
+            r"|(?<![A-Za-z0-9_-])--(?:[A-Za-z0-9]+[-_])*(?:access[-_]?key|admin[-_]?api[-_]?key|api[-_]?key|api[-_]?secret|api[-_]?token|auth[-_]?token|bearer[-_]?token|client[-_]?secret|hf[-_]?token|hicache[-_]?storage[-_]?backend[-_]?extra[-_]?config|passwd|password|private[-_]?key|secret|secret[-_]?key|ssl[-_]?keyfile[-_]?password|unified[-_]?cache[-_]?external[-_]?linker[-_]?config|watermark[-_]?config|watermark[-_]?key(?:[-_]?b)?)(?=[=:,\s`'\"\]|]|$)"
+            + _CRED_VAL_PAT
+            + r"|(?<![A-Za-z0-9_-])--(?:token|admin[-_]?api[A-Za-z0-9_-]*|api[-_]?k[A-Za-z0-9_-]*|ssl[-_]?keyfile[-_]?p[A-Za-z0-9_-]*|hicache[-_]?storage[-_]?backend[-_]?e[A-Za-z0-9_-]*|unified[-_]?cache[-_]?external[-_]?linker[-_]?c[A-Za-z0-9_-]*|watermark[-_]?conf[A-Za-z0-9_-]*|watermark[-_]?key[A-Za-z0-9_-]*)(?=[=:,\s`'\"\]|]|$)"
+            + _CRED_VAL_PAT
+            + r"|\b(?:[A-Za-z0-9]+_)*(?:API_KEY|API_SECRET|API_TOKEN|AUTH_TOKEN|BEARER_TOKEN|CLIENT_SECRET|HF_TOKEN|ACCESS_KEY|SECRET_KEY|PRIVATE_KEY|PASSWORD|PASSWD|SECRET|WATERMARK_KEY|WATERMARK_KEY_B|WATERMARK_CONFIG|HICACHE_STORAGE_BACKEND_EXTRA_CONFIG|UNIFIED_CACHE_EXTERNAL_LINKER_CONFIG)\s*=\s*(?:\{[^\r\n`|]*\}|'[^\r\n']*'|\"[^\r\n\"]*\"|\S+)"
             r"|\bQODER_PAT\b",
             re.I,
         ),
@@ -1963,12 +2011,32 @@ def _validate_hf_model_id(value: Any, *, context: str) -> None:
         )
 
 
+def _has_embedded_secret_key(obj: Any, *, in_watermark: bool = False) -> bool:
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            key_s = str(k)
+            if _SENSITIVE_ENV_KEY_RE.search(key_s) or (
+                in_watermark and key_s.lower() in {"key", "key_b"}
+            ):
+                if v is not None and str(v).strip():
+                    return True
+            if _has_embedded_secret_key(
+                v, in_watermark=in_watermark or key_s.lower() == "watermark"
+            ):
+                return True
+    elif isinstance(obj, list):
+        return any(
+            _has_embedded_secret_key(item, in_watermark=in_watermark) for item in obj
+        )
+    return False
+
+
 def _validate_flag_list(
     tokens: Any, *, context: str, allow_policy_flags: bool = False
 ) -> None:
     raw = _check_str_list(tokens, context=context)
     for flag, val, _ in _parse_flag_entries(raw):
-        if flag in _AUTH_CLI_FLAGS:
+        if _is_auth_cli_flag(flag):
             raise ValidationError(
                 f"{context}: plaintext auth credential flag is forbidden in recipe/policy"
             )
@@ -2005,6 +2073,10 @@ def _validate_flag_list(
             if not isinstance(parsed, dict):
                 raise ValidationError(
                     f"{context}: JSON flag {flag} must decode to a JSON object"
+                )
+            if _has_embedded_secret_key(parsed):
+                raise ValidationError(
+                    f"{context}: JSON flag {flag} must not embed plaintext credentials"
                 )
             unknown_ph = sorted(
                 _find_placeholders_in_obj(parsed) - set(TOPOLOGY_PLACEHOLDERS)
