@@ -92,13 +92,55 @@ test("the same approved SHA works for either label notification and bot reruns",
   }
 });
 
-test("both label workflows stop before shared runners for fork or unknown repositories", async () => {
+test("maintainer-approved fork PRs work for both label workflows and stay SHA-pinned", async () => {
   for (const label of ["run-ci-ppu", "run-ci-ppu-nightly"]) {
     const f = fixture(label);
-    f.pr.head.repo.id = f.context.payload.pull_request.head.repo.id = 456;
-    await assert.rejects(approved.resolve(f), /isolated PPU executor/);
-    delete f.context.payload.repository;
-    await assert.rejects(approved.resolve(f), /isolated PPU executor/);
+    const activityCalls = [];
+    const writeCalls = [];
+    f.pr.head.repo = {id: 456, owner: {login: "contributor"}, name: "sglang-fork"};
+    f.context.payload.pull_request.head.repo = structuredClone(f.pr.head.repo);
+    f.github.request = async (route, args) => {
+      assert.equal(route, "GET /repos/{owner}/{repo}/activity");
+      activityCalls.push({owner: args.owner, repo: args.repo, ref: args.ref});
+      return {data: [f.change]};
+    };
+    f.github.rest.repos.getCollaboratorPermissionLevel = async ({owner, repo, username}) => {
+      writeCalls.push({owner, repo, username});
+      return {data: {permission: username === "maintainer" ? "maintain" : "triage"}};
+    };
+
+    assert.deepEqual(await approved.resolve(f), {approved: true, sha: head});
+    assert.deepEqual(activityCalls, [
+      {owner: "contributor", repo: "sglang-fork", ref: "refs/heads/feature/topic"},
+    ]);
+    assert.deepEqual(writeCalls, [
+      {owner: "t-head", repo: "sglang-for-sail", username: "maintainer"},
+    ]);
+
+    // Pushing a new commit (or force-pushing) after labeling invalidates approval.
+    f.change.timestamp = "2026-11-20T10:02:00Z";
+    assert.deepEqual(await approved.resolve(f), {approved: false, sha: ""});
+    f.change.timestamp = "2026-11-20T10:00:00Z";
+
+    // Missing/empty fork activity or 404 fails closed without throwing.
+    f.github.request = async () => ({data: []});
+    assert.deepEqual(await approved.resolve(f), {approved: false, sha: ""});
+    f.github.request = async () => {
+      const err = new Error("Not Found");
+      err.status = 404;
+      throw err;
+    };
+    assert.deepEqual(await approved.resolve(f), {approved: false, sha: ""});
+
+    // Non-writer labeler on base repo is denied.
+    f.github.request = async () => ({data: [f.change]});
+    f.timeline[0].actor.login = "contributor";
+    assert.deepEqual(await approved.resolve(f), {approved: false, sha: ""});
+
+    // Deleted fork repo (head.repo = null) fails closed.
+    f.timeline[0].actor.login = "maintainer";
+    f.pr.head.repo = null;
+    assert.deepEqual(await approved.resolve(f), {approved: false, sha: ""});
   }
 });
 

@@ -75,6 +75,20 @@ class TestWorkflowTriggers(unittest.TestCase):
                     f"t-head/sglang-for-sail/.github/workflows/{name}-test-ppu.yml@{branch}",
                 )
         self.assertIn("pr-test-ppu-finish", self.workflows["pr"]["jobs"])
+        expected_secrets = {
+            key: f"${{{{ secrets.{key} }}}}"
+            for key in (
+                "PPU_CI_K8S_RUNTIME_DIGEST",
+                "PPU_CI_RECIPE_IMAGE_REPO",
+                "PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS",
+            )
+        }
+        for name, workflow in self.workflows.items():
+            for job in BRANCHES:
+                with self.subTest(workflow=name, job=job):
+                    secrets = workflow["jobs"][job]["secrets"]
+                    self.assertNotEqual(secrets, "inherit")
+                    self.assertEqual(secrets, expected_secrets)
         tiers = json.loads((ROOT / "scripts/ci/opt_in_ci_tiers.json").read_text())
         self.assertEqual(
             tiers["ppu-extra"],

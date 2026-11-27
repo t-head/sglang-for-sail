@@ -80,11 +80,8 @@ async function approvedPullRequest(github, context, label, ref) {
   }
   if (pr.draft) return DENIED;
 
-  // Both label workflows currently delegate to runners with shared PPU storage.
-  if (!context.payload.repository?.id || pr.head.repo.id !== context.payload.repository.id) {
-    throw new Error("Fork PRs require an isolated PPU executor. The shared PPU runners accept same-repository revisions only.");
-  }
-
+  // Approved fork PRs rely on maintainer code review and SHA-pinned labeling
+  // until an isolated fork executor lands.
   const timeline = await github.paginate(github.rest.issues.listEventsForTimeline, {
     ...context.repo, issue_number: pr.number, per_page: 100,
   });
@@ -97,10 +94,17 @@ async function approvedPullRequest(github, context, label, ref) {
   // Repository activity timestamps are server receipt times. Commit dates can
   // predate a push or stay unchanged when a branch is force-pushed back.
   const branchRef = "refs/heads/" + pr.head.ref;
-  const {data: [change]} = await github.request("GET /repos/{owner}/{repo}/activity", {
-    owner: pr.head.repo.owner.login, repo: pr.head.repo.name,
-    ref: branchRef, direction: "desc", per_page: 1,
-  });
+  let changes;
+  try {
+    ({data: changes} = await github.request("GET /repos/{owner}/{repo}/activity", {
+      owner: pr.head.repo.owner.login, repo: pr.head.repo.name,
+      ref: branchRef, direction: "desc", per_page: 1,
+    }));
+  } catch (error) {
+    if (error.status === 404) return DENIED;
+    throw error;
+  }
+  const change = Array.isArray(changes) ? changes[0] : null;
   if (change?.ref !== branchRef || change.after !== pr.head.sha ||
       !(Date.parse(lastLabel.created_at) > Date.parse(change.timestamp))) return DENIED;
   return await canWrite(github, context.repo, lastLabel.actor?.login)
