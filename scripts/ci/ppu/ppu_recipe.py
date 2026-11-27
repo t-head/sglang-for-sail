@@ -1075,10 +1075,22 @@ def _classify_checkpoint_kv_arch(
 ) -> str:
     """Classify bound checkpoint KV architecture as ``'mla'``, ``'non_mla'``, or ``'unknown'``.
 
-    Logical ``model.model_id`` and CLI ``--attention-backend`` strings are never
-    accepted as standalone MLA evidence.
+    An explicit ``bound_hf_model_id`` is mandatory for MLA admission; logical
+    ``model.model_id``, CLI ``--attention-backend`` strings, and local ``assets_map``
+    metadata never upgrade an unbound or unverified checkpoint to ``'mla'``.
     """
-    local_arch = "unknown"
+    if not isinstance(bound_hf_model_id, str) or not bound_hf_model_id.strip():
+        return "unknown"
+    lowered = bound_hf_model_id.strip().lower()
+    if any(
+        lowered.startswith(prefix) for prefix in _VERIFIED_NON_MLA_CHECKPOINT_PREFIXES
+    ):
+        return "non_mla"
+    if not any(
+        lowered.startswith(prefix) for prefix in _VERIFIED_MLA_CHECKPOINT_PREFIXES
+    ):
+        return "unknown"
+
     if isinstance(resolved_model, str) and resolved_model.strip():
         candidate_dir = Path(resolved_model)
         cfg_file = candidate_dir / "config.json"
@@ -1097,19 +1109,9 @@ def _classify_checkpoint_kv_arch(
                 }
                 if archs & _VERIFIED_NON_MLA_HF_ARCHITECTURES:
                     return "non_mla"
-                if archs & _VERIFIED_MLA_HF_ARCHITECTURES:
-                    local_arch = "mla"
-
-    if not isinstance(bound_hf_model_id, str) or not bound_hf_model_id.strip():
-        return local_arch
-    lowered = bound_hf_model_id.strip().lower()
-    if any(
-        lowered.startswith(prefix) for prefix in _VERIFIED_NON_MLA_CHECKPOINT_PREFIXES
-    ):
-        return "non_mla"
-    if any(lowered.startswith(prefix) for prefix in _VERIFIED_MLA_CHECKPOINT_PREFIXES):
-        return "mla"
-    return local_arch
+                if archs and not (archs & _VERIFIED_MLA_HF_ARCHITECTURES):
+                    return "unknown"
+    return "mla"
 
 
 def _is_mla_model(
@@ -2609,6 +2611,14 @@ def _validate_pd_disagg_pair(
                 if "bound_hf_model_id" in prefill_res
                 else prefill_res.get("hf_model_id")
             )
+            if not d_bound_ckpt or not p_bound_ckpt:
+                raise ValidationError(
+                    f"{context}: insufficient KV architecture evidence to admit "
+                    f"pd_decode --dcp-size > 1 ({d_dcp}): effective variant "
+                    f"{decode_res.get('variant')!r} binds no explicit hf_model_id "
+                    f"checkpoint (logical model.model_id, attention-backend flags, and "
+                    f"local assets_map paths cannot stand alone as MLA evidence)"
+                )
             d_kv_arch = _classify_checkpoint_kv_arch(
                 d_bound_ckpt, resolved_model=decode_res.get("resolved_model")
             )
@@ -2623,14 +2633,6 @@ def _validate_pd_disagg_pair(
                 )
             if d_kv_arch != "mla" or p_kv_arch != "mla":
                 missing_ckpt = d_bound_ckpt if d_kv_arch != "mla" else p_bound_ckpt
-                if not missing_ckpt:
-                    raise ValidationError(
-                        f"{context}: insufficient KV architecture evidence to admit "
-                        f"pd_decode --dcp-size > 1 ({d_dcp}): effective variant "
-                        f"{decode_res.get('variant')!r} binds no explicit hf_model_id "
-                        f"checkpoint (logical model.model_id and attention-backend flags "
-                        f"cannot stand alone as MLA evidence)"
-                    )
                 raise ValidationError(
                     f"{context}: insufficient KV architecture evidence for checkpoint "
                     f"{missing_ckpt!r} to admit pd_decode --dcp-size > 1 ({d_dcp}); "

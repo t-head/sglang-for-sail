@@ -4819,6 +4819,105 @@ class PresetCatalogContractTest(unittest.TestCase):
                 unbound_ckpt_dcp2, context="unbound_ckpt_dcp2_bad"
             )
 
+        # Direct resolve_recipe with --assets-map + local MLA config.json must NOT bypass
+        # missing or unverified hf_model_id binding across all DCP flag spellings and roles.
+        with tempfile.TemporaryDirectory() as tmp_dcp:
+            dcp_root = Path(tmp_dcp)
+            local_mla_dir = dcp_root / "mounted_dsv41"
+            local_mla_dir.mkdir()
+            (local_mla_dir / "config.json").write_text(
+                json.dumps({"architectures": ["DeepseekV4ForCausalLM"]}),
+                encoding="utf-8",
+            )
+            local_qwen_dir = dcp_root / "mounted_qwen"
+            local_qwen_dir.mkdir()
+            (local_qwen_dir / "config.json").write_text(
+                json.dumps({"architectures": ["Qwen3ForCausalLM"]}),
+                encoding="utf-8",
+            )
+            asset_key = dsv_dcp["ppu"]["assets"]["model"]
+            tok_key = dsv_dcp["ppu"]["assets"]["tokenizer"]
+            mla_assets_file = dcp_root / "assets_mla.yaml"
+            mla_assets_file.write_text(
+                yaml.safe_dump(
+                    {asset_key: str(local_mla_dir), tok_key: str(local_mla_dir)}
+                ),
+                encoding="utf-8",
+            )
+            qwen_assets_file = dcp_root / "assets_qwen.yaml"
+            qwen_assets_file.write_text(
+                yaml.safe_dump(
+                    {asset_key: str(local_qwen_dir), tok_key: str(local_qwen_dir)}
+                ),
+                encoding="utf-8",
+            )
+
+            bound_dsv_file = dcp_root / "bound_dsv.yaml"
+            bound_dsv_file.write_text(
+                yaml.safe_dump(ok_dcp_1_to_2, sort_keys=False), encoding="utf-8"
+            )
+            # Positive control: bound MLA hf_model_id + local MLA config.json passes both roles.
+            for role_preset in ("pd_decode", "pd_prefill"):
+                res_ok = resolve_recipe(
+                    bound_dsv_file,
+                    preset=role_preset,
+                    assets_map_path=mla_assets_file,
+                )
+                self.assertEqual(res_ok["resolved_model"], str(local_mla_dir))
+
+            # Contradictory local non-MLA config.json fails closed even with MLA hf_model_id.
+            with self.assertRaisesRegex(
+                ValidationError, "uses non-MLA KV architecture"
+            ):
+                resolve_recipe(
+                    bound_dsv_file,
+                    preset="pd_decode",
+                    assets_map_path=qwen_assets_file,
+                )
+
+            # Unbound hf_model_id + local MLA config.json rejected across all DCP2 spellings & roles.
+            for dcp_tokens in (
+                ["--dcp-size", "2"],
+                ["--dcp-size=2"],
+                ["--decode-context-parallel-size=2"],
+            ):
+                unbound_dsv = copy.deepcopy(dsv_dcp)
+                unbound_dsv["ppu"].pop("hf_model_id", None)
+                for v_cfg in unbound_dsv["variants"].values():
+                    v_cfg.pop("hf_model_id", None)
+                unbound_dsv["presets"]["pd_decode"]["args"].extend(dcp_tokens)
+                unbound_dsv_file = dcp_root / "unbound_dsv.yaml"
+                unbound_dsv_file.write_text(
+                    yaml.safe_dump(unbound_dsv, sort_keys=False), encoding="utf-8"
+                )
+                for role_preset in ("pd_decode", "pd_prefill"):
+                    with self.assertRaisesRegex(
+                        ValidationError,
+                        "insufficient KV architecture evidence .* binds no explicit hf_model_id checkpoint",
+                    ):
+                        resolve_recipe(
+                            unbound_dsv_file,
+                            preset=role_preset,
+                            assets_map_path=mla_assets_file,
+                        )
+
+            # Unverified bound hf_model_id + local MLA config.json also rejected.
+            unverified_dsv = copy.deepcopy(ok_dcp_1_to_2)
+            unverified_dsv["ppu"]["hf_model_id"] = "acme/Unverified-Custom-70B"
+            unverified_dsv_file = dcp_root / "unverified_dsv.yaml"
+            unverified_dsv_file.write_text(
+                yaml.safe_dump(unverified_dsv, sort_keys=False), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                ValidationError,
+                "insufficient KV architecture evidence for checkpoint 'acme/Unverified-Custom-70B'",
+            ):
+                resolve_recipe(
+                    unverified_dsv_file,
+                    preset="pd_decode",
+                    assets_map_path=mla_assets_file,
+                )
+
         # 6b. Single-node PP GPU selection: TP1xPP2 with gpu-id-step=2 -> GPUs [0, 1] admitted
         #     across auto-select, explicit select, cluster_width, and recipe_runner.run;
         #     step=1 positive control and out-of-bounds/duplicate/strided/width/PD/multi-node rejections.
