@@ -1,9 +1,12 @@
+from collections import OrderedDict
+
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.utils import is_cpu, is_npu, is_xpu
+from sglang.srt.utils import is_cpu, is_npu, is_sail, is_xpu
 
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
@@ -42,6 +45,151 @@ class TritonGDNKernel(LinearAttnKernelBase):
 
     supports_packed_decode: bool = not is_cpu() and not is_npu()
     supports_strided_target_verify_qkv: bool = True
+
+    def __init__(self):
+        super().__init__()
+        self._triton_capture_signatures = OrderedDict()
+
+    def _prepare_triton_capture(
+        self, q, k, v, a, b, A_log, dt_bias, ssm_states, query_start_loc
+    ):
+        from sglang.kernels.ops.attention.fla.chunk import CHUNK_SIZE
+        from sglang.kernels.ops.attention.fla.index import (
+            prepare_chunk_indices,
+            prepare_chunk_offsets,
+        )
+
+        # Populate the exact metadata cache keys used by direct capture. PLA's
+        # own host plan does not populate these Triton caches.
+        prepare_chunk_indices(query_start_loc, CHUNK_SIZE)
+        prepare_chunk_offsets(query_start_loc, CHUNK_SIZE)
+        output_chunk_size = min(CHUNK_SIZE, max(16, 1 << (q.shape[1] - 1).bit_length()))
+        prepare_chunk_indices(query_start_loc, output_chunk_size)
+        signature = (
+            tuple(
+                (t.device, t.dtype, tuple(t.shape), tuple(t.stride()))
+                for t in (q, k, v, a, b)
+            ),
+            ssm_states.dtype,
+            query_start_loc.numel(),
+            query_start_loc.dtype,
+        )
+        if signature not in self._triton_capture_signatures:
+            # Autotuning must also finish before capture. Use a scratch pool:
+            # warmup must not apply the recurrence twice to the caller's state.
+            from sglang.kernels.ops.attention.linear.fused_gdn_gating import (
+                fused_gdn_gating,
+            )
+
+            # Only cold Triton preparation needs activated gates. Steady-state
+            # packed PLA calls consume raw a/b and perform their own gating.
+            g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
+            count = query_start_loc.numel() - 1
+            scratch = ssm_states.new_zeros((count, *ssm_states.shape[1:]))
+            slots = torch.arange(count, dtype=query_start_loc.dtype, device=q.device)
+            chunk_gated_delta_rule(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=scratch,
+                initial_state_indices=slots,
+                cu_seqlens=query_start_loc,
+                head_first=False,
+                use_qk_l2norm_in_kernel=True,
+                inplace_update=True,
+            )
+            self._triton_capture_signatures[signature] = None
+            if len(self._triton_capture_signatures) > 64:
+                self._triton_capture_signatures.popitem(last=False)
+        else:
+            self._triton_capture_signatures.move_to_end(signature)
+
+    def packed_prefill(
+        self,
+        packed_qkv,
+        a,
+        b,
+        *,
+        A_log,
+        dt_bias,
+        num_qk_heads,
+        num_v_heads,
+        ssm_states,
+        cache_indices,
+        query_start_loc,
+        seq_lens_cpu,
+        inplace_update=True,
+        use_qk_l2norm_in_kernel=True,
+        **kwargs,
+    ):
+        """Attempt PLA before SRT splits QKV or computes activated gates."""
+        if not (
+            envs.SGLANG_SAIL_PLA_CUDA.get()
+            and is_sail()
+            and packed_qkv.ndim == 2
+            and packed_qkv.is_cuda
+            and inplace_update
+            and use_qk_l2norm_in_kernel
+            and kwargs.get("out") is None
+            and kwargs.get("output_indices") is None
+            and kwargs.get("chunk_indices") is None
+            and not kwargs.get("requires_intermediate_states", False)
+            and not kwargs.get("needs_track_state", False)
+            and kwargs.get("track_state") is None
+            and not kwargs.get("num_state_checkpoints", 0)
+            and query_start_loc.ndim == 1
+            and cache_indices.ndim == 1
+            and query_start_loc.numel() == cache_indices.numel() + 1
+            and cache_indices.dtype in (torch.int32, torch.int64)
+            and query_start_loc.dtype in (torch.int32, torch.int64)
+            and cache_indices.device == packed_qkv.device
+            and query_start_loc.device == packed_qkv.device
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        from sglang.srt.layers.attention.linear.kernels.gdn_pla import (
+            pla_gdn_prefill,
+            pla_gdn_prefill_supported,
+            pla_host_offsets,
+        )
+
+        offsets = pla_host_offsets(seq_lens_cpu, query_start_loc, packed_qkv.shape[0])
+        if offsets is None or not pla_gdn_prefill_supported(
+            packed_qkv,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            ssm_states,
+            num_qk_heads=num_qk_heads,
+            num_v_heads=num_v_heads,
+        ):
+            return None
+        # Alias the original post-conv buffer; never concatenate split copies.
+        tokens = packed_qkv.shape[0]
+        width_qk = num_qk_heads * 128
+        q, k, v = packed_qkv.split((width_qk, width_qk, num_v_heads * 128), dim=-1)
+        q = q.view(1, tokens, num_qk_heads, 128)
+        k = k.view(1, tokens, num_qk_heads, 128)
+        v = v.view(1, tokens, num_v_heads, 128)
+        self._prepare_triton_capture(
+            q, k, v, a, b, A_log, dt_bias, ssm_states, query_start_loc
+        )
+        return pla_gdn_prefill(
+            packed_qkv,
+            a,
+            b,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            num_qk_heads=num_qk_heads,
+            num_v_heads=num_v_heads,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            raw_cu_seqlens=offsets,
+        )
 
     def packed_decode(
         self,
@@ -178,6 +326,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         inplace_update: bool = True,
+        use_qk_l2norm_in_kernel: bool = True,
         **kwargs,
     ) -> tuple:
         recurrent_state = ssm_states
@@ -209,7 +358,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             initial_state=recurrent_state,
             cu_seqlens=query_start_loc,
             head_first=False,
-            use_qk_l2norm_in_kernel=True,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             **recurrent_state_indices_args,
             **inplace_update_args,
         )

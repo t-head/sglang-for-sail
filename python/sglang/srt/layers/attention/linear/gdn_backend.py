@@ -376,6 +376,11 @@ class GDNKernelDispatcher:
     def extend_uses_state_checkpoints(self) -> bool:
         return self.extend_kernel.uses_state_checkpoints
 
+    def packed_prefill(self, mixed_qkv, a, b, **kwargs):
+        """Return None when the selected kernel needs the existing split path."""
+        packed = getattr(self.extend_kernel, "packed_prefill", None)
+        return None if packed is None else packed(mixed_qkv, a, b, **kwargs)
+
     def packed_decode(
         self,
         mixed_qkv: torch.Tensor,
@@ -1027,8 +1032,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
             and (not conv_states.is_contiguous() or not ssm_states.is_contiguous())
         )
         if needs_state_gather:
-            conv_states_contig = conv_states[cache_indices].contiguous()
-            ssm_states_contig = ssm_states[cache_indices].contiguous()
+            valid_state_rows = cache_indices >= 0
+            safe_state_indices = cache_indices.clamp_min(0)
+            conv_states_contig = conv_states[safe_state_indices].contiguous()
+            ssm_states_contig = ssm_states[safe_state_indices].contiguous()
+            for states in (conv_states_contig, ssm_states_contig):
+                states.masked_fill_(
+                    ~valid_state_rows.view(-1, *([1] * (states.ndim - 1))), 0
+                )
             state_cache_indices = torch.arange(
                 cache_indices.shape[0],
                 device=cache_indices.device,
@@ -1076,31 +1087,62 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 state_cache_indices,
             )
 
-        actual_seq_len = mixed_qkv.shape[0]
-        qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
+        packed_prefill_result = None
         if (
-            (is_cuda() or is_hip() or is_xpu())
-            and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
-            and not self._use_strided_target_verify_qkv
+            not is_target_verify
+            and layer.num_q_heads == layer.num_k_heads
+            and (layer.head_q_dim == layer.head_k_dim == layer.head_v_dim == 128)
         ):
-            query, key, value = fused_qkv_split_gdn_prefill(
+            packed_prefill_result = self.kernel_dispatcher.packed_prefill(
                 mixed_qkv,
-                layer.num_q_heads,
-                layer.num_k_heads,
-                layer.num_v_heads,
-                layer.head_q_dim,
-                layer.head_k_dim,
-                layer.head_v_dim,
+                a,
+                b,
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                num_qk_heads=layer.num_k_heads,
+                num_v_heads=layer.num_v_heads,
+                ssm_states=ssm_states_contig,
+                cache_indices=state_cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                num_state_checkpoints=forward_metadata.num_state_checkpoints,
+                needs_track_state=(
+                    forward_metadata.has_mamba_track_mask
+                    and forward_metadata.track_ssm_h_src is not None
+                    and forward_metadata.track_ssm_h_src.numel() > 0
+                ),
             )
-        else:
-            query, key, value = torch.split(
-                mixed_qkv,
-                [layer.q_dim, layer.k_dim, layer.v_dim],
-                dim=-1,
-            )
-            query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
-            key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
-            value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
+
+        if packed_prefill_result is None:
+            actual_seq_len = mixed_qkv.shape[0]
+            qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
+            if (
+                (is_cuda() or is_hip() or is_xpu())
+                and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
+                and not self._use_strided_target_verify_qkv
+            ):
+                query, key, value = fused_qkv_split_gdn_prefill(
+                    mixed_qkv,
+                    layer.num_q_heads,
+                    layer.num_k_heads,
+                    layer.num_v_heads,
+                    layer.head_q_dim,
+                    layer.head_k_dim,
+                    layer.head_v_dim,
+                )
+            else:
+                query, key, value = torch.split(
+                    mixed_qkv,
+                    [layer.q_dim, layer.k_dim, layer.v_dim],
+                    dim=-1,
+                )
+                query = query.view(
+                    1, actual_seq_len, layer.num_q_heads, layer.head_q_dim
+                )
+                key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
+                value = value.view(
+                    1, actual_seq_len, layer.num_v_heads, layer.head_v_dim
+                )
 
         if is_target_verify:
             # ReplaySSM verify protocols: fold-every-commit (ring-write during
@@ -1163,47 +1205,57 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     stable_rows=pp_spec_stable_rows_enabled(),
                 )
         else:
-            g, beta = self._prefill_gates(layer, a, b)
             h_track_buf = None
-            if (
-                forward_metadata.has_mamba_track_mask
-                and forward_metadata.track_ssm_h_src.numel() > 0
-                and self.kernel_dispatcher.extend_kernel.supports_track_state_snapshot
-            ):
-                # Snapshot-capable kernels can supply just the selected FP32
-                # checkpoint instead of materializing all per-chunk states.
-                assert forward_metadata.track_chunk_idx is not None
-                h_track_buf = torch.empty(
-                    (len(cache_indices), *ssm_states.shape[1:]),
-                    dtype=torch.float32,
-                    device=ssm_states.device,
+            if packed_prefill_result is not None:
+                core_attn_out, last_recurrent_state, h = packed_prefill_result
+            else:
+                g, beta = self._prefill_gates(layer, a, b)
+                if (
+                    forward_metadata.has_mamba_track_mask
+                    and forward_metadata.track_ssm_h_src is not None
+                    and forward_metadata.track_ssm_h_src.numel() > 0
+                    and self.kernel_dispatcher.extend_kernel.supports_track_state_snapshot
+                ):
+                    # Snapshot-capable kernels can supply just the selected FP32
+                    # checkpoint instead of materializing all per-chunk states.
+                    assert forward_metadata.track_chunk_idx is not None
+                    h_track_buf = torch.empty(
+                        (len(cache_indices), *ssm_states.shape[1:]),
+                        dtype=torch.float32,
+                        device=ssm_states.device,
+                    )
+                core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
+                    q=query,
+                    k=key,
+                    v=value,
+                    g=g,
+                    beta=beta,
+                    ssm_states=ssm_states_contig,
+                    cache_indices=state_cache_indices,
+                    query_start_loc=query_start_loc,
+                    seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                    requires_intermediate_states=(
+                        forward_metadata.has_mamba_track_mask
+                        and forward_metadata.track_ssm_h_src is not None
+                        and forward_metadata.track_ssm_h_src.numel() > 0
+                    ),
+                    state_checkpoint_cu_starts=(
+                        forward_metadata.state_checkpoint_cu_starts
+                    ),
+                    num_state_checkpoints=forward_metadata.num_state_checkpoints,
+                    state_checkpoint_every_n_tokens=(
+                        forward_metadata.state_checkpoint_every_n_tokens
+                    ),
+                    output=kwargs.get("linear_attn_output"),
+                    layer_id=layer.layer_id,
+                    extend_prefix_lens=forward_batch.extend_prefix_lens,
+                    track_state=h_track_buf,
+                    track_chunk_idx=(
+                        forward_metadata.track_chunk_idx
+                        if h_track_buf is not None
+                        else None
+                    ),
                 )
-            core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
-                q=query,
-                k=key,
-                v=value,
-                g=g,
-                beta=beta,
-                ssm_states=ssm_states_contig,
-                cache_indices=state_cache_indices,
-                query_start_loc=query_start_loc,
-                state_checkpoint_cu_starts=(
-                    forward_metadata.state_checkpoint_cu_starts
-                ),
-                num_state_checkpoints=forward_metadata.num_state_checkpoints,
-                state_checkpoint_every_n_tokens=(
-                    forward_metadata.state_checkpoint_every_n_tokens
-                ),
-                output=kwargs.get("linear_attn_output"),
-                layer_id=layer.layer_id,
-                extend_prefix_lens=forward_batch.extend_prefix_lens,
-                track_state=h_track_buf,
-                track_chunk_idx=(
-                    forward_metadata.track_chunk_idx
-                    if h_track_buf is not None
-                    else None
-                ),
-            )
 
             if is_npu() and last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(
@@ -1214,8 +1266,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             if needs_state_gather:
                 # Scatter the in-place-updated contiguous copies back to the
                 # strided envelope pool (advanced indexing handles the strides).
-                conv_states[cache_indices] = conv_states_contig
-                ssm_states[cache_indices] = ssm_states_contig
+                valid_slots = cache_indices[valid_state_rows]
+                conv_states[valid_slots] = conv_states_contig[valid_state_rows]
+                ssm_states[valid_slots] = ssm_states_contig[valid_state_rows]
 
             if forward_metadata.has_mamba_track_mask:
                 self._track_mamba_state_extend(
