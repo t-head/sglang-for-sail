@@ -210,6 +210,26 @@ ALLOWED_CACHE_MODES = frozenset({"sanity_throughput_guard", "prefix_reuse_bench"
 _PROHIBITED_TOKEN_A = "".join(chr(c) for c in (98, 116, 118))
 _PROHIBITED_TOKEN_B = "".join(chr(c) for c in (102, 108, 121, 116, 105, 103, 101, 114))
 _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_AUTH_CLI_FLAGS = frozenset(
+    {
+        "--access-key",
+        "--api-key",
+        "--api-secret",
+        "--auth-token",
+        "--bearer-token",
+        "--client-secret",
+        "--hf-token",
+        "--passwd",
+        "--password",
+        "--secret",
+        "--secret-key",
+        "--token",
+    }
+)
+_SENSITIVE_ENV_KEY_RE = re.compile(
+    r"(?:^|_)(?:API_KEY|AUTH_TOKEN|BEARER_TOKEN|HF_TOKEN|ACCESS_KEY|SECRET_KEY|PRIVATE_KEY|PASSWORD|PASSWD|SECRET|TOKEN)$",
+    re.I,
+)
 _SENSITIVE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("internal_domain", re.compile(r"\.(?:alibaba-inc\.com|eng\.t-head\.cn)\b", re.I)),
     ("internal_mirror", re.compile(r"\brsproxy\.cn\b", re.I)),
@@ -222,7 +242,18 @@ _SENSITIVE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "credential",
         re.compile(
-            r"\b(?:ghp|gho|ghu|ghs)_[A-Za-z0-9_]{8,}|github_pat_|AKIA[0-9A-Z]{8,}|QODER_PAT\b"
+            r"(?:ghp|gho|ghu|ghs)_[A-Za-z0-9_]{8,}"
+            r"|github_pat_[A-Za-z0-9_-]*"
+            r"|AKIA[0-9A-Z]{8,}"
+            r"|AIza[0-9A-Za-z_-]{16,}"
+            r"|xox[baprs]-[0-9A-Za-z-]{10,}"
+            r"|(?<![A-Za-z0-9_-])sk-(?:proj-|ant-|live-|test-|svcacct-)?[A-Za-z0-9_-]{12,}"
+            r"|Authorization\s*:\s*Bearer\s+\S+"
+            r"|\bBearer\s+[A-Za-z0-9._-]{8,}"
+            r"|(?<![A-Za-z0-9_-])--(?:api[-_]?key|auth[-_]?token|bearer[-_]?token|hf[-_]?token|access[-_]?key|secret[-_]?key|api[-_]?secret|client[-_]?secret|password|passwd|secret|token)(?=[=:,\s`'\"\]|]|$)(?:(?:[=:]\s*|[`'\"]?\s*,\s*[`'\"]?|\s+)[^\s,`'\";\]|]+)?"
+            r"|\b(?:API_KEY|AUTH_TOKEN|BEARER_TOKEN|HF_TOKEN|ACCESS_KEY|SECRET_KEY|PRIVATE_KEY|PASSWORD|PASSWD|CLIENT_SECRET)\s*=\s*\S+"
+            r"|\bQODER_PAT\b",
+            re.I,
         ),
     ),
     (
@@ -1287,7 +1318,7 @@ def _validate_assets_map_variant_isolation(
         v_ckpt = _resolved_ckpt(vid)
         if (v_asset in assets_map or top_asset in assets_map) and v_ckpt == top_ckpt:
             raise ValidationError(
-                f"{context}.variants.{vname}: assets_map resolves model asset {_safe_diag_repr(v_asset)} "
+                f"{context}.variants.{_safe_variant_label(vname)}: assets_map resolves model asset {_safe_diag_repr(v_asset)} "
                 f"to {_safe_diag_repr(v_ckpt)}, colliding with default/top-level checkpoint "
                 "(use distinct mapped paths or declare allow_shared_fields: [assets])"
             )
@@ -1300,10 +1331,10 @@ def _validate_assets_map_variant_isolation(
                 target = (
                     "default/top-level checkpoint"
                     if other_name == "default"
-                    else f"variant {other_name!r}"
+                    else f"variant {_safe_diag_repr(other_name)}"
                 )
                 raise ValidationError(
-                    f"{context}.variants.{vname}: assets_map resolves model asset {_safe_diag_repr(v_asset)} "
+                    f"{context}.variants.{_safe_variant_label(vname)}: assets_map resolves model asset {_safe_diag_repr(v_asset)} "
                     f"to {_safe_diag_repr(v_ckpt)}, colliding with {target} "
                     "(use distinct mapped paths or declare allow_shared_fields: [assets])"
                 )
@@ -1833,6 +1864,14 @@ def _safe_diag_repr(value: str) -> str:
     return repr(value)
 
 
+def _safe_variant_label(value: Any) -> str:
+    """Return variant name unless it contains sensitive text, else ``'<redacted>'``."""
+    text = str(value)
+    if _scan_text(text, context="diag", allow_loopback=True):
+        return "<redacted>"
+    return text
+
+
 def _redact_error_text(text: str) -> str:
     """Scrub secret tokens, internal domains, prohibited tokens, and private IPs from error text."""
     scrubbed = text
@@ -1879,6 +1918,10 @@ def _validate_env_block(
 ) -> None:
     checked = _check_str_dict(env, context=context)
     for name, val in checked.items():
+        if _SENSITIVE_ENV_KEY_RE.search(name):
+            raise ValidationError(
+                f"{context}: credential env var {_safe_diag_repr(name)} must not be set in recipe"
+            )
         if name in FORBIDDEN_RECIPE_ENV:
             raise ValidationError(
                 f"{context}: runtime-mode env {name!r} must not be set in recipe"
@@ -1925,6 +1968,10 @@ def _validate_flag_list(
 ) -> None:
     raw = _check_str_list(tokens, context=context)
     for flag, val, _ in _parse_flag_entries(raw):
+        if flag in _AUTH_CLI_FLAGS:
+            raise ValidationError(
+                f"{context}: plaintext auth credential flag is forbidden in recipe/policy"
+            )
         if not allow_policy_flags and flag in FORBIDDEN_RECIPE_FLAGS:
             raise ValidationError(f"{context}: framework runner owns {flag}")
         if flag == "--mem-fraction-static":
@@ -2128,6 +2175,7 @@ def validate_serving_recipe_structure(
 
     variant_compat_hw_map: dict[str, frozenset[str]] = {}
     for vname, vcfg in variants_blk.items():
+        v_label = _safe_variant_label(vname)
         _check_keys(
             vcfg,
             allowed={
@@ -2143,63 +2191,64 @@ def validate_serving_recipe_structure(
                 "allow_shared_fields",
             },
             required={"precision"},
-            context=f"{context}.variants.{vname}",
+            context=f"{context}.variants.{v_label}",
         )
         if "allow_shared_fields" in vcfg:
             shared = _check_str_list(
                 vcfg["allow_shared_fields"],
-                context=f"{context}.variants.{vname}.allow_shared_fields",
+                context=f"{context}.variants.{v_label}.allow_shared_fields",
             )
             unknown_shared = sorted(set(shared) - set(VARIANT_ISOLATED_FIELDS))
             if unknown_shared:
                 raise ValidationError(
-                    f"{context}.variants.{vname}.allow_shared_fields has unsupported field(s): "
+                    f"{context}.variants.{v_label}.allow_shared_fields has unsupported field(s): "
                     f"{', '.join(unknown_shared)}"
                 )
             if len(shared) != len(set(shared)):
                 raise ValidationError(
-                    f"{context}.variants.{vname}.allow_shared_fields must not contain duplicates"
+                    f"{context}.variants.{v_label}.allow_shared_fields must not contain duplicates"
                 )
         compat_hw = _variant_compatible_hardware(
-            vcfg, context=f"{context}.variants.{vname}"
+            vcfg, context=f"{context}.variants.{v_label}"
         )
         for hw in sorted(compat_hw):
             _validate_hardware_precision(
                 hardware=hw,
                 precision=vcfg["precision"],
-                context=f"{context}.variants.{vname}",
+                context=f"{context}.variants.{v_label}",
             )
         variant_compat_hw_map[vname] = compat_hw
         if "topology" in vcfg:
             _validate_topology_block(
-                vcfg["topology"], context=f"{context}.variants.{vname}.topology"
+                vcfg["topology"], context=f"{context}.variants.{v_label}.topology"
             )
         if "assets" in vcfg:
             v_assets = _check_keys(
                 vcfg["assets"],
                 allowed={"model", "tokenizer"},
                 required={"model", "tokenizer"},
-                context=f"{context}.variants.{vname}.assets",
+                context=f"{context}.variants.{v_label}.assets",
             )
-            _check_str_dict(v_assets, context=f"{context}.variants.{vname}.assets")
+            _check_str_dict(v_assets, context=f"{context}.variants.{v_label}.assets")
         if "hf_model_id" in vcfg:
             _validate_hf_model_id(
-                vcfg["hf_model_id"], context=f"{context}.variants.{vname}.hf_model_id"
+                vcfg["hf_model_id"], context=f"{context}.variants.{v_label}.hf_model_id"
             )
         for key in ("golden_model_key", "served_name"):
             if key in vcfg and (
                 not isinstance(vcfg[key], str) or not vcfg[key].strip()
             ):
                 raise ValidationError(
-                    f"{context}.variants.{vname}.{key} must be non-empty string"
+                    f"{context}.variants.{v_label}.{key} must be non-empty string"
                 )
         _validate_flag_list(
-            vcfg.get("extra_args", []), context=f"{context}.variants.{vname}.extra_args"
+            vcfg.get("extra_args", []),
+            context=f"{context}.variants.{v_label}.extra_args",
         )
         _validate_env_block(
             vcfg.get("extra_env", {}),
             external_env=external_env,
-            context=f"{context}.variants.{vname}.extra_env",
+            context=f"{context}.variants.{v_label}.extra_env",
         )
 
     if len(variants_blk) > 1:
@@ -2211,19 +2260,20 @@ def validate_serving_recipe_structure(
         for vname, vcfg in variants_blk.items():
             if vname == "default":
                 continue
+            v_label = _safe_variant_label(vname)
             exempt = set(vcfg.get("allow_shared_fields", []))
             vid = eff_ids[vname]
             if "assets" not in exempt:
                 if "assets" not in vcfg:
                     raise ValidationError(
-                        f"{context}.variants.{vname}: multi-variant recipe requires explicit "
-                        f"'assets' on non-default variant {vname!r} "
+                        f"{context}.variants.{v_label}: multi-variant recipe requires explicit "
+                        f"'assets' on non-default variant {_safe_diag_repr(vname)} "
                         "(or declare allow_shared_fields: [assets])"
                     )
                 v_model_asset = vid["assets"]["model"]
                 if v_model_asset == top_id["assets"]["model"]:
                     raise ValidationError(
-                        f"{context}.variants.{vname}.assets.model ({_safe_diag_repr(v_model_asset)}) "
+                        f"{context}.variants.{v_label}.assets.model ({_safe_diag_repr(v_model_asset)}) "
                         "duplicates default/top-level value "
                         "(set distinct assets or declare allow_shared_fields: [assets])"
                     )
@@ -2234,10 +2284,10 @@ def validate_serving_recipe_structure(
                         target = (
                             "default/top-level value"
                             if other_name == "default"
-                            else f"variant {other_name!r}"
+                            else f"variant {_safe_diag_repr(other_name)}"
                         )
                         raise ValidationError(
-                            f"{context}.variants.{vname}.assets.model ({_safe_diag_repr(v_model_asset)}) "
+                            f"{context}.variants.{v_label}.assets.model ({_safe_diag_repr(v_model_asset)}) "
                             f"duplicates {target} "
                             "(set distinct assets or declare allow_shared_fields: [assets])"
                         )
@@ -2247,14 +2297,14 @@ def validate_serving_recipe_structure(
                     continue
                 if field not in vcfg:
                     raise ValidationError(
-                        f"{context}.variants.{vname}: multi-variant recipe requires explicit "
-                        f"{field!r} on non-default variant {vname!r} "
+                        f"{context}.variants.{v_label}: multi-variant recipe requires explicit "
+                        f"{field!r} on non-default variant {_safe_diag_repr(vname)} "
                         f"(or declare allow_shared_fields: [{field}])"
                     )
                 val = vid[field]
                 if val == top_id[field]:
                     raise ValidationError(
-                        f"{context}.variants.{vname}.{field} ({_safe_diag_repr(val)}) duplicates "
+                        f"{context}.variants.{v_label}.{field} ({_safe_diag_repr(val)}) duplicates "
                         f"default/top-level value (set distinct {field} or declare "
                         f"allow_shared_fields: [{field}])"
                     )
@@ -2265,10 +2315,10 @@ def validate_serving_recipe_structure(
                         target = (
                             "default/top-level value"
                             if other_name == "default"
-                            else f"variant {other_name!r}"
+                            else f"variant {_safe_diag_repr(other_name)}"
                         )
                         raise ValidationError(
-                            f"{context}.variants.{vname}.{field} ({_safe_diag_repr(val)}) duplicates "
+                            f"{context}.variants.{v_label}.{field} ({_safe_diag_repr(val)}) duplicates "
                             f"{target} (set distinct {field} or declare "
                             f"allow_shared_fields: [{field}])"
                         )
@@ -3046,21 +3096,29 @@ def _iter_repo_yaml_files(repo_root: Path) -> list[Path]:
 
 
 def _unescape_yaml_scalar_text(raw: str) -> str:
-    return _YAML_ESCAPE_RE.sub(
-        lambda m: chr(int(m.group(1) or m.group(2) or m.group(3), 16)),
-        raw,
-    )
+    def _replace(match: re.Match[str]) -> str:
+        hex_digits = match.group(1) or match.group(2) or match.group(3)
+        try:
+            codepoint = int(hex_digits, 16)
+            if not (0 <= codepoint <= 0x10FFFF):
+                return match.group(0)
+            return chr(codepoint)
+        except (ValueError, OverflowError):
+            return match.group(0)
+
+    return _YAML_ESCAPE_RE.sub(_replace, raw)
 
 
 def _text_has_stray_serving_schema(text: str) -> bool:
     for match in _STRAY_SERVING_SCHEMA_RE.finditer(text):
+        quote = match.group(1)
         raw_val = match.group(2).strip()
         if len(raw_val) >= 2 and raw_val[0] == raw_val[-1] and raw_val[0] in {"'", '"'}:
+            if not quote:
+                quote = raw_val[0]
             raw_val = raw_val[1:-1]
-        if (
-            raw_val == SERVING_SCHEMA
-            or _unescape_yaml_scalar_text(raw_val) == SERVING_SCHEMA
-        ):
+        candidate = _unescape_yaml_scalar_text(raw_val) if quote == '"' else raw_val
+        if candidate == SERVING_SCHEMA:
             return True
     return False
 
@@ -3114,16 +3172,20 @@ def scan_stray_serving_recipes(repo_root: Path | None = None) -> list[Path]:
                     matched = True
                     break
         except yaml.YAMLError:
+            failed_chunks: list[str] = []
             for chunk in re.split(r"(?m)^(?:---|\.\.\.)(?=$|[\s#])", text):
                 try:
                     doc_node = yaml.compose(chunk)
                 except yaml.YAMLError:
+                    failed_chunks.append(chunk)
                     continue
                 if doc_node is not None and _mapping_node_has_serving_schema(doc_node):
                     matched = True
                     break
-        if not matched and _text_has_stray_serving_schema(text):
-            matched = True
+            if not matched and any(
+                _text_has_stray_serving_schema(chunk) for chunk in failed_chunks
+            ):
+                matched = True
         if matched:
             stray.append(path)
     if stray:
