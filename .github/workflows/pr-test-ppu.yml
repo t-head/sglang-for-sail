@@ -274,6 +274,7 @@ jobs:
     env:
       TIER: legacy
       PPU_CI_BOARD: ${{ matrix.board }}
+      PPU_CI_FP8_ONLY: "0"
       PPU_CI_SOURCE_SHA: ${{ needs.check-changes.outputs.source-sha }}
     steps:
       - name: Checkout the triggering source revision
@@ -319,6 +320,65 @@ jobs:
           path: ppu-public/legacy.json
           if-no-files-found: error
 
+  ppu-fp8-sanity:
+    needs: [check-changes, pr-gate, ppu-build, ppu-cluster-config]
+    if: inputs.run_legacy_sanity != true && inputs.preflight_only != true && needs.check-changes.outputs.ppu == 'true'
+    runs-on: k8s-runner-group-cpu-thead
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+    env:
+      TIER: legacy
+      PPU_CI_BOARD: ZW-M890P
+      PPU_CI_FP8_ONLY: "1"
+      PPU_CI_SOURCE_SHA: ${{ needs.check-changes.outputs.source-sha }}
+    steps:
+      - name: Checkout the triggering source revision
+        timeout-minutes: 10
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ needs.check-changes.outputs.source-sha }}
+          persist-credentials: false
+      - name: Download the matching PPU wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.ppu-build.outputs.wheel-artifact-id }}
+          merge-multiple: true
+          path: wheels
+      - name: Fetch pinned Cluster Run backend
+        uses: actions/checkout@v4
+        with:
+          repository: t-head/ci-infra
+          ref: 96e25147971f5d2a04d828f8ad508cae38a4fa8a
+          path: .ppu-infra
+          persist-credentials: false
+      - name: Orchestrate PPU Pod with private logs
+        id: cluster
+        shell: bash
+        run: |
+          export PPU_PUBLIC_SUMMARY="$GITHUB_STEP_SUMMARY"
+          exec bash scripts/ci/ppu/run_recipe_cluster.sh
+      - name: Approve only the checked single-device evidence file
+        id: evidence
+        if: always() && steps.cluster.outcome != 'skipped'
+        shell: bash
+        run: |
+          if [[ -f ppu-public/legacy.json && ! -L ppu-public/legacy.json ]] &&
+            python3 -B scripts/ci/ppu/recipe_publish.py --verify-only ppu-public/legacy.json >/dev/null 2>&1; then
+            printf 'approved=true\n' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Upload checked single-device evidence
+        if: always() && steps.evidence.outputs.approved == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fp8-sanity-ZW-M890P-${{ github.run_attempt }}
+          path: ppu-public/legacy.json
+          if-no-files-found: error
+
   ppu-fast-sanity:
     needs: [check-changes, pr-gate, ppu-build, ppu-cluster-config]
     if: >-
@@ -348,7 +408,7 @@ jobs:
           ((github.event_name == 'pull_request_target' && github.event.action == 'labeled' &&
             !contains(fromJSON('["run-ci","run-ci-ppu"]'), github.event.label.name)) &&
            'ignored-label-pr-test-ppu-finish' || 'pr-test-ppu-finish') }}
-    needs: [pr-gate, check-changes, ppu-ci-selftest, ppu-build, ppu-cluster-config, ppu-fast-sanity]
+    needs: [pr-gate, check-changes, ppu-ci-selftest, ppu-build, ppu-cluster-config, ppu-fp8-sanity, ppu-fast-sanity]
     if: >-
       always() && inputs.run_legacy_sanity != true && (needs.pr-gate.result == 'failure' || needs.pr-gate.result == 'cancelled' ||
        needs.check-changes.result != 'skipped')
@@ -368,7 +428,7 @@ jobs:
           fi
           if [[ "$PPU_IN_SCOPE" == "true" ]]; then
             if [[ "$PREFLIGHT_ONLY" == true ]]; then
-              jq -e '.["ppu-build"].result == "skipped" and (del(.["ppu-build"]) | all(.[]; .result == "success"))' <<< "$NEEDS_JSON" >/dev/null
+              jq -e '.["ppu-build"].result == "skipped" and (del(.["ppu-build"], .["ppu-fp8-sanity"]) | all(.[]; .result == "success"))' <<< "$NEEDS_JSON" >/dev/null
               [[ "$SANITY_RESULT" == success ]]
               echo 'Linux selftests and cluster preflights passed.'
               exit 0

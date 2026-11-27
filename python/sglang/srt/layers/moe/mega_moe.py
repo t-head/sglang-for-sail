@@ -115,7 +115,11 @@ def check_mega_moe_shapes(hidden: int, intermediate: int, mma_type: str) -> None
     scale_group = 16 if mma_type == "nvfp4xnvfp4" else 32
     align = 128 if mma_type in ("fp8xfp4", "fp8xfp8") else 16 * scale_group
     hidden_align = 256 if mma_type == "fp8xfp8" else 16 * scale_group
-    if hidden % hidden_align != 0 or intermediate % align != 0:
+    if (
+        (mma_type == "fp8xfp8" and min(hidden, intermediate) <= 0)
+        or hidden % hidden_align != 0
+        or intermediate % align != 0
+    ):
         raise ValueError(
             f"DeepGEMM MegaMoE ({mma_type}) needs hidden_size to be a multiple "
             f"of {hidden_align} and moe_intermediate_size to be a multiple of "
@@ -152,6 +156,8 @@ def _get_mega_moe_symm_buffer(
             num_shared_experts,
             activation,
             deep_gemm.get_num_sms(),
+            # FP8 pre-dispatch and compute share workspace generation state.
+            torch.cuda.current_stream() if mma_type == "fp8xfp8" else None,
         )
         buf = _MEGA_MOE_SYMM_BUFFER.get(key)
         if buf is None:
@@ -182,6 +188,8 @@ def _get_mega_moe_symm_buffer(
 def is_mega_moe_experts_ready(experts) -> bool:
     if not experts._mega_moe_weights_built:
         return False
+    if getattr(experts, "_mega_moe_mma_type", None) == "fp8xfp8":
+        return _is_sail and _device_sm == 89
     if _is_sail:
         return _device_sm >= 89
     if _device_sm == 90:
@@ -225,9 +233,16 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
 
     if not get_moe_a2a_backend().is_megamoe():
         return False
+    fp8_channelwise = getattr(moe.experts, "_mega_moe_mma_type", None) == "fp8xfp8"
     if not is_mega_moe_experts_ready(moe.experts):
+        if fp8_channelwise:
+            raise RuntimeError(
+                "PPU FP8 MegaMoE needs packed channelwise weights on SM89."
+            )
         return False
     if get_is_capture_mode():
+        if fp8_channelwise:
+            raise RuntimeError("PPU channelwise FP8 MegaMoE requires eager execution.")
         return True
 
     global_num_tokens = get_dp_global_num_tokens()
@@ -243,6 +258,11 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
         max_tokens_per_rank = hidden_states.shape[0]
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
     ret = max_tokens_per_rank <= cap
+    if not ret and fp8_channelwise:
+        raise RuntimeError(
+            f"PPU FP8 MegaMoE has no unpacked fallback: {max_tokens_per_rank} tokens "
+            f"exceed SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK={cap}."
+        )
     if ret:
         _log_mega_moe_hit(moe)
     return ret
@@ -278,6 +298,12 @@ def forward_mega_moe(
         )
 
     num_tokens = hidden_states.shape[0]
+    valid_rows = None
+    if _mega_moe_mma_type(moe.experts) == "fp8xfp8" and forward_batch is not None:
+        bound = forward_batch.moe_num_token_non_padded()
+        if bound is not None:
+            valid_rows = torch.arange(num_tokens, device=hidden_states.device) < bound
+            hidden_states = hidden_states.masked_fill(~valid_rows[:, None], 0)
     fused_shared = moe.mega_shared_l1_weights is not None
     fork_mega_moe = (
         moe.alt_stream is not None
@@ -297,7 +323,7 @@ def forward_mega_moe(
 
     with mega_stream_ctx:
         y = _run_mega_routed(
-            moe, hidden_states, forward_batch, input_ids_global, num_tokens
+            moe, hidden_states, forward_batch, input_ids_global, num_tokens, valid_rows
         )
 
     if fork_mega_moe:
@@ -305,6 +331,8 @@ def forward_mega_moe(
 
     if shared_output is not None:
         y.add_(shared_output)
+    if valid_rows is not None:
+        y.masked_fill_(~valid_rows[:, None], 0)
     return y
 
 
@@ -395,6 +423,7 @@ def _run_mega_routed(
     forward_batch: Optional[ForwardBatch],
     input_ids_global: Optional[torch.Tensor],
     num_tokens: int,
+    valid_rows: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     hidden_size = moe.config.hidden_size
 
@@ -438,6 +467,9 @@ def _run_mega_routed(
             )
         topk_ids = topk_output.topk_ids
         topk_weights = topk_output.topk_weights
+        if valid_rows is not None:
+            topk_ids = topk_ids.masked_fill(~valid_rows[:, None], -1)
+            topk_weights = topk_weights.masked_fill(~valid_rows[:, None], 0)
     else:
         topk_ids = None
         topk_weights = None
@@ -505,6 +537,21 @@ def run_mega_routed_experts(
     )
 
     mma_type = _mega_moe_mma_type(experts)
+    fp8_channelwise = mma_type == "fp8xfp8"
+    if fp8_channelwise:
+        if not is_mega_moe_experts_ready(experts):
+            raise RuntimeError(
+                "PPU FP8 MegaMoE needs packed channelwise weights on SM89."
+            )
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("PPU FP8 MegaMoE requires eager execution.")
+        if (
+            num_shared_experts
+            or shared_l1_weights is not None
+            or shared_l2_weights is not None
+        ):
+            raise ValueError("PPU FP8 MegaMoE requires separate shared experts.")
+
     if _is_sail and activation == "swigluoai":
         activation = "swiglu_oai"
     buf = _get_mega_moe_symm_buffer(
@@ -543,7 +590,7 @@ def run_mega_routed_experts(
             routed_scaling_factor=routed_scaling_factor,
         )
 
-    if routed_scaling_factor != 1.0:
+    if routed_scaling_factor != 1.0 and not fp8_channelwise:
         assert not routing_in_buffer
         topk_weights_in = topk_weights_in * routed_scaling_factor
 
@@ -558,7 +605,7 @@ def run_mega_routed_experts(
             buf.topk_idx,
             buf.topk_weights,
             num_tokens=num_tokens,
-            group_size=0 if mma_type == "fp8xfp8" else 32,
+            group_size=0 if fp8_channelwise else 32,
             mma_type=mma_type,
         )
         if mma_type != "fp4xfp4":
@@ -637,10 +684,12 @@ def run_mega_routed_experts(
                 copy_topk=not routing_in_buffer,
             )
 
-    # Allocate at least one CUDA row so y has a non-null data_ptr;
-    # the DeepGEMM tvm-ffi binding rejects nullptr in convert_to_torch_tensor().
+    # Preserve the release PPU FP4 allocation and the verified FP8 runner's
+    # one-row placeholder on idle ranks (pre-dispatch invalidates its routes).
+    # The CUDA tvm-ffi binding also requires a non-null output pointer.
+    output_rows = num_tokens if _is_sail and not fp8_channelwise else max(num_tokens, 1)
     y = torch.empty(
-        (num_tokens if _is_sail else max(num_tokens, 1), hidden_size),
+        (output_rows, hidden_size),
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
@@ -674,7 +723,12 @@ def run_mega_routed_experts(
             buf,
             **kernel_kwargs,
         )
-    return y[:num_tokens]
+    y = y[:num_tokens]
+    if fp8_channelwise and routed_scaling_factor != 1.0:
+        # Match the verified FP8 runner: scale the combined BF16 rows before
+        # the model adds its separate shared expert output.
+        y.mul_(routed_scaling_factor)
+    return y
 
 
 def _interleave_mega_moe_gate_up(t: torch.Tensor, gran: int = 8) -> torch.Tensor:

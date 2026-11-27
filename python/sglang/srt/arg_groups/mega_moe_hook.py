@@ -111,20 +111,100 @@ def mega_moe_needs_token_budget(
     return model_arch in MEGA_MOE_NO_FALLBACK_ARCHS or nvfp4_experts
 
 
+_PPU_CHANNELWISE_FP8_ARCHS = frozenset(
+    {
+        "Glm5NextForConditionalGeneration",
+        "MiniMaxM3SparseForCausalLM",
+        "MiniMaxM3SparseForConditionalGeneration",
+    }
+)
+
+
+def _ppu_channelwise_fp8_routed_experts(hf_quant_config: dict) -> bool:
+    if hf_quant_config.get("quant_method") != "compressed-tensors":
+        return False
+
+    # Resolve the same expert projection targets and ignore rules used while
+    # constructing FusedMoE, rather than accepting a dense-only FP8 group.
+    from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+    from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsConfig,
+    )
+
+    quant_config = CompressedTensorsConfig.from_config(hf_quant_config)
+    quant_config._add_fused_moe_to_target_scheme_map()
+    projection = object.__new__(FusedMoE)
+    for prefix in (
+        "model.layers.0.mlp.experts.0.",
+        "model.language_model.layers.0.mlp.experts.0.",
+    ):
+        try:
+            schemes = [
+                quant_config.get_scheme_dict(projection, prefix + name)
+                for name in ("gate_proj", "up_proj", "down_proj")
+            ]
+        except ValueError:
+            continue
+        if any(scheme is None for scheme in schemes) or any(
+            scheme != schemes[0] for scheme in schemes[1:]
+        ):
+            continue
+        weights = schemes[0].get("weights")
+        activations = schemes[0].get("input_activations")
+        if (
+            weights is not None
+            and weights.strategy == "channel"
+            and weights.type == "float"
+            and weights.num_bits == 8
+            and activations is not None
+            and activations.strategy == "token"
+            and activations.type == "float"
+            and activations.num_bits == 8
+            and activations.dynamic is True
+        ):
+            return True
+    return False
+
+
+def _validate_ppu_channelwise_fp8_eager(cfg, channelwise_fp8: bool) -> None:
+    if not channelwise_fp8 or not get_platform().is_ppu:
+        return
+
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+
+    graph = cfg.cuda_graph_config
+    if (
+        graph is None
+        or graph.prefill.backend != Backend.DISABLED
+        or graph.decode.backend != Backend.DISABLED
+    ):
+        raise ValueError(
+            "PPU channelwise FP8 MegaMoE requires eager execution; "
+            "use --disable-cuda-graph."
+        )
+
+
 def validate_mega_moe_token_budget_for_model(server_args: ServerArgs) -> None:
     # Runs after speculative resolution so the decode / verify bound is final.
     cfg = resolving_view(server_args)
     if cfg.moe_a2a_backend != "megamoe" or cfg.encoder_only:
         return
     validate_flydsl_decode_capacity(server_args)
+
     if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
         return
     model_config = model_config_of(server_args)
     model_arch = model_config.hf_config.architectures[0]
+    channelwise_fp8 = model_arch in _PPU_CHANNELWISE_FP8_ARCHS and (
+        _ppu_channelwise_fp8_routed_experts(model_config.hf_quant_config)
+    )
+    _validate_ppu_channelwise_fp8_eager(cfg, channelwise_fp8)
     if mega_moe_needs_token_budget(
         model_arch, model_config.hf_quant_config, cfg.quantization
     ):
-        validate_mega_moe_token_budget(server_args, model_arch)
+        validate_mega_moe_token_budget(
+            server_args, model_arch, ppu_channelwise_fp8=channelwise_fp8
+        )
 
 
 def mega_moe_decode_tokens_per_rank(cfg) -> int:
@@ -194,7 +274,12 @@ def validate_flydsl_decode_capacity(server_args: ServerArgs) -> None:
         )
 
 
-def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) -> None:
+def validate_mega_moe_token_budget(
+    server_args: ServerArgs,
+    model_label: str,
+    *,
+    ppu_channelwise_fp8: bool = False,
+) -> None:
     cfg = resolving_view(server_args)
     if cfg.moe_a2a_backend != "megamoe":
         return
@@ -209,9 +294,12 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
         "MiniMaxM3SparseForCausalLM",
         "MiniMaxM3SparseForConditionalGeneration",
     ]
+    eager_and_graph_budget = (
+        ppu_channelwise_fp8 or model_label in eager_and_graph_budget_models
+    )
     if cfg.disaggregation_mode != "prefill":
         decode_tokens = mega_moe_decode_tokens_per_rank(cfg)
-        if model_label in eager_and_graph_budget_models:
+        if eager_and_graph_budget:
             # Repacked experts cannot fall back for oversized eager batches.
             if cfg.max_running_requests is None:
                 raise ValueError(
@@ -255,7 +343,7 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
 
     prefill_tokens = cfg.chunked_prefill_size
     kimi = model_label == "KimiK31ForConditionalGeneration"
-    if model_label in eager_and_graph_budget_models:
+    if eager_and_graph_budget:
         prefill_tokens = max(prefill_tokens, getattr(cfg, "max_prefill_tokens", 0) or 0)
         graph = cfg.cuda_graph_config.prefill if cfg.cuda_graph_config else None
         if graph is not None and graph.backend != "disabled":
