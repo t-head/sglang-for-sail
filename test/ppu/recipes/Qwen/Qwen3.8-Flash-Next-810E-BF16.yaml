@@ -1,0 +1,52 @@
+# Source: framework_ci_cases/sglang/qwen3.8-next-flash-cases.md, sections 2.1.1.1 and 2.1.2.1.
+schema_version: ppu-serving/v1
+ppu:
+  framework: sglang
+  visibility: public
+  assets: {model: qwen3.8-flash-next-810e-bf16, tokenizer: qwen3.8-flash-next-810e-bf16}
+  hf_model_id: Qwen/Qwen3.8-Flash-Next
+  topology: {kind: single_node, nodes: 1, devices_per_node: 8}
+model:
+  model_id: Qwen/Qwen3.8-Flash-Next
+  base_args:
+    - --trust-remote-code
+    - --mem-fraction-static
+    - "0.9"
+    - --chunked-prefill-size
+    - "8192"
+    - --linear-attn-prefill-backend
+    - "triton"
+    - --linear-attn-decode-backend
+    - "triton"
+    - --linear-attn-verify-backend
+    - "triton"
+    - --mamba-ssm-dtype
+    - "bfloat16"
+    - --reasoning-parser
+    - "auto"
+    - --ple-offload-embedding
+variants:
+  default: {precision: bf16}
+presets:
+  fast_sanity:
+    args:
+      - --tp-size
+      - "4"
+      - --max-running-requests
+      - "16"
+  model_sanity:
+    args:
+      - --tp-size
+      - "8"
+      - --max-running-requests
+      - "64"
+      - --moe-a2a-backend
+      - "deepep"
+      - --enable-dp-lm-head
+      - --moe-dense-tp-size
+      - "1"
+      - --attn-dp-size
+      - "8"
+    env:
+      SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN: "1"
+      SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK: "128"

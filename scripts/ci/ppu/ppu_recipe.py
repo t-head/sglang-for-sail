@@ -82,6 +82,7 @@ ALLOWED_PRESET_SLOTS = frozenset(
         "decode_nographs",
         "dp_ep_low_latency",
         "eval_longctx",
+        "fast_sanity",
         "model_sanity",
         "prefill_long",
         "tp8",
@@ -1389,14 +1390,19 @@ def _format_model_sanity_stages(policy_doc: dict[str, Any]) -> str:
     return ", ".join(items) if items else _md_code("none")
 
 
+def golden_path_for(resolved: dict[str, Any]) -> tuple[str, str]:
+    chip = {"zhenwu_810e": "810e", "zhenwu_m890": "890p"}[resolved["hardware"]]
+    return f"test/ppu/golden/accuracy_{resolved['golden_model_key']}_{chip}.json", chip
+
+
 def _format_golden(resolved: dict[str, Any], *, base_dir: Path) -> str:
     golden_key = resolved.get("golden_model_key")
     if not golden_key:
         return _md_code("none")
-    rel_path = f"test/ppu/golden/accuracy_{golden_key}_890p.json"
+    rel_path, _ = golden_path_for(resolved)
     if (REPO_ROOT / rel_path).is_file():
         return _md_link(golden_key, rel_path, base_dir=base_dir)
-    return _md_code(golden_key)
+    return f"{_md_code(golden_key)} (baseline pending)"
 
 
 def _render_md_table(headers: list[str], rows: list[list[str]]) -> list[str]:
@@ -1505,7 +1511,7 @@ def render_ci_matrix_markdown(*, base_dir: Path | None = None) -> str:
                 [
                     _md_link("golden/", "test/ppu/golden", base_dir=doc_dir),
                     "`schema_version: 2` JSON",
-                    "Reference GSM8K score and tolerance band per `golden_model_key` (`accuracy_<key>_890p.json`).",
+                    "Reference GSM8K score and tolerance band per `golden_model_key` (`accuracy_<key>_<chip>.json`).",
                 ],
                 [
                     f"{_md_link('e2e/', 'test/ppu/e2e', base_dir=doc_dir)}, {_md_link('unit/', 'test/ppu/unit', base_dir=doc_dir)}, {_md_link('module/', 'test/ppu/module', base_dir=doc_dir)}",
@@ -1520,7 +1526,7 @@ def render_ci_matrix_markdown(*, base_dir: Path | None = None) -> str:
         "- **Resolution order**: `model.base_args` / `model.base_env` -> `variants.<variant>` (default: `default`) -> `hardware_overrides.<hardware>` -> enabled `features` (`ppu.default_features` overridden by `presets.<preset>.select.features`) -> optional `presets.<preset>` (`remove_args`, `tp`, `json_args`, `args`, `env`) -> policy switches (`--disable-radix-cache`, `--load-format dummy`, `--json-model-override-args`) -> runner-owned flags (`--enable-metrics`, `--model-path`, `--tokenizer-path`, `--served-model-name`, `--host`, `--port`).",
         "- **Default preset behavior**: When a policy does not specify `preset`, CI runs the recipe's default baseline configuration. Named presets (such as `tp8` or `model_sanity`) are only applied when explicitly selected by a policy tier/stage or `--preset`.",
         "- **Weights & layers in `fast_sanity`**: Policies declare `dummy_weights` and optional `layer_override`; current models start directly with full-layer dummy weights (`--load-format dummy`) unless `layer_override` is set.",
-        "- **Shared server in `model_sanity`**: All stages in `model_sanity` (`sanity`, `evalscope`, `bench`) run against one shared server process with real weights and `cache: enabled`.",
+        "- **Shared server in `model_sanity`**: All stages run against one server process with real weights and `cache: enabled`. Both boards run full GSM8K against the checkpoint-specific golden and the micro-benchmark at C=1 and C=16.",
         "- **Regenerate / verify**:",
         "  ```bash",
         "  python3 -B scripts/ci/ppu/ppu_recipe.py render-matrix --output test/ppu/README.md",
@@ -1561,7 +1567,7 @@ def render_ci_matrix_markdown(*, base_dir: Path | None = None) -> str:
                     "Preset",
                     "Features",
                     "Stages",
-                    "Golden",
+                    "Accuracy gate",
                     "Effective serve flags",
                 ],
                 nightly_rows,
@@ -1585,7 +1591,7 @@ def render_ci_matrix_markdown(*, base_dir: Path | None = None) -> str:
             "## Adding or Changing a Model",
             "",
             "1. Add or edit the serving recipe under `test/ppu/recipes/` (`ppu-serving/v1`).",
-            "2. Add or edit the policy under `test/ppu/policy/models/` (`ppu-test-policy/v1`) and, for `model_sanity`, add `test/ppu/golden/accuracy_<golden_model_key>_890p.json`.",
+            "2. Add or edit the policy under `test/ppu/policy/models/` (`ppu-test-policy/v1`). For `model_sanity`, add the measured `test/ppu/golden/accuracy_<golden_model_key>_<chip>.json` for the selected checkpoint and board.",
             "3. Regenerate this document with `python3 -B scripts/ci/ppu/ppu_recipe.py render-matrix --output test/ppu/README.md`.",
             "4. Verify with `python3 -B scripts/ci/ppu/ppu_recipe.py validate --all --sglang-parser skip`, `python3 -B scripts/ci/ppu/ppu_recipe.py render-matrix --check`, and `python3 -B -m unittest discover -s scripts/ci/ppu -p 'test_recipe*.py'`.",
         ]

@@ -43,7 +43,7 @@ else
     cache_key=$(python3 -B scripts/ci/ppu/recipe_bundle.py cache-key "$PPU_CI_WHEEL_DIR" "$PPU_CI_SOURCE_SHA")
 fi
 [[ -d "${PPU_CI_HF_CACHE_ROOT:?}/hub" && -d /recipe-jit ]]
-[[ "${RECIPE_PPU_COUNT:?}" =~ ^(2|4|8)$ ]]
+[[ "${RECIPE_PPU_COUNT:?}" =~ ^(1|2|4|8|16)$ ]]
 if [[ "$TIER" == model_sanity ]]; then
     [[ -d "${PPU_CI_GSM8K_PATH:?}" ]]
     export PPU_CI_EVAL_WHEEL_DIR="$PWD/evalscope-wheels"

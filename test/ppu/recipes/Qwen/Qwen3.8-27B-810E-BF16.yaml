@@ -1,0 +1,40 @@
+# Source: framework_ci_cases/sglang/qwen3.8-27b-cases.md, sections 2.1.1.1 and 2.1.2.1.
+schema_version: ppu-serving/v1
+ppu:
+  framework: sglang
+  visibility: public
+  assets: {model: qwen3.8-27b-810e-bf16, tokenizer: qwen3.8-27b-810e-bf16}
+  hf_model_id: Qwen/Qwen3.8-27B
+  topology: {kind: single_node, nodes: 1, devices_per_node: 1}
+model:
+  model_id: Qwen/Qwen3.8-27B
+  base_args:
+    - --trust-remote-code
+    - --tp-size
+    - "1"
+    - --attention-backend
+    - "fa3"
+    - --mem-fraction-static
+    - "0.85"
+    - --page-size
+    - "64"
+    - --dist-timeout
+    - "60000"
+    - --watchdog-timeout
+    - "60000"
+    - --soft-watchdog-timeout
+    - "60000"
+    - --log-level
+    - "info"
+    - --disable-custom-all-reduce
+    - --disable-shared-experts-fusion
+    - --stream-interval
+    - "128"
+    - --cuda-graph-max-bs-decode
+    - "128"
+    - --decode-log-interval
+    - "1"
+    - --reasoning-parser
+    - "qwen3"
+variants:
+  default: {precision: bf16}

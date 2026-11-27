@@ -141,8 +141,12 @@ RECIPE_TREE_SHA256=""
 case "$mode" in
     fast_sanity|model_sanity)
         [[ "$MODEL_KEY" =~ ^[a-z0-9][a-z0-9.-]*$ && -f "test/ppu/policy/models/$MODEL_KEY.yaml" ]]
-        INPUT_NODE_SELECTOR=board-type=ZW-M890P
-        [[ "${RECIPE_PPU_COUNT:?}" =~ ^(2|4|8)$ ]]
+        case "${PPU_CI_BOARD:-ZW-M890P}" in
+            ZW-M890P) [[ "${RECIPE_PPU_COUNT:?}" =~ ^(2|4|8)$ ]] ;;
+            OAM-810E) [[ "${RECIPE_PPU_COUNT:?}" =~ ^(1|2|4|8|16)$ ]] ;;
+            *) exit 2 ;;
+        esac
+        INPUT_NODE_SELECTOR="board-type=${PPU_CI_BOARD:-ZW-M890P}"
         INPUT_NPROC_PER_NODE=$RECIPE_PPU_COUNT
         INPUT_TIMEOUT_MINUTES=330
         [[ "$mode" != fast_sanity ]] || INPUT_TIMEOUT_MINUTES=30

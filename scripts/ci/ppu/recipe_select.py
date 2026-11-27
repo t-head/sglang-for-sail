@@ -15,14 +15,21 @@ from ppu_recipe import (
 
 
 def cluster_width(policy_path, tier):
-    recipe = REPO_ROOT / _load_yaml(policy_path)["recipe"]
+    policy = _load_yaml(policy_path)
+    recipe = REPO_ROOT / policy["recipe"]
     topology = _load_yaml(recipe)["ppu"]["topology"]
     width = resolve_recipe(recipe, policy_path=policy_path, tier=tier)["ppu_count"]
+    if policy["hardware"] == "zhenwu_810e":
+        valid_width = (
+            width in {1, 2, 4, 8, 16}
+            and width <= topology["devices_per_node"] <= 16
+        )
+    else:
+        valid_width = width in {2, 4, 8} and width == topology["devices_per_node"]
     if (
         topology["kind"] != "single_node"
         or topology["nodes"] != 1
-        or topology["devices_per_node"] != width
-        or width not in {2, 4, 8}
+        or not valid_width
     ):
         raise ValueError(f"unsupported cluster topology for policy {policy_path.stem}")
     return width
@@ -53,7 +60,15 @@ def select(tier, model_filter):
         )
     return {
         "include": [
-            {"model": key, "ppu_count": cluster_width(models[key], tier)}
+            {
+                "model": key,
+                "ppu_count": cluster_width(models[key], tier),
+                **(
+                    {"board": "OAM-810E"}
+                    if _load_yaml(models[key])["hardware"] == "zhenwu_810e"
+                    else {}
+                ),
+            }
             for key in requested
         ]
     }

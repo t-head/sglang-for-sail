@@ -1,0 +1,51 @@
+# Source: framework_ci_cases/sglang/dpsk-v4.1-flash-cases.md, sections 2.1.1.1 and 2.1.2.1.
+schema_version: ppu-serving/v1
+ppu:
+  framework: sglang
+  visibility: public
+  assets: {model: deepseek-v4.1-flash-810e-w8a8, tokenizer: deepseek-v4.1-flash-810e-w8a8}
+  hf_model_id: T-HEAD/DeepSeek-V4.1-Flash-Quant-W-INT8-PerChannel-A-INT8-PerToken-Engram-MXFP8
+  topology: {kind: single_node, nodes: 1, devices_per_node: 16}
+  external_env: [DG_USE_MOE_DYNAMIC_TILE, HGGC_EMBEDDED_COPY_THRESHOLD]
+model:
+  model_id: deepseek-ai/DeepSeek-V4.1-Flash
+  base_args:
+    - --tp-size
+    - "16"
+    - --trust-remote-code
+    - --mem-fraction-static
+    - "0.9"
+    - --cuda-graph-max-bs-decode
+    - "64"
+    - --chunked-prefill-size
+    - "19968"
+    - --enable-prefill-cp
+    - --cp-strategy
+    - "interleave"
+    - --disable-shared-experts-fusion
+    - --disable-custom-all-reduce
+    - --page-size
+    - "64"
+    - --quantization
+    - "w8a8_int8"
+    - --reasoning-parser
+    - "auto"
+    - --tool-call-parser
+    - "auto"
+  base_env:
+    SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK: "512"
+variants:
+  default: {precision: w8a8}
+presets:
+  fast_sanity:
+    env:
+      DG_USE_MOE_DYNAMIC_TILE: "1"
+      HGGC_EMBEDDED_COPY_THRESHOLD: "0x10000"
+      SGLANG_OPT_FLASHMLA_SPARSE_PREFILL: "1"
+      SGLANG_SAIL_DEEPEP_RECV_HOOK: "0"
+  model_sanity:
+    env:
+      SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN: "1"
+      SGLANG_DSV4_FP4_EXPERTS: "0"
+      SGLANG_OPT_USE_TOPK_V2: "0"
+      SGLANG_SAIL_DSV4_USE_FLASH_MLA_SPARSE_FWD: "0"

@@ -108,6 +108,10 @@ def validate(payload):
         "recipe_tree_sha256",
     }
     tier = payload.get("tier")
+    if "board" in payload:
+        if payload["board"] != "OAM-810E":
+            raise ValueError("unexpected Recipe board")
+        meta.add("board")
     tier_fields = {"fast_sanity": FAST, "model_sanity": NIGHTLY}.get(tier)
     if tier_fields is None or set(payload) - (meta | BASE | tier_fields):
         raise ValueError("unexpected result field")
@@ -186,6 +190,11 @@ def validate(payload):
     ):
         raise ValueError("invalid correct count")
     if payload["outcome"] == "pass":
+        collecting_baseline = (
+            tier == "model_sanity"
+            and payload.get("board") == "OAM-810E"
+            and payload.get("baseline_established") is False
+        )
         required = (
             (meta - {"failure_phase", "runtime_versions"})
             | BASE
@@ -193,6 +202,9 @@ def validate(payload):
         )
         if payload["route"] == "prebuilt-image":
             required = required | {"runtime_versions"}
+        comparison_fields = {"golden_score", "accuracy_within_band"}
+        if collecting_baseline:
+            required -= comparison_fields
         if (
             not required.issubset(payload)
             or "failure_phase" in payload
@@ -217,17 +229,23 @@ def validate(payload):
             not all(
                 payload[key]
                 for key in (
-                    "accuracy_within_band",
-                    "baseline_established",
                     "kv_gauge_zero_verified",
                     "c1_passed",
                     "c16_passed",
                 )
             )
-            or abs(payload["gsm8k_score"] - payload["golden_score"]) > 0.02
             or payload["gsm8k_correct"] != round(payload["gsm8k_score"] * 1319)
         ):
             raise ValueError("passing nightly result did not meet gate")
+        if collecting_baseline:
+            if comparison_fields & payload.keys():
+                raise ValueError("baseline collection must not claim a golden comparison")
+        elif tier == "model_sanity" and (
+            not payload["baseline_established"]
+            or not payload["accuracy_within_band"]
+            or abs(payload["gsm8k_score"] - payload["golden_score"]) > 0.02
+        ):
+            raise ValueError("passing nightly result did not meet golden gate")
 
 
 def publish(payload, artifact, summary, console):
@@ -268,6 +286,10 @@ def main():
                 and record["board"] != os.environ["PPU_CI_BOARD"]
             ):
                 raise ValueError("unmatched legacy board")
+            if record["schema"] != LEGACY_SCHEMA and record.get(
+                "board", "ZW-M890P"
+            ) != os.environ.get("PPU_CI_BOARD", "ZW-M890P"):
+                raise ValueError("unmatched Recipe board")
         else:
             publish(record, args.artifact, args.summary, sys.stdout)
     except (ValueError, OSError, KeyError, TypeError, OverflowError, RecursionError):
