@@ -1173,7 +1173,10 @@ class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
         token_capacity: int,
         sliding_window_size: int | None,
         chunk_size: int | None,
+        cold_prefill: bool = True,
     ) -> int | None:
+        # cold_prefill marks prefix-aware callers; the shared-pool budget below
+        # is prefix-independent, so the flag does not change the result.
         from sglang.srt.mem_cache.prefill_budget import estimate_swa_kv_tokens
 
         def fits(candidate):

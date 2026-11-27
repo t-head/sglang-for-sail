@@ -1353,9 +1353,11 @@ class Engine(EngineScoreMixin, EngineBase):
             cls._set_startup_time(tokenizer_manager, scheduler_init_result, startup_tic)
 
             # Get back some info from scheduler to tokenizer_manager
-            tokenizer_manager.max_req_input_len = scheduler_init_result.scheduler_infos[
-                0
-            ]["max_req_input_len"]
+            scheduler_info = scheduler_init_result.scheduler_infos[0]
+            tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+            tokenizer_manager.warmup_max_req_input_len = scheduler_info.get(
+                "warmup_max_req_input_len", scheduler_info["max_req_input_len"]
+            )
 
             # Set up subprocess liveness watchdog to detect crashes
             # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
@@ -1398,6 +1400,9 @@ class Engine(EngineScoreMixin, EngineBase):
             TokenizerManagerClass=get_tokenizer_worker_class(server_args),
         )
         tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+        tokenizer_manager.warmup_max_req_input_len = scheduler_info.get(
+            "warmup_max_req_input_len", scheduler_info["max_req_input_len"]
+        )
         tokenizer_manager.set_startup_time(scheduler_info["startup_time"])
         return tokenizer_manager, template_manager
 

@@ -1221,6 +1221,7 @@ class Scheduler(
             _,
             _,
             _,
+            self.warmup_max_req_input_len,
         ) = self.tp_worker.get_worker_info()
         # DFlash auto-enables the legacy formula; other workloads opt in via
         # --min-free-slots-delay. Built independently of the prefill delayer.
@@ -1944,6 +1945,7 @@ class Scheduler(
             "status": "ready",
             "max_total_num_tokens": self.max_total_num_tokens,
             "max_req_input_len": self.max_req_input_len,
+            "warmup_max_req_input_len": self.warmup_max_req_input_len,
             "startup_time": self.startup_time,
         }
 
@@ -2720,12 +2722,17 @@ class Scheduler(
             self.max_total_num_tokens * self.kv_shard_widening
             - self.page_size * (self.kv_shard_widening - 1)
         )
+        # Prefix-aware: the SWA prefill transient is charged for the uncached
+        # extension, which prefix matching resolves later, so this queue-time
+        # budget only rejects prompts that cannot fit the prefix-independent
+        # (FULL) budget. SWAPrefillBudget checks the actual extension.
         max_new_tokens = self.token_to_kv_pool_allocator.max_new_tokens_for_memory(
             input_len,
             max_new_tokens,
             token_capacity=token_capacity,
             sliding_window_size=self.sliding_window_size,
             chunk_size=self.chunked_prefill_size,
+            cold_prefill=False,
         )
         if max_new_tokens is None:
             req.set_finish_with_abort(
@@ -3239,9 +3246,6 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        # initialize before returning
-        self.init_req_max_new_tokens(req)
-
         # Validate prompt length
         error_msg = validate_input_length(
             req,
@@ -3250,8 +3254,14 @@ class Scheduler(
         )
         if error_msg:
             req.set_finish_with_abort(error_msg)
+            # Normalize the one-token abort request before queue processing.
+            self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
             return
+
+        # Auto-truncation must happen before computing the allocator budget.
+        # An untruncated prompt may be impossible even though its prefix fits.
+        self.init_req_max_new_tokens(req)
 
         if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
             # When return_logprob is False, logprob_start_len should be ignored
@@ -3749,6 +3759,7 @@ class Scheduler(
             get_serving().allow_auto_truncate,
         )
         if error_msg:
+            req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
 
