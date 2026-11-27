@@ -10,9 +10,8 @@ from pathlib import Path
 
 from ppu_recipe import (
     REPO_ROOT,
-    _compute_launched_gpu_ids,
     _load_yaml,
-    _parse_flag_entries,
+    resolve_launched_gpu_ids,
     resolve_recipe,
     validate_paths,
 )
@@ -53,21 +52,15 @@ def cluster_width(
     )
     width = int(resolved["ppu_count"])
     allowed_widths = _allowed_cluster_widths(max_devices)
-    launched_gpus = _compute_launched_gpu_ids(
-        _parse_flag_entries(list(resolved.get("flags", []))),
-        dp_val=int(resolved.get("dp_size", 1)),
-        tp_val=max(width // max(int(resolved.get("dp_size", 1)), 1), 1),
-        pp_val=1,
-        topo_nodes=1,
-        context=policy_path.stem,
-    )
     if (
         topology["kind"] != "single_node"
         or topology["nodes"] != 1
         or topology["devices_per_node"] != width
         or width not in allowed_widths
-        or launched_gpus != list(range(width))
     ):
+        raise ValueError(f"unsupported cluster topology for policy {policy_path.stem}")
+    launched_gpus = resolve_launched_gpu_ids(resolved, context=policy_path.stem)
+    if launched_gpus != list(range(width)):
         raise ValueError(f"unsupported cluster topology for policy {policy_path.stem}")
     return width
 

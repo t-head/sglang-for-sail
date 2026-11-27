@@ -109,29 +109,60 @@ FORBIDDEN_RECIPE_ENV = frozenset(
         "VLLM_USE_RUST_FRONTEND",
     }
 )
+# Authoritative SGLang ServerArgs fields carrying credentials or storage secrets
+# (mirrors sglang.srt.server_args.SERVER_ARGS_SECRET_FIELD_NAMES plus TLS/watermark/decrypted config fields).
+SGLANG_SENSITIVE_DEST_NAMES = frozenset(
+    {
+        "admin_api_key",
+        "api_key",
+        "decrypted_config_file",
+        "decrypted_draft_config_file",
+        "hicache_storage_backend_extra_config",
+        "ssl_ca_certs",
+        "ssl_certfile",
+        "ssl_keyfile",
+        "ssl_keyfile_password",
+        "unified_cache_external_linker_config",
+        "watermark_config",
+    }
+)
 FORBIDDEN_CREDENTIAL_FLAGS = frozenset(
     {
         "--admin-api-key",
         "--api-key",
+        "--decrypted-config-file",
+        "--decrypted-draft-config-file",
+        "--hicache-storage-backend-extra-config",
         "--ssl-ca-certs",
         "--ssl-certfile",
         "--ssl-keyfile",
         "--ssl-keyfile-password",
+        "--unified-cache-external-linker-config",
+        "--watermark-config",
     }
 )
-_ABBREV_CREDENTIAL_TARGETS: tuple[str, ...] = tuple(sorted(FORBIDDEN_CREDENTIAL_FLAGS))
-_NON_CREDENTIAL_TOKEN_SUFFIXES: tuple[str, ...] = (
-    "-bos-token",
-    "-eos-token",
-    "-max-token",
-    "-min-token",
-    "-num-token",
-    "-pad-token",
-    "-stop-token",
-    "-unk-token",
+# Exact minimum unambiguous argparse(allow_abbrev=True) prefixes (target_flag, min_prefix)
+# against SGLang ServerArgs long options.
+_SENSITIVE_ARGPARSE_ABBREV_RULES: tuple[tuple[str, str], ...] = (
+    ("--admin-api-key", "--ad"),
+    ("--api-key", "--ap"),
+    ("--decrypted-config-file", "--decrypted"),
+    ("--decrypted-draft-config-file", "--decrypted"),
+    ("--hicache-storage-backend-extra-config", "--hicache-storage-backend-"),
+    ("--ssl-ca-certs", "--ssl"),
+    ("--ssl-certfile", "--ssl"),
+    ("--ssl-keyfile", "--ssl"),
+    ("--ssl-keyfile-password", "--ssl"),
+    ("--unified-cache-external-linker-config", "--unified-cache-external-linker-c"),
+    ("--watermark-config", "--wate"),
 )
 _CREDENTIAL_FLAG_RE = re.compile(
-    r"^--(?:[a-z0-9-]+-)?(?:api-key|password|passwd|secret|access-token|auth-token|hf-token|private-key|certfile|keyfile|ca-certs)s?$",
+    r"^--(?:[a-z0-9-]+-)?(?:"
+    r"api-keys?|passwords?|passwds?|secrets?|credentials?|private-keys?|certfiles?|keyfiles?|ca-certs"
+    r"|(?:access|api|auth|bearer|client|hf|hub|id|jwt|oauth|pat|refresh|router|secret|service|session)-tokens?"
+    r")$"
+    r"|^--tokens?$"
+    r"|^--(?:hicache-storage-(?:[a-z0-9-]+-)?extra-config|(?:unified-cache-)?external-linker-(?:[a-z0-9-]+-)?config)$",
     re.I,
 )
 _CREDENTIAL_ENV_RE = re.compile(
@@ -794,18 +825,113 @@ def _parse_nonneg_int_flag(
 
 
 def _is_credential_flag(flag: str) -> bool:
-    opt = flag.split("=", 1)[0].strip().lower()
+    opt = flag.split("=", 1)[0].strip().lower().replace("_", "-")
     if opt in FORBIDDEN_CREDENTIAL_FLAGS or _CREDENTIAL_FLAG_RE.fullmatch(opt):
         return True
-    if opt == "--token" or (
-        opt.endswith("-token") and not opt.endswith(_NON_CREDENTIAL_TOKEN_SUFFIXES)
-    ):
-        return True
-    if len(opt) >= 5 and any(
-        target.startswith(opt) for target in _ABBREV_CREDENTIAL_TARGETS
-    ):
-        return True
-    return False
+    return any(
+        opt.startswith(min_prefix) and target.startswith(opt)
+        for target, min_prefix in _SENSITIVE_ARGPARSE_ABBREV_RULES
+    )
+
+
+_SUSPECT_SENSITIVE_DEST_RE = re.compile(
+    r"(?:^|_)(?:api_key|password|passwd|secret|private_key|keyfile|certfile|ca_certs|credential)s?(?:$|_)"
+    r"|(?:hicache_storage|external_linker).*(?:config|secret|token|auth|password|cred)"
+    r"|^watermark_(?:config|key)"
+    r"|^decrypted_.*config",
+    re.I,
+)
+
+
+def verify_secret_flag_registry_parity(
+    parser: argparse.ArgumentParser | None = None,
+    *,
+    secret_field_names: frozenset[str] | set[str] | None = None,
+) -> dict[str, Any]:
+    """Verify static credential-flag coverage against SGLang ``ServerArgs`` without drift."""
+    if parser is None or secret_field_names is None:
+        sa_mod = importlib.import_module("sglang.srt.server_args")
+        if secret_field_names is None:
+            secret_field_names = frozenset(sa_mod.SERVER_ARGS_SECRET_FIELD_NAMES)
+        if parser is None:
+            parser = argparse.ArgumentParser(prog="sglang serve", allow_abbrev=True)
+            sa_mod.ServerArgs.add_cli_args(parser)
+
+    missing_secret_dests = sorted(set(secret_field_names) - SGLANG_SENSITIVE_DEST_NAMES)
+    if missing_secret_dests:
+        raise ValidationError(
+            "SGLang ServerArgs secret field drift: static SGLANG_SENSITIVE_DEST_NAMES "
+            f"is missing {missing_secret_dests}"
+        )
+
+    option_actions: Mapping[str, argparse.Action] = getattr(
+        parser, "_option_string_actions", {}
+    )
+    long_options = [opt for opt in option_actions if opt.startswith("--")]
+    if not long_options:
+        raise ValidationError("SGLang parser registered no long CLI options")
+
+    expected_sensitive_dests = set(secret_field_names) | (
+        set(SGLANG_SENSITIVE_DEST_NAMES) & {act.dest for act in option_actions.values()}
+    )
+    untracked_dests = sorted(
+        {
+            act.dest
+            for opt, act in option_actions.items()
+            if opt.startswith("--")
+            and _SUSPECT_SENSITIVE_DEST_RE.search(act.dest)
+            and act.dest not in SGLANG_SENSITIVE_DEST_NAMES
+        }
+    )
+    if untracked_dests:
+        raise ValidationError(
+            "SGLang ServerArgs sensitive option drift: untracked sensitive dest(s) "
+            f"{untracked_dests}"
+        )
+
+    checked_prefixes = 0
+    for opt, act in sorted(option_actions.items()):
+        if not opt.startswith("--"):
+            continue
+        if act.dest in expected_sensitive_dests:
+            if not _is_credential_flag(opt):
+                raise ValidationError(
+                    f"static _is_credential_flag missed sensitive option {opt!r} (dest={act.dest!r})"
+                )
+            for k in range(3, len(opt) + 1):
+                prefix = opt[:k]
+                if prefix in option_actions:
+                    resolves_to_sensitive = (
+                        option_actions[prefix].dest in expected_sensitive_dests
+                    )
+                else:
+                    matched_actions = {
+                        cand_act
+                        for cand_opt, cand_act in option_actions.items()
+                        if cand_opt.startswith(prefix)
+                    }
+                    resolves_to_sensitive = (
+                        len(matched_actions) == 1
+                        and next(iter(matched_actions)).dest in expected_sensitive_dests
+                    )
+                if resolves_to_sensitive:
+                    checked_prefixes += 1
+                    if not _is_credential_flag(prefix):
+                        raise ValidationError(
+                            f"static _is_credential_flag missed unambiguous argparse abbreviation "
+                            f"{prefix!r} -> {opt!r} (dest={act.dest!r})"
+                        )
+        elif _is_credential_flag(opt):
+            raise ValidationError(
+                f"static _is_credential_flag falsely blocked non-sensitive ServerArgs option "
+                f"{opt!r} (dest={act.dest!r})"
+            )
+
+    return {
+        "secret_dests": sorted(expected_sensitive_dests),
+        "checked_long_options": len(long_options),
+        "checked_unambiguous_prefixes": checked_prefixes,
+    }
 
 
 def _is_credential_env(name: str) -> bool:
@@ -857,39 +983,148 @@ _DSA_MODEL_PREFIXES: tuple[str, ...] = (
     "deepseek-ai/deepseek-v3.2",
     "t-head/deepseek-v3.2",
 )
-_MLA_MODEL_PREFIXES: tuple[str, ...] = (
+_VERIFIED_MLA_CHECKPOINT_PREFIXES: tuple[str, ...] = (
     *_DSA_MODEL_PREFIXES,
+    "deepseek-ai/deepseek-v2",
+    "t-head/deepseek-v2",
     "deepseek-ai/deepseek-v3",
     "deepseek-ai/deepseek-v4",
+    "deepseek-ai/deepseek-r1",
     "t-head/deepseek-v3",
     "t-head/deepseek-v4",
+    "t-head/deepseek-r1",
     "moonshotai/kimi-k2",
     "t-head/kimi-k2",
+    "moonshotai/kimi-linear",
+    "t-head/kimi-linear",
+    "moonshotai/kimi-vl",
+    "t-head/kimi-vl",
 )
+_VERIFIED_NON_MLA_CHECKPOINT_PREFIXES: tuple[str, ...] = (
+    "deepseek-ai/deepseek-r1-distill-",
+    "t-head/deepseek-r1-distill-",
+    "qwen/qwen2",
+    "qwen/qwen3",
+    "t-head/qwen2",
+    "t-head/qwen3",
+    "minimaxai/minimax-",
+    "t-head/minimax-",
+    "meta-llama/llama-",
+    "mistralai/mistral-7b",
+    "mistralai/mixtral-",
+    "zai-org/glm-4-",
+)
+_VERIFIED_MLA_HF_ARCHITECTURES: frozenset[str] = frozenset(
+    {
+        "BailingMoeV2_5ForCausalLM",
+        "BailingMoeV3ForCausalLM",
+        "BailingMoeV3VLForConditionalGeneration",
+        "DeepseekV2ForCausalLM",
+        "DeepseekV32ForCausalLM",
+        "DeepseekV3ForCausalLM",
+        "DeepseekV3ForCausalLMNextN",
+        "DeepseekV4ForCausalLM",
+        "DeepseekV4ForCausalLMDSpark",
+        "DeepseekV4ForCausalLMNextN",
+        "DeepseekVL2ForCausalLM",
+        "Dots3NoteForCausalLM",
+        "DotsVLMForCausalLM",
+        "GigaChat35ForCausalLM",
+        "Glm4MoeLiteForCausalLM",
+        "Glm5NextForConditionalGeneration",
+        "GlmMoeDsaForCausalLM",
+        "HYV4ForCausalLM",
+        "KimiK25ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
+        "KimiK3ForConditionalGeneration",
+        "KimiK3LinearForCausalLM",
+        "KimiLinearForCausalLM",
+        "KimiVLForConditionalGeneration",
+        "LongcatFlashForCausalLM",
+        "MiniCPM3ForCausalLM",
+        "MistralLarge3ForCausalLM",
+        "SarvamMLAForCausalLM",
+        "Xing4_0ForCausalLM",
+    }
+)
+_VERIFIED_NON_MLA_HF_ARCHITECTURES: frozenset[str] = frozenset(
+    {
+        "Glm4ForCausalLM",
+        "Glm4MoeForCausalLM",
+        "LlamaForCausalLM",
+        "MiniMaxForCausalLM",
+        "MiniMaxM1ForCausalLM",
+        "MiniMaxText01ForCausalLM",
+        "MistralForCausalLM",
+        "MixtralForCausalLM",
+        "Qwen2ForCausalLM",
+        "Qwen2MoeForCausalLM",
+        "Qwen3ForCausalLM",
+        "Qwen3MoeForCausalLM",
+        "Qwen3NextForCausalLM",
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5MoeForCausalLM",
+    }
+)
+
+
+def _classify_checkpoint_kv_arch(
+    bound_hf_model_id: str | None,
+    *,
+    resolved_model: str | None = None,
+) -> str:
+    """Classify bound checkpoint KV architecture as ``'mla'``, ``'non_mla'``, or ``'unknown'``.
+
+    Logical ``model.model_id`` and CLI ``--attention-backend`` strings are never
+    accepted as standalone MLA evidence.
+    """
+    local_arch = "unknown"
+    if isinstance(resolved_model, str) and resolved_model.strip():
+        candidate_dir = Path(resolved_model)
+        cfg_file = candidate_dir / "config.json"
+        if candidate_dir.is_dir() and cfg_file.is_file():
+            try:
+                cfg_obj = json.loads(cfg_file.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                cfg_obj = None
+            if isinstance(cfg_obj, dict) and isinstance(
+                cfg_obj.get("architectures"), list
+            ):
+                archs = {
+                    str(item)
+                    for item in cfg_obj["architectures"]
+                    if isinstance(item, str)
+                }
+                if archs & _VERIFIED_NON_MLA_HF_ARCHITECTURES:
+                    return "non_mla"
+                if archs & _VERIFIED_MLA_HF_ARCHITECTURES:
+                    local_arch = "mla"
+
+    if not isinstance(bound_hf_model_id, str) or not bound_hf_model_id.strip():
+        return local_arch
+    lowered = bound_hf_model_id.strip().lower()
+    if any(
+        lowered.startswith(prefix) for prefix in _VERIFIED_NON_MLA_CHECKPOINT_PREFIXES
+    ):
+        return "non_mla"
+    if any(lowered.startswith(prefix) for prefix in _VERIFIED_MLA_CHECKPOINT_PREFIXES):
+        return "mla"
+    return local_arch
 
 
 def _is_mla_model(
     model_id: str | None,
     hf_model_id: str | None,
-    entries: Sequence[tuple[str, str | None, bool]],
+    entries: Sequence[tuple[str, str | None, bool]] = (),
+    *,
+    resolved_model: str | None = None,
 ) -> bool:
-    """Return True when the target model uses an MLA or hybrid-MLA KV pool."""
-    if _is_deepseek_dsa_model(model_id, hf_model_id, entries):
-        return True
-    for candidate in (model_id, hf_model_id):
-        if isinstance(candidate, str):
-            lowered = candidate.strip().lower()
-            if any(lowered.startswith(prefix) for prefix in _MLA_MODEL_PREFIXES):
-                return True
-    for attn_flag in (
-        "--attention-backend",
-        "--prefill-attention-backend",
-        "--decode-attention-backend",
-    ):
-        val = (_flag_value(entries, attn_flag) or "").strip().lower()
-        if val in {"dsv4", "dsa", "nsa", "flashmla", "trtllm_mla"}:
-            return True
-    return False
+    """Return True iff the bound checkpoint has a verified MLA or hybrid-MLA KV architecture."""
+    del model_id, entries
+    return (
+        _classify_checkpoint_kv_arch(hf_model_id, resolved_model=resolved_model)
+        == "mla"
+    )
 
 
 def _is_deepseek_dsa_model(
@@ -971,6 +1206,35 @@ def _compute_launched_gpu_ids(
             f"{context}: SGLang worker GPU ID assignment has duplicate local GPU IDs: {launched}"
         )
     return launched
+
+
+def resolve_launched_gpu_ids(resolved: Mapping[str, Any], *, context: str) -> list[int]:
+    """Return per-node GPU IDs from resolver output (or recompute using effective TP/PP/DP)."""
+    raw_launched = resolved.get("launched_gpu_ids")
+    if isinstance(raw_launched, list) and all(type(x) is int for x in raw_launched):
+        return list(raw_launched)
+    entries = _parse_flag_entries(list(resolved.get("flags", [])))
+    topo_nodes = int(resolved.get("topology", {}).get("nodes", 1))
+    if "tp_size" in resolved and "pp_size" in resolved:
+        dp_val = max(int(resolved.get("dp_size", 1)), 1)
+        tp_val = max(int(resolved["tp_size"]), 1)
+        pp_val = max(int(resolved["pp_size"]), 1)
+    elif entries:
+        _, dp_val, tp_val, pp_val, _, _ = _compute_sglang_parallelism(
+            entries, topo_nodes=topo_nodes, context=context
+        )
+    else:
+        dp_val = max(int(resolved.get("dp_size", 1)), 1)
+        tp_val = max(int(resolved["ppu_count"]) // dp_val, 1)
+        pp_val = 1
+    return _compute_launched_gpu_ids(
+        entries,
+        dp_val=dp_val,
+        tp_val=tp_val,
+        pp_val=pp_val,
+        topo_nodes=topo_nodes,
+        context=context,
+    )
 
 
 def _validate_multinode_tp_pp_layout(
@@ -2069,11 +2333,8 @@ def _resolve_recipe_from_doc(
     assets_map = _load_assets_map(assets_map_path)
     eff_assets = {**ppu_blk["assets"], **var_blk.get("assets", {})}
     asset_name = eff_assets["model"]
-    hf_model_id = (
-        var_blk.get("hf_model_id")
-        or ppu_blk.get("hf_model_id")
-        or model_blk["model_id"]
-    )
+    bound_hf_model_id = var_blk.get("hf_model_id") or ppu_blk.get("hf_model_id")
+    hf_model_id = bound_hf_model_id or model_blk["model_id"]
     resolved_model = assets_map.get(asset_name, hf_model_id)
     resolved_tokenizer = assets_map.get(eff_assets["tokenizer"], resolved_model)
     effective_served_name = (
@@ -2106,10 +2367,18 @@ def _resolve_recipe_from_doc(
         *flags_only,
     ]
 
-    ppu_count, dp_val, _, _, attn_dp_val, _ = _compute_sglang_parallelism(
+    ppu_count, dp_val, tp_val, pp_val, attn_dp_val, _ = _compute_sglang_parallelism(
         ordered,
         topo_nodes=int(eff_topology["nodes"]),
         devices_per_node=int(eff_topology["devices_per_node"]),
+        context=recipe_label,
+    )
+    launched_gpu_ids = _compute_launched_gpu_ids(
+        ordered,
+        dp_val=dp_val,
+        tp_val=tp_val,
+        pp_val=pp_val,
+        topo_nodes=int(eff_topology["nodes"]),
         context=recipe_label,
     )
 
@@ -2145,9 +2414,13 @@ def _resolve_recipe_from_doc(
         "server_env": server_env,
         "ppu_count": ppu_count,
         "dp_size": dp_val,
+        "tp_size": tp_val,
+        "pp_size": pp_val,
         "attn_dp_size": attn_dp_val,
+        "launched_gpu_ids": launched_gpu_ids,
         "model_id": model_blk["model_id"],
         "hf_model_id": hf_model_id,
+        "bound_hf_model_id": bound_hf_model_id,
         "assets": copy.deepcopy(eff_assets),
         "resolved_model": resolved_model,
         "resolved_tokenizer": resolved_tokenizer,
@@ -2326,10 +2599,43 @@ def _validate_pd_disagg_pair(
                 f"equal attention TP sizes, got prefill={p_attn_tp} vs decode={d_attn_tp}"
             )
         if d_dcp > 1:
-            if not d_geom["is_mla"]:
+            d_bound_ckpt = (
+                decode_res["bound_hf_model_id"]
+                if "bound_hf_model_id" in decode_res
+                else decode_res.get("hf_model_id")
+            )
+            p_bound_ckpt = (
+                prefill_res["bound_hf_model_id"]
+                if "bound_hf_model_id" in prefill_res
+                else prefill_res.get("hf_model_id")
+            )
+            d_kv_arch = _classify_checkpoint_kv_arch(
+                d_bound_ckpt, resolved_model=decode_res.get("resolved_model")
+            )
+            p_kv_arch = _classify_checkpoint_kv_arch(
+                p_bound_ckpt, resolved_model=prefill_res.get("resolved_model")
+            )
+            if d_kv_arch == "non_mla" or p_kv_arch == "non_mla":
+                bad_ckpt = d_bound_ckpt if d_kv_arch == "non_mla" else p_bound_ckpt
                 raise ValidationError(
-                    f"{context}: pd_decode --dcp-size > 1 ({d_dcp}) requires an MLA or "
-                    f"hybrid-MLA model backend"
+                    f"{context}: checkpoint {bad_ckpt!r} uses non-MLA KV architecture; "
+                    f"pd_decode --dcp-size > 1 ({d_dcp}) requires an MLA or hybrid-MLA checkpoint"
+                )
+            if d_kv_arch != "mla" or p_kv_arch != "mla":
+                missing_ckpt = d_bound_ckpt if d_kv_arch != "mla" else p_bound_ckpt
+                if not missing_ckpt:
+                    raise ValidationError(
+                        f"{context}: insufficient KV architecture evidence to admit "
+                        f"pd_decode --dcp-size > 1 ({d_dcp}): effective variant "
+                        f"{decode_res.get('variant')!r} binds no explicit hf_model_id "
+                        f"checkpoint (logical model.model_id and attention-backend flags "
+                        f"cannot stand alone as MLA evidence)"
+                    )
+                raise ValidationError(
+                    f"{context}: insufficient KV architecture evidence for checkpoint "
+                    f"{missing_ckpt!r} to admit pd_decode --dcp-size > 1 ({d_dcp}); "
+                    f"logical model.model_id and attention-backend flags cannot stand "
+                    f"alone as MLA evidence"
                 )
             if p_geom["attn_cp_size"] > 1:
                 raise ValidationError(
@@ -3402,10 +3708,14 @@ def validate_policy_structure(
 
 
 def _build_sglang_serve_parser() -> argparse.ArgumentParser:
-    """Register the installed candidate's actual SGLang options."""
-    server_args = importlib.import_module("sglang.srt.server_args").ServerArgs
+    """Register the installed candidate's actual SGLang options and check secret-flag parity."""
+    sa_mod = importlib.import_module("sglang.srt.server_args")
     parser = argparse.ArgumentParser(prog="sglang", allow_abbrev=False)
-    server_args.add_cli_args(parser)
+    sa_mod.ServerArgs.add_cli_args(parser)
+    verify_secret_flag_registry_parity(
+        parser,
+        secret_field_names=frozenset(sa_mod.SERVER_ARGS_SECRET_FIELD_NAMES),
+    )
     return parser
 
 

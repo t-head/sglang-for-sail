@@ -20,9 +20,8 @@ from urllib.request import Request, urlopen
 from ppu_recipe import (
     GSM8K_GOLDEN_BAND_ABS,
     REPO_ROOT,
-    _compute_launched_gpu_ids,
     _load_yaml,
-    _parse_flag_entries,
+    resolve_launched_gpu_ids,
     resolve_recipe,
 )
 
@@ -468,19 +467,11 @@ def run(policy_path, tier, queue_s):
     effective = resolve_recipe(recipe, policy_path=policy_path, tier=tier)
     expected_width = int(os.environ.get("RECIPE_PPU_COUNT", "8"))
     eff_topo = effective["topology"]
-    eff_dp = max(int(effective.get("dp_size", 1)), 1)
-    eff_launched = _compute_launched_gpu_ids(
-        _parse_flag_entries(list(effective["flags"])),
-        dp_val=eff_dp,
-        tp_val=max(int(effective["ppu_count"]) // eff_dp, 1),
-        pp_val=1,
-        topo_nodes=int(eff_topo["nodes"]),
-        context=policy_path.stem,
-    )
     if eff_topo["kind"] != "single_node" or eff_topo["nodes"] != 1:
         raise ValueError(
             f"unsupported single-node worker topology for policy {policy_path.stem}"
         )
+    eff_launched = resolve_launched_gpu_ids(effective, context=policy_path.stem)
     if (
         eff_topo["devices_per_node"] != expected_width
         or int(effective["ppu_count"]) != expected_width
@@ -531,6 +522,8 @@ def run(policy_path, tier, queue_s):
     expected_width = int(os.environ.get("RECIPE_PPU_COUNT", "8"))
     if (
         config["ppu_count"] != expected_width
+        or resolve_launched_gpu_ids(config, context=policy_path.stem)
+        != list(range(expected_width))
         or policy["model_id"] != config["model_id"]
         or config["hf_model_id"] != effective["hf_model_id"]
         or config["resolved_model"] != model_path

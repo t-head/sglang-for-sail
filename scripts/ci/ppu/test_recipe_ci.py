@@ -22,20 +22,27 @@ from ppu_recipe import (
     DEFAULT_MATRIX_DOC,
     DEFAULT_POLICY_ROOT,
     REPO_ROOT,
+    SGLANG_SENSITIVE_DEST_NAMES,
     ValidationError,
+    _format_flags_and_env,
+    _is_credential_flag,
+    _is_mla_model,
     _load_yaml,
     _scan_text,
+    _validate_flag_list,
     iter_recipe_catalog_entries,
 )
 from ppu_recipe import main as ppu_recipe_main
 from ppu_recipe import (
     render_ci_matrix_markdown,
+    resolve_launched_gpu_ids,
     resolve_recipe,
     substitute_validation_placeholders,
     validate_flags_with_parser,
     validate_paths,
     validate_policy_structure,
     validate_serving_recipe_structure,
+    verify_secret_flag_registry_parity,
 )
 from recipe_bundle import sha256, wheel_inventory
 from recipe_cluster_config import BACKEND_SHA, CONFIG_NAME, load_settings
@@ -4437,17 +4444,53 @@ class PresetCatalogContractTest(unittest.TestCase):
         ok_ep_args[ok_ep_args.index("--ep-size") + 1] = "16"
         validate_serving_recipe_structure(ok_moe_dp, context="ok_moe_dp")
 
-        # 5. Credential-bearing CLI flags and secret env vars blocked before validation & catalog render.
+        # 5. Credential-bearing CLI flags (including HiCache & external-linker storage configs and
+        #    all runtime argparse abbreviations) blocked consistently across validation & catalog render.
         sentinel = "AUDIT_SYNTHETIC_DO_NOT_USE"
-        for cred_flag in (
+        json_sentinel = json.dumps({"endpoint_credential": sentinel})
+        sensitive_flag_cases = (
             ["--api-key", sentinel],
             [f"--api-key={sentinel}"],
+            ["--ap", sentinel],
+            [f"--ap={sentinel}"],
+            ["--api", sentinel],
             ["--api-ke", sentinel],
             [f"--api-ke={sentinel}"],
-            ["--router-token", sentinel],
             ["--admin-api-key", sentinel],
+            [f"--admin-api-key={sentinel}"],
+            ["--ad", sentinel],
+            [f"--ad={sentinel}"],
+            ["--adm", sentinel],
+            ["--ssl-keyfile", sentinel],
+            ["--ssl-certfile", sentinel],
+            ["--ssl-ce", sentinel],
+            ["--ssl-ca-certs", sentinel],
+            ["--ssl-ca", sentinel],
             ["--ssl-keyfile-password", sentinel],
-        ):
+            [f"--ssl-keyfile-={sentinel}"],
+            ["--hicache-storage-backend-extra-config", json_sentinel],
+            [f"--hicache-storage-backend-extra-config={json_sentinel}"],
+            ["--hicache-storage-backend-", json_sentinel],
+            [f"--hicache-storage-backend-e={json_sentinel}"],
+            ["--hicache-storage-extra-config", json_sentinel],
+            ["--unified-cache-external-linker-config", json_sentinel],
+            [f"--unified-cache-external-linker-config={json_sentinel}"],
+            ["--unified-cache-external-linker-c", json_sentinel],
+            [f"--unified-cache-external-linker-c={json_sentinel}"],
+            ["--external-linker-config", json_sentinel],
+            ["--watermark-config", json_sentinel],
+            [f"--wate={json_sentinel}"],
+            ["--decrypted-config-file", sentinel],
+            ["--decrypted-c", sentinel],
+            ["--decrypted-draft-config-file", sentinel],
+            ["--decrypted-d", sentinel],
+            ["--router-token", sentinel],
+            ["--hf-token", sentinel],
+            ["--auth-token", sentinel],
+            ["--bearer-token", sentinel],
+            ["--token", sentinel],
+        )
+        for cred_flag in sensitive_flag_cases:
             bad_cred = copy.deepcopy(glm_doc)
             bad_cred["variants"]["fp8"]["extra_args"].extend(cred_flag)
             with self.assertRaisesRegex(
@@ -4455,6 +4498,74 @@ class PresetCatalogContractTest(unittest.TestCase):
             ) as ctx:
                 validate_serving_recipe_structure(bad_cred, context="bad_cred")
             self.assertNotIn(sentinel, str(ctx.exception))
+            with self.assertRaisesRegex(
+                ValidationError, "credential/secret CLI flag .* is forbidden"
+            ) as render_ctx:
+                _format_flags_and_env(list(cred_flag), {})
+            self.assertNotIn(sentinel, str(render_ctx.exception))
+
+        # Positive controls for legitimate non-sensitive ServerArgs options.
+        benign_flags = [
+            "--bucket-time-to-first-token",
+            "0.1",
+            "--kt-max-deferred-experts-per-token",
+            "4",
+            "--max-prefill-tokens",
+            "8192",
+            "--speculative-num-draft-tokens",
+            "4",
+            "--hicache-storage-backend",
+            "mooncake",
+            "--unified-cache-external-linker-backend",
+            "mooncake",
+            "--watchdog-timeout",
+            "300",
+        ]
+        for tok in benign_flags:
+            if tok.startswith("--"):
+                self.assertFalse(_is_credential_flag(tok), tok)
+        _validate_flag_list(benign_flags, context="benign_flags_ok")
+        rendered_benign = _format_flags_and_env(benign_flags, {})
+        self.assertIn("--bucket-time-to-first-token 0.1", rendered_benign)
+        self.assertIn("--hicache-storage-backend mooncake", rendered_benign)
+        self.assertIn(
+            "--unified-cache-external-linker-backend mooncake", rendered_benign
+        )
+
+        # Real ServerArgs registry parity & drift detection (plus synthetic drift negative probes).
+        drift_probe_parser = argparse.ArgumentParser(prog="sglang", allow_abbrev=True)
+        drift_probe_parser.add_argument("--api-key", dest="api_key")
+        drift_probe_parser.add_argument("--new-secret-opt", dest="new_secret_opt")
+        with self.assertRaisesRegex(ValidationError, "secret field drift"):
+            verify_secret_flag_registry_parity(
+                drift_probe_parser,
+                secret_field_names=frozenset({"api_key", "new_secret_opt"}),
+            )
+        untracked_storage_parser = argparse.ArgumentParser(
+            prog="sglang", allow_abbrev=True
+        )
+        untracked_storage_parser.add_argument("--api-key", dest="api_key")
+        untracked_storage_parser.add_argument(
+            "--hicache-storage-auth-token", dest="hicache_storage_auth_token"
+        )
+        with self.assertRaisesRegex(ValidationError, "sensitive option drift"):
+            verify_secret_flag_registry_parity(
+                untracked_storage_parser,
+                secret_field_names=frozenset({"api_key"}),
+            )
+        try:
+            import sglang.srt.server_args as real_sa
+        except ImportError:
+            real_sa = None
+        if real_sa is not None:
+            parity_report = verify_secret_flag_registry_parity()
+            self.assertTrue(
+                set(real_sa.SERVER_ARGS_SECRET_FIELD_NAMES).issubset(
+                    SGLANG_SENSITIVE_DEST_NAMES
+                )
+            )
+            self.assertGreater(parity_report["checked_long_options"], 500)
+            self.assertGreater(parity_report["checked_unambiguous_prefixes"], 40)
 
         for env_key in ("SGLANG_ADMIN_API_KEY", "MC_TOKEN", "SGLANG_TOKEN"):
             bad_cred_env = copy.deepcopy(glm_doc)
@@ -4465,27 +4576,35 @@ class PresetCatalogContractTest(unittest.TestCase):
                 validate_serving_recipe_structure(bad_cred_env, context="bad_cred_env")
             self.assertNotIn(sentinel, str(env_ctx.exception))
 
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            shutil.copytree(REPO_ROOT / "test/ppu", root / "test/ppu")
-            rec_file = root / "test/ppu/recipes/zai-org/GLM-5.3.yaml"
-            rec_doc = _load_yaml(rec_file)
-            rec_doc["variants"]["fp8"]["extra_args"].extend(["--api-key", sentinel])
-            rec_file.write_text(yaml.safe_dump(rec_doc, sort_keys=False))
-            with (
-                patch("ppu_recipe.REPO_ROOT", root),
-                patch("recipe_select.REPO_ROOT", root),
-            ):
-                with self.assertRaisesRegex(
-                    ValidationError, "credential/secret CLI flag .* is forbidden"
+        for end_to_end_flag in (
+            ["--ap", sentinel],
+            [f"--hicache-storage-backend-e={json_sentinel}"],
+            [f"--unified-cache-external-linker-c={json_sentinel}"],
+        ):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                shutil.copytree(REPO_ROOT / "test/ppu", root / "test/ppu")
+                rec_file = root / "test/ppu/recipes/zai-org/GLM-5.3.yaml"
+                rec_doc = _load_yaml(rec_file)
+                rec_doc["variants"]["fp8"]["extra_args"].extend(end_to_end_flag)
+                rec_file.write_text(yaml.safe_dump(rec_doc, sort_keys=False))
+                with (
+                    patch("ppu_recipe.REPO_ROOT", root),
+                    patch("recipe_select.REPO_ROOT", root),
                 ):
-                    validate_paths([rec_file], sglang_parser_mode="skip")
-                with self.assertRaisesRegex(
-                    ValidationError, "credential/secret CLI flag .* is forbidden"
-                ):
-                    render_ci_matrix_markdown()
+                    with self.assertRaisesRegex(
+                        ValidationError, "credential/secret CLI flag .* is forbidden"
+                    ) as val_ctx:
+                        validate_paths([rec_file], sglang_parser_mode="skip")
+                    self.assertNotIn(sentinel, str(val_ctx.exception))
+                    with self.assertRaisesRegex(
+                        ValidationError, "credential/secret CLI flag .* is forbidden"
+                    ) as mat_ctx:
+                        render_ci_matrix_markdown()
+                    self.assertNotIn(sentinel, str(mat_ctx.exception))
 
-        # 6. Round-1 consumer-edge closures: MoE-DP long alias, EAGLE3/PP_SPEC=on, PD DCP, and direct worker gate.
+        # 6. Consumer-edge closures: MoE-DP long alias, EAGLE3/PP_SPEC=on, PD DCP checkpoint KV arch,
+        #    and single-node PP GPU selection across selector + worker.
         bad_moe_dp_long = copy.deepcopy(bad_moe_dp)
         long_args = bad_moe_dp_long["presets"]["decode_ep"]["args"]
         long_args[long_args.index("--moe-dp-size")] = "--moe-data-parallel-size"
@@ -4524,6 +4643,7 @@ class PresetCatalogContractTest(unittest.TestCase):
         ok_pp_spec_one["presets"]["decode_ep"]["env"]["SGLANG_ENABLE_PP_SPEC"] = "1"
         validate_serving_recipe_structure(ok_pp_spec_one, context="ok_pp_spec_one")
 
+        # 6a. PD Decode DCP architecture classification strictly from bound variant checkpoint.
         dsv41_doc = _load_yaml(
             REPO_ROOT / "test/ppu/recipes/deepseek-ai/DeepSeek-V4.1-Flash.yaml"
         )
@@ -4557,71 +4677,317 @@ class PresetCatalogContractTest(unittest.TestCase):
         ok_dcp_2_to_2["presets"]["pd_decode"]["args"].extend(["--dcp-size", "2"])
         validate_serving_recipe_structure(ok_dcp_2_to_2, context="ok_dcp_2_to_2")
 
+        # Same Qwen/Qwen3.8-27B checkpoint under BOTH original logical name AND logical MLA alias
+        # (even with --attention-backend flashmla): DCP2 rejected, DCP1 accepted.
         qwen_doc = _load_yaml(REPO_ROOT / "test/ppu/recipes/Qwen/Qwen3.8-27B.yaml")
-        bad_non_mla_dcp = copy.deepcopy(qwen_doc)
-        bad_non_mla_dcp["variants"]["default"]["hardware"] = "zhenwu_m890"
-        bad_non_mla_dcp["presets"] = {
-            "pd_prefill": {
-                "hardware": "zhenwu_m890",
-                "topology": {
-                    "kind": "pd_disagg",
-                    "nodes": 1,
-                    "devices_per_node": 2,
-                    "role": "prefill",
+        self.assertFalse(
+            _is_mla_model(
+                "moonshotai/Kimi-K2.6",
+                "Qwen/Qwen3.8-27B",
+                [("--attention-backend", "flashmla", False)],
+            )
+        )
+        for logical_model_id in (
+            "Qwen/Qwen3.8-27B",
+            "moonshotai/Kimi-K2.6",
+            "deepseek-ai/DeepSeek-V4.1-Flash",
+        ):
+            qwen_pd_base = copy.deepcopy(qwen_doc)
+            qwen_pd_base["model"]["model_id"] = logical_model_id
+            qwen_pd_base["variants"]["default"]["hardware"] = "zhenwu_m890"
+            qwen_pd_base["presets"] = {
+                "pd_prefill": {
+                    "hardware": "zhenwu_m890",
+                    "topology": {
+                        "kind": "pd_disagg",
+                        "nodes": 1,
+                        "devices_per_node": 2,
+                        "role": "prefill",
+                    },
+                    "tp": 2,
+                    "args": [
+                        "--attention-backend",
+                        "flashmla",
+                        "--disaggregation-mode",
+                        "prefill",
+                        "--disaggregation-transfer-backend",
+                        "mooncake",
+                        "--disaggregation-ib-device",
+                        "{ib_devices}",
+                        "--disaggregation-bootstrap-port",
+                        "{kv_port}",
+                    ],
+                    "env": {
+                        "MOONCAKE_PROTOCOL": "rdma",
+                        "SGLANG_HOST_IP": "{kv_ip}",
+                    },
                 },
-                "tp": 2,
-                "args": [
-                    "--disaggregation-mode",
-                    "prefill",
-                    "--disaggregation-transfer-backend",
-                    "mooncake",
-                    "--disaggregation-ib-device",
-                    "{ib_devices}",
-                    "--disaggregation-bootstrap-port",
-                    "{kv_port}",
-                ],
-                "env": {
-                    "MOONCAKE_PROTOCOL": "rdma",
-                    "SGLANG_HOST_IP": "{kv_ip}",
+                "pd_decode": {
+                    "hardware": "zhenwu_m890",
+                    "topology": {
+                        "kind": "pd_disagg",
+                        "nodes": 1,
+                        "devices_per_node": 2,
+                        "role": "decode",
+                    },
+                    "tp": 2,
+                    "args": [
+                        "--attention-backend",
+                        "flashmla",
+                        "--dcp-size",
+                        "1",
+                        "--disaggregation-mode",
+                        "decode",
+                        "--disaggregation-transfer-backend",
+                        "mooncake",
+                        "--disaggregation-ib-device",
+                        "{ib_devices}",
+                    ],
+                    "env": {
+                        "MOONCAKE_PROTOCOL": "rdma",
+                        "SGLANG_HOST_IP": "{kv_ip}",
+                    },
                 },
-            },
-            "pd_decode": {
-                "hardware": "zhenwu_m890",
-                "topology": {
-                    "kind": "pd_disagg",
-                    "nodes": 1,
-                    "devices_per_node": 2,
-                    "role": "decode",
-                },
-                "tp": 2,
-                "args": [
-                    "--dcp-size",
-                    "2",
-                    "--disaggregation-mode",
-                    "decode",
-                    "--disaggregation-transfer-backend",
-                    "mooncake",
-                    "--disaggregation-ib-device",
-                    "{ib_devices}",
-                ],
-                "env": {
-                    "MOONCAKE_PROTOCOL": "rdma",
-                    "SGLANG_HOST_IP": "{kv_ip}",
-                },
-            },
-        }
+            }
+            validate_serving_recipe_structure(
+                qwen_pd_base, context=f"qwen_dcp1_ok:{logical_model_id}"
+            )
+            qwen_pd_dcp2 = copy.deepcopy(qwen_pd_base)
+            d_list = qwen_pd_dcp2["presets"]["pd_decode"]["args"]
+            d_list[d_list.index("--dcp-size") + 1] = "2"
+            with self.assertRaisesRegex(
+                ValidationError,
+                "checkpoint 'Qwen/Qwen3.8-27B' uses non-MLA KV architecture; "
+                "pd_decode --dcp-size > 1 \\(2\\) requires an MLA or hybrid-MLA checkpoint",
+            ):
+                validate_serving_recipe_structure(
+                    qwen_pd_dcp2, context=f"qwen_dcp2_bad:{logical_model_id}"
+                )
+
+        # Effective variant hf_model_id overrides ppu.hf_model_id and decides DCP2 admission.
+        variant_override_qwen = copy.deepcopy(qwen_pd_base)
+        variant_override_qwen["model"]["model_id"] = "moonshotai/Kimi-K2.6"
+        variant_override_qwen["ppu"]["hf_model_id"] = "T-HEAD/Kimi-K2.6-MXFP4-FP8"
+        variant_override_qwen["variants"]["default"]["hf_model_id"] = "Qwen/Qwen3.8-27B"
+        validate_serving_recipe_structure(
+            variant_override_qwen, context="variant_override_qwen_dcp1_ok"
+        )
+        variant_override_qwen_dcp2 = copy.deepcopy(variant_override_qwen)
+        vo_args = variant_override_qwen_dcp2["presets"]["pd_decode"]["args"]
+        vo_args[vo_args.index("--dcp-size") + 1] = "2"
         with self.assertRaisesRegex(
-            ValidationError, "requires an MLA or hybrid-MLA model backend"
+            ValidationError,
+            "checkpoint 'Qwen/Qwen3.8-27B' uses non-MLA KV architecture",
         ):
             validate_serving_recipe_structure(
-                bad_non_mla_dcp, context="bad_non_mla_dcp"
+                variant_override_qwen_dcp2, context="variant_override_qwen_dcp2_bad"
             )
 
+        # Insufficient KV architecture evidence: unverified bound checkpoint OR missing hf_model_id binding.
+        unknown_ckpt_dcp1 = copy.deepcopy(qwen_pd_base)
+        unknown_ckpt_dcp1["model"]["model_id"] = "deepseek-ai/DeepSeek-V4.1-Flash"
+        unknown_ckpt_dcp1["ppu"]["hf_model_id"] = "acme/Unverified-Custom-70B"
+        validate_serving_recipe_structure(
+            unknown_ckpt_dcp1, context="unknown_ckpt_dcp1_ok"
+        )
+        unknown_ckpt_dcp2 = copy.deepcopy(unknown_ckpt_dcp1)
+        uk_args = unknown_ckpt_dcp2["presets"]["pd_decode"]["args"]
+        uk_args[uk_args.index("--dcp-size") + 1] = "2"
+        with self.assertRaisesRegex(
+            ValidationError,
+            "insufficient KV architecture evidence for checkpoint 'acme/Unverified-Custom-70B'",
+        ):
+            validate_serving_recipe_structure(
+                unknown_ckpt_dcp2, context="unknown_ckpt_dcp2_bad"
+            )
+
+        unbound_ckpt_dcp1 = copy.deepcopy(qwen_pd_base)
+        unbound_ckpt_dcp1["model"]["model_id"] = "deepseek-ai/DeepSeek-V4.1-Flash"
+        unbound_ckpt_dcp1["ppu"].pop("hf_model_id", None)
+        unbound_ckpt_dcp1["variants"]["default"].pop("hf_model_id", None)
+        validate_serving_recipe_structure(
+            unbound_ckpt_dcp1, context="unbound_ckpt_dcp1_ok"
+        )
+        unbound_ckpt_dcp2 = copy.deepcopy(unbound_ckpt_dcp1)
+        ub_args = unbound_ckpt_dcp2["presets"]["pd_decode"]["args"]
+        ub_args[ub_args.index("--dcp-size") + 1] = "2"
+        with self.assertRaisesRegex(
+            ValidationError,
+            "insufficient KV architecture evidence .* binds no explicit hf_model_id checkpoint",
+        ):
+            validate_serving_recipe_structure(
+                unbound_ckpt_dcp2, context="unbound_ckpt_dcp2_bad"
+            )
+
+        # 6b. Single-node PP GPU selection: TP1xPP2 with gpu-id-step=2 -> GPUs [0, 1] admitted
+        #     across auto-select, explicit select, cluster_width, and recipe_runner.run;
+        #     step=1 positive control and out-of-bounds/duplicate/strided/width/PD/multi-node rejections.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             shutil.copytree(REPO_ROOT / "test/ppu", root / "test/ppu")
             results_dir = root / "artifacts/results"
             results_dir.mkdir(parents=True)
+            model_mount = root / "mounted-model"
+            model_mount.mkdir(parents=True)
+
+            qwen_rec_file = root / "test/ppu/recipes/Qwen/Qwen3.8-27B.yaml"
+            qwen_pol_file = root / "test/ppu/policy/models/qwen3.8-27b.yaml"
+            orig_qwen_rec = _load_yaml(qwen_rec_file)
+
+            @contextlib.contextmanager
+            def _fake_server(_cfg, _stage, res, _timeout):
+                res["cold_start_s"] = 1.0
+                yield
+
+            for step_val in ("2", "1"):
+                pp_rec = copy.deepcopy(orig_qwen_rec)
+                pp_rec["ppu"]["topology"] = {
+                    "kind": "single_node",
+                    "nodes": 1,
+                    "devices_per_node": 2,
+                }
+                pp_rec["variants"]["default"]["hardware"] = "zhenwu_m890"
+                pp_rec["model"]["base_args"] = [
+                    "--tp-size",
+                    "1",
+                    "--pp-size",
+                    "2",
+                    "--gpu-id-step",
+                    step_val,
+                    "--disable-overlap-schedule",
+                ]
+                qwen_rec_file.write_text(yaml.safe_dump(pp_rec, sort_keys=False))
+
+                with (
+                    patch.dict(
+                        os.environ,
+                        {
+                            "RECIPE_PPU_COUNT": "2",
+                            "PPU_RECIPE_CONTAINER_MODEL": str(model_mount),
+                        },
+                        clear=False,
+                    ),
+                    patch("ppu_recipe.REPO_ROOT", root),
+                    patch("recipe_select.REPO_ROOT", root),
+                    patch("recipe_runner.REPO_ROOT", root),
+                    patch("recipe_runner.RESULTS", results_dir),
+                    patch("recipe_runner.server", side_effect=_fake_server) as mock_srv,
+                    patch("recipe_runner.probes") as mock_probes,
+                ):
+                    resolved_pp = resolve_recipe(
+                        qwen_rec_file, policy_path=qwen_pol_file, tier="fast_sanity"
+                    )
+                    self.assertEqual(resolved_pp["tp_size"], 1)
+                    self.assertEqual(resolved_pp["pp_size"], 2)
+                    self.assertEqual(resolved_pp["dp_size"], 1)
+                    self.assertEqual(resolved_pp["launched_gpu_ids"], [0, 1])
+                    try:
+                        from sglang.srt.weight_cache.protocol import (
+                            compute_local_gpu_id,
+                        )
+                    except ImportError:
+                        compute_local_gpu_id = None
+                    if compute_local_gpu_id is not None:
+                        runtime_gpus = [
+                            compute_local_gpu_id(
+                                pp_rank=pp_r,
+                                tp_rank=0,
+                                pp_size_per_node=2,
+                                tp_size_per_node=1,
+                                base_gpu_id=0,
+                                gpu_id_step=int(step_val),
+                            )
+                            for pp_r in range(2)
+                        ]
+                        self.assertEqual(resolved_pp["launched_gpu_ids"], runtime_gpus)
+                    self.assertEqual(
+                        resolve_launched_gpu_ids(resolved_pp, context="qwen3.8-27b"),
+                        [0, 1],
+                    )
+                    self.assertEqual(cluster_width(qwen_pol_file, "fast_sanity"), 2)
+                    self.assertEqual(
+                        select("fast_sanity", "qwen3.8-27b"),
+                        {"include": [{"model": "qwen3.8-27b", "ppu_count": 2}]},
+                    )
+                    self.assertIn(
+                        {"model": "qwen3.8-27b", "ppu_count": 2},
+                        select("fast_sanity", "")["include"],
+                    )
+                    run_out = run(qwen_pol_file, "fast_sanity", 0.0)
+                    self.assertEqual(run_out["outcome"], "pass")
+                    mock_srv.assert_called_once()
+                    mock_probes.assert_called_once()
+
+                    # Device-width mismatch rejected in single-node worker.
+                    with patch.dict(os.environ, {"RECIPE_PPU_COUNT": "4"}, clear=False):
+                        with self.assertRaisesRegex(
+                            ValueError, "incorrect recipe identity or device width"
+                        ):
+                            run(qwen_pol_file, "fast_sanity", 0.0)
+
+            # Duplicate GPU slots (TP2 x PP2 with gpu-id-step=2 -> [0, 2, 2, 4]) rejected.
+            dup_pp_rec = copy.deepcopy(orig_qwen_rec)
+            dup_pp_rec["ppu"]["topology"] = {
+                "kind": "single_node",
+                "nodes": 1,
+                "devices_per_node": 8,
+            }
+            dup_pp_rec["variants"]["default"]["hardware"] = "zhenwu_m890"
+            dup_pp_rec["model"]["base_args"] = [
+                "--tp-size",
+                "2",
+                "--pp-size",
+                "2",
+                "--gpu-id-step",
+                "2",
+                "--disable-overlap-schedule",
+            ]
+            with self.assertRaisesRegex(ValidationError, "duplicate local GPU IDs"):
+                validate_serving_recipe_structure(dup_pp_rec, context="dup_pp_rec")
+
+            # Strided TP2 x PP1 with gpu-id-step=2 on 4-device node -> [0, 2]:
+            # skipped by auto-select, rejected by explicit select, cluster_width, and worker.
+            strided_tp_rec = copy.deepcopy(orig_qwen_rec)
+            strided_tp_rec["ppu"]["topology"] = {
+                "kind": "single_node",
+                "nodes": 1,
+                "devices_per_node": 4,
+            }
+            strided_tp_rec["variants"]["default"]["hardware"] = "zhenwu_m890"
+            strided_tp_rec["model"]["base_args"] = [
+                "--tp-size",
+                "2",
+                "--gpu-id-step",
+                "2",
+            ]
+            qwen_rec_file.write_text(yaml.safe_dump(strided_tp_rec, sort_keys=False))
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "RECIPE_PPU_COUNT": "2",
+                        "PPU_RECIPE_CONTAINER_MODEL": str(model_mount),
+                    },
+                    clear=False,
+                ),
+                patch("ppu_recipe.REPO_ROOT", root),
+                patch("recipe_select.REPO_ROOT", root),
+                patch("recipe_runner.REPO_ROOT", root),
+                patch("recipe_runner.RESULTS", results_dir),
+            ):
+                auto_models = [
+                    item["model"] for item in select("fast_sanity", "")["include"]
+                ]
+                self.assertNotIn("qwen3.8-27b", auto_models)
+                with self.assertRaisesRegex(ValueError, "unsupported cluster topology"):
+                    select("fast_sanity", "qwen3.8-27b")
+                with self.assertRaisesRegex(
+                    ValueError, "incorrect recipe identity or device width"
+                ):
+                    run(qwen_pol_file, "fast_sanity", 0.0)
+
+            # Restore Qwen recipe and verify PD & multi-node policies rejected in single-node worker.
+            qwen_rec_file.write_text(yaml.safe_dump(orig_qwen_rec, sort_keys=False))
             glm_rec_file = root / "test/ppu/recipes/zai-org/GLM-5.3.yaml"
             rec_doc = _load_yaml(glm_rec_file)
             rec_doc["presets"]["decode_ep"]["topology"] = {
