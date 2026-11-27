@@ -210,6 +210,19 @@ ALLOWED_CACHE_MODES = frozenset({"sanity_throughput_guard", "prefix_reuse_bench"
 _PROHIBITED_TOKEN_A = "".join(chr(c) for c in (98, 116, 118))
 _PROHIBITED_TOKEN_B = "".join(chr(c) for c in (102, 108, 121, 116, 105, 103, 101, 114))
 _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_NON_SECRET_CLI_FLAGS = frozenset(
+    {
+        "--bucket-time-to-first-token",
+        "--kt-max-deferred-experts-per-token",
+    }
+)
+_NON_SECRET_WATERMARK_PREFIXES = (
+    "--watermark-context",
+    "--watermark-mix",
+    "--watermark-max",
+    "--watermark-default",
+    "--watermark-enforce",
+)
 _AUTH_CLI_FLAGS = frozenset(
     {
         "--access-key",
@@ -249,6 +262,7 @@ _AUTH_CLI_FLAG_SUFFIXES = (
     "-private-key",
     "-secret",
     "-secret-key",
+    "-token",
 )
 _AUTH_CLI_ABBREV_PREFIXES = (
     "--admin-api",
@@ -256,13 +270,17 @@ _AUTH_CLI_ABBREV_PREFIXES = (
     "--hicache-storage-backend-e",
     "--ssl-keyfile-p",
     "--unified-cache-external-linker-c",
-    "--watermark-conf",
-    "--watermark-key",
 )
 
 
 def _is_auth_cli_flag(flag: str) -> bool:
     norm = flag.lower().replace("_", "-")
+    if norm in _NON_SECRET_CLI_FLAGS:
+        return False
+    if norm.startswith("--watermark") and not norm.startswith(
+        _NON_SECRET_WATERMARK_PREFIXES
+    ):
+        return True
     return (
         norm in _AUTH_CLI_FLAGS
         or norm.endswith(_AUTH_CLI_FLAG_SUFFIXES)
@@ -274,7 +292,32 @@ _SENSITIVE_ENV_KEY_RE = re.compile(
     r"(?:^|_)(?:API_KEY|API_SECRET|API_TOKEN|AUTH_TOKEN|BEARER_TOKEN|CLIENT_SECRET|HF_TOKEN|ACCESS_KEY|SECRET_KEY|PRIVATE_KEY|PASSWORD|PASSWD|SECRET|TOKEN|WATERMARK_KEY|WATERMARK_KEY_B|WATERMARK_CONFIG|HICACHE_STORAGE_BACKEND_EXTRA_CONFIG|UNIFIED_CACHE_EXTERNAL_LINKER_CONFIG)$",
     re.I,
 )
-_CRED_VAL_PAT = r"(?:(?:[=:]\s*|[`'\"]?\s*,\s*[`'\"]?|\s+)(?:\{[^\r\n`|]*\}|'[^\r\n']*'|\"[^\r\n\"]*\"|[^\s,`'\";\]|]+))?"
+_CRED_VAL_PAT = (
+    r"(?:(?:[=:]\s*|[`'\"]?\s*,\s*[`'\"]?|\s+)(?:\{[^\r\n`|]*\}|'[^\r\n']*'|'[^\r\n']*|"
+    + r'"[^\r\n"]*"|"[^\r\n"]*|'
+    + r"[^\s,`'\";\]|]+))?"
+)
+_CRED_KEY_ALTS = (
+    r"API[-_]?KEY|API[-_]?SECRET|API[-_]?TOKEN|AUTH[-_]?TOKEN|BEARER[-_]?TOKEN"
+    r"|CLIENT[-_]?SECRET|HF[-_]?TOKEN|ACCESS[-_]?KEY|SECRET[-_]?KEY|PRIVATE[-_]?KEY"
+    r"|PASSWORD|PASSWD|SECRET|TOKEN|WATERMARK[-_]?KEY(?:[-_]?B)?|WATERMARK[-_]?CONFIG"
+    r"|HICACHE[-_]?STORAGE[-_]?BACKEND[-_]?EXTRA[-_]?CONFIG"
+    r"|UNIFIED[-_]?CACHE[-_]?EXTERNAL[-_]?LINKER[-_]?CONFIG"
+)
+_CRED_FLAG_BODY = (
+    r"(?:access[-_]?key|admin[-_]?api[-_]?key|api[-_]?key|api[-_]?secret|api[-_]?token"
+    r"|auth[-_]?token|bearer[-_]?token|client[-_]?secret|hf[-_]?token"
+    r"|hicache[-_]?storage[-_]?backend[-_]?extra[-_]?config|passwd|password"
+    r"|private[-_]?key|secret|secret[-_]?key|ssl[-_]?keyfile[-_]?password"
+    r"|token|unified[-_]?cache[-_]?external[-_]?linker[-_]?config"
+    r"|watermark[-_]?config|watermark[-_]?key(?:[-_]?b)?)"
+)
+_CRED_ABBREV_BODY = (
+    r"(?:admin[-_]?api[A-Za-z0-9_-]*|api[-_]?k[A-Za-z0-9_-]*"
+    r"|ssl[-_]?keyfile[-_]?p[A-Za-z0-9_-]*|hicache[-_]?storage[-_]?backend[-_]?e[A-Za-z0-9_-]*"
+    r"|unified[-_]?cache[-_]?external[-_]?linker[-_]?c[A-Za-z0-9_-]*"
+    r"|watermark(?!(?:[-_]?(?:context|mix|max|default|enforce)))[A-Za-z0-9_-]*)"
+)
 _SENSITIVE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("internal_domain", re.compile(r"\.(?:alibaba-inc\.com|eng\.t-head\.cn)\b", re.I)),
     ("internal_mirror", re.compile(r"\brsproxy\.cn\b", re.I)),
@@ -295,11 +338,17 @@ _SENSITIVE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
             r"|(?<![A-Za-z0-9_-])sk-(?:proj-|ant-|live-|test-|svcacct-)?[A-Za-z0-9_-]{12,}"
             r"|Authorization\s*:\s*Bearer\s+\S+"
             r"|\bBearer\s+[A-Za-z0-9._-]{8,}"
-            r"|(?<![A-Za-z0-9_-])--(?:[A-Za-z0-9]+[-_])*(?:access[-_]?key|admin[-_]?api[-_]?key|api[-_]?key|api[-_]?secret|api[-_]?token|auth[-_]?token|bearer[-_]?token|client[-_]?secret|hf[-_]?token|hicache[-_]?storage[-_]?backend[-_]?extra[-_]?config|passwd|password|private[-_]?key|secret|secret[-_]?key|ssl[-_]?keyfile[-_]?password|unified[-_]?cache[-_]?external[-_]?linker[-_]?config|watermark[-_]?config|watermark[-_]?key(?:[-_]?b)?)(?=[=:,\s`'\"\]|]|$)"
+            r"|(?<![A-Za-z0-9_-])--(?!(?:bucket[-_]time[-_]to[-_]first[-_]token|kt[-_]max[-_]deferred[-_]experts[-_]per[-_]token)(?=[=:,\s`'\"\]|]|$))(?:(?:[A-Za-z0-9]+[-_])*"
+            + _CRED_FLAG_BODY
+            + r"|"
+            + _CRED_ABBREV_BODY
+            + r")(?=[=:,\s`'\"\]|]|$)"
             + _CRED_VAL_PAT
-            + r"|(?<![A-Za-z0-9_-])--(?:token|admin[-_]?api[A-Za-z0-9_-]*|api[-_]?k[A-Za-z0-9_-]*|ssl[-_]?keyfile[-_]?p[A-Za-z0-9_-]*|hicache[-_]?storage[-_]?backend[-_]?e[A-Za-z0-9_-]*|unified[-_]?cache[-_]?external[-_]?linker[-_]?c[A-Za-z0-9_-]*|watermark[-_]?conf[A-Za-z0-9_-]*|watermark[-_]?key[A-Za-z0-9_-]*)(?=[=:,\s`'\"\]|]|$)"
-            + _CRED_VAL_PAT
-            + r"|\b(?:[A-Za-z0-9]+_)*(?:API_KEY|API_SECRET|API_TOKEN|AUTH_TOKEN|BEARER_TOKEN|CLIENT_SECRET|HF_TOKEN|ACCESS_KEY|SECRET_KEY|PRIVATE_KEY|PASSWORD|PASSWD|SECRET|WATERMARK_KEY|WATERMARK_KEY_B|WATERMARK_CONFIG|HICACHE_STORAGE_BACKEND_EXTRA_CONFIG|UNIFIED_CACHE_EXTERNAL_LINKER_CONFIG)\s*=\s*(?:\{[^\r\n`|]*\}|'[^\r\n']*'|\"[^\r\n\"]*\"|\S+)"
+            + r"|\b(?:[A-Za-z0-9]+_)*(?:"
+            + _CRED_KEY_ALTS
+            + r")\s*[=:]\s*(?:\{[^\r\n`|]*\}|'[^\r\n']*'|'[^\r\n']*|"
+            + r'"[^\r\n"]*"|"[^\r\n"]*|'
+            + r"[^\s,`'\";\]|]+)"
             r"|\bQODER_PAT\b",
             re.I,
         ),
@@ -323,7 +372,9 @@ def _load_yaml(path: Path) -> dict[str, Any]:
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
-        raise ValidationError(f"{path}: failed to read YAML: {exc}") from exc
+        raise ValidationError(
+            f"{path}: failed to read YAML: {_redact_error_text(str(exc))}"
+        ) from exc
     if not isinstance(data, dict):
         raise ValidationError(f"{path}: top-level YAML must be a mapping")
     return data
