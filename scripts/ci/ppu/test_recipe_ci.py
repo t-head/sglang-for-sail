@@ -26,6 +26,7 @@ from ppu_recipe import (
     ValidationError,
     _load_yaml,
     _md_code,
+    _redact_error_text,
     _scan_text,
     iter_recipe_catalog_entries,
 )
@@ -4629,6 +4630,87 @@ class PresetCatalogContractTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 1)
             self.assertNotIn(fake_cred, proc.stdout)
             self.assertNotIn(fake_cred, proc.stderr)
+
+            # Single-quoted Unicode escapes and block scalars in valid non-serving YAML
+            # must not trigger OverflowError or false-positive stray detection.
+            with tempfile.TemporaryDirectory() as stray_tmp:
+                stray_root = Path(stray_tmp).resolve()
+                (stray_root / "test/ppu/recipes/Qwen").mkdir(parents=True)
+                (stray_root / "test/ppu/recipes/Qwen/Qwen3.8-27B.yaml").write_text(
+                    (REPO_ROOT / "test/ppu/recipes/Qwen/Qwen3.8-27B.yaml").read_text(
+                        encoding="utf-8"
+                    ),
+                    encoding="utf-8",
+                )
+                (stray_root / "docs").mkdir()
+                (stray_root / "docs/safe_literal.yaml").write_text(
+                    "custom: '\\UFFFFFFFF'\nliteral: 'ppu-serving\\u002fv1'\nnotes: |\n  schema_version: ppu-serving/v1\n",
+                    encoding="utf-8",
+                )
+                (stray_root / "docs/single_quote_schema.yaml").write_text(
+                    "schema_version: 'ppu-serving\\u002fv1'\n",
+                    encoding="utf-8",
+                )
+                self.assertEqual(scan_stray_serving_recipes(stray_root), [])
+
+            # Long github_pat_ suffixes and sibling variant names with credentials must
+            # be completely redacted (zero leaked suffix), and plaintext auth flags/tokens
+            # must be rejected before diff/validation output.
+            long_pat = "github_pat_" + ("11ABCDEF_" * 9 + "XYZ9")
+            sib_rec = _load_yaml(REPO_ROOT / "test/ppu/recipes/zai-org/GLM-5.3.yaml")
+            sib_rec["variants"][long_pat] = copy.deepcopy(sib_rec["variants"]["fp8"])
+            sib_rec["variants"][long_pat]["served_name"] = sib_rec["variants"]["fp8"][
+                "served_name"
+            ]
+            with self.assertRaises(ValidationError) as sib_ctx:
+                validate_serving_recipe_structure(sib_rec, context="sib_cred")
+            self.assertNotIn("11ABCDEF", str(sib_ctx.exception))
+            self.assertNotIn(long_pat, _redact_error_text(str(sib_ctx.exception)))
+
+            sk_token = "sk-proj-REVIEW_ONLY_12345678901234567890"
+            for flag_pair in (["--api-key", sk_token], [f"--api-key={sk_token}"]):
+                auth_rec = _load_yaml(
+                    REPO_ROOT / "test/ppu/recipes/Qwen/Qwen3.8-27B.yaml"
+                )
+                auth_rec["model"]["base_args"] = [
+                    *auth_rec["model"]["base_args"],
+                    *flag_pair,
+                ]
+                with self.assertRaisesRegex(ValidationError, "auth credential"):
+                    validate_serving_recipe_structure(auth_rec, context="auth_flag")
+
+            # Even if a historical base snapshot contains an auth flag/key, diff must
+            # either reject via the redaction gate or emit a sanitized <unresolved> row,
+            # never leaking the credential or env secret. Direct diff redaction gate also
+            # blocks plaintext --api-key / sk- / Bearer strings.
+            auth_base = root / "auth_base"
+            shutil.copytree(REPO_ROOT / "test/ppu", auth_base / "test/ppu")
+            qwen_auth = auth_base / "test/ppu/recipes/Qwen/Qwen3.8-27B.yaml"
+            auth_doc = _load_yaml(qwen_auth)
+            auth_doc["model"]["base_args"].extend(["--api-key", sk_token])
+            qwen_auth.write_text(
+                yaml.safe_dump(auth_doc, sort_keys=False), encoding="utf-8"
+            )
+            diff_out = render_resolved_diff_markdown(
+                base_root=auth_base,
+                head_root=base_dir,
+                only_when_changed=True,
+            )
+            self.assertIn("<unresolved:", diff_out)
+            self.assertNotIn(sk_token, diff_out)
+            with self.assertRaisesRegex(
+                ValidationError, "plaintext auth credential flag"
+            ) as head_auth_ctx:
+                render_resolved_diff_markdown(
+                    base_root=base_dir,
+                    head_root=auth_base,
+                    only_when_changed=True,
+                )
+            self.assertNotIn(sk_token, _redact_error_text(str(head_auth_ctx.exception)))
+            self.assertTrue(_scan_text(f"+ --api-key {sk_token}", context="diff_line"))
+            self.assertTrue(
+                _scan_text("Bearer secret_token_12345678", context="diff_line")
+            )
 
 
 if __name__ == "__main__":
