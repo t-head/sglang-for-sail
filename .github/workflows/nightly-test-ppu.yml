@@ -330,6 +330,7 @@ jobs:
       matrix: ${{ fromJSON(needs.plan.outputs.models) }}
     env:
       MODEL_KEY: ${{ matrix.model }}
+      PPU_CI_BOARD: ${{ matrix.board || 'ZW-M890P' }}
       RECIPE_PPU_COUNT: ${{ matrix.ppu_count || 8 }}
       PPU_CI_SOURCE_SHA: ${{ needs.plan.outputs.source-sha }}
       PPU_CI_RUNTIME_IMAGE_TAG: ${{ inputs.image_tag || '' }}

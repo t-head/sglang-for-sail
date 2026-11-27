@@ -82,6 +82,8 @@ def main():
         else "native-build + sglang-release-runtime",
         outcome="pass" if outcome == "success" and retained else "fail",
     )
+    if env.get("PPU_CI_BOARD") == "OAM-810E":
+        result["board"] = "OAM-810E"
     if retained:
         provenance = source / "provenance.json"
         if provenance.is_file() and not provenance.is_symlink():

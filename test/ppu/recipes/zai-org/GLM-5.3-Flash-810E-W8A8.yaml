@@ -1,0 +1,79 @@
+# Source: framework_ci_cases/sglang/glm-5.3-flash-cases.md, sections 2.1.1.2 and 2.1.2.2.
+schema_version: ppu-serving/v1
+ppu:
+  framework: sglang
+  visibility: public
+  assets: {model: glm-5.3-flash-810e-w8a8, tokenizer: glm-5.3-flash-810e-w8a8}
+  hf_model_id: T-HEAD/GLM-5.3-Flash-Quant-W-INT8-PerChannel-A-INT8-PerToken
+  topology: {kind: single_node, nodes: 1, devices_per_node: 16}
+model:
+  model_id: zai-org/GLM-5.3-Flash
+  base_args:
+    - --trust-remote-code
+    - --quantization
+    - "w8a8_int8"
+    - --attention-backend
+    - "dsa"
+    - --dsa-prefill-backend
+    - "flashmla_sparse"
+    - --disable-overlap-schedule
+    - --speculative-algorithm
+    - "EAGLE"
+    - --speculative-num-steps
+    - "5"
+    - --speculative-eagle-topk
+    - "1"
+    - --speculative-num-draft-tokens
+    - "6"
+    - --disable-shared-experts-fusion
+    - --disable-custom-all-reduce
+    - --reasoning-parser
+    - "glm45"
+    - --tool-call-parser
+    - "glm47"
+    - --dist-timeout
+    - "24000"
+    - --watchdog-timeout
+    - "24000"
+  base_env:
+    SGLANG_DISABLE_DSA_INDEXER_FUSION: "1"
+variants:
+  default: {precision: w8a8}
+presets:
+  fast_sanity:
+    args:
+      - --tp-size
+      - "16"
+      - --mem-fraction-static
+      - "0.85"
+      - --max-running-requests
+      - "192"
+      - --cuda-graph-max-bs-decode
+      - "96"
+      - --dsa-decode-backend
+      - "flashmla_kv"
+      - --disable-prefill-cuda-graph
+      - --speculative-attention-mode
+      - "decode"
+    env:
+      SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8: "0"
+      SGLANG_DSA_USE_DSV4_BF16_TOPK: "1"
+      SGLANG_SAIL_DEEPGEMM_DENSE: "1"
+  model_sanity:
+    args:
+      - --tp-size
+      - "8"
+      - --dsa-decode-backend
+      - "flashmla_sparse"
+      - --kv-cache-dtype
+      - "bfloat16"
+      - --mem-fraction-static
+      - "0.75"
+      - --cuda-graph-backend-prefill
+      - "disabled"
+      - --cuda-graph-max-bs-decode
+      - "32"
+      - --max-running-requests
+      - "64"
+    env:
+      SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8: "0"

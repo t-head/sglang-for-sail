@@ -117,17 +117,38 @@ class RecipeContractTest(unittest.TestCase):
             select("fast_sanity", ""),
             {
                 "include": [
+                    {"model": "deepseek-v4-flash-810e-w8a8", "ppu_count": 8, "board": "OAM-810E"},
                     {"model": "deepseek-v4-flash-tp8", "ppu_count": 8},
                     {"model": "deepseek-v4-flash", "ppu_count": 8},
+                    {
+                        "model": "deepseek-v4-pro-810e-w4a8",
+                        "ppu_count": 16,
+                        "board": "OAM-810E",
+                    },
                     {"model": "deepseek-v4-pro", "ppu_count": 8},
+                    {
+                        "model": "deepseek-v4.1-flash-810e-w8a8",
+                        "ppu_count": 16,
+                        "board": "OAM-810E",
+                    },
                     {"model": "deepseek-v4.1-flash", "ppu_count": 8},
+                    {"model": "glm-5.3-810e-w8a8", "ppu_count": 16, "board": "OAM-810E"},
+                    {"model": "glm-5.3-flash-810e-w8a8", "ppu_count": 16, "board": "OAM-810E"},
                     {"model": "glm-5.3-flash", "ppu_count": 2},
                     {"model": "glm-5.3-tp4", "ppu_count": 4},
                     {"model": "glm-5.3", "ppu_count": 8},
+                    {
+                        "model": "kimi-k2.6-810e-w4a8",
+                        "ppu_count": 8,
+                        "board": "OAM-810E",
+                    },
                     {"model": "kimi-k2.6", "ppu_count": 8},
+                    {"model": "minimax-m3-810e-w8a8", "ppu_count": 16, "board": "OAM-810E"},
                     {"model": "minimax-m3-fp8", "ppu_count": 8},
                     {"model": "minimax-m3", "ppu_count": 8},
+                    {"model": "qwen3.8-27b-810e-bf16", "ppu_count": 1, "board": "OAM-810E"},
                     {"model": "qwen3.8-27b", "ppu_count": 2},
+                    {"model": "qwen3.8-flash-next-810e-bf16", "ppu_count": 4, "board": "OAM-810E"},
                     {"model": "qwen3.8-flash-next-tp4", "ppu_count": 4},
                     {"model": "qwen3.8-flash-next", "ppu_count": 8},
                 ]
@@ -135,6 +156,18 @@ class RecipeContractTest(unittest.TestCase):
         )
 
     def test_nightly_exact_filter(self):
+        self.assertEqual(
+            select("model_sanity", "qwen3.8-flash-next-810e-bf16"),
+            {
+                "include": [
+                    {
+                        "model": "qwen3.8-flash-next-810e-bf16",
+                        "ppu_count": 8,
+                        "board": "OAM-810E",
+                    }
+                ]
+            },
+        )
         self.assertEqual(
             select("model_sanity", "glm-5.3"),
             {"include": [{"model": "glm-5.3", "ppu_count": 8}]},
@@ -955,6 +988,25 @@ class RunEvidenceTest(unittest.TestCase):
             cache_mode="sanity_throughput_guard",
         )
         validate(result)
+        validate({**result, "model": "deepseek-v4-flash-810e-w8a8", "board": "OAM-810E"})
+        collection = {**result, "baseline_established": False}
+        collection.pop("golden_score")
+        collection.pop("accuracy_within_band")
+        with self.assertRaisesRegex(ValueError, "lacks evidence"):
+            validate(collection)
+        collection.update(model="deepseek-v4-flash-810e-w8a8", board="OAM-810E")
+        validate(collection)
+        with self.assertRaisesRegex(ValueError, "did not meet gate"):
+            validate({**collection, "c16_passed": False})
+        with self.assertRaisesRegex(ValueError, "must not claim"):
+            validate({**collection, "golden_score": 0.9689})
+        with self.assertRaisesRegex(ValueError, "GSM8K count"):
+            validate({
+                **result,
+                "model": "deepseek-v4-flash-810e-w8a8",
+                "board": "OAM-810E",
+                "gsm8k_count": 10,
+            })
         for key in ("baseline_established", "kv_gauge_zero_verified", "c16_passed"):
             with self.subTest(key=key):
                 with self.assertRaises(ValueError):

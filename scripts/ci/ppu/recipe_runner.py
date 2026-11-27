@@ -17,7 +17,13 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
-from ppu_recipe import GSM8K_GOLDEN_BAND_ABS, REPO_ROOT, _load_yaml, resolve_recipe
+from ppu_recipe import (
+    GSM8K_GOLDEN_BAND_ABS,
+    REPO_ROOT,
+    _load_yaml,
+    golden_path_for,
+    resolve_recipe,
+)
 
 HOST = "http://127.0.0.1:9985"
 MODEL = "recipe-model"
@@ -228,12 +234,16 @@ def evaluate(stage, config):
 
     phase("gsm8k_eval")
     dataset = _load_yaml(REPO_ROOT / "test/ppu/policy/datasets/gsm8k.yaml")
-    golden_path = (
-        REPO_ROOT
-        / "test/ppu/golden"
-        / f"accuracy_{config['golden_model_key']}_890p.json"
-    )
-    golden = json.loads(golden_path.read_text())
+    golden_path, chip = golden_path_for(config)
+    try:
+        golden = json.loads((REPO_ROOT / golden_path).read_text())
+    except FileNotFoundError as exc:
+        if chip != "810e":
+            raise ValueError(f"missing measured GSM8K golden: {golden_path}") from exc
+        golden = None
+    else:
+        if not isinstance(golden, dict):
+            raise ValueError(f"invalid GSM8K golden: {golden_path}")
     expected = dataset["num_expected"]
     dataset_id = f"{dataset['id']}@{dataset['version']}"
     dataset_options = {
@@ -244,9 +254,12 @@ def evaluate(stage, config):
         or expected != 1319
         or stage["dataset"] != dataset_id
         or stage["limit"] is not None
-        or golden["schema_version"] != 2
+    ):
+        raise ValueError("GSM8K evaluation contract mismatch")
+    if golden is not None and (
+        golden["schema_version"] != 2
         or golden["benchmark"] != "gsm8k"
-        or golden["chip"] != "890p"
+        or golden["chip"] != chip
         or golden["model"] != config["golden_model_key"]
         or golden["checkpoint"] != config["hf_model_id"]
         or golden["serving"]["ppu_count"] != config["ppu_count"]
@@ -294,14 +307,18 @@ def evaluate(stage, config):
             stream.write(
                 json.dumps({"question_id": question, "correct": answer}) + "\n"
             )
-    return {
+    result = {
         "gsm8k_score": score,
         "gsm8k_correct": correct,
         "gsm8k_count": count,
-        "golden_score": golden["score"],
-        "accuracy_within_band": abs(score - golden["score"]) <= GSM8K_GOLDEN_BAND_ABS,
-        "baseline_established": True,
+        "baseline_established": golden is not None,
     }
+    if golden is not None:
+        result.update(
+            golden_score=golden["score"],
+            accuracy_within_band=abs(score - golden["score"]) <= GSM8K_GOLDEN_BAND_ABS,
+        )
+    return result
 
 
 def bench_module_name():
@@ -374,7 +391,10 @@ def run_evaluation(stage, config):
         return evaluate(stage, config)
     args = [
         stage,
-        {key: config[key] for key in ("golden_model_key", "hf_model_id", "ppu_count")},
+        {
+            key: config[key]
+            for key in ("golden_model_key", "hf_model_id", "ppu_count", "hardware")
+        },
     ]
     launcher = (
         "import runpy, sys; sys.path[:0] = sys.argv[1:3]; del sys.argv[1:3]; "

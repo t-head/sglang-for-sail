@@ -1,0 +1,42 @@
+# Source: framework_ci_cases/sglang/minimax-m3-cases.md, sections 2.1.1.2 and 2.1.2.2.
+schema_version: ppu-serving/v1
+ppu:
+  framework: sglang
+  visibility: public
+  assets: {model: minimax-m3-810e-w8a8, tokenizer: minimax-m3-810e-w8a8}
+  hf_model_id: T-HEAD/MiniMax-M3-MoE-Quant-W-INT8-PerChannel-A-INT8-PerToken
+  topology: {kind: single_node, nodes: 1, devices_per_node: 16}
+model:
+  model_id: MiniMaxAI/MiniMax-M3
+  base_args:
+    - --trust-remote-code
+    - --cuda-graph-max-bs-decode
+    - "16"
+    - --disable-shared-experts-fusion
+    - --tp-size
+    - "16"
+    - --reasoning-parser
+    - "auto"
+    - --tool-call-parser
+    - "auto"
+    - --attention-backend
+    - "fa3"
+    - --moe-runner-backend
+    - "deep_gemm"
+    - --quantization
+    - "w8a8_int8"
+variants:
+  default: {precision: w8a8}
+presets:
+  fast_sanity:
+    args:
+      - --mem-fraction-static
+      - "0.9"
+  model_sanity:
+    args:
+      - --ep-size
+      - "16"
+      - --mem-fraction-static
+      - "0.8"
+      - --attn-dp-size
+      - "16"

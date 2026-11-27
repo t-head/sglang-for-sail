@@ -1,0 +1,61 @@
+# Source: framework_ci_cases/sglang/dpsk-v4-flash-cases.md, sections 2.1.1.1 and 2.1.2.1.
+schema_version: ppu-serving/v1
+ppu:
+  framework: sglang
+  visibility: public
+  assets: {model: deepseek-v4-flash-810e-w8a8, tokenizer: deepseek-v4-flash-810e-w8a8}
+  hf_model_id: T-HEAD/DeepSeek-V4-Flash-0731-Quant-W-INT8-PerChannel-A-INT8-PerToken
+  topology: {kind: single_node, nodes: 1, devices_per_node: 8}
+model:
+  model_id: deepseek-ai/DeepSeek-V4-Flash
+  base_args:
+    - --trust-remote-code
+    - --tp-size
+    - "8"
+    - --mem-fraction-static
+    - "0.8"
+    - --cuda-graph-backend-prefill
+    - "disabled"
+    - --dist-timeout
+    - "60000"
+    - --watchdog-timeout
+    - "60000"
+    - --soft-watchdog-timeout
+    - "60000"
+    - --cuda-graph-max-bs-decode
+    - "64"
+    - --disable-shared-experts-fusion
+    - --disable-custom-all-reduce
+    - --quantization
+    - "w8a8_int8"
+    - --speculative-algorithm
+    - "DSPARK"
+    - --speculative-attention-mode
+    - "decode"
+    - --speculative-dspark-block-size
+    - "5"
+  base_env:
+    SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK: "512"
+    SGLANG_DSV4_FP4_EXPERTS: "0"
+    SGLANG_OPT_USE_TOPK_V2: "0"
+    SGLANG_SAIL_DSV4_USE_FLASH_MLA_SPARSE_FWD: "0"
+variants:
+  default: {precision: w8a8}
+presets:
+  model_sanity:
+    args:
+      - --reasoning-parser
+      - "deepseek-v4"
+      - --tool-call-parser
+      - "deepseekv4"
+      - --moe-dense-tp-size
+      - "1"
+      - --enable-dp-lm-head
+      - --moe-a2a-backend
+      - "deepep"
+      - --deepep-mode
+      - "auto"
+      - --attn-dp-size
+      - "8"
+    env:
+      SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN: "1"

@@ -1,0 +1,27 @@
+# Source: best_practice_doc/docs/inference/Kimi/Kimi-K2.6最佳实践.md, section 2.2.2.1.1 (serving).
+schema_version: ppu-serving/v1
+ppu:
+  framework: sglang
+  visibility: public
+  assets: {model: kimi-k2.6-810e-w4a8, tokenizer: kimi-k2.6-810e-w4a8}
+  hf_model_id: T-HEAD/Kimi-K2.6-MoE-Quant-W-INT4-PerChannel-A-INT8-PerToken
+  topology: {kind: single_node, nodes: 1, devices_per_node: 8}
+model:
+  model_id: moonshotai/Kimi-K2.6
+  base_args:
+    - --tp-size
+    - "8"
+    - --trust-remote-code
+    - --prefill-attention-backend
+    - "fa3"
+    - --decode-attention-backend
+    - "flashmla"
+    - --dist-timeout
+    - "3600"
+    - --watchdog-timeout
+    - "3600"
+    - --mem-fraction-static
+    - "0.9"
+    - --disable-prefill-cuda-graph
+variants:
+  default: {precision: w4a8}
