@@ -8,6 +8,7 @@ import math
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -15,7 +16,13 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
-from ppu_recipe import REPO_ROOT, _load_yaml, resolve_recipe
+from ppu_recipe import (
+    REPO_ROOT,
+    _build_sglang_serve_parser,
+    _load_yaml,
+    resolve_recipe,
+    validate_flags_with_parser,
+)
 
 HOST = "http://127.0.0.1:9985"
 MODEL = "recipe-model"
@@ -87,6 +94,167 @@ def server(config, label, timings, ready_timeout):
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait(timeout=5)
+
+
+@contextlib.contextmanager
+def pd_server(config, timings):
+    import yaml
+
+    pd = config["pd_config"]
+    width = config["ppu_count"]
+    devices = os.environ.get(
+        "CUDA_VISIBLE_DEVICES", ",".join(str(index) for index in range(width))
+    ).split(",")
+    devices = [device.strip() for device in devices]
+    if len(devices) != width or len(set(devices)) != width or not all(devices):
+        raise ValueError(f"Expose exactly {width} distinct PPU devices")
+    jit = Path(os.environ["PPU_CI_RECIPE_JIT_DIR"]) / "sglang"
+    (jit / "jit").mkdir(parents=True, exist_ok=True)
+    environment = pd["environment"]
+    env = {
+        **os.environ,
+        **pd["common_env"],
+        "PD_TEST_CODE_SOURCE": "installed",
+        "PD_TEST_DUMMY_WEIGHTS": "0",
+        "MODEL_PATH": config["resolved_model"],
+        "SERVED_MODEL_NAME": config["served_name"],
+        "SGLANG_CACHE_DIR": str(jit),
+        "SGLANG_JIT_CACHE_DIR": str(jit / "jit"),
+        "PD_TEST_ARTIFACT_DIR": str(RESULTS),
+        "NCCL_IB_GID_INDEX": os.environ.get(
+            "NCCL_IB_GID_INDEX", str(environment["gid_index"])
+        ),
+    }
+    env.pop("PYTHONPATH", None)
+    config_path = RESULTS / "pd-config.yaml"
+    config_path.write_text(yaml.safe_dump(pd, sort_keys=False))
+    phase("platform_check")
+    with (RESULTS / "pd-preflight.log").open("wb") as log:
+        subprocess.run(
+            [
+                sys.executable, "-I", "-B",
+                str(Path(__file__).with_name("check_ppu_environment.py")),
+                "--pd-case", pd["case_id"], "--pd-config", str(config_path),
+            ],
+            env=env, stdout=log, stderr=subprocess.STDOUT, timeout=180, check=True,
+        )
+    (RESULTS / "runtime.json").rename(RESULTS / "pd-runtime.json")
+    roles = pd["roles"]
+    parser = _build_sglang_serve_parser()
+    commands = {}
+    for name in ("prefill", "decode"):
+        role = roles[name]
+        flags = [
+            "--model-path", config["resolved_model"],
+            "--tokenizer-path", config["resolved_tokenizer"],
+            "--served-model-name", config["served_name"],
+            *pd["common_args"], *role["args"],
+            "--disaggregation-bootstrap-port", str(role["bootstrap_port"]),
+            "--nccl-port", str(role["nccl_port"]),
+            "--host", role["host"], "--port", str(role["port"]),
+            "--disaggregation-ib-device", os.environ.get("IB_DEVICE", environment["ib_device"]),
+        ]
+        validate_flags_with_parser(parser, flags, context=f"PD {name}")
+        commands[name] = [sys.executable, "-I", "-B", "-m", "sglang.launch_server", *flags]
+    router = pd["router"]
+    ports = [router["port"], router["metrics_port"]]
+    ports.extend(role[key] for role in roles.values() for key in ("port", "nccl_port", "bootstrap_port"))
+    for port in ports:
+        with socket.socket() as listener:
+            listener.bind(("0.0.0.0", port))
+    prefill_url, decode_url = config["control_urls"]
+    commands["router"] = [
+        sys.executable, "-I", "-B", "-m", "sglang_router.launch_router",
+        *router["args"], "--prefill", prefill_url, str(roles["prefill"]["bootstrap_port"]),
+        "--decode", decode_url, "--host", router["host"], "--port", str(router["port"]),
+        "--prometheus-host", router["metrics_host"],
+        "--prometheus-port", str(router["metrics_port"]),
+        "--request-timeout-secs", str(pd["request_timeout_s"]),
+    ]
+    processes = []
+    handlers = {}
+    cleaning_up = False
+    cleanup_signal = None
+
+    def stop(process):
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=5)
+
+    def interrupted(signum, frame):
+        nonlocal cleanup_signal
+        if cleaning_up:
+            cleanup_signal = signum
+            return
+        raise InterruptedError(f"PD interrupted by signal {signum}")
+
+    def restore_handlers():
+        for sig, handler in handlers.items():
+            signal.signal(sig, handler)
+
+    def start_process(stack, name, process_env):
+        log = stack.enter_context((RESULTS / f"pd-{name}.log").open("wb"))
+        process = subprocess.Popen(
+            commands[name], env=process_env, stdout=log,
+            stderr=subprocess.STDOUT, start_new_session=True,
+        )
+        processes.append(process)
+        stack.callback(stop, process)
+
+    def check_processes():
+        if any(process.poll() is not None for process in processes):
+            raise StartupError("server_exit")
+
+    def wait_ready(url, deadline):
+        while time.monotonic() < deadline:
+            check_processes()
+            try:
+                with urlopen(url + "/health", timeout=3) as response:
+                    if response.status == 200:
+                        check_processes()
+                        return
+            except (URLError, TimeoutError):
+                pass
+            time.sleep(1)
+        raise StartupError("readiness_timeout")
+
+    with contextlib.ExitStack() as stack:
+        stack.callback(restore_handlers)
+        try:
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                handlers[sig] = signal.getsignal(sig)
+                signal.signal(sig, interrupted)
+            phase("server_startup")
+            start = time.monotonic()
+            deadline = start + pd["ready_timeout_s"]
+            for name in ("prefill", "decode"):
+                role = roles[name]
+                start_process(stack, name, {
+                    **env, **role["env"],
+                    "CUDA_VISIBLE_DEVICES": ",".join(devices[index] for index in role["devices"]),
+                    "SERVING_PORT": str(role["port"]),
+                })
+            for url in config["control_urls"]:
+                wait_ready(url, deadline)
+            start_process(stack, "router", env)
+            wait_ready(config["api_url"], deadline)
+            timings["cold_start_s"] = round(time.monotonic() - start, 3)
+            yield
+            check_processes()
+        finally:
+            cleaning_up = True
+    if cleanup_signal is not None:
+        raise InterruptedError(f"PD interrupted by signal {cleanup_signal}")
 
 
 def probes(cfg, *, fast):
@@ -256,7 +424,9 @@ def evaluate(stage, config):
     report = run_task(
         task_cfg=TaskConfig(
             model=MODEL,
-            api_url=HOST + "/v1",
+            api_url=(
+                config["api_url"] if config.get("deployment_kind") == "pd_disagg" else HOST
+            ) + "/v1",
             api_key="EMPTY",
             eval_type="openai_api",
             datasets=["gsm8k"],
@@ -361,6 +531,8 @@ def run_evaluation(stage, config):
         stage,
         {key: config[key] for key in ("golden_model_key", "hf_model_id", "ppu_count")},
     ]
+    if config.get("deployment_kind") == "pd_disagg":
+        args[1].update(deployment_kind="pd_disagg", api_url=config["api_url"])
     launcher = (
         "import runpy, sys; sys.path[:0] = sys.argv[1:3]; del sys.argv[1:3]; "
         "runpy.run_module('recipe_runner', run_name='__main__')"
@@ -508,6 +680,15 @@ def run(policy_path, tier, queue_s):
             cold_start_s=round(cold_total + result["cold_start_s"], 3),
             sse_verified=True,
         )
+    elif config.get("deployment_kind") == "pd_disagg":
+        if config.get("measurement") != "accuracy_only":
+            raise ValueError("PD requires accuracy_only measurement")
+        result["measurement"] = "accuracy_only"
+        (stage,) = policy["tiers"][tier]["stages"]
+        with pd_server(config, result):
+            start = time.monotonic()
+            result.update(run_evaluation(stage, config))
+            result["eval_s"] = round(time.monotonic() - start, 3)
     else:
         stages = {stage["kind"]: stage for stage in policy["tiers"][tier]["stages"]}
         ready_timeout = MODEL_SANITY_READY_TIMEOUTS.get(policy["model_id"], 2400)

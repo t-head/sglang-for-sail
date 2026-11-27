@@ -1,12 +1,17 @@
 """Validate the PPU runner environment without importing SGLang."""
 
+import argparse
+import importlib
+import json
 import os
 import platform
 import re
 import shutil
 import stat
 import subprocess
+import sys
 import traceback
+from importlib import metadata
 from pathlib import Path
 
 
@@ -163,15 +168,168 @@ def check_visibility_consistency(reported: int, visible: int) -> None:
         print(f"ppu-smi and torch agree on {reported} device(s).")
 
 
+def check_memory_limit(max_bytes, cgroup=Path("/sys/fs/cgroup"), meminfo=Path("/proc/meminfo")):
+    limit = (cgroup / "memory.max").read_text().strip()
+    require(
+        limit.isdecimal() and 0 < int(limit) <= max_bytes,
+        "Set a container memory limit within the PD case limit",
+    )
+    swap_disabled = (cgroup / "memory.swap.max").read_text().strip() == "0"
+    if not swap_disabled:
+        swap_disabled = bool(
+            re.search(r"^SwapTotal:\s+0\s+kB$", meminfo.read_text(), re.MULTILINE)
+        )
+    require(swap_disabled, "Disable swap for the PD test container or host")
+    return int(limit)
+
+
+def check_model(model_path):
+    for name in ("config.json", "tokenizer.json", "model.safetensors.index.json"):
+        require((model_path / name).is_file(), f"Missing model file: {name}")
+    index = json.loads((model_path / "model.safetensors.index.json").read_text())
+    shards = set(index["weight_map"].values())
+    require(shards, "Model index contains no weight shards")
+    for name in shards:
+        require(
+            isinstance(name, str)
+            and not Path(name).is_absolute()
+            and ".." not in Path(name).parts,
+            "Invalid model weight shard path",
+        )
+        path = model_path / name
+        require(
+            path.is_file() and path.stat().st_size > 0,
+            f"Missing or empty shard: {name}",
+        )
+    return len(shards)
+
+
+def check_rdma(devices, gid_index, sysfs=Path("/sys/class"), dev=Path("/dev/infiniband")):
+    names = devices.split(",")
+    require(
+        all(re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", name) for name in names)
+        and len(names) == len(set(names)),
+        "IB_DEVICE must contain distinct RDMA device names",
+    )
+    require(gid_index >= 0, "NCCL_IB_GID_INDEX must not be negative")
+    verbs = {
+        path.read_text().strip(): dev / path.parent.name
+        for path in (sysfs / "infiniband_verbs").glob("uverbs*/ibdev")
+    }
+    for name in names:
+        active = False
+        for port in (sysfs / "infiniband" / name / "ports").glob("*"):
+            if not (port / "state").read_text().startswith("4:"):
+                continue
+            gid = (port / "gids" / str(gid_index)).read_text().strip()
+            if gid.replace(":", "").strip("0"):
+                active = True
+        require(active, "RDMA device has no active port with the selected GID")
+        require(name in verbs, "No verbs device is exposed for an RDMA device")
+        descriptor = os.open(verbs[name], os.O_RDWR)
+        os.close(descriptor)
+    return names
+
+
+def check_pd_devices(expected_count):
+    import torch
+
+    require(
+        torch.cuda.device_count() == expected_count,
+        f"The PD case requires {expected_count} visible PPUs",
+    )
+    for index in range(expected_count):
+        value = torch.ones(1, device=f"cuda:{index}") + 1
+        require(value.item() == 2, f"PPU {index} compute failed")
+
+
+def check_pd_runtime():
+    root = Path(__file__).resolve().parents[3]
+    code_source = os.environ["PD_TEST_CODE_SOURCE"]
+    require(code_source in ("source", "installed"), "Invalid PD_TEST_CODE_SOURCE")
+    if code_source == "source":
+        sys.path.insert(0, str(root / "python"))
+    import sglang
+    from sglang.srt.platforms import current_platform
+
+    require(current_platform.is_sail(), "PD must select the SAIL platform")
+    origin = Path(sglang.__file__).resolve()
+    require(
+        origin.is_relative_to(root / "python") == (code_source == "source"),
+        "SGLang import does not match PD_TEST_CODE_SOURCE",
+    )
+    for name in (
+        "sgl_kernel", "deep_gemm", "flash_mla", "mooncake.engine", "sglang_router"
+    ):
+        importlib.import_module(name)
+    router = subprocess.run(
+        [sys.executable, "-I", "-B", "-m", "sglang_router.launch_router", "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    for option in ("--mini-lb", "--pd-disaggregation", "--prefill", "--decode"):
+        require(option in router.stdout, f"Installed Router does not support {option}")
+    versions = {}
+    for name in (
+        "sglang", "sglang-kernel", "sgl-kernel", "torch", "sglang-router", "deep-gemm"
+    ):
+        try:
+            versions[name] = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            pass
+    return {
+        "code_source": code_source,
+        "sglang_import": str(origin),
+        "versions": versions,
+        "jit_dir": os.environ["PPU_CI_RECIPE_JIT_DIR"],
+    }
+
+
 def main() -> int:
     """Run every check and return a process-compatible status code."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--pd-case", choices=("deepseek-v41-flash-1p1d",))
+    parser.add_argument("--pd-config", type=Path)
+    args = parser.parse_args()
+    if args.pd_config is not None and args.pd_case is None:
+        parser.error("--pd-config requires --pd-case")
     try:
         print_host_summary()
+        if args.pd_case:
+            require(
+                os.environ.get("PD_TEST_DUMMY_WEIGHTS", "0") == "0",
+                "PD requires real weights",
+            )
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from ppu_pd import config_digest, load_pd_config
+
+            config = load_pd_config(args.pd_config) if args.pd_config else load_pd_config()
+            environment = config["environment"]
+            memory_limit = check_memory_limit(environment["memory_limit_gib"] * 1024**3)
+            shards = check_model(Path(os.environ["MODEL_PATH"]))
+            rdma = check_rdma(
+                os.environ.get("IB_DEVICE", environment["ib_device"]),
+                int(os.environ.get("NCCL_IB_GID_INDEX", environment["gid_index"])),
+            )
         reported = check_ppu_inventory()
         check_device_nodes()
         check_ppu_sdk()
         visible = check_torch_compute()
         check_visibility_consistency(reported, visible)
+        if args.pd_case:
+            check_pd_devices(next(iter(config["nodes"].values()))["devices"])
+            runtime = {
+                **check_pd_runtime(),
+                "case": args.pd_case,
+                "config_digest": config_digest(config),
+                "memory_limit_bytes": memory_limit,
+                "weight_shards": shards,
+                "rdma_devices": rdma,
+            }
+            output = Path(os.environ["PD_TEST_ARTIFACT_DIR"]) / "runtime.json"
+            output.write_text(json.dumps(runtime, sort_keys=True) + "\n")
     except Exception:
         traceback.print_exc()
         return 1

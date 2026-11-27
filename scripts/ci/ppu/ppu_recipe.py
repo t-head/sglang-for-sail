@@ -22,6 +22,7 @@ DEFAULT_RECIPES_ROOT = REPO_ROOT / "test" / "ppu" / "recipes"
 DEFAULT_POLICY_ROOT = REPO_ROOT / "test" / "ppu" / "policy"
 
 SERVING_SCHEMA = "ppu-serving/v1"
+PD_SCHEMA = "ppu-pd-test/v1"
 DATASET_SCHEMA = "ppu-dataset/v1"
 POLICY_SCHEMA = "ppu-test-policy/v1"
 POLICY_TIERS = frozenset({"fast_sanity", "model_sanity", "nightly", "release"})
@@ -309,6 +310,21 @@ def resolve_recipe(
 ) -> dict[str, Any]:
     """Resolve recipe + optional policy tier into effective SGLang argv, env, and digest."""
     recipe = _load_yaml(recipe_path)
+    if recipe.get("schema_version") == PD_SCHEMA:
+        return _resolve_pd_recipe(
+            recipe_path,
+            policy_path=policy_path,
+            tier=tier,
+            variant=variant,
+            hardware=hardware,
+            preset=preset,
+            cache=cache,
+            dummy_weights=dummy_weights,
+            layer_override=layer_override,
+            assets_map_path=assets_map_path,
+            cache_revision=cache_revision,
+            served_model_name=served_model_name,
+        )
     validate_serving_recipe_structure(recipe, context=str(recipe_path))
 
     ppu_blk = recipe["ppu"]
@@ -523,6 +539,166 @@ def resolve_recipe(
         "hardware": hardware,
         "layer_override": eff_layers,
         "dummy_weights": eff_dummy,
+    }
+
+
+def _load_pd_recipe(recipe_path: Path) -> dict[str, Any]:
+    from ppu_pd import load_pd_config
+
+    try:
+        config = load_pd_config(recipe_path)
+    except (KeyError, TypeError, ValueError, NotImplementedError) as exc:
+        raise ValidationError(f"{recipe_path}: invalid PD recipe: {exc}") from exc
+
+    def mask_local_addresses(section, allowed):
+        return {
+            key: "" if key in allowed and value == allowed[key] else value
+            for key, value in section.items()
+        }
+
+    scan_config = {
+        **config,
+        "nodes": {
+            name: mask_local_addresses(node, {"host": "127.0.0.1"})
+            for name, node in config["nodes"].items()
+        },
+        "roles": {
+            name: mask_local_addresses(role, {"host": "0.0.0.0"})
+            for name, role in config["roles"].items()
+        },
+        "router": mask_local_addresses(
+            config["router"], {"host": "127.0.0.1", "metrics_host": "127.0.0.1"}
+        ),
+    }
+    for _, text in _walk_strings(scan_config):
+        findings = _scan_text(text, context=str(recipe_path))
+        if findings:
+            raise ValidationError("; ".join(findings))
+    return config
+
+
+def _pd_role_flag_sets(config: dict[str, Any]) -> list[tuple[str, list[str]]]:
+    """Keep role argv separate; the union is only for policy cache guardrails."""
+    sets = []
+    for name in ("prefill", "decode"):
+        flags = [*config["common_args"], *config["roles"][name]["args"]]
+        for flag, value, _ in _parse_flag_entries(flags):
+            if flag in {
+                "--model-path", "--model", "--tokenizer-path", "--served-model-name",
+                "--host", "--port", "--config", "--load-format", "--disable-radix-cache",
+            }:
+                raise ValidationError(f"PD {name}: unsupported runtime override {flag}")
+            if flag in JSON_FLAGS:
+                try:
+                    obj = json.loads(value) if value is not None else None
+                except json.JSONDecodeError as exc:
+                    raise ValidationError(f"PD {name}: invalid JSON flag {flag}") from exc
+                if not isinstance(obj, dict):
+                    raise ValidationError(f"PD {name}: JSON flag {flag} must be an object")
+                if flag == "--json-model-override-args":
+                    text_config = obj.get("text_config")
+                    if text_config is not None and not isinstance(text_config, dict):
+                        raise ValidationError(f"PD {name}: text_config must be an object")
+                    if "num_hidden_layers" in obj or "num_hidden_layers" in (text_config or {}):
+                        raise ValidationError("PD does not support layer overrides")
+        sets.append((name, flags))
+    return sets
+
+
+def _resolve_pd_recipe(
+    recipe_path: Path,
+    *,
+    policy_path: Path | None,
+    tier: str | None,
+    variant: str,
+    hardware: str,
+    preset: str | None,
+    cache: str | None,
+    dummy_weights: bool,
+    layer_override: Any,
+    assets_map_path: Path | None,
+    cache_revision: str | None,
+    served_model_name: str | None,
+) -> dict[str, Any]:
+    config = _load_pd_recipe(recipe_path)
+    if tier not in {None, "model_sanity"}:
+        raise ValidationError("PD only supports the model_sanity tier")
+    if variant != "default" or preset is not None:
+        raise ValidationError("PD only supports the default variant without a preset")
+    if dummy_weights or (layer_override is not _UNSET and layer_override is not None):
+        raise ValidationError("PD requires real weights without layer overrides")
+    if cache not in {None, "enabled"}:
+        raise ValidationError("PD only supports cache='enabled'")
+
+    policy = None
+    if policy_path is not None:
+        policy = _load_yaml(policy_path)
+        validate_policy_structure(policy, context=str(policy_path), base_dir=REPO_ROOT)
+        if tier is None:
+            raise ValidationError("--tier is required when --policy is supplied")
+        if tier not in policy.get("tiers", {}):
+            raise ValidationError(f"{policy_path}: tier {tier!r} not found")
+        if (
+            policy["model_id"] != config["model_id"]
+            or "recipe" not in policy
+            or (REPO_ROOT / policy["recipe"]).resolve() != recipe_path.resolve()
+        ):
+            raise ValidationError("PD policy model identity and recipe must match")
+        if hardware == "zhenwu_m890":
+            hardware = policy["hardware"]
+    if hardware not in {"zhenwu_m890", "zhenwu_810e"}:
+        raise ValidationError(f"unsupported PD hardware: {hardware!r}")
+
+    role_sets = _pd_role_flag_sets(config)
+    ppu = config["ppu"]
+    assets_map = _load_assets_map(assets_map_path)
+    resolved_model = assets_map.get(ppu["assets"]["model"], ppu["hf_model_id"])
+    resolved_tokenizer = assets_map.get(ppu["assets"]["tokenizer"], resolved_model)
+    served_name = served_model_name or ppu.get("served_name") or ppu["assets"]["model"]
+
+    def http_url(endpoint: dict[str, Any]) -> str:
+        # Bind hosts such as 0.0.0.0 are not client destinations.
+        node = config["nodes"][endpoint["node"]]
+        return f"http://{node['host']}:{endpoint['port']}"
+
+    digest_payload = {
+        "deployment_kind": "pd_disagg",
+        "pd_config": config,
+        "policy": policy,
+        "tier": tier,
+        "hardware": hardware,
+        "variant": variant,
+        "preset": preset,
+        "cache": "enabled",
+        "served_name": served_name,
+    }
+    if cache_revision is not None:
+        digest_payload["cache_revision"] = cache_revision
+    digest = hashlib.sha256(
+        json.dumps(digest_payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return {
+        "deployment_kind": "pd_disagg",
+        "measurement": policy.get("measurement") if policy is not None else None,
+        "pd_config": config,
+        "api_url": http_url(config["router"]),
+        "control_urls": [http_url(config["roles"][name]) for name in ("prefill", "decode")],
+        "flags": [*config["common_args"], *(arg for name in ("prefill", "decode")
+                   for arg in config["roles"][name]["args"])],
+        "ppu_count": sum(len(config["roles"][name]["devices"]) for name, _ in role_sets),
+        "model_id": config["model_id"],
+        "hf_model_id": ppu["hf_model_id"],
+        "resolved_model": resolved_model,
+        "resolved_tokenizer": resolved_tokenizer,
+        "golden_model_key": ppu["golden_model_key"],
+        "served_name": served_name,
+        "tier": tier,
+        "preset": preset,
+        "variant": variant,
+        "hardware": hardware,
+        "layer_override": None,
+        "dummy_weights": False,
+        "config_digest": digest,
     }
 
 
@@ -975,6 +1151,30 @@ def validate_policy_structure(
             )
 
     tiers = policy.get("tiers", {})
+    is_pd = (
+        recipe_path is not None
+        and _load_yaml(recipe_path).get("schema_version") == PD_SCHEMA
+    )
+    accuracy_only = policy.get("measurement") == "accuracy_only"
+    if accuracy_only and not is_pd:
+        raise ValidationError(f"{context}: accuracy_only requires a PD recipe")
+    if is_pd:
+        if Path(policy["recipe"]).is_absolute():
+            raise ValidationError(f"{context}: PD recipe reference must be relative")
+        pd = resolve_recipe(recipe_path, hardware=policy["hardware"])
+        if policy["model_id"] != pd["model_id"]:
+            raise ValidationError(f"{context}: PD policy and recipe model identity must match")
+        if not isinstance(tiers, dict) or set(tiers) != {"model_sanity"} or "stages" in policy:
+            raise ValidationError(f"{context}: PD policy only supports tiers.model_sanity")
+        if not accuracy_only:
+            raise ValidationError(f"{context}: current PD runner requires accuracy_only")
+        if policy.get("accuracy_gate") != {
+            "method": "golden_band",
+            "golden_band_abs": 0.02,
+            "golden_source": "framework_repo",
+            "save_per_question": True,
+        }:
+            raise ValidationError(f"{context}: invalid PD accuracy gate")
     if tiers:
         _check_keys(
             tiers,
@@ -1123,11 +1323,29 @@ def validate_policy_structure(
                         raise ValidationError(
                             f"{context}: dataset {dataset_ref} version mismatch in {ds_path}"
                         )
-            missing_kinds = sorted({"sanity", "evalscope", "bench"} - seen_kinds)
+            required_kinds = {"evalscope"} if accuracy_only else {"sanity", "evalscope", "bench"}
+            missing_kinds = sorted(required_kinds - seen_kinds)
             if missing_kinds:
                 raise ValidationError(
                     f"{context}.tiers.model_sanity: missing required stage kind(s): {', '.join(missing_kinds)}"
                 )
+            if accuracy_only:
+                if seen_kinds != required_kinds:
+                    raise ValidationError(f"{context}: accuracy_only supports only evalscope")
+                stage = ms["stages"][0]
+                if (
+                    stage.get("dataset") != "gsm8k@2026-11"
+                    or "limit" not in stage
+                    or stage["limit"] is not None
+                    or type(stage.get("seed")) is not int
+                    or stage["seed"] != 42
+                    or type(stage.get("eval_batch_size")) is not int
+                    or stage["eval_batch_size"] < 1
+                    or stage.get("generation") != {
+                        "temperature": 1.0, "top_p": 1.0, "max_tokens": 10240
+                    }
+                ):
+                    raise ValidationError(f"{context}: PD requires the full GSM8K contract")
 
     for idx, stage in enumerate(policy.get("stages", [])):
         _validate_stage_cache_rules(
@@ -1181,6 +1399,11 @@ def validate_flags_with_parser(
 def _collect_all_recipe_flag_sets(
     recipe_path: Path, recipe: dict[str, Any]
 ) -> list[tuple[str, list[str]]]:
+    if recipe.get("schema_version") == PD_SCHEMA:
+        return [
+            (f"{recipe_path.name}:{name}", flags)
+            for name, flags in _pd_role_flag_sets(_load_pd_recipe(recipe_path))
+        ]
     sets: list[tuple[str, list[str]]] = []
     default_res = resolve_recipe(recipe_path, cache="enabled")
     sets.append((f"{recipe_path.name}:default", default_res["flags"]))
@@ -1253,6 +1476,10 @@ def validate_paths(
             validate_dataset_structure(doc, context=str(path))
         elif schema == POLICY_SCHEMA:
             validate_policy_structure(doc, context=str(path), base_dir=REPO_ROOT)
+        elif schema == PD_SCHEMA:
+            config = _load_pd_recipe(path)
+            _pd_role_flag_sets(config)
+            recipe_items.append((path, config))
         else:
             raise ValidationError(f"{path}: unsupported schema_version {schema!r}")
         validated.append(str(path))
@@ -1277,7 +1504,7 @@ def validate_paths(
                 for label, flag_set in _collect_all_recipe_flag_sets(rpath, rdoc):
                     validate_flags_with_parser(active_parser, flag_set, context=label)
                     checked_flag_sets += 1
-            parser_checked = True
+                parser_checked = checked_flag_sets > 0
 
     return {
         "validated_files": validated,
@@ -1357,6 +1584,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
     try:
         raise SystemExit(main())
     except ValidationError as error:

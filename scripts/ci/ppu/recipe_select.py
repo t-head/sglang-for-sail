@@ -17,7 +17,19 @@ from ppu_recipe import (
 def cluster_width(policy_path, tier):
     recipe = REPO_ROOT / _load_yaml(policy_path)["recipe"]
     topology = _load_yaml(recipe)["ppu"]["topology"]
-    width = resolve_recipe(recipe, policy_path=policy_path, tier=tier)["ppu_count"]
+    resolved = resolve_recipe(recipe, policy_path=policy_path, tier=tier)
+    width = resolved["ppu_count"]
+    if topology["kind"] == "pd_disagg":
+        # Only the current local eight-device case is executable by this selector.
+        if (
+            resolved.get("deployment_kind") != "pd_disagg"
+            or tier != "model_sanity"
+            or topology["nodes"] != 1
+            or topology["devices_per_node"] != width
+            or width != 8
+        ):
+            raise ValueError(f"unsupported cluster topology for policy {policy_path.stem}")
+        return width
     if (
         topology["kind"] != "single_node"
         or topology["nodes"] != 1

@@ -11,7 +11,8 @@ from pathlib import Path
 
 from recipe_diagnostics import PHASES
 
-MODEL_POLICY_ROOT = Path(__file__).resolve().parents[3] / "test/ppu/policy/models"
+REPO_ROOT = Path(__file__).resolve().parents[3]
+MODEL_POLICY_ROOT = REPO_ROOT / "test/ppu/policy/models"
 ALLOWED_ROUTES = {
     "native-build + sglang-release-runtime",
     "prebuilt-image",
@@ -48,6 +49,34 @@ BASE = {
     "parser_checked",
     "sse_verified",
 }
+ACCURACY_BASE = (BASE - {"sse_verified"}) | {"measurement"}
+ACCURACY = {
+    "gsm8k_score",
+    "gsm8k_correct",
+    "gsm8k_count",
+    "golden_score",
+    "accuracy_within_band",
+    "baseline_established",
+    "eval_s",
+}
+
+
+def validate_accuracy_baseline(payload):
+    golden_key = "deepseek_v41_flash_mxfp4"
+    golden = json.loads(
+        (REPO_ROOT / f"test/ppu/golden/accuracy_{golden_key}_890p.json").read_text()
+    )
+    if (
+        golden["schema_version"] != 2
+        or golden["benchmark"] != "gsm8k"
+        or golden["chip"] != "890p"
+        or golden["model"] != golden_key
+        or golden["dataset"]["num_expected"] != 1319
+        or golden["tolerance"] != {"mode": "band", "abs": 0.02}
+        or golden["score"] != 0.96
+        or payload["golden_score"] != golden["score"]
+    ):
+        raise ValueError("accuracy-only golden baseline mismatch")
 
 
 def validate_legacy(payload):
@@ -109,7 +138,11 @@ def validate(payload):
     }
     tier = payload.get("tier")
     tier_fields = {"fast_sanity": FAST, "model_sanity": NIGHTLY}.get(tier)
-    if tier_fields is None or set(payload) - (meta | BASE | tier_fields):
+    accuracy_only = payload.get("model") == "deepseek-v41-flash-pd"
+    base_fields = ACCURACY_BASE if accuracy_only else BASE
+    if accuracy_only and tier == "model_sanity":
+        tier_fields = ACCURACY
+    if tier_fields is None or set(payload) - (meta | base_fields | tier_fields):
         raise ValueError("unexpected result field")
     if (
         payload["schema"] != "ppu-sanity/v1"
@@ -121,6 +154,11 @@ def validate(payload):
         or type(payload["private_retention"]) is not bool
     ):
         raise ValueError("invalid run identity")
+    if accuracy_only:
+        if tier != "model_sanity":
+            raise ValueError("accuracy-only policy requires model_sanity")
+        if payload.get("measurement", "accuracy_only") != "accuracy_only":
+            raise ValueError("invalid accuracy-only measurement profile")
     for key in ("recipe_tree_sha256", "config_digest"):
         if key in payload and not re.fullmatch(r"[0-9a-f]{64}", payload[key]):
             raise ValueError("invalid digest")
@@ -188,18 +226,18 @@ def validate(payload):
     if payload["outcome"] == "pass":
         required = (
             (meta - {"failure_phase", "runtime_versions"})
-            | BASE
+            | base_fields
             | (tier_fields - {"fallback_reason"})
         )
         if payload["route"] == "prebuilt-image":
             required = required | {"runtime_versions"}
+        verified = ("private_retention", "parser_checked")
+        if not accuracy_only:
+            verified += ("sse_verified",)
         if (
             not required.issubset(payload)
             or "failure_phase" in payload
-            or not all(
-                payload[key]
-                for key in ("private_retention", "parser_checked", "sse_verified")
-            )
+            or not all(payload[key] for key in verified)
         ):
             raise ValueError("passing result lacks evidence")
         if (
@@ -213,7 +251,18 @@ def validate(payload):
             and payload["layer_override"] is not None
         ):
             raise ValueError("fallback result retained a layer override")
-        if tier == "model_sanity" and (
+        if accuracy_only:
+            validate_accuracy_baseline(payload)
+            if (
+                not payload["accuracy_within_band"]
+                or not payload["baseline_established"]
+                or abs(payload["gsm8k_score"] - payload["golden_score"]) > 0.02
+                or payload["gsm8k_correct"] != round(payload["gsm8k_score"] * 1319)
+                or abs(payload["gsm8k_correct"] / 1319 - payload["gsm8k_score"])
+                > 1 / 1319
+            ):
+                raise ValueError("passing accuracy-only result did not meet gate")
+        elif tier == "model_sanity" and (
             not all(
                 payload[key]
                 for key in (

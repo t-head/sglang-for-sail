@@ -1,0 +1,169 @@
+schema_version: ppu-pd-test/v1
+case_id: deepseek-v41-flash-1p1d
+model_id: deepseek-ai/DeepSeek-V4.1-Flash
+ppu:
+  framework: sglang
+  visibility: public
+  assets:
+    model: deepseek-v4.1-flash-mxfp4
+    tokenizer: deepseek-v4.1-flash-mxfp4
+  hf_model_id: T-HEAD/DeepSeek-V4.1-Flash-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken
+  golden_model_key: deepseek_v41_flash_mxfp4
+  topology:
+    kind: pd_disagg
+    nodes: 1
+    devices_per_node: 8
+nodes:
+  worker:
+    host: 127.0.0.1
+    devices: 8
+environment:
+  model_path: /cpfs/models/DeepSeek-V4.1-Flash-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken
+  memory_limit_gib: 900
+  ib_device: mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3
+  gid_index: 3
+ready_timeout_s: 3600
+request_timeout_s: 1800
+common_env:
+  MC_LOG_LEVEL: TRACE
+  MC_TE_METRIC: "1"
+  MC_NUM_QP_PER_EP: "4"
+  SGLANG_OPT_FUSED_Q_A_RMSNORM_QUANT: "1"
+  NCCL_CUMEM_ENABLE: "1"
+  SGLANG_WARMUP_TIMEOUT: "3600"
+  SGLANG_OPT_FLASHMLA_SPARSE_PREFILL: "1"
+  SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE: "1"
+  SGLANG_DSV4_KV_LAYOUT: auto
+  SGLANG_ENABLE_JIT_DEEPGEMM: "1"
+  SGLANG_JIT_DEEPGEMM_PRECOMPILE: "1"
+  SGLANG_JIT_DEEPGEMM_FAST_WARMUP: "0"
+  PYTHONUNBUFFERED: "1"
+  SGLANG_ENABLE_CACHELINK: "0"
+  MC_FORCE_HCA: "1"
+  MOONCAKE_PROTOCOL: rdma
+  SGLANG_USE_MODELSCOPE: "1"
+common_args:
+  - --trust-remote-code
+  - --page-size
+  - "64"
+  - --tp-size
+  - "4"
+  - --moe-a2a-backend
+  - megamoe
+  - --moe-dense-tp-size
+  - "1"
+  - --disaggregation-transfer-backend
+  - mooncake
+  - --kv-cache-dtype
+  - fp8_e4m3
+  - --enable-deepseek-v4-fp4-indexer
+  - --enable-decoder-swa-bounded-replay
+  - --speculative-algorithm
+  - DSPARK
+  - --speculative-attention-mode
+  - decode
+  - --speculative-dspark-block-size
+  - "5"
+  - --disable-custom-all-reduce
+  - --disable-shared-experts-fusion
+  - --json-model-override-args
+  - '{"vision_n_layers": 0}'
+  - --dist-timeout
+  - "3600"
+  - --watchdog-timeout
+  - "3600"
+  - --log-level
+  - info
+  - --enable-metrics
+  - --enable-cache-report
+  - --reasoning-parser
+  - deepseek-v41
+  - --tool-call-parser
+  - deepseekv41
+roles:
+  prefill:
+    node: worker
+    devices: [0, 1, 2, 3]
+    host: 0.0.0.0
+    port: 2000
+    nccl_port: 2001
+    bootstrap_port: 2030
+    args:
+      - --disaggregation-mode
+      - prefill
+      - --enable-prefill-cp
+      - --cp-strategy
+      - interleave
+      - --attn-cp-size
+      - "4"
+      - --mem-fraction-static
+      - "0.7"
+      - --chunked-prefill-size
+      - "39936"
+      - --max-prefill-tokens
+      - "19968"
+      - --max-running-requests
+      - "96"
+      - --schedule-policy
+      - hrrn
+      - --disable-overlap-schedule
+      - --enable-request-time-stats-logging
+      - --dsv4-prefill-backend
+      - flashmla_sparse_q8
+    env:
+      SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT: per_rank
+      SGLANG_OPT_DSV41_MEGA_MHC_PREFILL: "1"
+      SGLANG_OPT_DSV41_PREFILL_CAPTURE_CONSUME: "1"
+      SGLANG_LOG_MS: "1"
+      SGLANG_DSV4_Q8KV8_PREFILL: "1"
+      SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK: "39936"
+      SGLANG_OPT_DSV4_INDEXER_TP_SHARD: "1"
+      SGLANG_PPU_HC_SEQ_PARALLEL: "1"
+      SGLANG_OPT_PPU_DSV4_NATIVE_FP8_PREFILL: "1"
+      SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION: "false"
+      WORKER_ROLE: prefill-only
+  decode:
+    node: worker
+    devices: [4, 5, 6, 7]
+    host: 0.0.0.0
+    port: 2256
+    nccl_port: 2257
+    bootstrap_port: 2286
+    args:
+      - --disaggregation-mode
+      - decode
+      - --enable-dp-attention
+      - --dp-size
+      - "4"
+      - --enable-dp-lm-head
+      - --load-balance-method
+      - total_tokens
+      - --mem-fraction-static
+      - "0.75"
+      - --cuda-graph-max-bs-decode
+      - "64"
+      - --chunked-prefill-size
+      - "8192"
+      - --max-running-requests
+      - "128"
+    env:
+      SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT: shared
+      DG_USE_MOE_DYNAMIC_TILE: "1"
+      SGLANG_OPT_USE_JIT_NORM: "1"
+      SGLANG_DSV4_USE_NATIVE_MXFP4_MOE: "1"
+      SGLANG_OPT_DSV4_INDEXER_TP_SHARD: "1"
+      SGLANG_OPT_PPU_DSV4_NATIVE_DECODE_HEADS: "1"
+      SGLANG_OPT_PPU_DSV41_PREFILL_INDEXER_NATIVE: "1"
+      SGLANG_DISAGGREGATION_WAITING_TIMEOUT: "2400"
+      WORKER_ROLE: decode-only
+router:
+  node: worker
+  host: 127.0.0.1
+  port: 8008
+  metrics_host: 127.0.0.1
+  metrics_port: 8010
+  args:
+    - --pd-disaggregation
+    - --mini-lb
+    - --policy
+    - cache_aware

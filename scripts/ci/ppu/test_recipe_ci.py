@@ -1,25 +1,33 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import argparse
 import contextlib
 import io
 import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+from copy import deepcopy
 from importlib import metadata
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import yaml
+
+from ppu_pd import PD_CONFIG_PATH, load_pd_config
 from ppu_recipe import (
     DEFAULT_POLICY_ROOT,
     REPO_ROOT,
     ValidationError,
+    _collect_all_recipe_flag_sets,
     _load_yaml,
+    _parse_flag_entries,
     resolve_recipe,
     validate_paths,
     validate_policy_structure,
@@ -33,10 +41,13 @@ from recipe_report import main as report_recipe
 from recipe_retention import retain
 from recipe_runner import (
     cached_model_path,
+    evaluate,
     metrics_zero,
+    pd_server,
     probes,
     read_eval_reviews,
     run,
+    run_evaluation,
 )
 from recipe_select import cluster_width, select
 
@@ -677,6 +688,541 @@ class RecipeContractTest(unittest.TestCase):
                 ):
                     self.assertNotIn(flag, flags)
 
+    def test_pd_policy_uses_accuracy_only_model_sanity_with_96_percent_reference(self):
+        path = DEFAULT_POLICY_ROOT / "models/deepseek-v41-flash-pd.yaml"
+        policy = _load_yaml(path)
+        reference_policy = _load_yaml(DEFAULT_POLICY_ROOT / "models/deepseek-v4-flash.yaml")
+        with patch("ppu_recipe._build_sglang_serve_parser") as build:
+            report = validate_paths([path], sglang_parser_mode="required")
+        build.assert_not_called()
+        self.assertEqual(report["validated_files"], [str(path)])
+        self.assertFalse(report["parser_checked"])
+        self.assertEqual(REPO_ROOT / policy["recipe"], PD_CONFIG_PATH)
+        self.assertEqual(policy["schema_version"], "ppu-test-policy/v1")
+        self.assertEqual(set(policy["tiers"]), {"model_sanity"})
+        self.assertEqual(policy["model_id"], load_pd_config()["model_id"])
+        self.assertEqual(policy["accuracy_gate"], reference_policy["accuracy_gate"])
+        self.assertEqual(policy["measurement"], "accuracy_only")
+        (stage,) = policy["tiers"]["model_sanity"]["stages"]
+        reference_stage = deepcopy(reference_policy["tiers"]["model_sanity"]["stages"][1])
+        reference_stage["eval_batch_size"] = 8
+        self.assertEqual(stage, reference_stage)
+        self.assertEqual(_load_yaml(DEFAULT_POLICY_ROOT / "datasets/gsm8k.yaml")["num_expected"], 1319)
+        resolved = resolve_recipe(PD_CONFIG_PATH, policy_path=path, tier="model_sanity")
+        self.assertFalse(resolved["dummy_weights"])
+        self.assertEqual(resolved["measurement"], "accuracy_only")
+        self.assertEqual(resolved["api_url"], "http://127.0.0.1:8008")
+        golden_path = REPO_ROOT / f"test/ppu/golden/accuracy_{resolved['golden_model_key']}_890p.json"
+        golden = json.loads(golden_path.read_text())
+        self.assertEqual(golden["score"], 0.96)
+        self.assertEqual(golden["checkpoint"], resolved["hf_model_id"])
+        self.assertIsNone(golden["measured_at"])
+
+    def test_pd_policy_accepts_positive_integer_eval_concurrency(self):
+        policy = _load_yaml(DEFAULT_POLICY_ROOT / "models/deepseek-v41-flash-pd.yaml")
+        for value in (1, 8, 128):
+            with self.subTest(eval_batch_size=value):
+                candidate = deepcopy(policy)
+                candidate["tiers"]["model_sanity"]["stages"][0]["eval_batch_size"] = value
+                validate_policy_structure(candidate, context="policy", base_dir=REPO_ROOT)
+
+    def test_pd_policy_rejects_invalid_references_weights_and_tiers(self):
+        policy = _load_yaml(DEFAULT_POLICY_ROOT / "models/deepseek-v41-flash-pd.yaml")
+        stages = policy["tiers"]["model_sanity"]["stages"]
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "policy.yaml"
+            for keys, value in (
+                (("schema_version",), "ppu-pd-test-policy/v1"),
+                (("measurement",), None),
+                (("accuracy_gate", "golden_band_abs"), 0.05),
+                (("model_id",), ""),
+                (("model_id",), "deepseek-ai/Other-Model"),
+                (("model_id",), None),
+                (("hardware",), "unknown"),
+                (("recipe",), "test/ppu/recipes/missing.yaml"),
+                (("recipe",), str(PD_CONFIG_PATH)),
+                (("tiers",), {"pd_sanity": {"dummy_weights": False}}),
+                (("tiers",), {"model_sanity": {"stages": stages}, "fast_sanity": {}}),
+                (("tiers", "model_sanity", "dummy_weights"), True),
+                (("tiers", "model_sanity", "layer_override"), 2),
+                (("tiers", "model_sanity", "stages"), stages[:-1]),
+                (("tiers", "model_sanity", "stages"), [*stages, stages[0]]),
+            ):
+                with self.subTest(keys=keys, value=value):
+                    invalid = deepcopy(policy)
+                    target = invalid
+                    for key in keys[:-1]:
+                        target = target[key]
+                    target[keys[-1]] = value
+                    path.write_text(yaml.safe_dump(invalid))
+                    with self.assertRaises(ValidationError):
+                        validate_paths([path], sglang_parser_mode="skip")
+            for stage_index, key, value in (
+                (0, "cache", "disabled"),
+                (0, "dataset", "gsm8k@missing"),
+                (0, "limit", 10),
+                (0, "seed", None),
+                (0, "seed", 43),
+                (0, "eval_batch_size", 0),
+                (0, "eval_batch_size", -1),
+                (0, "eval_batch_size", None),
+                (0, "eval_batch_size", True),
+                (0, "eval_batch_size", "8"),
+                (0, "eval_batch_size", 8.0),
+                (0, "generation", {"temperature": 0.0}),
+                (0, "preset", "tp8"),
+            ):
+                with self.subTest(stage=stage_index, key=key, value=value):
+                    invalid = deepcopy(policy)
+                    invalid["tiers"]["model_sanity"]["stages"][stage_index][key] = value
+                    path.write_text(yaml.safe_dump(invalid))
+                    with self.assertRaises(ValidationError):
+                        validate_paths([path], sglang_parser_mode="skip")
+
+    def test_pd_selector_adds_only_model_sanity_and_preserves_old_models(self):
+        path = DEFAULT_POLICY_ROOT / "models/deepseek-v41-flash-pd.yaml"
+        for tier in ("fast_sanity", "model_sanity"):
+            with self.subTest(tier=tier):
+                with patch(
+                    "recipe_select._load_yaml",
+                    side_effect=lambda file: {} if file == path else _load_yaml(file),
+                ):
+                    original = select(tier, "")
+                selected = select(tier, "")
+                self.assertEqual(
+                    [item for item in selected["include"] if item["model"] != path.stem],
+                    original["include"],
+                )
+                for item in original["include"]:
+                    self.assertEqual(select(tier, item["model"]), {"include": [item]})
+                if tier == "fast_sanity":
+                    self.assertEqual(selected, original)
+                    with self.assertRaises(ValueError):
+                        select(tier, path.stem)
+                else:
+                    self.assertEqual(len(selected["include"]), len(original["include"]) + 1)
+                    self.assertEqual(select(tier, path.stem), {"include": [{"model": path.stem, "ppu_count": 8}]})
+
+    def test_mixed_serving_and_pd_validation_preserves_old_flag_sets(self):
+        policy = DEFAULT_POLICY_ROOT / "models/deepseek-v4.1-flash.yaml"
+        recipe = REPO_ROOT / _load_yaml(policy)["recipe"]
+        resolved = resolve_recipe(recipe, policy_path=policy, tier="fast_sanity")
+        with patch("ppu_recipe.validate_flags_with_parser") as check_flags:
+            original = validate_paths(
+                [recipe], sglang_parser_mode="required", parser=Mock()
+            )
+            original_calls = list(check_flags.call_args_list)
+            check_flags.reset_mock()
+            paths = [
+                recipe,
+                PD_CONFIG_PATH,
+                DEFAULT_POLICY_ROOT / "models/deepseek-v41-flash-pd.yaml",
+            ]
+            mixed = validate_paths(
+                paths,
+                sglang_parser_mode="required",
+                parser=Mock(),
+            )
+            self.assertGreater(original["checked_flag_sets"], 0)
+            self.assertEqual(mixed["checked_flag_sets"], original["checked_flag_sets"] + 2)
+            self.assertEqual(mixed["validated_files"], [str(path) for path in paths])
+            self.assertTrue(mixed["parser_checked"])
+            mixed_calls = check_flags.call_args_list
+            self.assertEqual(
+                [(c.args[1], c.kwargs) for c in mixed_calls[:len(original_calls)]],
+                [(c.args[1], c.kwargs) for c in original_calls],
+            )
+            pd = load_pd_config()
+            for call, role in zip(mixed_calls[len(original_calls):], ("prefill", "decode")):
+                self.assertEqual(call.args[1], pd["common_args"] + pd["roles"][role]["args"])
+                self.assertEqual(call.kwargs["context"], f"{PD_CONFIG_PATH.name}:{role}")
+                self.assertNotIn("dummy", call.args[1])
+        self.assertEqual(
+            resolve_recipe(recipe, policy_path=policy, tier="fast_sanity"), resolved
+        )
+
+    def test_available_parser_does_not_claim_unchecked_recipe_flags(self):
+        recipe = _load_yaml(
+            REPO_ROOT / "test/ppu/recipes/deepseek-ai/DeepSeek-V4.1-Flash.yaml"
+        )
+        recipe["ppu"]["framework"] = "vllm"
+        parser = argparse.ArgumentParser(allow_abbrev=False)
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "recipe.yaml"
+            path.write_text(yaml.safe_dump(recipe))
+            report = validate_paths(
+                [path], sglang_parser_mode="required", parser=parser
+            )
+        self.assertEqual(report["validated_files"], [str(path)])
+        self.assertFalse(report["parser_checked"])
+        self.assertEqual(report["checked_flag_sets"], 0)
+
+    def test_pd_parser_evidence_requires_both_role_checks(self):
+        parser = argparse.ArgumentParser(allow_abbrev=False)
+        parser.add_argument("--model-path")
+        for _, flags in _collect_all_recipe_flag_sets(
+            PD_CONFIG_PATH, load_pd_config()
+        ):
+            for flag, value, _ in _parse_flag_entries(flags):
+                if flag not in parser._option_string_actions:
+                    if value is None:
+                        parser.add_argument(flag, action="store_true")
+                    else:
+                        parser.add_argument(flag)
+        report = validate_paths(
+            [PD_CONFIG_PATH], sglang_parser_mode="required", parser=parser
+        )
+        self.assertTrue(report["parser_checked"])
+        self.assertEqual(report["checked_flag_sets"], 2)
+        mode_action = parser._option_string_actions["--disaggregation-mode"]
+        for rejected_role in ("prefill", "decode"):
+            with self.subTest(rejected_role=rejected_role):
+                mode_action.choices = [
+                    role for role in ("prefill", "decode") if role != rejected_role
+                ]
+                with self.assertRaisesRegex(
+                    ValidationError, f":{rejected_role}: parser rejected args"
+                ):
+                    validate_paths(
+                        [PD_CONFIG_PATH],
+                        sglang_parser_mode="required",
+                        parser=parser,
+                    )
+
+    def test_pd_only_validation_requires_parser_and_does_not_claim_skipped_checks(self):
+        with patch("ppu_recipe._build_sglang_serve_parser", side_effect=ImportError) as build:
+            with self.assertRaisesRegex(ValidationError, "parser check required"):
+                validate_paths([PD_CONFIG_PATH], sglang_parser_mode="required")
+            build.assert_called_once()
+            for mode in ("auto", "skip"):
+                report = validate_paths([PD_CONFIG_PATH], sglang_parser_mode=mode)
+                self.assertEqual(
+                    report,
+                    {
+                        "validated_files": [str(PD_CONFIG_PATH)],
+                        "parser_checked": False,
+                        "checked_flag_sets": 0,
+                    },
+                )
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            from ppu_recipe import main
+
+            self.assertEqual(main(["validate", "--all", "--sglang-parser", "skip"]), 0)
+        self.assertIn(str(PD_CONFIG_PATH), json.loads(output.getvalue())["validated_files"])
+
+    def test_isolated_recipe_cli_loads_pd_helpers_outside_checkout(self):
+        with tempfile.TemporaryDirectory() as temp:
+            result = subprocess.run(
+                [sys.executable, "-I", "-B", str(REPO_ROOT / "scripts/ci/ppu/ppu_recipe.py"),
+                 "validate", str(PD_CONFIG_PATH), "--sglang-parser", "skip"],
+                cwd=temp, capture_output=True, text=True, timeout=30,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["validated_files"], [str(PD_CONFIG_PATH)])
+
+    def test_invalid_pd_configuration_is_reported_as_validation_error(self):
+        config = load_pd_config()
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "pd.yaml"
+            for keys, value, cause in (
+                (("case_id",), "unsupported", ValueError),
+                (("nodes", "worker", "host"), "10.0.0.1", NotImplementedError),
+                (("roles", "decode", "devices"), [3, 5, 6, 7], ValueError),
+                (("router", "port"), True, ValueError),
+                (("roles", "prefill", "args"), None, ValueError),
+                (("environment",), {}, KeyError),
+                (("nodes",), None, TypeError),
+            ):
+                with self.subTest(keys=keys, value=value):
+                    invalid = deepcopy(config)
+                    target = invalid
+                    for key in keys[:-1]:
+                        target = target[key]
+                    target[keys[-1]] = value
+                    path.write_text(yaml.safe_dump(invalid))
+                    with self.assertRaises(ValidationError) as error:
+                        validate_paths([path], sglang_parser_mode="required")
+                    self.assertIn(str(path), str(error.exception))
+                    self.assertIsInstance(error.exception.__cause__, cause)
+
+    def test_pd_recipe_scans_public_strings_except_declared_local_addresses(self):
+        config = load_pd_config()
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "pd.yaml"
+            path.write_text(yaml.safe_dump(config))
+            report = validate_paths([path], sglang_parser_mode="skip")
+            self.assertEqual(report["validated_files"], [str(path)])
+            self.assertEqual(resolve_recipe(path)["pd_config"], config)
+
+            for keys, value, finding in (
+                (("common_env", "QODER_PAT"), "fixture", "credential"),
+                (
+                    ("roles", "prefill", "env", "MC_TEST_VALUE"),
+                    "fixture.alibaba-inc.com",
+                    "internal_domain",
+                ),
+                (
+                    ("roles", "decode", "env", "MC_TEST_VALUE"),
+                    "127.0.0.1",
+                    "ipv4_literal",
+                ),
+                (("router", "metrics_host"), "192.0.2.5", "ipv4_literal"),
+            ):
+                with self.subTest(keys=keys):
+                    invalid = deepcopy(config)
+                    target = invalid
+                    for key in keys[:-1]:
+                        target = target[key]
+                    target[keys[-1]] = value
+                    path.write_text(yaml.safe_dump(invalid))
+                    message = f"matched {finding}"
+                    with self.assertRaisesRegex(ValidationError, message) as error:
+                        validate_paths([path], sglang_parser_mode="skip")
+                    self.assertNotIn("QODER_PAT", str(error.exception))
+                    with self.assertRaisesRegex(ValidationError, message):
+                        resolve_recipe(path)
+
+    def test_pd_recipe_rejects_text_model_layer_overrides(self):
+        config = load_pd_config()
+        flag = "--json-model-override-args"
+        index = config["common_args"].index(flag) + 1
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "pd.yaml"
+            for override, message in (
+                ({"num_hidden_layers": 2}, "does not support layer overrides"),
+                ({"text_config": {"num_hidden_layers": 2}}, "does not support layer overrides"),
+                ({"text_config": []}, "text_config must be an object"),
+            ):
+                with self.subTest(override=override):
+                    candidate = deepcopy(config)
+                    candidate["common_args"][index] = json.dumps(override)
+                    path.write_text(yaml.safe_dump(candidate))
+                    with self.assertRaisesRegex(ValidationError, message):
+                        validate_paths([path], sglang_parser_mode="skip")
+                    with self.assertRaisesRegex(ValidationError, message):
+                        resolve_recipe(path)
+
+    def test_pd_runner_executes_only_accuracy_and_keeps_real_weights(self):
+        policy = DEFAULT_POLICY_ROOT / "models/deepseek-v41-flash-pd.yaml"
+        accuracy = {
+            "gsm8k_score": 1253 / 1319, "gsm8k_correct": 1253,
+            "gsm8k_count": 1319, "golden_score": 0.96,
+            "accuracy_within_band": True, "baseline_established": True,
+        }
+
+        @contextlib.contextmanager
+        def lifecycle(config, result):
+            self.assertEqual(config["resolved_model"], "/fixture/model")
+            self.assertEqual(config["api_url"], "http://127.0.0.1:8008")
+            self.assertFalse(config["dummy_weights"])
+            result["cold_start_s"] = 3.0
+            yield
+
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            patch("recipe_runner.RESULTS", Path(temp)),
+            patch.dict(os.environ, {
+                "PPU_RECIPE_CONTAINER_MODEL": "/fixture/model", "RECIPE_PPU_COUNT": "8"
+            }, clear=True),
+            patch("recipe_runner.pd_server", side_effect=lifecycle) as start,
+            patch("recipe_runner.server") as old_server,
+            patch("recipe_runner.probes") as probe,
+            patch("recipe_runner.bench") as bench,
+            patch("recipe_runner.flush") as flush,
+            patch("recipe_runner.run_evaluation", return_value=accuracy) as evaluation,
+        ):
+            result = run(policy, "model_sanity", 2)
+            start.assert_called_once()
+            evaluation.assert_called_once()
+            self.assertEqual(evaluation.call_args.args[0]["kind"], "evalscope")
+            self.assertEqual(result["measurement"], "accuracy_only")
+            self.assertEqual(result["outcome"], "pass")
+            for mock in (old_server, probe, bench, flush):
+                mock.assert_not_called()
+            self.assertFalse(set(result) & {
+                "sse_verified", "kv_gauge_zero_verified", "c1_passed", "c16_passed",
+                "bench_s", "cache_mode",
+            })
+            evaluation.return_value = {**accuracy, "accuracy_within_band": False}
+            self.assertEqual(run(policy, "model_sanity", 0)["outcome"], "fail")
+
+    def test_pd_lifecycle_orders_readiness_and_cleans_partial_startup(self):
+        policy = DEFAULT_POLICY_ROOT / "models/deepseek-v41-flash-pd.yaml"
+        config = resolve_recipe(PD_CONFIG_PATH, policy_path=policy, tier="model_sanity")
+        for failure in (
+            None, "spawn", "health", "exit", "eval", "signal", "preflight", "parser",
+            "timeout", "ports", "cleanup_timeout", "cleanup_signal",
+        ):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp:
+                results = Path(temp) / "results"
+                results.mkdir()
+                events = []
+                children = []
+                previous = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
+
+                def preflight(*args, **kwargs):
+                    if failure == "preflight":
+                        raise subprocess.CalledProcessError(1, args[0])
+                    (results / "runtime.json").write_text("{}")
+
+                def spawn(command, **kwargs):
+                    name = "router" if "sglang_router.launch_router" in command else (
+                        "prefill" if "2000" in command else "decode"
+                    )
+                    if failure == "spawn" and name == "decode":
+                        raise OSError("spawn failed")
+                    events.append("start:" + name)
+                    process = Mock(pid=100 + len(children))
+                    process.poll.return_value = 1 if failure == "exit" else None
+
+                    def wait(*, timeout):
+                        for sig, handler in previous.items():
+                            self.assertIsNot(signal.getsignal(sig), handler)
+                        if timeout == 15 and failure in ("signal", "cleanup_signal"):
+                            signal.getsignal(signal.SIGINT)(signal.SIGINT, None)
+                        if timeout == 15 and failure == "cleanup_timeout":
+                            raise subprocess.TimeoutExpired("fixture", timeout)
+                        return 0
+
+                    process.wait.side_effect = wait
+                    children.append(process)
+                    return process
+
+                def health(url, **kwargs):
+                    events.append(url)
+                    if failure == "health":
+                        raise RuntimeError("health failed")
+                    response = Mock(status=200)
+                    response.__enter__ = Mock(return_value=response)
+                    response.__exit__ = Mock(return_value=False)
+                    return response
+
+                with (
+                    patch("recipe_runner.RESULTS", results),
+                    patch.dict(os.environ, {
+                        "PPU_CI_RECIPE_JIT_DIR": str(Path(temp) / "jit"),
+                        "CUDA_VISIBLE_DEVICES": "7,6,5,4,3,2,1,0", "PYTHONPATH": "/untrusted",
+                    }, clear=True),
+                    patch("recipe_runner.subprocess.run", side_effect=preflight) as check,
+                    patch("recipe_runner._build_sglang_serve_parser", return_value=Mock()),
+                    patch("recipe_runner.validate_flags_with_parser", side_effect=(
+                        ValueError("bad flags") if failure == "parser" else None
+                    )) as flags,
+                    patch("recipe_runner.subprocess.Popen", side_effect=spawn) as launch,
+                    patch("recipe_runner.socket.socket", side_effect=(
+                        OSError("port busy") if failure == "ports" else None
+                    )),
+                    patch("recipe_runner.urlopen", side_effect=health),
+                    patch("recipe_runner.time.monotonic", side_effect=(
+                        [0, config["pd_config"]["ready_timeout_s"] + 1]
+                        if failure == "timeout" else None
+                    ), return_value=0),
+                    patch("recipe_runner.os.killpg") as kill,
+                ):
+                    timings = {}
+                    def execute():
+                        with pd_server(config, timings):
+                            if failure == "eval":
+                                raise ValueError("eval failed")
+                            if failure == "signal":
+                                signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+                    if failure in (None, "cleanup_timeout"):
+                        execute()
+                        self.assertEqual(events, [
+                            "start:prefill", "start:decode",
+                            "http://127.0.0.1:2000/health", "http://127.0.0.1:2256/health",
+                            "start:router", "http://127.0.0.1:8008/health",
+                        ])
+                        self.assertIn("cold_start_s", timings)
+                        self.assertEqual(flags.call_count, 2)
+                        for call, devices in zip(launch.call_args_list, ("7,6,5,4", "3,2,1,0")):
+                            self.assertEqual(call.kwargs["env"]["CUDA_VISIBLE_DEVICES"], devices)
+                            self.assertNotIn("PYTHONPATH", call.kwargs["env"])
+                            self.assertEqual(call.args[0][:3], [sys.executable, "-I", "-B"])
+                            self.assertTrue(call.kwargs["start_new_session"])
+                        self.assertEqual(check.call_args.kwargs["env"]["PD_TEST_CODE_SOURCE"], "installed")
+                        self.assertTrue((results / "pd-runtime.json").is_file())
+                    elif failure in ("signal", "cleanup_signal"):
+                        expected = signal.SIGTERM if failure == "signal" else signal.SIGINT
+                        with self.assertRaisesRegex(InterruptedError, f"interrupted by signal {expected}"):
+                            execute()
+                    else:
+                        with self.assertRaises((RuntimeError, OSError, ValueError, InterruptedError, subprocess.CalledProcessError)):
+                            execute()
+                    for process in children:
+                        self.assertIn(unittest.mock.call(process.pid, signal.SIGTERM), kill.call_args_list)
+                        self.assertIn(unittest.mock.call(process.pid, signal.SIGKILL), kill.call_args_list)
+                        process.wait.assert_called()
+                    for sig, handler in previous.items():
+                        self.assertEqual(signal.getsignal(sig), handler)
+
+    def test_pd_eval_worker_keeps_router_url_and_golden_contract(self):
+        path = DEFAULT_POLICY_ROOT / "models/deepseek-v41-flash-pd.yaml"
+        config = resolve_recipe(PD_CONFIG_PATH, policy_path=path, tier="model_sanity")
+        (stage,) = _load_yaml(path)["tiers"]["model_sanity"]["stages"]
+        with tempfile.TemporaryDirectory() as temp, patch("recipe_runner.RESULTS", Path(temp)):
+            (Path(temp) / "gsm8k-result.json").write_text('{"outcome": "fixture"}')
+            with patch.dict(os.environ, {"PPU_CI_EVAL_SITE": "/eval-site"}), patch(
+                "recipe_runner.subprocess.run"
+            ) as worker:
+                run_evaluation(stage, config)
+                forwarded = json.loads(worker.call_args.kwargs["input"])[1]
+                self.assertEqual(forwarded["api_url"], config["api_url"])
+                self.assertEqual(worker.call_args.args[0][1:4], ["-I", "-S", "-B"])
+            task_config = Mock(side_effect=lambda **kwargs: SimpleNamespace(**kwargs))
+            task = Mock(return_value={"gsm8k": SimpleNamespace(score=1253 / 1319, num=1319)})
+            with patch.dict(sys.modules, {"evalscope": SimpleNamespace(TaskConfig=task_config, run_task=task)}), patch(
+                "recipe_runner.read_eval_reviews", return_value=({"fixture": True}, 1253)
+            ):
+                result = evaluate(stage, forwarded)
+                self.assertEqual(task_config.call_args.kwargs["api_url"], "http://127.0.0.1:8008/v1")
+                self.assertEqual(result["golden_score"], 0.96)
+                self.assertTrue(result["accuracy_within_band"])
+                for changes in ({"hf_model_id": "wrong/model"}, {"ppu_count": 4}):
+                    with self.subTest(changes=changes), self.assertRaisesRegex(
+                        ValueError, "golden evaluation contract"
+                    ):
+                        evaluate(stage, {**forwarded, **changes})
+                with self.assertRaisesRegex(ValueError, "golden evaluation contract"):
+                    evaluate({**stage, "generation": {"temperature": 0.0}}, forwarded)
+
+    def test_old_model_eval_worker_keeps_existing_endpoint_and_payload(self):
+        path = DEFAULT_POLICY_ROOT / "models/deepseek-v4-flash.yaml"
+        config = resolve_recipe(
+            REPO_ROOT / _load_yaml(path)["recipe"], policy_path=path, tier="model_sanity"
+        )
+        stage = next(
+            stage for stage in _load_yaml(path)["tiers"]["model_sanity"]["stages"]
+            if stage["kind"] == "evalscope"
+        )
+        config["api_url"] = "http://127.0.0.1:8008"
+        expected = {key: config[key] for key in ("golden_model_key", "hf_model_id", "ppu_count")}
+        with tempfile.TemporaryDirectory() as temp, patch("recipe_runner.RESULTS", Path(temp)):
+            (Path(temp) / "gsm8k-result.json").write_text("{}")
+            with patch.dict(os.environ, {"PPU_CI_EVAL_SITE": "/eval-site"}), patch(
+                "recipe_runner.subprocess.run"
+            ) as worker:
+                run_evaluation(stage, config)
+                self.assertEqual(json.loads(worker.call_args.kwargs["input"]), [stage, expected])
+            task_config = Mock(side_effect=lambda **kwargs: SimpleNamespace(**kwargs))
+            task = Mock(return_value={"gsm8k": SimpleNamespace(score=1253 / 1319, num=1319)})
+            with patch.dict(sys.modules, {"evalscope": SimpleNamespace(TaskConfig=task_config, run_task=task)}), patch(
+                "recipe_runner.read_eval_reviews", return_value=({"fixture": True}, 1253)
+            ):
+                evaluate(stage, config)
+            self.assertEqual(task_config.call_args.kwargs["api_url"], "http://127.0.0.1:9985/v1")
+
+    def test_old_model_cannot_opt_out_of_full_model_sanity(self):
+        policy = _load_yaml(DEFAULT_POLICY_ROOT / "models/deepseek-v4-flash.yaml")
+        validate_policy_structure(policy, context="fixture")
+        policy["measurement"] = "accuracy_only"
+        with self.assertRaisesRegex(ValidationError, "accuracy_only requires a PD recipe"):
+            validate_policy_structure(policy, context="fixture")
+        del policy["measurement"]
+        policy["tiers"]["model_sanity"]["stages"] = policy["tiers"]["model_sanity"]["stages"][1:2]
+        with self.assertRaisesRegex(ValidationError, "missing required stage"):
+            validate_policy_structure(policy, context="fixture")
+
     def test_required_parser_fails_if_runtime_unavailable(self):
         with patch("ppu_recipe._build_sglang_serve_parser", side_effect=ImportError):
             with self.assertRaises(ValidationError):
@@ -709,6 +1255,296 @@ class RecipeContractTest(unittest.TestCase):
 
 
 class RunEvidenceTest(unittest.TestCase):
+    @staticmethod
+    def accuracy_result():
+        result = fast_result()
+        result.pop("sse_verified")
+        result.pop("layer_override")
+        result.update(
+            model="deepseek-v41-flash-pd",
+            tier="model_sanity",
+            measurement="accuracy_only",
+            eval_s=16,
+            gsm8k_count=1319,
+            gsm8k_correct=1253,
+            gsm8k_score=1253 / 1319,
+            golden_score=0.96,
+            accuracy_within_band=True,
+            baseline_established=True,
+        )
+        return result
+
+    def test_non_pd_publication_keeps_original_dependencies_and_rejection_order(self):
+        result = fast_result()
+        with patch("recipe_publish.Path.read_text", side_effect=AssertionError("no policy parsing")):
+            validate(result)
+        with self.assertRaisesRegex(ValueError, "unexpected result field"):
+            validate({"tier": "fast_sanity", "unexpected": True})
+        launcher = (
+            "import sys, json; sys.path.insert(0, sys.argv[1]); "
+            "from recipe_publish import validate; validate(json.loads(sys.argv[2]))"
+        )
+        isolated = subprocess.run(
+            [sys.executable, "-I", "-S", "-B", "-c", launcher,
+             str(REPO_ROOT / "scripts/ci/ppu"), json.dumps(result)],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(isolated.returncode, 0, isolated.stderr)
+
+    def test_accuracy_only_pass_publishes_without_fabricated_bench_fields(self):
+        result = self.accuracy_result()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            artifact, summary, console = (
+                root / "public.json", root / "summary", io.StringIO()
+            )
+            publish(result, artifact, summary, console)
+            self.assertEqual(json.loads(console.getvalue()), result)
+            self.assertEqual(artifact.read_text(), console.getvalue())
+            self.assertIn(console.getvalue(), summary.read_text())
+            for key in (
+                "sse_verified",
+                "kv_gauge_zero_verified",
+                "c1_passed",
+                "c16_passed",
+                "bench_s",
+                "cache_mode",
+            ):
+                with self.subTest(key=key):
+                    self.assertNotIn(key, json.loads(console.getvalue()))
+                    for outcome in ("pass", "fail"):
+                        with self.assertRaises(ValueError):
+                            validate({**result, "outcome": outcome, key: True})
+
+    def test_accuracy_only_failure_and_missing_runner_summary_publish(self):
+        result = self.accuracy_result()
+        result.update(
+            outcome="fail",
+            failure_phase="gsm8k_eval",
+            gsm8k_correct=1187,
+            gsm8k_score=1187 / 1319,
+            accuracy_within_band=False,
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            console = io.StringIO()
+            publish(result, root / "failed.json", root / "summary", console)
+            self.assertEqual(json.loads(console.getvalue()), result)
+            for outcome, retained in (
+                ("failure", True), ("success", True), ("failure", False)
+            ):
+                with (
+                    self.subTest(outcome=outcome, retained=retained),
+                    patch.dict(
+                        os.environ,
+                        {
+                            "PPU_CI_ARTIFACT_DIR": temp,
+                            "RECIPE_OUTCOME": outcome,
+                            "TIER": "model_sanity",
+                            "MODEL_KEY": "deepseek-v41-flash-pd",
+                            "PPU_CI_SOURCE_SHA": "a" * 40,
+                        },
+                    ),
+                    patch.object(
+                        sys, "argv", ["recipe_report", str(root / "candidate.json")]
+                    ),
+                    patch(
+                        "recipe_report.retain",
+                        side_effect=None if retained else PermissionError,
+                    ),
+                ):
+                    self.assertEqual(report_recipe(), 1)
+                    candidate = json.loads((root / "candidate.json").read_text())
+                    self.assertEqual(candidate["outcome"], "fail")
+                    self.assertNotIn("measurement", candidate)
+                    validate(candidate)
+                    publish(
+                        candidate,
+                        root / f"early-{outcome}-{retained}.json",
+                        root / "summary",
+                        io.StringIO(),
+                    )
+                    candidate.pop("failure_phase")
+                    with self.assertRaises(ValueError):
+                        validate({**candidate, "outcome": "pass"})
+
+    def test_accuracy_only_pass_requires_profile_and_complete_evidence(self):
+        result = self.accuracy_result()
+        for key in result:
+            if key in {
+                "schema", "model", "tier", "source_sha", "outcome", "route",
+                "private_retention",
+            }:
+                continue
+            with self.subTest(missing=key), self.assertRaises(ValueError):
+                validate({name: value for name, value in result.items() if name != key})
+        for key in (
+            "parser_checked", "private_retention", "baseline_established",
+            "accuracy_within_band",
+        ):
+            with self.subTest(false=key), self.assertRaises(ValueError):
+                validate({**result, key: False})
+        for changes in (
+            {"gsm8k_count": 100},
+            {"gsm8k_correct": 1252},
+            {"gsm8k_correct": True},
+            {"gsm8k_score": float("nan")},
+            {"gsm8k_correct": 1187, "gsm8k_score": 1187 / 1319},
+            {"gsm8k_correct": 1293, "gsm8k_score": 1293 / 1319},
+            {"golden_score": 1253 / 1319},
+            {"config_digest": "invalid"},
+            {"recipe_tree_sha256": "invalid"},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                validate({**result, **changes})
+        prebuilt = {**result, "route": "prebuilt-image"}
+        with self.assertRaises(ValueError):
+            validate(prebuilt)
+        with self.assertRaises(ValueError):
+            validate({**prebuilt, "runtime_versions": {"torch": "2.8.0"}})
+        validate({**prebuilt, "runtime_versions": {"sglang": "0.5.0"}})
+
+    def test_accuracy_profile_cannot_downgrade_old_models_or_use_fast_tier(self):
+        for outcome in ("pass", "fail"):
+            for candidate in (
+                {**self.accuracy_result(), "model": "glm-5.3"},
+                {**fast_result(), "measurement": "accuracy_only"},
+                {**self.accuracy_result(), "tier": "fast_sanity"},
+                {**self.accuracy_result(), "measurement": "full"},
+            ):
+                with (
+                    self.subTest(candidate=candidate, outcome=outcome),
+                    self.assertRaises(ValueError),
+                ):
+                    validate({**candidate, "outcome": outcome})
+        full = self.accuracy_result()
+        full.pop("measurement")
+        full.update(
+            sse_verified=True,
+            kv_gauge_zero_verified=True,
+            c1_passed=True,
+            c16_passed=True,
+            bench_s=1,
+            cache_mode="sanity_throughput_guard",
+        )
+        for outcome in ("pass", "fail"):
+            with self.subTest(full_outcome=outcome), self.assertRaises(ValueError):
+                validate({**full, "outcome": outcome})
+
+    def test_accuracy_only_publish_and_verify_without_site_packages(self):
+        passed = self.accuracy_result()
+        failed = {
+            key: passed[key]
+            for key in ("schema", "model", "tier", "source_sha", "route", "private_retention")
+        }
+        failed.update(outcome="fail", failure_phase="server_startup")
+        command = [
+            sys.executable,
+            "-E",
+            "-S",
+            "-B",
+            str(REPO_ROOT / "scripts/ci/ppu/recipe_publish.py"),
+        ]
+        for result in (passed, failed):
+            with (
+                self.subTest(outcome=result["outcome"]),
+                tempfile.TemporaryDirectory() as temp,
+            ):
+                root = Path(temp)
+                candidate = root / "candidate.json"
+                artifact = root / "public.json"
+                summary = root / "summary"
+                candidate.write_text(json.dumps(result))
+                published = subprocess.run(
+                    [*command, str(candidate), str(artifact), str(summary)],
+                    capture_output=True, text=True, timeout=30,
+                )
+                self.assertEqual(published.returncode, 0, published.stderr)
+                self.assertEqual(json.loads(published.stdout), result)
+                self.assertEqual(artifact.read_text(), published.stdout)
+                self.assertIn(published.stdout, summary.read_text())
+                verified = subprocess.run(
+                    [*command, "--verify-only", str(artifact)],
+                    env={**os.environ, "PPU_CI_SOURCE_SHA": result["source_sha"]},
+                    capture_output=True, text=True, timeout=30,
+                )
+                self.assertEqual(verified.returncode, 0, verified.stderr)
+
+    def test_accuracy_only_pass_checks_repository_golden(self):
+        path = REPO_ROOT / "test/ppu/golden/accuracy_deepseek_v41_flash_mxfp4_890p.json"
+        golden = json.loads(path.read_text())
+        original_read = Path.read_text
+        for changes in (
+            {"score": 0.94},
+            {"model": "glm-5.3"},
+            {"dataset": {**golden["dataset"], "num_expected": 100}},
+            {"tolerance": {"mode": "band", "abs": 0.03}},
+        ):
+            altered = json.dumps({**golden, **changes})
+
+            def read(candidate, *args, **kwargs):
+                if candidate == path:
+                    return altered
+                return original_read(candidate, *args, **kwargs)
+
+            with (
+                self.subTest(changes=changes),
+                patch.object(Path, "read_text", read),
+                self.assertRaises(ValueError),
+            ):
+                validate(self.accuracy_result())
+
+    def test_private_retention_preserves_optional_pd_files_with_digests(self):
+        names = (
+            "pd-prefill.log", "pd-decode.log", "pd-router.log", "pd-config.yaml",
+            "pd-runtime.json", "pd-preflight.log",
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            archive, source, workspace = (
+                root / "archive", root / "artifacts", root / "workspace"
+            )
+            for directory in (
+                archive, source / "results", workspace, root / "runner-temp"
+            ):
+                directory.mkdir(parents=True)
+            (source / "launcher.log").write_text("fixture launcher\n")
+            (source / "provenance.json").write_text("{}\n")
+            (source / "results/summary.json").write_text(json.dumps(self.accuracy_result()))
+            for name in names:
+                (source / "results" / name).write_text(f"private fixture: {name}\n")
+            env = {
+                "PPU_CI_SOURCE_SHA": "a" * 40,
+                "TIER": "model_sanity",
+                "MODEL_KEY": "deepseek-v41-flash-pd",
+                "GITHUB_RUN_ID": "123",
+                "GITHUB_RUN_ATTEMPT": "1",
+                "PPU_CI_PRIVATE_RESULTS_ROOT": str(archive),
+                "PPU_CI_ARTIFACT_DIR": str(source),
+                "GITHUB_WORKSPACE": str(workspace),
+                "RUNNER_TEMP": str(root / "runner-temp"),
+                "RECIPE_OUTCOME": "success",
+            }
+            retain(env)
+            destination = (
+                archive / "sglang/logs/sglang-for-sail/123-1"
+                / env["PPU_CI_SOURCE_SHA"][:12]
+                / "model_sanity"
+                / "deepseek-v41-flash-pd"
+            )
+            index = json.loads((destination / "index.json").read_text())
+            self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o700)
+            for name in names:
+                with self.subTest(name=name):
+                    self.assertEqual(
+                        (destination / name).read_bytes(),
+                        (source / "results" / name).read_bytes(),
+                    )
+                    self.assertEqual(index["files"][name], sha256(source / "results" / name))
+                    self.assertEqual(
+                        stat.S_IMODE((destination / name).stat().st_mode), 0o600
+                    )
+
     def test_metrics_require_present_and_zero_for_all_series(self):
         names = ("sglang:num_running_reqs", "sglang:num_queue_reqs")
         first, second = names
