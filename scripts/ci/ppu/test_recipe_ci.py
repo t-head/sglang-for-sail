@@ -4726,6 +4726,12 @@ class PresetCatalogContractTest(unittest.TestCase):
                 ["--watermark-key", admin_cred],
                 ["--watermark-key-b", admin_cred],
                 ["--watermark-config", f'{{"key":"{admin_cred}"}}'],
+                ["--watermark-c", admin_cred],
+                [f"--watermark-c={admin_cred}"],
+                ["--watermark", admin_cred],
+                [f"--watermark={admin_cred}"],
+                ["--service-token", admin_cred],
+                [f"--service-token={admin_cred}"],
             ):
                 sec_rec = _load_yaml(
                     REPO_ROOT / "test/ppu/recipes/Qwen/Qwen3.8-27B.yaml"
@@ -4778,12 +4784,77 @@ class PresetCatalogContractTest(unittest.TestCase):
                 admin_cred, _redact_error_text(str(head_admin_ctx.exception))
             )
 
+            # Unclosed-quote YAML parse errors containing SGLANG_ADMIN_API_KEY must be
+            # scrubbed cleanly across both Python API (_load_yaml) and validate CLI stderr,
+            # and historical SGLANG_TOKEN / MC_ACCESS_TOKEN in base snapshots must not leak.
+            bad_yaml_path = admin_base / "test/ppu/recipes/Qwen/BrokenSecret.yaml"
+            bad_yaml_path.write_text(
+                f'model:\n  base_env:\n    SGLANG_ADMIN_API_KEY: "{admin_cred}\n',
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValidationError) as yaml_err_ctx:
+                _load_yaml(bad_yaml_path)
+            self.assertNotIn(admin_cred, str(yaml_err_ctx.exception))
+            broken_cli = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts/ci/ppu/ppu_recipe.py"),
+                    "validate",
+                    str(bad_yaml_path),
+                    "--sglang-parser",
+                    "skip",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(broken_cli.returncode, 1)
+            self.assertNotIn(admin_cred, broken_cli.stdout + broken_cli.stderr)
+
+            token_base = root / "token_base"
+            shutil.copytree(REPO_ROOT / "test/ppu", token_base / "test/ppu")
+            qwen_tok = token_base / "test/ppu/recipes/Qwen/Qwen3.8-27B.yaml"
+            tok_doc = _load_yaml(qwen_tok)
+            tok_doc["model"]["base_env"] = {"SGLANG_TOKEN": admin_cred}
+            qwen_tok.write_text(
+                yaml.safe_dump(tok_doc, sort_keys=False), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                ValidationError, "redaction gate blocked diff output"
+            ) as tok_diff_ctx:
+                render_resolved_diff_markdown(
+                    base_root=token_base,
+                    head_root=base_dir,
+                    only_when_changed=True,
+                )
+            self.assertNotIn(admin_cred, str(tok_diff_ctx.exception))
+            with self.assertRaisesRegex(
+                ValidationError, "credential env var"
+            ) as head_tok_ctx:
+                render_resolved_diff_markdown(
+                    base_root=base_dir,
+                    head_root=token_base,
+                    only_when_changed=True,
+                )
+            self.assertNotIn(
+                admin_cred, _redact_error_text(str(head_tok_ctx.exception))
+            )
+            self.assertTrue(
+                _scan_text(f"- SGLANG_TOKEN={admin_cred}", context="diff_line")
+            )
+
             # Non-secret server/cache/watermark/tokenizer flags must not be misclassified.
             for safe_flags in (
                 ["--ssl-keyfile", "certs/server.pem"],
                 ["--hicache-storage-backend", "mooncake"],
                 ["--unified-cache-external-linker-backend", "local"],
                 ["--watermark-context-window", "4"],
+                ["--watermark-mixing-probability", "0.5"],
+                ["--watermark-max-probability", "0.9"],
+                ["--watermark-default-enabled"],
+                ["--watermark-enforce-all"],
+                ["--bucket-time-to-first-token", "1.0"],
+                ["--kt-max-deferred-experts-per-token", "2"],
                 ["--speculative-num-draft-tokens", "3"],
             ):
                 safe_rec = _load_yaml(
