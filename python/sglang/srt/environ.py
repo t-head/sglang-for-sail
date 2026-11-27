@@ -2332,11 +2332,19 @@ class Envs:
     # prefill/extend path (kda_flashkda.FlashKDAKernel ->
     # pla.prefill.flashkdapro.flashkda_fwd). PPU defaults it to True in
     # platform_hook, so PLA is on out of the box; set it to 0 to send decode
-    # and prefill back to the community Triton kernels together. An explicit
-    # --linear-attn-prefill-backend still wins for the prefill side alone.
+    # and prefill back to the community Triton kernels together. Explicit
+    # FlashKDA on PPU SM89 uses the external package independently of this gate.
     SGLANG_SAIL_PLA_CUDA = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_SAIL_FLA_CUDA"
     )
+    # Compact PPU KDA ReplaySSM producer: "off" (default), "native" for the
+    # in-tree PPU SM89 verifier, or "flashkda" for the external FlashKDA verifier.
+    # Requires --enable-linear-replayssm-spec, a bounded-gate KDA model, static
+    # top-1 NEXTN/EAGLE verification and direct contiguous BF16/FP32 Mamba slots.
+    # "native" accepts windows up to 16 tokens. "flashkda" additionally requires
+    # FlashKDA decode and verify plus the pinned wheel's ReplaySSM ABI. The modes
+    # are mutually exclusive by construction; neither affects upstream PLA paths.
+    SGLANG_USE_PPU_KDA_REPLAYSSM = EnvStr("off")
     SGLANG_SAIL_DSV4_USE_INT8 = EnvBool(False)
     SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB = EnvInt(4096)
     # Use dsv4's bf16 topk kernel for PAGED path; requires logits to be bf16.

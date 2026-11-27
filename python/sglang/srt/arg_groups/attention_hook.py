@@ -35,7 +35,11 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.configs.model_config import uses_kda_attention
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
+from sglang.srt.layers.attention.linear.utils import (
+    default_linear_attn_verify_backend,
+    is_ppu_flashkda_supported,
+    pp_spec_stable_rows_enabled,
+)
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
@@ -167,9 +171,9 @@ def handle_attention_backend_compatibility(server_args: Any):
                 cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
             ),
         )
-        assert cfg.speculative_algorithm is None, (
-            "Speculative decoding is currently not supported with Flex Attention backend"
-        )
+        assert (
+            cfg.speculative_algorithm is None
+        ), "Speculative decoding is currently not supported with Flex Attention backend"
 
     # Whisper's encoder token padding conflicts with prefix caching.
     # Only disable for Whisper; other encoder-decoder models (e.g., mllama) use radix cache.
@@ -292,6 +296,16 @@ def handle_attention_backend_compatibility(server_args: Any):
 
 def handle_linear_attn_backend(server_args: Any):
     cfg = resolving_view(server_args)
+    replayssm_mode = envs.SGLANG_USE_PPU_KDA_REPLAYSSM.get()
+    if replayssm_mode not in ("off", "native", "flashkda"):
+        raise ValueError(
+            "SGLANG_USE_PPU_KDA_REPLAYSSM must be off, native, or flashkda; "
+            f"got {replayssm_mode!r}."
+        )
+    if replayssm_mode != "off" and not cfg.enable_linear_replayssm_spec:
+        raise ValueError(
+            "SGLANG_USE_PPU_KDA_REPLAYSSM requires --enable-linear-replayssm-spec."
+        )
     import torch
 
     # SM100+: default to FlashInfer GDN decode (and MTP verify, via pool API)
@@ -321,28 +335,18 @@ def handle_linear_attn_backend(server_args: Any):
     # SM100+ FlashInfer GDN decode requires bf16 state; SM90 uses float32.
     decode = cfg.linear_attn_decode_backend or cfg.linear_attn_backend
 
-    # FlashKDA is a prefill-only KDA kernel (no decode kernel) but shares the
-    # backend choice list, so guard it from being selected for decode: error
-    # on an explicit --linear-attn-decode-backend flashkda, and fall back to
-    # triton decode when it was only inherited from base=flashkda (prefill
-    # keeps FlashKDA).
-    if decode == "flashkda":
-        if cfg.linear_attn_decode_backend == "flashkda":
-            raise ValueError(
-                "--linear-attn-decode-backend flashkda is not supported: "
-                "FlashKDA is prefill-only. Use "
-                "--linear-attn-prefill-backend flashkda (decode stays on triton)."
-            )
+    # The external packed decode is an explicit PPU SM89 opt-in. Keep the
+    # prefill-only meaning of the base backend on every platform.
+    if decode == "flashkda" and cfg.linear_attn_decode_backend != "flashkda":
         declare_resolution(
             server_args,
             "_handle_linear_attn_backend",
             linear_attn_decode_backend="triton",
         )
         decode = "triton"
-        logger.info(
-            "FlashKDA is prefill-only; using triton for KDA decode "
-            "(FlashKDA stays on prefill)."
-        )
+        logger.info("Inherited FlashKDA is prefill-only; using Triton KDA decode.")
+    if decode == "flashkda" and not is_ppu_flashkda_supported():
+        raise ValueError("--linear-attn-decode-backend flashkda requires PPU SM89.")
 
     if (
         decode == "flashinfer"
@@ -356,9 +360,11 @@ def handle_linear_attn_backend(server_args: Any):
             f"got {cfg.mamba_ssm_dtype!r}"
         )
 
-    verify = cfg.linear_attn_verify_backend
-    if verify is None and decode == "flashinfer":
-        verify = "flashinfer"
+    verify = cfg.linear_attn_verify_backend or default_linear_attn_verify_backend(
+        decode
+    )
+    if verify == "flashkda" and not is_ppu_flashkda_supported():
+        raise ValueError("--linear-attn-verify-backend flashkda requires PPU SM89.")
     if (
         pp_spec_stable_rows_enabled()
         and verify == "flashinfer"
@@ -391,6 +397,19 @@ def handle_linear_attn_backend(server_args: Any):
     # SM100+ FlashInfer GDN prefill requires CUDA 13+ (CuTe DSL kernel)
     # for correctness and best performance.
     prefill = cfg.linear_attn_prefill_backend or cfg.linear_attn_backend
+
+    if is_ppu_flashkda_supported():
+        from sglang.srt.layers.attention.linear.kernels.kda_flashkda import (
+            validate_ppu_flashkda_startup,
+        )
+
+        validate_ppu_flashkda_startup(
+            decode=decode,
+            explicit_prefill=cfg.linear_attn_prefill_backend == "flashkda",
+            verify=verify,
+            replayssm_mode=replayssm_mode,
+            state_accum_dtype=cfg.mamba_ssm_accum_dtype,
+        )
 
     # The PPU KDA prefill default (SAIL PLA / "flashkda") is intentionally NOT
     # written here: a process-wide arg would also bind a speculative draft
@@ -475,10 +494,72 @@ def handle_linear_attn_backend(server_args: Any):
                 "EAGLE tree verify. Got "
                 f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
             )
-        if decode not in ("triton", "flashinfer"):
+        model_config = model_config_of(server_args)
+        is_kda = uses_kda_attention(model_config.hf_config)
+        compact_ppu_replay = replayssm_mode != "off"
+        flashkda_replay = replayssm_mode == "flashkda"
+        if compact_ppu_replay:
+            if not is_kda or not is_ppu_flashkda_supported():
+                raise ValueError(
+                    "Compact PPU KDA ReplaySSM requires a KDA model on PPU SM89."
+                )
+            from sglang.srt.configs.hybrid_arch import hybrid_kda_config
+
+            kda_config = hybrid_kda_config(model_config)
+            lower_bound = getattr(kda_config, "kda_lower_bound", None)
+            if lower_bound is None:
+                linear_attn_config = (
+                    getattr(kda_config, "linear_attn_config", None) or {}
+                )
+                lower_bound = linear_attn_config.get("gate_lower_bound")
+            if lower_bound is None:
+                raise ValueError(
+                    "Compact PPU KDA ReplaySSM requires a model with a bounded "
+                    "gate (gate_lower_bound/kda_lower_bound)."
+                )
+            if cfg.linear_replayssm_cache_len < 1 or (
+                replayssm_mode == "native" and cfg.linear_replayssm_cache_len > 16
+            ):
+                raise ValueError(
+                    "Native PPU ReplaySSM requires --linear-replayssm-cache-len "
+                    "between 1 and 16; external FlashKDA requires a positive length. "
+                    f"Got {cfg.linear_replayssm_cache_len}."
+                )
+            if (
+                cfg.speculative_num_draft_tokens is not None
+                and cfg.speculative_num_draft_tokens > cfg.linear_replayssm_cache_len
+            ):
+                raise ValueError(
+                    "Compact PPU KDA ReplaySSM requires "
+                    "--linear-replayssm-cache-len to cover the speculative draft "
+                    f"window ({cfg.speculative_num_draft_tokens} tokens)."
+                )
+            if cfg.mamba_ssm_dtype not in (None, "bfloat16", "float32"):
+                raise ValueError(
+                    "Compact PPU KDA ReplaySSM requires BF16 or FP32 Mamba states."
+                )
+        if flashkda_replay and (decode != "flashkda" or verify != "flashkda"):
             raise ValueError(
-                "--enable-linear-replayssm-spec requires the triton or "
-                "flashinfer linear-attn decode backend, got "
+                "SGLANG_USE_PPU_KDA_REPLAYSSM=flashkda requires FlashKDA decode "
+                "and verify."
+            )
+        if (
+            verify == "flashkda"
+            and is_ppu_flashkda_supported()
+            and replayssm_mode == "off"
+        ):
+            raise ValueError(
+                "FlashKDA ReplaySSM requires "
+                "SGLANG_USE_PPU_KDA_REPLAYSSM=flashkda, or use native mode to "
+                "override verification with the in-tree PPU kernel."
+            )
+        valid_decode = decode in ("triton", "flashinfer") or (
+            compact_ppu_replay and decode == "flashkda"
+        )
+        if not valid_decode:
+            raise ValueError(
+                "--enable-linear-replayssm-spec requires triton, flashinfer, or "
+                "compact PPU FlashKDA as the linear-attn decode backend, got "
                 f"--linear-attn-decode-backend={decode!r}."
             )
         from sglang.srt.speculative.ragged_verify import (
@@ -487,6 +568,16 @@ def handle_linear_attn_backend(server_args: Any):
         )
 
         ragged_mode = read_ragged_verify_mode()
+        if compact_ppu_replay and (
+            ragged_mode is not RaggedVerifyMode.STATIC
+            or (cfg.speculative_algorithm or "").upper() not in ("NEXTN", "EAGLE")
+            or cfg.enable_unified_memory
+            or cfg.enable_page_major_kv_layout
+        ):
+            raise ValueError(
+                "Compact PPU KDA ReplaySSM requires static top-1 NEXTN/EAGLE "
+                "verification and direct contiguous Mamba slots."
+            )
         if ragged_mode is not RaggedVerifyMode.STATIC:
             # Ragged ring-writes need the KDA fold-every-commit family
             # (DSPARK/DFLASH) + the triton verify kernel (nv_cutedsl falls
@@ -533,7 +624,7 @@ def handle_linear_attn_backend(server_args: Any):
                 "_handle_linear_attn_backend",
                 mamba_ssm_dtype="float32",
             )
-        elif cfg.mamba_ssm_dtype != "float32":
+        elif cfg.mamba_ssm_dtype != "float32" and not flashkda_replay:
             logger.warning(
                 "--enable-linear-replayssm-spec with --mamba-ssm-dtype=%s: the "
                 "compact checkpoint is materialized after each accepted "

@@ -26,15 +26,18 @@ def apply_kimi_k3_spec_backend_defaults(server_args: ServerArgs) -> None:
     # Decode is left free (its bf16-ssm SM100+ flashinfer default is fine -- the
     # target only verifies under spec); the verify backend is pinned directly.
     if cfg.linear_attn_verify_backend is None:
+        verify_backend = (
+            "flashkda" if cfg.linear_attn_decode_backend == "flashkda" else "nv_cutedsl"
+        )
         declare_resolution(
             server_args,
             "apply_kimi_k3_spec_backend_defaults",
-            linear_attn_verify_backend="nv_cutedsl",
+            linear_attn_verify_backend=verify_backend,
         )
         logger.info(
             "Kimi hybrid model with speculative decoding: pinning "
-            "--linear-attn-verify-backend to nv_cutedsl (uses the fused "
-            "Kimi-K3/DSPARK CuTeDSL kernel)."
+            "--linear-attn-verify-backend to %s.",
+            verify_backend,
         )
 
     # dspark's draft is dense MQA; trtllm_mha avoids flashinfer's blocking

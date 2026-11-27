@@ -77,6 +77,22 @@ PY
     mapfile -t eval_requirements <<< "$requirements"
     python3 -m pip wheel --index-url https://pypi.org/simple --no-deps --no-build-isolation \
         --wheel-dir "$wheel_dir/runtime-deps" "${eval_requirements[@]}"
+
+    # Build the exact FlashKDA PPU ABI required by the registered numerical test
+    # and benchmark. Cudafy rewrites its input, so keep it out of the source tree.
+    flash_work=$(mktemp -d)
+    git clone --filter=blob:none https://github.com/flytiger-eco/cudafy-for-sail.git \
+        "$flash_work/cudafy"
+    git -C "$flash_work/cudafy" checkout 3e04b25e0eca4c08a0be98155babf8f578c5ef55
+    git clone --filter=blob:none https://github.com/lfwang56/FlashKDA.git \
+        "$flash_work/FlashKDA"
+    git -C "$flash_work/FlashKDA" checkout 0dfef21294bea8dd5dfd193c7b06be8e0e2d8588
+    git -C "$flash_work/FlashKDA" submodule update --init actlize
+    python3 "$flash_work/cudafy/cudafy.py" general "$flash_work/FlashKDA"
+    FLASH_KDA_BACKEND=ppu FLASH_KDA_PPU_TARGET=tc02 \
+        FLASH_KDA_VERSION_SUFFIX=+0dfef21 NVCC_THREADS=2 \
+        python3 -m pip wheel --no-deps --no-build-isolation \
+        --wheel-dir "$wheel_dir/runtime-deps" "$flash_work/FlashKDA"
     python3 "$checker" snapshot "$artifacts/build-dependencies.json"
 
     work=$(mktemp -d)
@@ -158,5 +174,5 @@ python3 "$repo/scripts/ci/ppu/prepare_runtime.py"
 cd "$artifacts"
 python3 "$repo/scripts/ci/ppu/run_speculative_sanity.py" \
     2>&1 | tee "$artifacts/sanity.log"
-# Require both sanity files; update this count when extending the suite.
-grep -Fxq 'Test Summary: 2/2 passed' "$artifacts/sanity.log"
+# Require every selected model, numerical and benchmark file; update this count when extending the suite.
+grep -Fxq 'Test Summary: 4/4 passed' "$artifacts/sanity.log"
