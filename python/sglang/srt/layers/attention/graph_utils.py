@@ -46,6 +46,25 @@ def attention_output_tokens(forward_batch, tokens):
 
 
 @contextmanager
+def real_rows_scope(forward_batch, real_num_tokens):
+    out_cache_loc, positions = forward_batch.out_cache_loc, forward_batch.positions
+    forward_batch.out_cache_loc = out_cache_loc[:real_num_tokens]
+    if positions is not None:
+        forward_batch.positions = positions[:real_num_tokens]
+    try:
+        yield
+    finally:
+        forward_batch.out_cache_loc, forward_batch.positions = out_cache_loc, positions
+
+
+def pad_with_zero_rows(t: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    full = t.new_empty((num_tokens, *t.shape[1:]))
+    full[: t.shape[0]].copy_(t)
+    full[t.shape[0] :].zero_()
+    return full
+
+
+@contextmanager
 def attention_input_scope(
     forward_batch, output, query_tokens, kv_tokens, kwargs, *, cache_tokens=None
 ):

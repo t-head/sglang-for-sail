@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.attention import deepseek_v4_backend
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
     LateLayerTail,
@@ -24,6 +25,76 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+class TestEagerTailRows(CustomTestCase):
+    def test_tail_source_kv_keeps_shared_backend_contract(self):
+        for metadata in (NS(), NS(real_num_tokens=2)):
+            for num_rows in (0, 4):
+                with self.subTest(metadata=vars(metadata), num_rows=num_rows):
+                    x = torch.arange(num_rows * 2).view(num_rows, 2)
+                    positions = torch.arange(num_rows)
+                    batch, layer = NS(), NS(layer_id=7)
+                    calls = []
+                    backend = NS(
+                        forward_metadata=metadata,
+                        forward_low_ratio_sources=lambda **kwargs: calls.append(kwargs),
+                    )
+                    DeepseekV4AttnBackend.write_tail_source_kv(
+                        backend,
+                        layer=layer,
+                        x=x,
+                        positions=positions,
+                        forward_batch=batch,
+                    )
+                    self.assertEqual(backend.tail_source_kv_layer_id, layer.layer_id)
+                    self.assertEqual(len(calls), int(num_rows > 0))
+                    if calls:
+                        self.assertIs(calls[0]["x"], x)
+                        self.assertIs(calls[0]["positions"], positions)
+                        self.assertIs(calls[0]["forward_batch"], batch)
+                        self.assertIs(calls[0]["layer"], layer)
+                        self.assertIsNone(calls[0]["q_lora"])
+                        self.assertFalse(calls[0]["run_indexer"])
+
+    def test_contiguous_tail_ignores_mlp_sync_padding(self):
+        indices = torch.tensor([4, 5, 6])
+        rows = torch.arange(16).view(8, 2)
+        selected = deepseek_v4_backend._tail_rows(
+            rows, token_indices=indices, contiguous_start=4
+        )
+        torch.testing.assert_close(selected, rows[indices])
+        tail = NS(contiguous_start=4, scatter_indices=None)
+        result = deepseek_v4._scatter_tail_rows(tail, selected, 8)
+        torch.testing.assert_close(result[4:7], selected)
+
+    def test_eager_metadata_uses_real_rows_and_restores_batch(self):
+        batch = NS(
+            forward_mode=ForwardMode.EXTEND,
+            global_num_token_non_padded_cpu=129,
+            positions=torch.arange(132),
+            out_cache_loc=torch.arange(132),
+        )
+        positions, cache = batch.positions, batch.out_cache_loc
+        observed = []
+
+        def build(fb, *, real_num_tokens=None):
+            observed.append((len(fb.positions), len(fb.out_cache_loc), real_num_tokens))
+            return NS(real_num_tokens=real_num_tokens)
+
+        backend = NS(
+            mtp_enabled=False,
+            enable_decoder_swa_bounded_replay=True,
+            _build_forward_metadata=build,
+            init_forward_metadata_in_graph=lambda fb: None,
+            _build_late_layer_tail_metadata=lambda fb: len(fb.positions),
+            _activate_request_window=lambda: None,
+        )
+        DeepseekV4AttnBackend.init_forward_metadata(backend, batch)
+        self.assertEqual(observed, [(129, 129, 129)])
+        self.assertEqual(backend.tail_forward_metadata, 129)
+        self.assertIs(batch.positions, positions)
+        self.assertIs(batch.out_cache_loc, cache)
 
 
 class TestDSV41TailCPRoutingIDs(CustomTestCase):
