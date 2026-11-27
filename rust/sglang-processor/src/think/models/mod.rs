@@ -4,6 +4,7 @@
 mod glm45;
 mod kimi_k3;
 mod qwen3;
+mod step5;
 
 pub(crate) use self::kimi_k3::KimiK3Detector;
 use super::ThinkConfig;
@@ -14,6 +15,7 @@ pub(crate) fn think_config(reasoning_parser: &str) -> Option<ThinkConfig> {
         "glm45" => Some(ThinkConfig::Tags(glm45::THINK)),
         "kimi_k3" => Some(ThinkConfig::KimiK3),
         "qwen3" => Some(ThinkConfig::Tags(qwen3::THINK)),
+        "step5" => Some(ThinkConfig::Tags(step5::THINK)),
         _ => None,
     }
 }

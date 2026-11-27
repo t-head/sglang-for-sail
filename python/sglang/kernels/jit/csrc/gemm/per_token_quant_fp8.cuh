@@ -14,6 +14,9 @@
 
 #ifndef USE_ROCM
 #include <cuda_pipeline.h>
+#if defined(SGL_PER_TOKEN_QUANT_SAIL_BULK) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#include <cuda/ptx>
+#endif
 #endif
 
 // Ported from the v0.5.18_rel AOT gemm/per_token_quant_fp8.cu implementation.
@@ -200,6 +203,33 @@ __device__ __forceinline__ void load_128b_aiu(
 }
 #endif
 
+// Linear bulk AIU copies complete through a per-warp memory barrier.
+#if defined(SGL_PER_TOKEN_QUANT_SAIL_BULK) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+__device__ __forceinline__ void load_token_aiu_bulk(void* dst, const void* src, uint32_t bytes, uint64_t* barrier) {
+  namespace ptx = cuda::ptx;
+  const int lane_id = threadIdx.x & (kPerTokenQuantWarpSize - 1);
+
+  __syncwarp();
+  if (lane_id == 0) {
+    ptx::mbarrier_init(barrier, 1);
+    ptx::fence_proxy_async(ptx::space_shared);
+    (void)ptx::mbarrier_arrive_expect_tx(ptx::sem_release, ptx::scope_cta, ptx::space_shared, barrier, bytes);
+    ptx::cp_async_bulk(ptx::space_cluster, ptx::space_global, dst, src, bytes, barrier);
+  }
+  __syncwarp();
+
+  while (!ptx::mbarrier_try_wait_parity(barrier, 0)) {
+  }
+  __syncwarp();
+  if (lane_id == 0) {
+    // This SDK's PTX wrapper does not expose mbarrier.inval.
+    const uint32_t bar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(barrier));
+    asm volatile("mbarrier.inval.shared.b64 [%0];" ::"r"(bar_addr) : "memory");
+  }
+  __syncwarp();
+}
+#endif
+
 // ---------------------------------------------------------------------------
 // 1. Warp-local with configurable shared memory
 //    - One warp handles one token.
@@ -317,6 +347,15 @@ __global__ void per_token_quant_fp8_persistent_kernel(
   const int warp_smem_stride = (hidden_dim * static_cast<int>(sizeof(T)) + 127) / 128 * 128;
   T* smem_buf = reinterpret_cast<T*>(smem_buffer + warp_id * warp_smem_stride);
 
+#if defined(SGL_PER_TOKEN_QUANT_SAIL_BULK) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  uint64_t* aiu_bar = nullptr;
+  if constexpr (useAIU && sizeof(T) == 2) {
+    // Static storage is accounted for by the compiler and occupancy API.
+    __shared__ uint64_t aiu_barriers[kTokensPerCTA];
+    aiu_bar = &aiu_barriers[warp_id];
+  }
+#endif
+
   // Number of 16B copies per kVecSize-element chunk (compile-time constant)
   constexpr int kCopiesPerVec = kVecSize * static_cast<int>(sizeof(T)) / 16;
 
@@ -329,29 +368,36 @@ __global__ void per_token_quant_fp8_persistent_kernel(
     // Use outer loop over num_vec_elems + inner unrolled loop (kCopiesPerVec is
     // compile-time: 2 for fp16/bf16, 4 for fp32) to enable full unrolling.
     const T* src = input + token_id * hidden_dim;
-    // hidden_dim x fp16 per warp
-#if defined(SGL_PER_TOKEN_QUANT_SAIL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
-    if constexpr (sizeof(T) == 2 and useAIU) {
-      constexpr int AIU_CHUNK_SLISE_4 = 16 * 64;
-      for (int aiu_cp_offset = 0; aiu_cp_offset < hidden_dim; aiu_cp_offset += AIU_CHUNK_SLISE_4) {
-        load_128b_aiu<T, false>(smem_buf + aiu_cp_offset, src + aiu_cp_offset, 64, 16, 64, 16, 0, 0);
-      }
+#if defined(SGL_PER_TOKEN_QUANT_SAIL_BULK) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    if constexpr (useAIU && sizeof(T) == 2) {
+      load_token_aiu_bulk(smem_buf, src, static_cast<uint32_t>(hidden_dim * sizeof(T)), aiu_bar);
     } else
 #endif
     {
-      for (int32_t i = lane_id; i < num_vec_elems; i += kPerTokenQuantWarpSize) {
+      // hidden_dim x fp16 per warp
+#if defined(SGL_PER_TOKEN_QUANT_SAIL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+      if constexpr (sizeof(T) == 2 and useAIU) {
+        constexpr int AIU_CHUNK_SLISE_4 = 16 * 64;
+        for (int aiu_cp_offset = 0; aiu_cp_offset < hidden_dim; aiu_cp_offset += AIU_CHUNK_SLISE_4) {
+          load_128b_aiu<T, false>(smem_buf + aiu_cp_offset, src + aiu_cp_offset, 64, 16, 64, 16, 0, 0);
+        }
+      } else
+#endif
+      {
+        for (int32_t i = lane_id; i < num_vec_elems; i += kPerTokenQuantWarpSize) {
 #pragma unroll
-        for (int j = 0; j < kCopiesPerVec; ++j) {
-          __pipeline_memcpy_async(
-              reinterpret_cast<char*>(smem_buf + i * kVecSize) + j * 16,
-              reinterpret_cast<const char*>(src + i * kVecSize) + j * 16,
-              16);
+          for (int j = 0; j < kCopiesPerVec; ++j) {
+            __pipeline_memcpy_async(
+                reinterpret_cast<char*>(smem_buf + i * kVecSize) + j * 16,
+                reinterpret_cast<const char*>(src + i * kVecSize) + j * 16,
+                16);
+          }
         }
       }
+      __pipeline_commit();
+      __pipeline_wait_prior(0);
+      __syncwarp();
     }
-    __pipeline_commit();
-    __pipeline_wait_prior(0);
-    __syncwarp();
 
     //
     // Pass-1: read from smem, compute warp-level absolute max
@@ -723,6 +769,16 @@ void launch_per_token_quant_fp8(
   const uint32_t sm_count = host::runtime::get_sm_count(device.device_id);
   const bool use_warp_kernel = num_tokens >= sm_count * 2 * kPerTokenQuantTokensPerCTA;
   if (use_warp_kernel) {
+#if defined(SGL_PER_TOKEN_QUANT_SAIL) && !defined(USE_ROCM) && SGL_CUDA_ARCH >= 800
+    if (hidden_dim % 16 == 0) {
+      const bool launched = hidden_dim % 1024 == 0
+                                ? launch_per_token_quant_fp8_persistent<T, true>(
+                                      device, input, output_q, output_s, hidden_dim, num_tokens, sm_count)
+                                : launch_per_token_quant_fp8_persistent<T, false>(
+                                      device, input, output_q, output_s, hidden_dim, num_tokens, sm_count);
+      if (launched) return;
+    }
+#endif
     const uint32_t grid = host::div_ceil(num_tokens, kPerTokenQuantTokensPerCTA);
     host::LaunchKernel(grid, kBlockSize, device)(
         per_token_quant_fp8_warp_kernel<T, kVecSize>, input, output_q, output_s, hidden_dim, num_tokens);

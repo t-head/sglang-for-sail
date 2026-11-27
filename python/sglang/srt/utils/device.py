@@ -29,6 +29,7 @@ from functools import lru_cache
 from importlib.util import find_spec
 from typing import Any, Iterator, List, Optional, Tuple
 
+import numpy as np
 import psutil
 import torch
 
@@ -619,11 +620,18 @@ def is_pin_memory_available(device=None) -> bool:
     return current_platform.is_pin_memory_available(device)
 
 
-def async_h2d(args: List, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-    """A host list on ``device``; staged in pinned memory so the copy is enqueued
-    on the current stream instead of synchronizing like a pageable copy."""
+def async_h2d(
+    args: List | np.ndarray, *, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """Stage host data in pinned memory if available and copy to the device asynchronously."""
     pin = is_pin_memory_available(device)
-    return torch.tensor(args, dtype=dtype, pin_memory=pin).to(device, non_blocking=pin)
+    if isinstance(args, np.ndarray):
+        # An ndarray cannot directly create a pinned tensor. copy_ also converts the dtype.
+        host = torch.empty(args.shape, dtype=dtype, pin_memory=pin)
+        host.copy_(torch.from_numpy(args))
+    else:
+        host = torch.tensor(args, dtype=dtype, pin_memory=pin)
+    return host.to(device, non_blocking=pin)
 
 
 def async_h2d_stack(

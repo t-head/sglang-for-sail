@@ -1,0 +1,282 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Step5 region-score entry; all state and output storage belong to callers."""
+
+import functools
+
+import torch
+
+from sglang.kernels.ops.attention.step5 import options as step5_options
+from sglang.srt.environ import envs
+
+# Rows per scoring tile, from the narrowest span that still groups to the widest
+# the grouped Triton kernel compiles for.
+STEP5_SCORE_SPAN_ROWS = (1, 2, 4, 8)
+
+
+def can_use_step5_scoring_cute(device: torch.device) -> bool:
+    return (
+        # TODO(yhyang201): frozen SGLANG_OPT_STEP5_SCORING_CUTE; prune dead paths.
+        step5_options.SCORING_CUTE
+        and device.type == "cuda"
+        and torch.version.hip is None
+        and torch.cuda.get_device_capability(device)[0] == 10
+    )
+
+
+@functools.cache
+def _compact_device_supported(device: torch.device) -> bool:
+    return (
+        device.type == "cuda"
+        and torch.version.hip is None
+        and "ZW" in torch.cuda.get_device_name(device)
+        and torch.cuda.get_device_capability(device) == (8, 9)
+    )
+
+
+def can_use_step5_scoring_compact(device: torch.device) -> bool:
+    return (
+        envs.SGLANG_SAIL_STEP5_SCORING_COMPACT.get()
+        and envs.SGLANG_STEP5_SCORING_REGION_OPT.get()
+        and _compact_device_supported(device)
+    )
+
+
+def _check(value, *, shape, dtype, device, name):
+    if (
+        value.layout != torch.strided
+        or tuple(value.shape) != shape
+        or value.dtype != dtype
+        or value.device != device
+        or not value.is_contiguous()
+    ):
+        raise ValueError(
+            f"Step5 scoring {name} requires contiguous {shape}/{dtype} on {device}"
+        )
+
+
+def _assert_group32_ownership(row_to_req: torch.Tensor) -> None:
+    groups = row_to_req.view(-1, 32)
+    owner = groups[:, :1]
+    all_padding = (groups == 0).all(dim=1)
+    owned_or_padding = ((groups == owner) | (groups == 0)).all(dim=1)
+    torch._assert_async(
+        (all_padding | ((owner[:, 0] > 0) & owned_or_padding)).all(),
+        "Step5 group-32 rows must share one request slot or be padding",
+    )
+
+
+def step5_paged_scores(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    compressed_index_keys: torch.Tensor,
+    req_to_token: torch.Tensor,
+    row_to_req: torch.Tensor,
+    positions: torch.Tensor,
+    out: torch.Tensor,
+    clear_future: bool = True,
+    group_rows: int = 1,
+    workspace=None,
+    weight_scale: float | None = None,
+    score_groups: tuple[torch.Tensor, torch.Tensor, int] | None = None,
+    compact_workspace=None,
+) -> torch.Tensor:
+    """Score completed historical regions for flattened ragged query rows.
+
+    Q is BF16 or prequantized unscaled E4M3. FP32 weights are already scaled by the
+    index head count (``weight_scale=1``). BF16 weights are the unscaled GEMM
+    output and default to ``weight_scale=0.5`` (exact: ``4**-0.5``). An explicit
+    scale overrides the dtype default. CompressedIndexKeys is
+    the existing SW128 byte backing.
+    Request slot zero is padding. Valid slots/positions and compressed_index_keys
+    publication are the backend's responsibility. Each valid req_to_token entry
+    at logical offset 8*r must be an aligned physical start of a complete region.
+    Native 64-token pages retain their contiguous logical offsets. Groups of
+    4 or 32 rows share one request owner, with optional padding rows.
+    ``score_groups`` replaces that divisibility-based grouping with explicit
+    (start, end, rows) spans cut from the per-request packed lengths, so ragged
+    batches group as well; each span stays inside one request.
+    Output width must cover all positions//8, including Graph replay inputs.
+    With ``clear_future=True``, invalid/future output columns are always -inf.
+    Zeros are written as +0.0, never -0.0: ``step5_select_regions`` hands the
+    values to a radix top-k, which orders by bit pattern and would rank -0.0
+    below +0.0, breaking the small-region-id tie-break.
+    The SM10x and PPU radix selectors can disable full-width writes.
+    Consumers may only read ranked history. Input and output must use separate storage.
+    Warm up before Graph capture.
+    """
+    if q.device.type != "cuda" or torch.version.hip is not None:
+        raise ValueError("Step5 scoring requires a supported device")
+    if type(clear_future) is not bool:
+        raise ValueError("Step5 scoring clear_future must be a bool")
+    if q.ndim != 3 or q.shape[1] not in (2, 4) or q.shape[2] != 256:
+        raise ValueError("Step5 scoring Q requires [tokens, 2 or 4, 256]")
+    tokens, heads, _ = q.shape
+    if group_rows not in (1, 4, 32) or (group_rows > 1 and tokens % group_rows):
+        raise ValueError("Step5 scoring group_rows must be 1, 4, or 32 and divide rows")
+    if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        raise ValueError("Step5 scoring Q must be BF16 or E4M3")
+    _check(q, shape=tuple(q.shape), dtype=q.dtype, device=q.device, name="q")
+    if weights.dtype not in (torch.bfloat16, torch.float32):
+        raise ValueError("Step5 scoring weights must be BF16 or FP32")
+    explicit_weight_scale = weight_scale is not None
+    if weight_scale is None:
+        weight_scale = 0.5 if weights.dtype == torch.bfloat16 else 1.0
+    _check(
+        weights,
+        shape=(tokens, heads),
+        dtype=weights.dtype,
+        device=q.device,
+        name="weights",
+    )
+    if (
+        compressed_index_keys.ndim != 4
+        or compressed_index_keys.shape[1:] != (8, 1, 256)
+        or compressed_index_keys.shape[0] < 1
+    ):
+        raise ValueError(
+            "Step5 compressed_index_keys requires SW128 [pages, 8, 1, 256]"
+        )
+    _check(
+        compressed_index_keys,
+        shape=tuple(compressed_index_keys.shape),
+        dtype=torch.uint8,
+        device=q.device,
+        name="compressed_index_keys",
+    )
+    if req_to_token.ndim != 2 or req_to_token.shape[0] < 1:
+        raise ValueError("Step5 request map requires [request slots, token capacity]")
+    for name, value, shape in (
+        ("req_to_token", req_to_token, tuple(req_to_token.shape)),
+        ("row_to_req", row_to_req, (tokens,)),
+        ("positions", positions, (tokens,)),
+    ):
+        if value.dtype not in (torch.int32, torch.int64):
+            raise ValueError(f"Step5 scoring {name} must be int32 or int64")
+        _check(value, shape=shape, dtype=value.dtype, device=q.device, name=name)
+    if group_rows == 32:
+        _assert_group32_ownership(row_to_req)
+    if score_groups is not None:
+        starts, ends, span_rows = score_groups
+        for name, value in (("score_group_start", starts), ("score_group_end", ends)):
+            if (
+                value.ndim != 1
+                or value.dtype != torch.int32
+                or value.device != q.device
+                or not value.is_contiguous()
+            ):
+                raise ValueError(
+                    f"Step5 scoring {name} requires a contiguous 1-D int32 tensor "
+                    "on the query device"
+                )
+        if starts.numel() != ends.numel():
+            raise ValueError("Step5 scoring group start/end lengths differ")
+        if span_rows not in STEP5_SCORE_SPAN_ROWS:
+            raise ValueError(
+                f"Step5 scoring span rows must be one of {STEP5_SCORE_SPAN_ROWS}"
+            )
+    if (
+        out.ndim != 2
+        or not 1 <= out.shape[1] < 2**31
+        or out.shape[1] > (req_to_token.shape[1] // 8 + 255) // 256 * 256
+    ):
+        raise ValueError(
+            "Step5 score width must fit native request capacity and int32 indexing"
+        )
+    _check(
+        out,
+        shape=(tokens, out.shape[1]),
+        dtype=torch.float32,
+        device=q.device,
+        name="out",
+    )
+    if out.numel():
+        a, b = out.data_ptr(), out.data_ptr() + out.numel() * out.element_size()
+        for value in (
+            q,
+            weights,
+            compressed_index_keys,
+            req_to_token,
+            row_to_req,
+            positions,
+        ):
+            lo = value.data_ptr()
+            if max(a, lo) < min(b, lo + value.numel() * value.element_size()):
+                raise ValueError("Step5 scoring output must not alias inputs")
+    if tokens:
+        if can_use_step5_scoring_cute(q.device):
+            from sglang.kernels.ops.attention.step5.scoring_cute import launch
+
+            launch(
+                q,
+                weights,
+                compressed_index_keys,
+                req_to_token,
+                row_to_req,
+                positions,
+                out,
+                clear_future=clear_future,
+                group_rows=group_rows,
+                weight_scale=weight_scale,
+                workspace=workspace,
+            )
+            # The CuTe epilogue is library code, so this path folds -0.0 into
+            # +0.0 with a pass; the Triton stores fold it inline instead.
+            from sglang.kernels.ops.attention.step5.selection_triton import (
+                canonicalize_zero,
+            )
+
+            canonicalize_zero(out, out)
+            return out
+        from sglang.kernels.ops.attention.step5.scoring_triton import launch
+
+        if explicit_weight_scale:
+            weights = weights.float() * weight_scale
+            weight_scale = 1.0
+        if (
+            compact_workspace is not None
+            and heads == 4
+            and score_groups is not None
+            and tokens >= 256
+            and out.shape[1] > 512
+            and compact_workspace.rows == tokens
+            and compact_workspace.keys.shape[1:] == (out.shape[1], 256)
+            and compact_workspace.keys.device == q.device
+            and compact_workspace.fp8 == envs.SGLANG_SAIL_STEP5_FP8_INDEXER.get()
+            and can_use_step5_scoring_compact(q.device)
+        ):
+            from sglang.kernels.ops.attention.step5.scoring_compact import (
+                launch as launch_compact,
+            )
+
+            launch_compact(
+                q.to(torch.float8_e4m3fn).view(torch.uint8),
+                weights,
+                compressed_index_keys,
+                req_to_token,
+                row_to_req,
+                positions,
+                out,
+                workspace=compact_workspace,
+                weight_scale=weight_scale,
+                clear_future=clear_future,
+            )
+            return out
+        launch(
+            # Pass the E4M3 bytes as uint8: the kernel bitcasts them straight
+            # into fp8 MMA operands (fp8e4nv from sm89 up, fp8e4b15 below it),
+            # so no per-element software decode is needed on the PPU path. With
+            # SGLANG_SAIL_STEP5_FP8_INDEXER off it decodes them to BF16 instead.
+            q.to(torch.float8_e4m3fn).view(torch.uint8),
+            weights,
+            compressed_index_keys,
+            req_to_token,
+            row_to_req,
+            positions,
+            out,
+            clear_future=clear_future,
+            group_rows=group_rows,
+            weight_scale=weight_scale,
+            score_groups=score_groups,
+        )
+    return out

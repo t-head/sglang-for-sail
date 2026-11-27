@@ -697,6 +697,49 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
                         expected,
                     )
 
+    def test_step5_request_limit_participates_in_dp_vote(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.enable_lora = False
+        runner._is_full_backend = False
+        runner.prefill_backend_name = Backend.BREAKABLE
+        runner.use_captured_attn_metadata = True
+        runner.model_runner = SimpleNamespace(
+            attn_backend=SimpleNamespace(max_breakable_prefill_graph_batch_size=8)
+        )
+        runner._qwen_bcg_hc_sidechannel = False
+        runner._qwen_bcg_mtp_draft = False
+        runner.has_mha_companion_layers = False
+        runner._capture_chunked_prefix = False
+        runner.max_context_size = runner.max_seq_len = None
+        runner.max_num_tokens = 16
+        runner.capture_num_tokens = [16]
+
+        votes = []
+        for request_count in (9, 4):
+            batch = SimpleNamespace(
+                forward_mode=ForwardMode.EXTEND,
+                batch_size=lambda: request_count,
+                extend_num_tokens=16,
+                input_embeds=None,
+                replace_embeds=None,
+                prefix_lens=[0] * request_count,
+                return_logprob=False,
+                multimodal_inputs=None,
+            )
+            votes.append(
+                _local_prefill_cuda_graph_vote(
+                    local_batch=batch,
+                    num_tokens=16,
+                    prefill_graph_runner=runner,
+                    coordinated_prefill=True,
+                    breakable_prefill=True,
+                    spec_algorithm=None,
+                    model_config=None,
+                )
+            )
+        self.assertEqual(votes, [False, True])
+        self.assertFalse(all(votes))
+
     def test_prefix_gate_only_applies_to_chunked_prefix_variant(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._capture_req_slots = 4

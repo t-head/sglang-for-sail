@@ -354,7 +354,6 @@ class Mxfp4Config(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config):
-
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_mxfp4_serialized = "mxfp4" in quant_method
         ignored_layers = cls.get_from_keys_or(
@@ -368,11 +367,7 @@ class Mxfp4Config(QuantizationConfig):
         )
 
         if _is_hip:
-            if is_gfx95_supported():
-                return cls(
-                    is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized
-                )
-            else:
+            if not is_gfx95_supported():
                 platform = torch.cuda.get_device_properties(0).gcnArchName
                 raise ValueError(
                     f"Current platform {platform} not support mxfp4 computation"
@@ -415,7 +410,6 @@ class Mxfp4Config(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
-
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.quantization.unquant import (
@@ -1914,6 +1908,35 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     ):
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
+        if (
+            self.use_deep_gemm
+            and get_platform().is_sail
+            and moe_runner_config.silu_clamp_mode == "post"
+        ):
+            if not get_moe_a2a_backend().is_none():
+                raise ValueError("SAIL MXFP4 post-SiLU MoE requires standard dispatch")
+            if (
+                moe_runner_config.activation != "silu"
+                or not moe_runner_config.is_gated
+                or moe_runner_config.gate_up_interleaved
+                or moe_runner_config.gemm1_alpha is not None
+                or moe_runner_config.gemm1_clamp_limit is None
+                or moe_runner_config.swiglu_limit is not None
+                or moe_runner_config.apply_router_weight_on_input
+                or moe_runner_config.no_combine
+                or self.with_bias
+            ):
+                raise ValueError(
+                    "SAIL MXFP4 requires split, unbiased gate/up weights, "
+                    "a post-SiLU limit, and router weights on the expert outputs"
+                )
+            if (
+                self.use_deepgemm_mxfp4_w4a8
+                or self.use_deepgemm_mxfp4_w4a16_mma
+                or self.use_deepgemm_mxfp4_w4a16_valu
+            ):
+                raise ValueError("SAIL MXFP4 post-SiLU MoE requires W4A4")
+
         if self.use_mega_moe and moe_runner_backend.is_flashinfer_mxfp4():
             # MegaMoE uses this method for weight preparation only and calls
             # DeepGEMM directly instead of dispatching through a MoeRunner.
@@ -2088,7 +2111,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-
         from sglang.srt.layers.moe.token_dispatcher import (
             DispatchOutputChecker,
             StandardCombineInput,
@@ -2356,7 +2378,6 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         w13_weight = torch.nn.Parameter(

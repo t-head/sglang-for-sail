@@ -25,12 +25,10 @@ pub struct Limits {
     pub vocab_size: u64,
     /// `model_config.context_len`, the ceiling for input + `max_new_tokens`.
     pub context_len: u64,
-    /// Output slots reserved on top of the input (eagle draft tokens).
-    pub num_reserved_tokens: u64,
-    /// Clamp `max_new_tokens` to what fits instead of rejecting the request.
-    pub allow_auto_truncate: bool,
     /// The most a request's `return_hidden_states` may ask for.
     pub return_hidden_states_mode: HiddenStatesMode,
+    /// Minimum context space left after the prompt (admission only).
+    pub min_output_token_reserve: u64,
 }
 
 impl From<&ServerArgs> for Limits {
@@ -39,9 +37,8 @@ impl From<&ServerArgs> for Limits {
             skip_tokenizer_init: sa.skip_tokenizer_init,
             vocab_size: sa.model_config.vocab_size,
             context_len: sa.model_config.context_len,
-            num_reserved_tokens: sa.num_reserved_tokens,
-            allow_auto_truncate: sa.allow_auto_truncate,
             return_hidden_states_mode: sa.hidden_states_mode(),
+            min_output_token_reserve: sa.min_output_token_reserve,
         }
     }
 }

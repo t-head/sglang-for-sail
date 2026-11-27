@@ -128,6 +128,24 @@ mod tests {
     const NO_IDS: &[u32] = &[];
 
     #[test]
+    fn step5_hands_tool_calls_to_the_content_parser() {
+        let text = "reasoning<tool_call>{}</tool_call>";
+        let expected = (
+            "reasoning".to_owned(),
+            "<tool_call>{}</tool_call>".to_owned(),
+        );
+        assert_eq!(
+            split_reasoning(Some("step5"), &ReasoningOptions::default(), text, NO_IDS),
+            expected
+        );
+
+        let mut stream = ReasoningStreamSplitter::new(Some("step5"), ReasoningOptions::default());
+        let first = stream.split("reasoning<tool_", NO_IDS);
+        let second = stream.split("call>{}</tool_call>", NO_IDS);
+        assert_eq!((first.0 + &second.0, first.1 + &second.1), expected);
+    }
+
+    #[test]
     fn reasoning_parser_aliases_keep_python_semantics() {
         let split = build_reasoning_parser("deepseek-r1")
             .detect_and_parse_reasoning("think hard</think>Paris", &[]);

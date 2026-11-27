@@ -1,0 +1,428 @@
+"""Bound score workspace while retaining the native per-row selection contract."""
+
+import numpy as np
+import torch
+
+from sglang.kernels.ops.attention.step5 import options as step5_options
+from sglang.kernels.ops.attention.step5.scoring import (
+    STEP5_SCORE_SPAN_ROWS,
+    can_use_step5_scoring_compact,
+    can_use_step5_scoring_cute,
+    step5_paged_scores,
+)
+from sglang.kernels.ops.attention.step5.scoring_prefill import (
+    build_step5_prefill_scoring_plan,
+    can_use_step5_scoring_prefill,
+    step5_prefill_scores,
+)
+from sglang.kernels.ops.attention.step5.selection import (
+    can_use_step5_selection_cute,
+    step5_select_regions,
+)
+from sglang.kernels.ops.attention.step5.selection_deepselect import (
+    STEP5_HISTORY_REGIONS,
+    can_use_step5_selection_deepselect,
+    deepselect_score_width,
+    step5_select_regions_deepselect,
+)
+from sglang.kernels.ops.attention.step5.selection_ppu import (
+    allocate_step5_ppu_selector_workspace,
+    can_use_step5_selection_ppu,
+)
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.step5.metadata import (
+    STEP5_SCORE_WORKSPACE_ELEMENTS,
+    Step5CompactScoringWorkspace,
+    Step5SelectionWorkspace,
+    query_group_spans,
+    selection_tile_rows,
+)
+from sglang.srt.utils.device import async_h2d
+
+
+def _score_group_spans(rows, lengths, device):
+    """Cut (start, end, rows) spans from per-request packed lengths, or None.
+
+    Spans follow the real row layout, so a span never crosses a request boundary
+    and ragged lengths group without the divisibility the static hint needs.
+    """
+    if lengths is None:
+        return None
+    lengths = np.asarray(lengths, dtype=np.int64).reshape(-1)
+    if not lengths.size or int(lengths.sum()) != rows:
+        return None
+    widest = int(lengths.max())
+    if widest < 2:
+        return None
+    span_rows = max(cand for cand in STEP5_SCORE_SPAN_ROWS if cand <= widest)
+    starts, ends, _ = query_group_spans(lengths, span_rows)
+    if not starts.size:
+        return None
+    return (
+        async_h2d(starts.astype(np.int32), dtype=torch.int32, device=device),
+        async_h2d(ends.astype(np.int32), dtype=torch.int32, device=device),
+        span_rows,
+    )
+
+
+STEP5_COMPACT_KEY_BYTES = 128 * 1024 * 1024
+
+
+def _allocate_compact_scoring(*, rows, score_width, lengths, device):
+    if (
+        lengths is None
+        or rows < 256
+        or score_width <= 512
+        or not can_use_step5_scoring_compact(device)
+    ):
+        return None
+    lengths = np.asarray(lengths, dtype=np.int64).reshape(-1)
+    if not lengths.size or np.any(lengths < 0) or int(lengths.sum()) != rows:
+        return None
+    fp8 = envs.SGLANG_SAIL_STEP5_FP8_INDEXER.get()
+    group_rows = 16 if fp8 else 8
+    if int(lengths.max()) < group_rows:
+        return None
+    # Empty spans need no K scratch; each span's last row must hold its maximum position.
+    lengths = lengths[lengths > 0]
+    scratch_bytes = lengths.size * score_width * 256 * (1 if fp8 else 2)
+    if scratch_bytes > STEP5_COMPACT_KEY_BYTES:
+        return None
+    starts, ends, boundaries = query_group_spans(lengths, group_rows)
+    groups = (lengths + group_rows - 1) // group_rows
+    requests = np.repeat(np.arange(lengths.size), groups)
+    return Step5CompactScoringWorkspace(
+        keys=torch.empty(
+            (lengths.size, score_width, 256),
+            dtype=torch.uint8 if fp8 else torch.bfloat16,
+            device=device,
+        ),
+        request_last_rows=async_h2d(
+            (boundaries[1:] - 1).astype(np.int32), dtype=torch.int32, device=device
+        ),
+        span_start=async_h2d(starts.astype(np.int32), dtype=torch.int32, device=device),
+        span_end=async_h2d(ends.astype(np.int32), dtype=torch.int32, device=device),
+        span_requests=async_h2d(
+            requests.astype(np.int32), dtype=torch.int32, device=device
+        ),
+        rows=rows,
+        group_rows=group_rows,
+        fp8=fp8,
+    )
+
+
+def allocate_selection_workspace(
+    *,
+    rows,
+    score_width,
+    score_group_rows,
+    device,
+    prefill=False,
+    max_score_width=None,
+    prefill_spans=None,
+    score_lengths=None,
+    compact_allowed=True,
+    req_to_token=None,
+    row_to_req=None,
+    positions=None,
+):
+    """Per-forward scratch shared by sequential DSA layers on the model stream.
+
+    Selection/attention consume it before the next layer overwrites it. Each
+    eager forward owns its own tensors; graph capture gives each bucket fixed
+    addresses. It is not a global buffer shared with overlapping forwards.
+    """
+    if rows < 0 or not 1 <= score_width <= STEP5_SCORE_WORKSPACE_ELEMENTS:
+        raise ValueError(
+            "Step5 requires nonnegative rows and a score row fitting its workspace budget"
+        )
+    use_deepselect = False
+    if (
+        # TODO(yhyang201): frozen SGLANG_OPT_STEP5_TOPK_DEEPSELECT_DECODE; prune dead paths.
+        (prefill or step5_options.TOPK_DEEPSELECT_DECODE)
+        and score_width > STEP5_HISTORY_REGIONS
+        and can_use_step5_selection_deepselect(torch.device(device))
+    ):
+        padded = deepselect_score_width(score_width)
+        if max_score_width is None or padded <= deepselect_score_width(max_score_width):
+            score_width, use_deepselect = padded, True
+    # 512 MiB FP32 score budget, independent of packed prefill length.
+    capacity = selection_tile_rows(rows=rows, score_width=score_width)
+    if score_group_rows > 1 and capacity:
+        capacity -= capacity % score_group_rows
+    if rows > 0 and capacity == 0:
+        raise ValueError(
+            "Step5 selection tile cannot fit one score group: "
+            f"rows={rows}, score_group_rows={score_group_rows}, "
+            f"score_width={score_width}. Check "
+            "step5_options.SELECTION_TILE_ROWS and the score workspace budget."
+        )
+    prefill_scoring = None
+    if use_deepselect and prefill_spans is not None and req_to_token is not None:
+        prefill_scoring = dict(spans=prefill_spans, req_to_token=req_to_token)
+    score_rows = (capacity + 63) // 64 * 64 + 64 if prefill_scoring else capacity
+    region_scores = torch.empty(
+        (score_rows, score_width), dtype=torch.float32, device=device
+    )
+    use_cute = can_use_step5_selection_cute(region_scores)
+    scoring_cute = can_use_step5_scoring_cute(region_scores.device)
+    score_groups = None
+    if (
+        prefill
+        and prefill_scoring is None
+        and not scoring_cute
+        and envs.SGLANG_STEP5_SCORING_REGION_OPT.get()
+    ):
+        score_groups = _score_group_spans(rows, score_lengths, region_scores.device)
+    compact_scoring = None
+    if (
+        compact_allowed
+        and prefill
+        and capacity == rows
+        and score_groups is not None
+        and not scoring_cute
+        and not use_cute
+        and not use_deepselect
+    ):
+        compact_scoring = _allocate_compact_scoring(
+            rows=rows,
+            score_width=score_width,
+            lengths=score_lengths,
+            device=region_scores.device,
+        )
+    topk_lengths, topk_lengths_ready = None, False
+    if use_deepselect:
+        topk_lengths = torch.empty(rows, dtype=torch.int32, device=device)
+        if row_to_req is not None and positions is not None:
+            topk_lengths.copy_(torch.where(row_to_req > 0, positions // 8, 0))
+            topk_lengths_ready = True
+    scoring_workspace = None
+    scoring_metadata_ready = False
+    if capacity and scoring_cute:
+        from sglang.kernels.ops.attention.step5.scoring_cute import (
+            allocate_scoring_workspace,
+            prepare_scoring,
+        )
+
+        scoring_workspace = allocate_scoring_workspace(
+            capacity, score_width, score_group_rows, region_scores.device
+        )
+        # Metadata is computed in the forward graph, hence refreshed on replay.
+        # Prefill/tiled/CLEAR_FUTURE paths retain the original implementation.
+        if (
+            # TODO(yhyang201): frozen SGLANG_OPT_STEP5_INDEXER_NORM_PACKED; prune dead paths.
+            step5_options.INDEXER_NORM_PACKED
+            and not prefill
+            and use_cute
+            and rows == capacity
+            and req_to_token is not None
+            and row_to_req is not None
+            and positions is not None
+        ):
+            prepare_scoring(scoring_workspace, req_to_token, row_to_req, positions)
+            scoring_metadata_ready = True
+    # Region ids arrive ranked rather than ascending on the PPU radix path, so
+    # only allocate its scratch when that path will actually run. Tiles that fit
+    # in the 512 history slots keep every region, so the selector would be pure
+    # overhead there.
+    ppu_selector = None
+    if (
+        capacity
+        and score_width > 512
+        and not use_cute
+        and not use_deepselect
+        and envs.SGLANG_SAIL_STEP5_SELECTION_RADIX.get()
+        and can_use_step5_selection_ppu(region_scores)
+    ):
+        ppu_selector = allocate_step5_ppu_selector_workspace(
+            rows=capacity, width=score_width, device=device
+        )
+    return Step5SelectionWorkspace(
+        packed=torch.empty((rows, 513), dtype=torch.int64, device=device),
+        counts=torch.empty(rows, dtype=torch.int32, device=device),
+        lengths=torch.empty(rows, dtype=torch.int32, device=device),
+        region_scores=region_scores,
+        use_cute=use_cute,
+        scoring_workspace=scoring_workspace,
+        scoring_metadata_ready=scoring_metadata_ready,
+        ids=(
+            None
+            if use_cute and not use_deepselect
+            else torch.empty((capacity, 513), dtype=torch.int32, device=device)
+        ),
+        use_deepselect=use_deepselect,
+        prefill_scoring=prefill_scoring,
+        score_groups=score_groups,
+        compact_scoring=compact_scoring,
+        topk_lengths=topk_lengths,
+        topk_lengths_ready=topk_lengths_ready,
+        topk_ids=(
+            torch.empty(
+                (capacity, STEP5_HISTORY_REGIONS), dtype=torch.int32, device=device
+            )
+            if use_deepselect
+            else None
+        ),
+        tiles=tuple(
+            (start, min(start + capacity, rows))
+            for start in range(0, rows, capacity or 1)
+        ),
+        ppu_selector=ppu_selector,
+    )
+
+
+def select_step5_regions(
+    *,
+    index_q: torch.Tensor,
+    index_weights: torch.Tensor,
+    compressed_index_keys: torch.Tensor,
+    req_to_token: torch.Tensor,
+    row_to_req: torch.Tensor,
+    positions: torch.Tensor,
+    score_width: int,
+    score_group_rows: int = 1,
+    scoring_weight_scale: float | None = None,
+    packed_qw_ready: bool = False,
+    workspace: Step5SelectionWorkspace | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return packed region IDs, counts and lengths without owning request state.
+
+    CSA publication precedes this call. Every row sees the same completed
+    compressed_index_keys and causal position as the untiled path. Slicing only query rows
+    keeps request IDs, logical regions and subsequent prefill groups unchanged.
+    Scratch is reused on the caller's stream; Graph loops depend on shapes only.
+    """
+    if workspace is None:
+        # Standalone kernel callers may allocate their own one-call workspace.
+        workspace = allocate_selection_workspace(
+            rows=index_q.shape[0],
+            score_width=score_width,
+            score_group_rows=score_group_rows,
+            device=index_q.device,
+            row_to_req=row_to_req,
+            positions=positions,
+        )
+    packed, counts, lengths = workspace.packed, workspace.counts, workspace.lengths
+    region_scores, ids = workspace.region_scores, workspace.ids
+    plan = _prefill_scoring_plan(workspace, index_q)
+    if packed_qw_ready and (
+        not workspace.scoring_metadata_ready
+        or not workspace.use_cute
+        or len(workspace.tiles) != 1
+        or plan is not None
+    ):
+        raise ValueError("Packed Q/W requires prepared single-tile decode scoring")
+    for tile_index, (start, end) in enumerate(workspace.tiles):
+        tile_scores = region_scores[: end - start]
+        if packed_qw_ready:
+            from sglang.kernels.ops.attention.step5.scoring_cute import (
+                launch_prepared_scoring,
+            )
+
+            launch_prepared_scoring(
+                compressed_index_keys,
+                tile_scores,
+                workspace.scoring_workspace,
+                end - start,
+            )
+        elif plan is not None:
+            step5_prefill_scores(
+                index_q[start:end],
+                index_weights[start:end],
+                compressed_index_keys=compressed_index_keys,
+                tile=plan.tiles[tile_index],
+                plan=plan,
+                out=region_scores,
+                weight_scale=scoring_weight_scale,
+            )
+        else:
+            step5_paged_scores(
+                index_q[start:end],
+                index_weights[start:end],
+                compressed_index_keys=compressed_index_keys,
+                req_to_token=req_to_token,
+                row_to_req=row_to_req[start:end],
+                positions=positions[start:end],
+                out=tile_scores,
+                # The PPU radix selector reads live history only and keeps short histories intact.
+                clear_future=not (
+                    workspace.use_cute or workspace.ppu_selector is not None
+                ),
+                group_rows=score_group_rows,
+                workspace=workspace.scoring_workspace,
+                compact_workspace=workspace.compact_scoring,
+                weight_scale=scoring_weight_scale,
+                # Tiled rows are sliced before scoring, so spans only describe the
+                # whole layout when one tile covers every row.
+                score_groups=(
+                    workspace.score_groups if len(workspace.tiles) == 1 else None
+                ),
+            )
+        if workspace.use_deepselect:
+            step5_select_regions_deepselect(
+                tile_scores,
+                positions[start:end],
+                row_to_req[start:end],
+                packed[start:end],
+                counts[start:end],
+                req_to_token=req_to_token,
+                causal_lengths=lengths[start:end],
+                history_lengths=workspace.topk_lengths[start:end],
+                topk_ids=workspace.topk_ids[: end - start],
+                region_ids=ids[: end - start],
+                history_ready=workspace.topk_lengths_ready,
+            )
+        elif workspace.use_cute:
+            from sglang.kernels.ops.attention.step5.selection_cute import (
+                step5_select_regions_cute,
+            )
+
+            step5_select_regions_cute(
+                tile_scores,
+                positions[start:end],
+                row_to_req[start:end],
+                packed[start:end],
+                counts[start:end],
+                req_to_token=req_to_token,
+                causal_lengths=lengths[start:end],
+            )
+        else:
+            tile_ids = ids[: end - start]
+            # Packing is part of this launch: the kernel reads the IDs it just
+            # wrote, so the separate step5_pack_decode_regions pass is gone.
+            step5_select_regions(
+                tile_scores,
+                positions=positions[start:end],
+                row_to_req=row_to_req[start:end],
+                region_ids=tile_ids,
+                use_cute=workspace.use_cute,
+                counts=counts[start:end],
+                ppu_workspace=workspace.ppu_selector,
+                req_to_token=req_to_token,
+                packed=packed[start:end],
+                causal_lengths=lengths[start:end],
+            )
+    return packed, counts, lengths
+
+
+def _prefill_scoring_plan(workspace, index_q):
+    state = workspace.prefill_scoring
+    if state is None:
+        return None
+    if "plan" not in state:
+        heads = int(index_q.shape[1])
+        plan = None
+        if can_use_step5_scoring_prefill(index_q.device, heads):
+            prefixes, lengths, request_slots = state["spans"]
+            plan = build_step5_prefill_scoring_plan(
+                tiles=workspace.tiles,
+                prefixes=list(prefixes),
+                lengths=list(lengths),
+                request_slots=request_slots,
+                req_to_token=state["req_to_token"],
+                capacity=workspace.region_scores.shape[0],
+                heads=heads,
+                device=index_q.device,
+            )
+        state["plan"] = plan
+    return state["plan"]

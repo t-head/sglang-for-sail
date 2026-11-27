@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
+from sglang.kernels.fused_op import register_fused_op
+from sglang.kernels.ops.moe.step5_router_topk import Step5RouterTopKOp
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import (
@@ -285,6 +287,14 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="moe.local_expert_lookup",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.local_expert_map:local_expert_lookup",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
         op="moe.mask_topk_ids",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.moe.dsv4:mask_topk_ids",
@@ -412,3 +422,8 @@ register_kernel(
         target="sglang.kernels.ops.moe.eplb_stats:add_to_row",
     )
 )
+
+_STEP5_ROUTER_TOPK = register_fused_op(
+    Step5RouterTopKOp(), __name__, "_STEP5_ROUTER_TOPK"
+)
+__all__.append("Step5RouterTopKOp")

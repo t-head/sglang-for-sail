@@ -95,6 +95,9 @@ from sglang.srt.configs.all_configs import (
     Step3p5Config,
     Step3p7Config,
     Step3VLConfig,
+    Step5Config,
+    Step5MTPConfig,
+    Step5VLConfig,
     Xing4_0Config,
     XllmConfig,
 )
@@ -182,6 +185,9 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         Step3p5Config,
         Step3p7Config,
         MiniCPMHybridConfig,
+        Step5Config,
+        Step5MTPConfig,
+        Step5VLConfig,
         MiniCPMV4_6Config,
         MiniCPMV4_6VisionConfig,
         MiniCPMV4_7Config,
@@ -360,15 +366,22 @@ def resolve_runai_obj_uri(model_name_or_path: str) -> str:
     return model_name_or_path
 
 
-def _resolve_local_or_cached_file(model_name_or_path, filename, revision=None):
+def _resolve_local_or_cached_file(
+    model_name_or_path, filename, revision=None, *, cache_dir=None, subfolder=""
+):
     """Resolve a file from a local directory or HF hub cache (no network)."""
-    local_path = Path(model_name_or_path) / filename
+    local_path = Path(model_name_or_path) / subfolder / filename
     if local_path.is_file():
         return str(local_path)
     from huggingface_hub import hf_hub_download
 
     return hf_hub_download(
-        model_name_or_path, filename, revision=revision, local_files_only=True
+        model_name_or_path,
+        filename,
+        revision=revision,
+        local_files_only=True,
+        cache_dir=cache_dir,
+        subfolder=subfolder,
     )
 
 

@@ -51,7 +51,9 @@ from .tokenizer import (
     _fix_added_tokens_encoding,
     _fix_special_tokens_pattern,
     _fix_v5_add_bos_eos_token,
+    _fix_v5_tokenizer_components,
     _install_tokenizer_warnings_filter,
+    _is_step5_checkpoint,
     _shim_fastokens_backend,
     get_tokenizer,
 )
@@ -328,11 +330,13 @@ def _get_processor(
     # Checkpoints with language_model_only=True are text-only despite their
     # multimodal-family config; route to tokenizer instead of the mm processor.
     if getattr(config, "language_model_only", False):
-        return AutoTokenizer.from_pretrained(
+        return get_tokenizer(
             tokenizer_name,
             *args,
+            tokenizer_mode=tokenizer_mode,
+            tokenizer_backend=tokenizer_backend,
             trust_remote_code=trust_remote_code,
-            revision=revision,
+            tokenizer_revision=revision,
             **kwargs,
         )
 
@@ -423,12 +427,21 @@ def _get_processor(
     tokenizer = get_tokenizer_from_processor(processor)
 
     # AutoProcessor may internally create a TokenizersBackend tokenizer
-    # (same issue as get_tokenizer). Replace it with a properly loaded one.
-    if type(tokenizer).__name__ == _TOKENIZERS_BACKEND:
+    # (same issue as get_tokenizer). Step-5 is worse: class selection rebuilds
+    # its serialized byte-level BPE from the declared Llama class and drops the
+    # space prefix, so the processor path must also reload from tokenizer.json.
+    file_kwargs = {
+        key: kwargs[key]
+        for key in ("cache_dir", "subfolder")
+        if key in kwargs and kwargs[key] is not None
+    }
+    if type(tokenizer).__name__ == _TOKENIZERS_BACKEND or _is_step5_checkpoint(
+        tokenizer_name, revision, **file_kwargs
+    ):
         logger.warning(
-            "Processor tokenizer for %s is TokenizersBackend, "
-            "reloading via get_tokenizer",
+            "Processor tokenizer for %s is %s, reloading via get_tokenizer",
             tokenizer_name,
+            type(tokenizer).__name__,
         )
         tokenizer = get_tokenizer(
             tokenizer_name,
@@ -436,6 +449,12 @@ def _get_processor(
             trust_remote_code=trust_remote_code,
             tokenizer_revision=revision,
             tokenizer_backend=tokenizer_backend,
+            **file_kwargs,
+            **{
+                key: kwargs[key]
+                for key in ("local_files_only", "token", "force_download")
+                if key in kwargs
+            },
         )
         if isinstance(processor, PreTrainedTokenizerBase):
             processor = tokenizer
@@ -443,7 +462,9 @@ def _get_processor(
             processor.tokenizer = tokenizer
 
     _install_tokenizer_warnings_filter(tokenizer)
-    _fix_v5_add_bos_eos_token(tokenizer, tokenizer_name, revision)
+    # Restore the serialized tokenizer components and the checkpoint's BOS/EOS behavior.
+    _fix_v5_tokenizer_components(tokenizer, tokenizer_name, revision, **file_kwargs)
+    _fix_v5_add_bos_eos_token(tokenizer, tokenizer_name, revision, **file_kwargs)
 
     if tokenizer.chat_template is None:
         local_path = download_from_hf(

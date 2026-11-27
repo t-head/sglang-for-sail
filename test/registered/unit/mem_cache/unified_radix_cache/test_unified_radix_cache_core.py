@@ -1333,21 +1333,28 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
 
         pre_len = 20
         tokens = self._make_seq(1, pre_len)
-        req, _ = self._make_inflight_req(cache, allocator, req_to_token_pool, tokens)
+        req, kv_indices = self._make_inflight_req(
+            cache, allocator, req_to_token_pool, tokens
+        )
 
         swa_avail_before = allocator.swa_attn_allocator.available_size()
 
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
             cache.checkpoint(req, up_to=req.extend_end)
 
+        # Without bigrams and with page size one, the boundary covers all committed tokens.
         cushion = max(self.cfg.sliding_window_size, self.cfg.page_size)
-        expected_evicted = (pre_len - 1) - cushion
+        expected_evicted = pre_len - cushion
         self.assertEqual(
             req.kv.get_evicted_seqlen(cache.window_sub_pools()[0][0]),
             expected_evicted,
-            f"swa_evicted_seqlen should advance to (pre_len-1) - cushion = "
+            f"swa_evicted_seqlen should advance to pre_len - cushion = "
             f"{expected_evicted}, got {req.kv.get_evicted_seqlen(cache.window_sub_pools()[0][0])}",
         )
+        mapping = allocator.full_to_swa_index_mapping
+        self.assertTrue(bool((mapping[kv_indices[:expected_evicted]] == 0).all()))
+        self.assertTrue(bool((mapping[kv_indices[expected_evicted:]] > 0).all()))
+        self.assertEqual(req.kv.cache_protected_len, pre_len)
 
         swa_avail_after = allocator.swa_attn_allocator.available_size()
         self.assertGreaterEqual(
@@ -1403,10 +1410,12 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
     def test_swa_eager_eviction_noop_when_within_window(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
 
-        cushion = self.cfg.sliding_window_size + self.cfg.page_size  # = 5
-        pre_len = cushion  # exactly at the boundary, nothing slid out
+        # Without bigrams, the complete insertion window ends at four.
+        pre_len = max(self.cfg.sliding_window_size, self.cfg.page_size)
         tokens = self._make_seq(1, pre_len)
-        req, _ = self._make_inflight_req(cache, allocator, req_to_token_pool, tokens)
+        req, kv_indices = self._make_inflight_req(
+            cache, allocator, req_to_token_pool, tokens
+        )
 
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
             cache.checkpoint(req, up_to=req.extend_end)
@@ -1416,6 +1425,9 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
             0,
             "Nothing should be evicted when prefill fits inside the cushion",
         )
+        mapping = allocator.full_to_swa_index_mapping
+        self.assertTrue(bool((mapping[kv_indices] > 0).all()))
+        self.assertEqual(req.kv.cache_protected_len, pre_len)
 
         cache.unlock(req.lock)
         cache.sanity_check()

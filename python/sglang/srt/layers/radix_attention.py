@@ -179,7 +179,9 @@ class RadixAttention(nn.Module):
                 return output.view(-1, self.tp_q_head_num, self.v_head_dim), lse
             return output
         real_num_tokens = padded_extend_real_tokens(q.shape[0], forward_batch)
-        if real_num_tokens is not None:
+        if real_num_tokens is not None and not getattr(
+            get_attn_backend(), "handles_padded_extend", False
+        ):
             return _attention_on_real_rows(
                 self,
                 real_num_tokens,

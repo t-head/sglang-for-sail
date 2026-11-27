@@ -110,6 +110,10 @@ class TestDcpLogicalCapacity(CustomTestCase):
                 "sglang.srt.managers.tp_worker.get_schedule",
                 return_value=NS(max_prefill_tokens=16384, max_queued_requests=None),
             ),
+            patch(
+                "sglang.srt.managers.tp_worker.get_serving",
+                return_value=NS(min_output_token_reserve=1),
+            ),
         ):
             config.start()
             self.addCleanup(config.stop)
@@ -126,14 +130,14 @@ class TestDcpLogicalCapacity(CustomTestCase):
 
         self.assertEqual(info[0], 64)
         self.assertEqual(info[4], 64 * 3 - 1)
-        self.assertEqual(info[5], 64 * 3 - 6)
+        self.assertEqual(info[5], 64 * 3 - 2)
 
     def test_logical_capacity(self):
         for dcp_size in (1, 2, 8):
             with self.subTest(dcp_size=dcp_size):
                 info = TpModelWorker.get_worker_info(self.make_worker(dcp_size))
                 self.assertEqual(info[0], PHYSICAL * dcp_size)
-                self.assertEqual(info[4], min(CONTEXT, PHYSICAL * dcp_size) - 1)
+                self.assertEqual(info[4], min(CONTEXT, PHYSICAL * dcp_size - 1))
 
         # Unified Mamba's allocator.size also counts Mamba state bytes, so
         # capacity must come from the configured rows.

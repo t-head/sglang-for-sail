@@ -136,6 +136,9 @@ class PoolName(str, Enum):
     # Full-context MLA layers: latent KV and DSA index keys.
     ERNIE5_5_MLA = "ernie55_mla"
     ERNIE5_5_MLA_INDEXER = "ernie55_mla_indexer"
+    STEP5_COMPRESSED_INDEX_KEY = "step5_compressed_index_key"
+    STEP5_FP8_K_SCALE = "step5_fp8_k_scale"
+    STEP5_FP8_V_SCALE = "step5_fp8_v_scale"
 
     # Draft KV pool
     DRAFT = "draft"

@@ -109,6 +109,8 @@ pub(crate) struct TagConfig {
     pub end: &'static str,
     pub tool_start: Option<&'static str>,
     pub tool_start_at_line_start: bool,
+    pub force_reasoning_by_default: bool,
+    pub prefer_tool_start_boundary: bool,
     // Read only by the OpenAI layer.
     #[cfg_attr(not(feature = "openai"), allow(dead_code))]
     pub reasoning_default: ReasoningDefault,
@@ -150,6 +152,7 @@ pub(crate) struct TagDetector {
     end: &'static str,
     tool_start: Option<&'static str>,
     tool_start_at_line_start: bool,
+    prefer_tool_start_boundary: bool,
     in_reasoning: bool,
     stream_reasoning: bool,
     force_nonempty_content: bool,
@@ -163,7 +166,9 @@ pub(crate) struct TagDetector {
 impl TagDetector {
     pub(crate) fn new(config: TagConfig, options: &ReasoningOptions) -> Self {
         let previous_content = options.previous_content.clone().unwrap_or_default();
-        let mut in_reasoning = options.force_reasoning.unwrap_or(false);
+        let mut in_reasoning = options
+            .force_reasoning
+            .unwrap_or(config.force_reasoning_by_default);
         if previous_content.contains(config.start) {
             in_reasoning = true;
         }
@@ -175,6 +180,7 @@ impl TagDetector {
             end: config.end,
             tool_start: config.tool_start,
             tool_start_at_line_start: config.tool_start_at_line_start,
+            prefer_tool_start_boundary: config.prefer_tool_start_boundary,
             in_reasoning,
             stream_reasoning: options.stream_reasoning,
             force_nonempty_content: options.force_nonempty_content,
@@ -200,6 +206,12 @@ impl TagDetector {
         let mut processed = text;
         while let Some(rest) = processed.strip_prefix(self.start) {
             processed = rest;
+        }
+        if self.prefer_tool_start_boundary
+            && let Some(idx) = self.find_tool_start(processed, "")
+            && processed.find(self.end).is_none_or(|end| idx < end)
+        {
+            return (processed[..idx].to_owned(), processed[idx..].to_owned());
         }
         if !processed.contains(self.end) && !self.previous_content.contains(self.end) {
             if let Some(idx) = self.find_tool_start(processed, "") {
@@ -244,6 +256,15 @@ impl TagDetector {
             self.buffer = current.clone();
             self.stripped_think_start = true;
             self.in_reasoning = true;
+        }
+        if self.in_reasoning
+            && self.prefer_tool_start_boundary
+            && let Some(idx) = self.find_tool_start(&current, &self.streamed_reasoning_tail)
+            && current.find(self.end).is_none_or(|end| idx < end)
+        {
+            self.buffer.clear();
+            self.in_reasoning = false;
+            return (current[..idx].to_owned(), current[idx..].to_owned());
         }
         if self.in_reasoning
             && let Some(end_idx) = current.find(self.end)

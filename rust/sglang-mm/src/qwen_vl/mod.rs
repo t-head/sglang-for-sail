@@ -204,8 +204,11 @@ impl MmFamilyProcessor for QwenVlProcessor {
     fn layout(&self, input_ids: &[i64], items: &[Geometry]) -> Result<TokenLayout, String> {
         let counts = items
             .iter()
-            .map(|Geometry::Grid(grid)| self.tokens_per_image(grid))
-            .collect::<Vec<_>>();
+            .map(|geometry| match geometry {
+                Geometry::Grid(grid) => Ok(self.tokens_per_image(grid)),
+                _ => Err("qwen_vl: expected grid geometry".to_string()),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         token_layout::layout_by_placeholder(input_ids, self.spec.image_token_id, &counts)
     }
 
@@ -218,12 +221,15 @@ impl MmFamilyProcessor for QwenVlProcessor {
         let mrope_items = offsets
             .iter()
             .zip(items)
-            .map(|(&(start, end), Geometry::Grid(grid))| MropeItem {
-                start,
-                end,
-                grid: *grid,
+            .map(|(&(start, end), geometry)| match geometry {
+                Geometry::Grid(grid) => Ok(MropeItem {
+                    start,
+                    end,
+                    grid: *grid,
+                }),
+                _ => Err("qwen_vl: expected grid geometry".to_string()),
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         let (positions, delta) = mrope_image_only(input_len, &mrope_items, self.spec.merge_size)?;
         Ok(PositionOutput::MRope { positions, delta })
     }
@@ -441,7 +447,9 @@ mod python {
                 proc.process_item(&DecodedMedia::Image { rgb, height, width })
             })
             .map_err(PyValueError::new_err)?;
-        let Geometry::Grid([t, h, w]) = out.geometry;
+        let Geometry::Grid([t, h, w]) = out.geometry else {
+            return Err(PyValueError::new_err("qwen_vl: expected grid geometry"));
+        };
         let TensorData::F32(pixel_values) = out.feature.data else {
             return Err(PyValueError::new_err("qwen_vl: expected f32 feature"));
         };

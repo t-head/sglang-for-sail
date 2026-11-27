@@ -540,117 +540,110 @@ class TestInklingCheckpointIndices(CustomTestCase):
         from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 
         for static in (False, True):
-            for graph_available in (False, True):
-                with self.subTest(static=static, graph_available=graph_available):
-                    steps = []
-                    for step in range(2):
-                        backend, allocator, pool, slots = self.make_backend(
-                            static=static, slot_count=12, draft_token_num=4
-                        )
-                        backend.mamba_cache_chunk_size = 4
-                        backend.req_to_token_pool.req_index_to_mamba_index_mapping.fill_(
-                            slots[3]
-                        )
-                        if not static:
-                            allocator.free(slots[step : step + 1].clone())
-                            allocator.flush_for_allocation()
-                        wrapper = InklingShortConvHybridAttnBackend.__new__(
-                            InklingShortConvHybridAttnBackend
-                        )
-                        wrapper.full_attn_backend = Mock()
-                        wrapper.short_conv_backend = backend
-                        wrapper.attn_backend_list = [wrapper.full_attn_backend, backend]
-                        steps.append((wrapper, backend, pool))
-                    ids = slots[-1:].clone()
-                    original = ids.clone()
-                    batch = self.batch(ids, mode=ForwardMode.DRAFT_EXTEND_V2)
-                    batch.seq_lens = torch.tensor([2], device="cuda")
-                    batch.extend_seq_lens = torch.tensor([4], device="cuda")
-                    batch.extend_prefix_lens = None
-                    batch.extend_num_tokens = 4
-                    batch.spec_info = EagleDraftExtendInput(
-                        num_accept_tokens=torch.tensor([3], device="cuda")
+            with self.subTest(static=static):
+                steps = []
+                for step in range(2):
+                    backend, allocator, pool, slots = self.make_backend(
+                        static=static, slot_count=12, draft_token_num=4
                     )
-                    batch.mark_forward_metadata_ready = Mock()
-                    schedule_batch = SimpleNamespace(
-                        seq_lens=batch.seq_lens,
-                        seq_lens_cpu=None,
-                        forward_mode=batch.forward_mode,
-                        model_config=SimpleNamespace(vocab_size=32),
+                    backend.mamba_cache_chunk_size = 4
+                    backend.req_to_token_pool.req_index_to_mamba_index_mapping.fill_(
+                        slots[3]
                     )
-                    runner = SimpleNamespace(
-                        spec_algorithm=SimpleNamespace(is_standalone=lambda: False),
-                        attn_backend=steps[0][0],
-                        model_config=SimpleNamespace(model_is_mrope=False),
-                    )
-                    graph_runner = (
-                        SimpleNamespace(can_run_graph=lambda _: False)
-                        if graph_available
-                        else None
-                    )
-                    with (
-                        patch.object(
-                            common.ForwardBatch, "init_new", return_value=batch
-                        ),
-                        patch.object(common, "maybe_detect_oob"),
-                        patch.object(common, "is_npu", return_value=False),
-                    ):
-                        planned = common.prepare_for_draft_extend(
-                            batch.spec_info,
-                            schedule_batch,
-                            torch.zeros(4, dtype=torch.int64, device="cuda"),
-                            4,
-                            runner,
-                            graph_runner,
-                            return_hidden_states_before_norm=False,
-                        )
-                    self.assertIs(planned, batch)
-                    destinations = []
-                    # Inspect the real pre-plan, then repeat step 0 and enter step 1.
-                    for index in (0, 0, 1):
-                        wrapper, backend, pool = steps[index]
-                        if destinations:
-                            wrapper.init_forward_metadata(batch)
-                        self.assertIs(batch.mamba_track_indices, ids)
-                        torch.testing.assert_close(ids, original, rtol=0, atol=0)
-                        physical = backend._translate_mamba_indices(ids).long()
-                        torch.testing.assert_close(
-                            backend.sconv_metadata.track_cache_indices,
-                            physical,
-                            rtol=0,
-                            atol=0,
-                        )
-                        destinations.append(physical.clone())
-                        cache = pool.mamba_cache.conv[0][0]
-                        cache.fill_(-7)
-                        hidden = torch.arange(4, device="cuda")[:, None].expand(4, 64)
-                        hidden = hidden.to(torch.bfloat16)
-                        active = backend._cache_indices.long()
-                        joined = torch.cat([cache[active[0]], hidden])
-                        expected = cache.clone()
-                        expected[physical[0]] = joined[1:4]
-                        expected[active[0]] = joined[3:6]
-                        with patch(
-                            "sglang.srt.models.inkling_common.sconv.get_exec",
-                            return_value=SimpleNamespace(
-                                mamba=SimpleNamespace(
-                                    enable_mamba_extra_buffer=True,
-                                    mamba_track_interval=4,
-                                )
-                            ),
-                        ):
-                            ShortConvolution._update_sconv_cache_for_draft_extend(
-                                SimpleNamespace(
-                                    _conv_state=lambda _: backend.sconv_metadata
-                                ),
-                                batch,
-                                cache,
-                                backend._cache_indices,
-                                hidden,
-                            )
-                        torch.testing.assert_close(cache, expected, rtol=0, atol=0)
                     if not static:
-                        self.assertFalse(torch.equal(destinations[0], destinations[-1]))
+                        allocator.free(slots[step : step + 1].clone())
+                        allocator.flush_for_allocation()
+                    wrapper = InklingShortConvHybridAttnBackend.__new__(
+                        InklingShortConvHybridAttnBackend
+                    )
+                    wrapper.full_attn_backend = Mock()
+                    wrapper.short_conv_backend = backend
+                    wrapper.attn_backend_list = [wrapper.full_attn_backend, backend]
+                    steps.append((wrapper, backend, pool))
+                ids = slots[-1:].clone()
+                original = ids.clone()
+                batch = self.batch(ids, mode=ForwardMode.DRAFT_EXTEND_V2)
+                batch.seq_lens = torch.tensor([2], device="cuda")
+                batch.seq_lens_cpu = torch.tensor([2])
+                batch.extend_seq_lens = torch.tensor([4], device="cuda")
+                batch.extend_prefix_lens = None
+                batch.extend_num_tokens = 4
+                batch.spec_info = EagleDraftExtendInput(
+                    num_accept_tokens=torch.tensor([3], device="cuda")
+                )
+                batch.mark_forward_metadata_ready = Mock()
+                schedule_batch = SimpleNamespace(
+                    seq_lens=batch.seq_lens,
+                    seq_lens_cpu=batch.seq_lens_cpu,
+                    forward_mode=batch.forward_mode,
+                    model_config=SimpleNamespace(vocab_size=32),
+                )
+                runner = SimpleNamespace(
+                    spec_algorithm=SimpleNamespace(is_standalone=lambda: False),
+                    attn_backend=steps[0][0],
+                    model_config=SimpleNamespace(model_is_mrope=False),
+                )
+                with (
+                    patch.object(common.ForwardBatch, "init_new", return_value=batch),
+                    patch.object(common, "maybe_detect_oob"),
+                ):
+                    planned = common.prepare_for_draft_extend(
+                        batch.spec_info,
+                        schedule_batch,
+                        torch.zeros(4, dtype=torch.int64, device="cuda"),
+                        4,
+                        runner,
+                        return_hidden_states_before_norm=False,
+                    )
+                self.assertIs(planned, batch)
+                runner.attn_backend.init_forward_metadata(planned)
+                planned.mark_forward_metadata_ready()
+                destinations = []
+                # Inspect the real pre-plan, then repeat step 0 and enter step 1.
+                for index in (0, 0, 1):
+                    wrapper, backend, pool = steps[index]
+                    if destinations:
+                        wrapper.init_forward_metadata(batch)
+                    self.assertIs(batch.mamba_track_indices, ids)
+                    torch.testing.assert_close(ids, original, rtol=0, atol=0)
+                    physical = backend._translate_mamba_indices(ids).long()
+                    torch.testing.assert_close(
+                        backend.sconv_metadata.track_cache_indices,
+                        physical,
+                        rtol=0,
+                        atol=0,
+                    )
+                    destinations.append(physical.clone())
+                    cache = pool.mamba_cache.conv[0][0]
+                    cache.fill_(-7)
+                    hidden = torch.arange(4, device="cuda")[:, None].expand(4, 64)
+                    hidden = hidden.to(torch.bfloat16)
+                    active = backend._cache_indices.long()
+                    joined = torch.cat([cache[active[0]], hidden])
+                    expected = cache.clone()
+                    expected[physical[0]] = joined[1:4]
+                    expected[active[0]] = joined[3:6]
+                    with patch(
+                        "sglang.srt.models.inkling_common.sconv.get_exec",
+                        return_value=SimpleNamespace(
+                            mamba=SimpleNamespace(
+                                enable_mamba_extra_buffer=True,
+                                mamba_track_interval=4,
+                            )
+                        ),
+                    ):
+                        ShortConvolution._update_sconv_cache_for_draft_extend(
+                            SimpleNamespace(
+                                _conv_state=lambda _: backend.sconv_metadata
+                            ),
+                            batch,
+                            cache,
+                            backend._cache_indices,
+                            hidden,
+                        )
+                    torch.testing.assert_close(cache, expected, rtol=0, atol=0)
+                if not static:
+                    self.assertFalse(torch.equal(destinations[0], destinations[-1]))
 
     def test_static_draft_staging_keeps_checkpoint_metadata(self):
         from sglang.srt.speculative.eagle_info import EagleDraftExtendInput

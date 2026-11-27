@@ -734,6 +734,7 @@ def deep_moe_impl_fused(
     use_mxfp4_w4a8: bool = False,
     w1_inv_scale: float = 1.0,
     w2_inv_scale: float = 1.0,
+    silu_clamp_mode: Optional[str] = None,
 ):
     block_align = 1
 
@@ -1004,7 +1005,14 @@ def deep_moe_impl_fused(
                 gemm1_limit,
             )
         elif gemm1_limit is not None:
-            out2 = _swiglu_silu_clamp_mul(out1, gemm1_limit)
+            if silu_clamp_mode == "post":
+                from sglang.kernels.ops.activation.silu_clamp_and_mul import (
+                    SiluClampAndMulOp,
+                )
+
+                out2 = SiluClampAndMulOp(limit=gemm1_limit)(out1)
+            else:
+                out2 = _swiglu_silu_clamp_mul(out1, gemm1_limit)
         else:
             if swiglu_limit is not None:
                 out1 = _apply_swiglu_limit(out1, swiglu_limit=swiglu_limit)
@@ -1137,6 +1145,7 @@ def fused_experts_none_to_deep_gemm(
         gemm1_alpha=moe_runner_config.gemm1_alpha,
         gemm1_limit=moe_runner_config.gemm1_clamp_limit,
         swiglu_limit=moe_runner_config.swiglu_limit,
+        silu_clamp_mode=moe_runner_config.silu_clamp_mode,
         activation=moe_runner_config.activation,
         gate_up_interleaved=moe_runner_config.gate_up_interleaved,
         out_hidden_states=output,
