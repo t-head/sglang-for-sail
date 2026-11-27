@@ -59,3 +59,45 @@ def situ_and_mul_masked_post_quant(
         float(beta),
         float(linear_beta),
     )
+
+
+@cache_once
+def _jit_situ_mul_quant_int8_varlen_module():
+    args = make_cpp_args(is_arch_support_pdl())
+    return load_jit(
+        _make_name("situ_mul_quant_int8_varlen"),
+        *args,
+        cuda_files=["kimi_k3/situ_and_mul.cuh"],
+        cuda_wrappers=[("run", f"SituAndMulMaskedPostQuantInt8Kernel<{args}>::run")],
+        extra_cuda_cflags=["-use_fast_math"],
+    )
+
+
+def situ_and_mul_masked_post_quant_int8(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    beta: float,
+    linear_beta: float,
+    topk: int = 8,
+    expected_m: int | None = None,
+) -> None:
+    """Fused masked SiTU activation + per-token INT8 quantization.
+
+    input:        [E, T, 2*N] bf16
+    output:       [E, T, N] int8
+    output_scale: [E, T, 1] float32
+    masked_m:     [E] int32
+    """
+    module = _jit_situ_mul_quant_int8_varlen_module()
+    module.run(
+        input,
+        output,
+        output_scale,
+        masked_m,
+        topk,
+        int(expected_m) if expected_m is not None else int(input.shape[1]),
+        float(beta),
+        float(linear_beta),
+    )

@@ -5836,6 +5836,7 @@ class DeepseekV4ForCausalLM(
                 "mxfp4",
                 "w8a8_int8",
                 "w8a8_fp8",
+                "w4a8_int8",
             ):
                 name = name.replace(".weight_scale_inv", ".weight_scale")
 
