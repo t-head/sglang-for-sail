@@ -776,25 +776,10 @@ class ModelConfig:
             self.is_fp4_experts = True
             logger.info("Detected MiMo-V2 mxfp4 routed-expert layout.")
 
-        # DSV4 mxfp4 layout applies only when the ckpt does not opt in above.
-        if is_deepseek_v4(self.hf_config) and routed_experts_quant_method is None:
-            self.is_fp4_experts = envs.SGLANG_DSV4_FP4_EXPERTS.get()
-            if (
-                not envs.SGLANG_DSV4_FP4_EXPERTS.is_set()
-                or envs.SGLANG_DSV4_FP4_DEQUANT.is_set()
-            ):
-                from sglang.srt.configs.deepseek_v4 import try_detect_fp4_experts
-
-                detected = try_detect_fp4_experts(self.model_path)
-                if detected is not None:
-                    self.is_fp4_experts = detected
-                    logger.info(
-                        "Auto-detected DSV4 routed-expert layout: is_fp4_experts=%s",
-                        self.is_fp4_experts,
-                    )
-            if envs.SGLANG_DSV4_FP4_DEQUANT.get():
-                envs.SGLANG_DSV4_FP4_DEQUANT.set(self.is_fp4_experts is not None)
-
+        infer_dsv4_expert_layout = (
+            is_deepseek_v4(self.hf_config) and routed_experts_quant_method is None
+        )
+        if infer_dsv4_expert_layout:
             # HF config.json inherits topk_group=4 from the V3 template, but
             # DSV4 trains with no group limiting (sqrtsoftplus + full-expert
             # top-k). Force topk_group == n_group so deepseek_v2.py:531's
@@ -924,6 +909,31 @@ class ModelConfig:
 
         # Verify quantization
         self._verify_quantization()
+
+        if infer_dsv4_expert_layout:
+            # The safetensors I8 storage tag is also used for packed MXFP4.
+            int8_experts = (
+                self.quantization == "w8a8_int8"
+                or str(quantization_config.get("expert_dtype", "")).lower() == "int8"
+            )
+            self.is_fp4_experts = (
+                False if int8_experts else envs.SGLANG_DSV4_FP4_EXPERTS.get()
+            )
+            if not int8_experts and (
+                not envs.SGLANG_DSV4_FP4_EXPERTS.is_set()
+                or envs.SGLANG_DSV4_FP4_DEQUANT.is_set()
+            ):
+                from sglang.srt.configs.deepseek_v4 import try_detect_fp4_experts
+
+                detected = try_detect_fp4_experts(self.model_path)
+                if detected is not None:
+                    self.is_fp4_experts = detected
+                    logger.info(
+                        "Auto-detected DSV4 routed-expert layout: is_fp4_experts=%s",
+                        self.is_fp4_experts,
+                    )
+            if envs.SGLANG_DSV4_FP4_DEQUANT.get():
+                envs.SGLANG_DSV4_FP4_DEQUANT.set(self.is_fp4_experts is not None)
 
         # Verify dual-chunk attention config
         self._verify_dual_chunk_attention_config()

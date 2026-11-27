@@ -27,6 +27,10 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
 from sglang.srt.layers.moe.mega_gate import run_mega_gate, should_use_mega_gate
+from sglang.srt.layers.moe.mega_moe_sm80 import (
+    SM80_INT8_MMA_TYPE,
+    run_sm80_mega_routed,
+)
 from sglang.srt.layers.moe.mega_moe_sm90 import (
     is_sm90_fp8_mega_moe_available,
     run_sm90_mega_routed,
@@ -70,6 +74,8 @@ def _mega_moe_mma_type(experts) -> str:
 
 @functools.lru_cache(maxsize=1)
 def _mega_moe_max_num_sms() -> Optional[int]:
+    if _is_sail and _device_sm == 80:
+        return None
     if not _is_sail and _device_sm < 100:
         # The SM90 MegaMoE implementation does not use the whole-grid clustered
         # launch that needs a residency margin.
@@ -183,6 +189,8 @@ def is_mega_moe_experts_ready(experts) -> bool:
     if not experts._mega_moe_weights_built:
         return False
     if _is_sail:
+        if getattr(experts, "_mega_moe_mma_type", None) == SM80_INT8_MMA_TYPE:
+            return _device_sm == 80
         return _device_sm >= 89
     if _device_sm == 90:
         return is_sm90_fp8_mega_moe_available(experts)
@@ -243,6 +251,14 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
         max_tokens_per_rank = hidden_states.shape[0]
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
     ret = max_tokens_per_rank <= cap
+    if (
+        not ret
+        and getattr(moe.experts, "_mega_moe_mma_type", None) == SM80_INT8_MMA_TYPE
+    ):
+        raise ValueError(
+            f"INT8 MegaMoE needs {max_tokens_per_rank} tokens per rank, but "
+            f"SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK is {cap}."
+        )
     if ret:
         _log_mega_moe_hit(moe)
     return ret
@@ -546,6 +562,19 @@ def run_mega_routed_experts(
     if routed_scaling_factor != 1.0:
         assert not routing_in_buffer
         topk_weights_in = topk_weights_in * routed_scaling_factor
+
+    if mma_type == SM80_INT8_MMA_TYPE:
+        return run_sm80_mega_routed(
+            experts,
+            hidden_states,
+            topk_ids_in,
+            topk_weights_in,
+            buf,
+            num_tokens,
+            hidden_size=hidden_size,
+            activation=activation,
+            activation_clamp=activation_clamp,
+        )
 
     mega_kwargs = {"recipe": (1, 1, 32)}
     if _is_sail:
