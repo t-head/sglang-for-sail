@@ -4772,6 +4772,162 @@ class PresetCatalogContractTest(unittest.TestCase):
                     _scan_text(" ".join(safe_flags), context="safe_scan"), []
                 )
 
+    def test_runner_allows_variant_with_shared_tokenizer_asset(self):
+        rev_mxfp4 = "a" * 40
+        rev_fp8 = "b" * 40
+        base_glm = _load_yaml(REPO_ROOT / "test/ppu/recipes/zai-org/GLM-5.3.yaml")
+        mxfp4_id = base_glm["ppu"]["hf_model_id"]
+        fp8_id = base_glm["variants"]["fp8"]["hf_model_id"]
+        mxfp4_asset = base_glm["ppu"]["assets"]["model"]
+        fp8_asset = base_glm["variants"]["fp8"]["assets"]["model"]
+        self.assertNotEqual(mxfp4_asset, fp8_asset)
+
+        def _make_snapshot(cache_root: Path, repo_id: str, revision: str) -> Path:
+            folder = f"models--{repo_id.replace('/', '--')}"
+            repo_dir = cache_root / folder
+            (repo_dir / "refs").mkdir(parents=True, exist_ok=True)
+            (repo_dir / "refs/main").write_text(revision)
+            snap = repo_dir / "snapshots" / revision
+            snap.mkdir(parents=True, exist_ok=True)
+            for name in ("config.json", "tokenizer.json"):
+                (snap / name).write_text("{}")
+            (snap / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": {"w": "weight.safetensors"}})
+            )
+            (snap / "weight.safetensors").write_bytes(b"fixture")
+            return snap.resolve()
+
+        for shared_tokenizer in (True, False):
+            with (
+                self.subTest(shared_tokenizer=shared_tokenizer),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                root = Path(tmp)
+                shutil.copytree(REPO_ROOT / "test/ppu", root / "test/ppu")
+                cache_root = root / "hf_cache"
+                snap_mxfp4 = _make_snapshot(cache_root, mxfp4_id, rev_mxfp4)
+                snap_fp8 = _make_snapshot(cache_root, fp8_id, rev_fp8)
+                snapshots = {
+                    (mxfp4_id, rev_mxfp4): str(snap_mxfp4),
+                    (fp8_id, rev_fp8): str(snap_fp8),
+                }
+
+                glm_rec_path = root / "test/ppu/recipes/zai-org/GLM-5.3.yaml"
+                if shared_tokenizer:
+                    glm_doc = _load_yaml(glm_rec_path)
+                    glm_doc["variants"]["fp8"]["assets"]["tokenizer"] = mxfp4_asset
+                    glm_rec_path.write_text(yaml.safe_dump(glm_doc, sort_keys=False))
+                    validate_serving_recipe_structure(
+                        glm_doc, context="glm_shared_tokenizer"
+                    )
+
+                pol = _load_yaml(root / "test/ppu/policy/models/glm-5.3.yaml")
+                pol["variant"] = "fp8"
+                pol["tiers"] = {"fast_sanity": pol["tiers"]["fast_sanity"]}
+                pol_path = root / "test/ppu/policy/models/glm-5.3-fp8.yaml"
+                pol_path.write_text(yaml.safe_dump(pol, sort_keys=False))
+
+                results_dir = root / "artifacts/results"
+                results_dir.mkdir(parents=True)
+                captured_configs = []
+
+                @contextlib.contextmanager
+                def fake_server(config, label, result_dict, timeout):
+                    captured_configs.append((config, label, timeout))
+                    result_dict["cold_start_s"] = 0.5
+                    yield
+
+                def fake_download(*, repo_id, revision, cache_dir, local_files_only):
+                    self.assertTrue(local_files_only)
+                    self.assertEqual(Path(cache_dir), cache_root)
+                    return snapshots[(repo_id, revision)]
+
+                fake_hf_modules = {
+                    "huggingface_hub": SimpleNamespace(snapshot_download=fake_download),
+                    "huggingface_hub.file_download": SimpleNamespace(
+                        repo_folder_name=lambda *, repo_id, repo_type: (
+                            f"models--{repo_id.replace('/', '--')}"
+                        )
+                    ),
+                    "huggingface_hub.utils": SimpleNamespace(
+                        validate_repo_id=lambda repo_id: None
+                    ),
+                }
+                clean_env = {
+                    k: v
+                    for k, v in os.environ.items()
+                    if k
+                    not in {
+                        "PPU_CI_HF_MODEL_REVISION",
+                        "PPU_RECIPE_CONTAINER_MODEL",
+                    }
+                }
+                clean_env.update(
+                    {
+                        "PPU_CI_HF_CACHE_ROOT": str(cache_root),
+                        "HF_HUB_CACHE": str(cache_root),
+                        "RECIPE_PPU_COUNT": "8",
+                    }
+                )
+                with (
+                    patch.dict(os.environ, clean_env, clear=True),
+                    patch.dict(sys.modules, fake_hf_modules),
+                    patch("ppu_recipe.REPO_ROOT", root),
+                    patch("recipe_select.REPO_ROOT", root),
+                    patch("recipe_runner.REPO_ROOT", root),
+                    patch("recipe_runner.RESULTS", results_dir),
+                    patch("recipe_runner.phase"),
+                    patch("recipe_runner.server", side_effect=fake_server),
+                    patch("recipe_runner.probes") as mock_probes,
+                ):
+                    run(pol_path, "fast_sanity", 1.0)
+                    mock_probes.assert_called_once()
+                    self.assertEqual(len(captured_configs), 1)
+                    cfg, _, _ = captured_configs[0]
+                    self.assertEqual(cfg["resolved_model"], str(snap_fp8))
+                    self.assertEqual(cfg["resolved_tokenizer"], str(snap_fp8))
+                    assets_written = json.loads(
+                        (results_dir.parent / "assets.json").read_text()
+                    )
+                    self.assertEqual(assets_written, {fp8_asset: str(snap_fp8)})
+
+                    if shared_tokenizer:
+                        explicit_tok_map = root / "artifacts/explicit-tok-assets.json"
+                        explicit_tok_map.write_text(
+                            json.dumps(
+                                {fp8_asset: str(snap_fp8), mxfp4_asset: str(snap_mxfp4)}
+                            )
+                        )
+                        explicit_cfg = resolve_recipe(
+                            glm_rec_path,
+                            policy_path=pol_path,
+                            tier="fast_sanity",
+                            assets_map_path=explicit_tok_map,
+                            served_model_name="recipe-model",
+                        )
+                        self.assertEqual(explicit_cfg["resolved_model"], str(snap_fp8))
+                        self.assertEqual(
+                            explicit_cfg["resolved_tokenizer"], str(snap_mxfp4)
+                        )
+
+                        colliding_map = root / "artifacts/colliding-assets.json"
+                        colliding_map.write_text(
+                            json.dumps(
+                                {fp8_asset: str(snap_fp8), mxfp4_asset: str(snap_fp8)}
+                            )
+                        )
+                        with self.assertRaisesRegex(
+                            ValidationError,
+                            "colliding with default/top-level checkpoint",
+                        ):
+                            resolve_recipe(
+                                glm_rec_path,
+                                policy_path=pol_path,
+                                tier="fast_sanity",
+                                assets_map_path=colliding_map,
+                                served_model_name="recipe-model",
+                            )
+
 
 if __name__ == "__main__":
     unittest.main()

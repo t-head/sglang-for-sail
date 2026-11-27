@@ -471,9 +471,7 @@ def run(policy_path, tier, queue_s):
         model_path, snapshot_revision = cached_model_path(
             effective["hf_model_id"], revision
         )
-    assets.write_text(
-        json.dumps({name: model_path for name in effective["assets"].values()})
-    )
+    assets.write_text(json.dumps({effective["assets"]["model"]: model_path}))
 
     resolve = dict(
         policy_path=policy_path,
