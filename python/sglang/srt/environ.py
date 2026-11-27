@@ -2050,6 +2050,8 @@ class Envs:
     # ===================================================================
     # DSA backend (GLM 5 and DeepSeek V3.2)
     # ===================================================================
+    SGLANG_OPT_DSA_LAYER_SPLIT_VECTOR_SCATTER = EnvBool(False)
+    SGLANG_OPT_DSA_LAYER_SPLIT_PREFETCH_AFTER_MOE = EnvBool(False)
     SGLANG_DSA_FUSE_TOPK = EnvBool(True)
     # Opt into the PPU-only compiler mode for BF16 prefill TopK.
     SGLANG_DSA_TOPK_NO_SIMT = EnvBool(False)
