@@ -15,10 +15,11 @@ from sglang.srt.layers.quantization.w8a8_fp8 import (
 )
 from sglang.srt.models.kimi_k3 import KimiK3MoE
 from sglang.srt.utils import is_sail
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-large")
+register_ppu_ci(est_time=30, suite="extra-unit-test-1-gpu-ppu")
 
 
 @contextmanager

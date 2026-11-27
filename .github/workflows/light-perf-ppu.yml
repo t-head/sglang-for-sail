@@ -1,0 +1,22 @@
+name: Light Performance (PPU)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+jobs:
+  light-perf:
+    if: github.repository == 't-head/sglang-for-sail'
+    uses: ./.github/workflows/nightly-test-ppu.yml
+    with:
+      ref: ${{ github.sha }}
+      tier: light_perf
+      model_filter: qwen3.8-27b
+    secrets:
+      PPU_CI_K8S_RUNTIME_DIGEST: ${{ secrets.PPU_CI_K8S_RUNTIME_DIGEST }}
+      PPU_CI_RECIPE_IMAGE_REPO: ${{ secrets.PPU_CI_RECIPE_IMAGE_REPO }}
+      PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS: ${{ secrets.PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS }}

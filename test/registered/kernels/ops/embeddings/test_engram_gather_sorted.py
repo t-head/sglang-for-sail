@@ -2,9 +2,11 @@ import pytest
 import torch
 
 from sglang.kernels.ops.embeddings.engram_gather import engram_gather
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+# backend-specific: cover this path with the SAIL runtime and device kernels.
+register_ppu_ci(est_time=10, suite="extra-unit-test-1-gpu-ppu")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="engram gather needs a CUDA device"

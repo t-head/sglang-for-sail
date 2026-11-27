@@ -18,3 +18,31 @@ model:
     - --trust-remote-code
 variants:
   default: {precision: bf16}
+hardware_overrides:
+  zhenwu_810e:
+    extra_args: [--tp-size, "1"]
+features:
+  one_batch:
+    args:
+      - --attention-backend
+      - fa3
+      - --page-size
+      - "64"
+      - --disable-shared-experts-fusion
+      - --mamba-ssm-dtype
+      - bfloat16
+presets:
+  one_batch_prefill:
+    select: {features: {one_batch: true}}
+    remove_args: [--context-length]
+    args:
+      - --mem-fraction-static
+      - "0.7"
+      - --max-total-tokens
+      - "106496"
+  one_batch_decode:
+    select: {features: {one_batch: true}}
+    remove_args: [--context-length]
+    args:
+      - --mem-fraction-static
+      - "0.8"

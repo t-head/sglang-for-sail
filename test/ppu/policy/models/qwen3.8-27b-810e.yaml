@@ -1,0 +1,27 @@
+schema_version: ppu-test-policy/v1
+model_id: Qwen/Qwen3.8-27B
+recipe: test/ppu/recipes/Qwen/Qwen3.8-27B.yaml
+hardware: zhenwu_810e
+tiers:
+  light_perf:
+    engine: one_batch
+    hardware: zhenwu_810e
+    variant: default
+    dummy_weights: true
+    # Smoke floors until throughput baselines are measured on 810E.
+    cases:
+      - id: qwen3_8_27b_bf16_tp1_prefill
+        preset: one_batch_prefill
+        input: {batch_size: 1, input_len: [4096, 16384, 65536, 102400], output_len: 1}
+        threshold:
+          metric: prefill_throughput
+          allowed_drop_ratio: 0.10
+          min_tokens_per_s:
+            4096: 2481.7869405132483
+            16384: 2085.9040232923985
+            65536: 1848.4829787946683
+            102400: 1597.309804276172
+      - id: qwen3_8_27b_bf16_tp1_decode
+        preset: one_batch_decode
+        input: {batch_size: 16, input_len: [4096], output_len: 1536}
+        threshold: {metric: median_decode_throughput, min_tokens_per_s: 435.45709350654283, allowed_drop_ratio: 0.10}

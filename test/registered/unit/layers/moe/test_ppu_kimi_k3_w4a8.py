@@ -11,6 +11,7 @@ import torch
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+# Re-enable in base-a-test-cpu-ppu once imports work without libnvrtc.so.13.
 
 from sglang.srt.layers.deep_gemm_wrapper import compile_utils, entrypoint
 from sglang.srt.layers.moe import MoeA2ABackend, MoeRunnerBackend

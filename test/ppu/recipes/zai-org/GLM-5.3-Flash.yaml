@@ -26,3 +26,39 @@ model:
     - --trust-remote-code
 variants:
   default: {precision: mxfp4}
+features:
+  one_batch:
+    args:
+      - --tp-size
+      - "8"
+      - --attention-backend
+      - dsa
+      - --dsa-decode-backend
+      - tilelang
+      - --mem-fraction-static
+      - "0.9"
+presets:
+  one_batch_prefill:
+    select: {features: {one_batch: true}}
+    remove_args:
+      - --context-length
+      - --page-size
+      - --kv-cache-dtype
+      - --disable-prefill-cuda-graph
+      - --disable-custom-all-reduce
+    args: [--max-total-tokens, "106496"]
+  one_batch_decode:
+    select: {features: {one_batch: true}}
+    remove_args:
+      - --context-length
+      - --page-size
+      - --kv-cache-dtype
+      - --disable-prefill-cuda-graph
+      - --disable-custom-all-reduce
+    args:
+      - --chunked-prefill-size
+      - "8192"
+      - --cuda-graph-max-bs-decode
+      - "64"
+      - --max-total-tokens
+      - "360448"

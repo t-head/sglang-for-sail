@@ -81,8 +81,8 @@ source snapshot are documented below.
 Run inside a verified PPU task container after synchronizing the source:
 
 ```bash
-python3 -m pytest test/ppu/unit/test_qsa_ppu_compressed_logits.py -v -s
-python3 -m pytest test/ppu/unit/test_qsa_ppu_backends.py -v -s
+python3 -m pytest test/registered/ppu/test_qsa_ppu_compressed_logits.py -v -s
+python3 -m pytest test/registered/ppu/test_qsa_ppu_backends.py -v -s
 python3 -m pytest test/registered/kernels/ops/attention/qsa/test_qsa.py -v
 ```
 
@@ -245,7 +245,7 @@ request IDs, lengths and selections twice after capture. Existing tolerances
 remain `rtol=atol=0.02`. The command was:
 
 ```bash
-python3 -m pytest test/ppu/unit/test_qsa_ppu_backends.py \
+python3 -m pytest test/registered/ppu/test_qsa_ppu_backends.py \
   -k 'test_fa3_sparse_matches_reference or test_fa3_resolver_does_not_import_second_valid_wrapper or test_fa3_sparse_padded_production_width or test_fa3_graph' \
   -v -s
 ```

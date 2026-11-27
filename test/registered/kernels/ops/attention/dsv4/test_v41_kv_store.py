@@ -28,7 +28,11 @@ from sglang.kernels.ops.attention.dsv4.norm_rope import (
 from sglang.kernels.ops.attention.dsv4.rope import set_batched_rope
 from sglang.kernels.ops.quantization.fp4_fake_quant import fake_quant_compressed_kv
 from sglang.srt.utils import is_gfx95_supported, is_hip, is_sail
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
 from sglang.test.kernels.deepseek_v4 import dsv41_kv_quant_reference as tq
 from sglang.test.test_utils import CustomTestCase
 
@@ -38,6 +42,7 @@ register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b
 # backend-specific: the gfx950 builds of the V4.1 row quantizers, the dequant NaN
 # canonicalization and the query rope in the K launch exist only on HIP
 register_amd_ci(est_time=60, suite="base-b-test-1-gpu-small-amd-mi35x")
+register_ppu_ci(est_time=60, suite="extra-unit-test-1-gpu-ppu")
 
 V41_LAYOUTS = (
     KVLayout.V41,

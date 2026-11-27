@@ -36,6 +36,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import is_sail
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu-ppu")
 
 
 class TestDeepGemmMegaMoeApi(CustomTestCase):
@@ -106,7 +107,6 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             ),
             get_flags().moe.override(a2a_backend=MoeA2ABackend.MEGAMOE),
             cap.override(1024),
-            envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.override(False),
             patch.multiple(
                 mega_moe,
                 is_mega_moe_experts_ready=lambda _: True,

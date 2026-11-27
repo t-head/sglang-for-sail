@@ -12,6 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+# Re-enable in base-a-test-cpu-ppu once imports work without libnvrtc.so.13.
 
 
 class TestPpuKimiK3Moe(CustomTestCase):

@@ -58,3 +58,24 @@ tiers:
         warmup_count_by_concurrency:
           1: 2
           16: 8
+  light_perf:
+    engine: one_batch
+    hardware: zhenwu_m890
+    variant: default
+    dummy_weights: true
+    cases:
+      - id: minimax_m3_mxfp4_fp8_tp_prefill
+        preset: one_batch_prefill
+        input: {batch_size: 1, input_len: [4096, 16384, 65536, 102400], output_len: 1}
+        threshold:
+          metric: prefill_throughput
+          allowed_drop_ratio: 0.10
+          min_tokens_per_s:
+            4096: 11596.229425027406
+            16384: 454.27989129698994
+            65536: 2919.4689721885743
+            102400: 3522.067064701376
+      - id: minimax_m3_mxfp4_fp8_tp_decode
+        preset: one_batch_decode
+        input: {batch_size: 64, input_len: [4096], output_len: 1536}
+        threshold: {metric: median_decode_throughput, min_tokens_per_s: 1935.580171063074, allowed_drop_ratio: 0.10}

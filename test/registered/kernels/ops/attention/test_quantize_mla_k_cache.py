@@ -20,9 +20,10 @@ from sglang.kernels.ops.quantization.dsa_quant_k_cache import (
     quantize_k_cache_separate,
 )
 from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 
 register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_ppu_ci(est_time=45, suite="extra-unit-test-1-gpu-ppu")
 
 DEVICE = "cuda"
 FP8_DTYPE = torch.float8_e4m3fn

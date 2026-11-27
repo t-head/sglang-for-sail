@@ -123,7 +123,7 @@ def retain(environ) -> None:
         "attempt": environ["GITHUB_RUN_ATTEMPT"],
     }
     if (
-        index["tier"] not in {"fast_sanity", "model_sanity"}
+        index["tier"] not in {"fast_sanity", "model_sanity", "light_perf", "unit_test"}
         or not re.fullmatch(r"[a-z0-9][a-z0-9.-]*", index["model_key"])
         or not re.fullmatch(r"[0-9a-f]{40}", index["checkout_sha"])
         or not all(re.fullmatch(r"[0-9]+", index[key]) for key in ("run_id", "attempt"))
@@ -167,6 +167,18 @@ def retain(environ) -> None:
             for path in sorted(review_root.rglob("*"))
             if path.is_file() and path.suffix in (".json", ".jsonl", ".log")
         )
+    if index["tier"] == "light_perf":
+        for prefix in ("results", "rank-1/results"):
+            results_root = source_dir / prefix
+            if results_root.is_symlink() or results_root.parent.is_symlink():
+                continue
+            for directory in sorted(results_root.glob("one-batch-*")):
+                if directory.is_dir() and not directory.is_symlink():
+                    entries.extend(
+                        path.relative_to(source_dir).as_posix()
+                        for path in sorted(directory.iterdir())
+                        if path.suffix in (".jsonl", ".log")
+                    )
     with tempfile.TemporaryDirectory(prefix=".staging-", dir=parent) as staging_dir:
         staging = Path(staging_dir)
         published = staging / index["model_key"]
@@ -176,7 +188,9 @@ def retain(environ) -> None:
             source = source_dir / relative_path
             name = (
                 relative_path
-                if relative_path.startswith("results/evalscope/")
+                if relative_path.startswith(
+                    ("results/evalscope/", "results/one-batch-", "rank-1/results/")
+                )
                 else source.name
             )
             try:

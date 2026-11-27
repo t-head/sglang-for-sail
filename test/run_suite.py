@@ -35,6 +35,7 @@ HW_MAPPING = {
 PER_COMMIT_SUITES = {
     HWBackend.CPU: [
         "base-a-test-cpu",
+        "base-a-test-cpu-ppu",
         "extra-test-cpu-intel",
         "extra-tp-test-cpu-intel",
         "extra-test-cpu-arm64",
@@ -139,6 +140,7 @@ PER_COMMIT_SUITES = {
     ],
     HWBackend.PPU: [
         "extra-test-1-gpu-ppu",
+        "extra-unit-test-1-gpu-ppu",
     ],
     HWBackend.MLU: [
         "extra-test-1-mlu",
@@ -310,10 +312,15 @@ def filter_tests(
         if suite not in valid:
             print(f"Warning: Unknown suite {suite} for backend {hw.name}")
 
-    enabled_tests = [t for t in ci_tests if t.disabled is None]
-    skipped_tests = [t for t in ci_tests if t.disabled is not None]
+    # A file can belong to several suites on the same backend.
+    enabled_by_file = {t.filename: t for t in ci_tests if t.disabled is None}
+    skipped_by_file = {
+        t.filename: t
+        for t in ci_tests
+        if t.disabled is not None and t.filename not in enabled_by_file
+    }
 
-    return enabled_tests, skipped_tests
+    return list(enabled_by_file.values()), list(skipped_by_file.values())
 
 
 def pretty_print_tests(

@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import itertools
 import json
 import os
 import shutil
@@ -38,12 +39,356 @@ from recipe_report import main as report_recipe
 from recipe_retention import retain
 from recipe_runner import (
     cached_model_path,
+    check_one_batch_results,
+    light_perf_worker_args,
     metrics_zero,
     probes,
     read_eval_reviews,
     run,
+    run_light_perf,
 )
 from recipe_select import cluster_width, select
+
+
+class TestLightPerf(unittest.TestCase):
+    def test_glm_light_perf_uses_single_node_tp8(self):
+        self.assertEqual(
+            select("light_perf", "glm-5.3"),
+            {"include": [{"model": "glm-5.3", "ppu_count": 8, "board": "ZW-M890P"}]},
+        )
+
+    def test_multi_node_light_perf_worker_args(self):
+        config = {
+            "nodes": 2,
+            "argv": [
+                "python3", "-I", "-B", "-m", "sglang.benchmark.one_batch_server",
+                "--node-rank", "0", "--dist-init-addr", "node0:29500",
+            ],
+        }
+        for rank, module in enumerate(
+            ("sglang.benchmark.one_batch_server", "sglang.launch_server")
+        ):
+            argv, actual_rank = light_perf_worker_args(config, {
+                "NNODES": "2",
+                "NODE_RANK": str(rank),
+                "MASTER_ADDR": "worker-0",
+                "MASTER_PORT": "29500",
+            })
+            self.assertEqual(actual_rank, rank)
+            self.assertEqual(argv[4], module)
+            self.assertEqual(argv[argv.index("--dist-init-addr") + 1], "worker-0:29500")
+            self.assertEqual(argv[argv.index("--node-rank") + 1], str(rank))
+
+    def test_server_decode_requires_full_generation(self):
+        policy = _load_yaml(DEFAULT_POLICY_ROOT / "models/qwen3.8-flash-next-tp4.yaml")
+        case = policy["tiers"]["light_perf"]["cases"][1]
+        threshold = case["threshold"]
+        floor = threshold["min_tokens_per_s"] * (1 - threshold["allowed_drop_ratio"])
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "result.jsonl"
+            row = {
+                "run_name": case["id"],
+                "batch_size": 64,
+                "input_len": 4096,
+                "output_len": 1536,
+                "output_throughput": floor,
+                "total_output_tokens": 64 * 1536,
+            }
+            output.write_text(json.dumps(row) + "\n")
+            passed, measurements = check_one_batch_results(
+                output, case, engine="one_batch_server"
+            )
+            self.assertTrue(passed)
+            self.assertEqual(
+                measurements,
+                [
+                    {
+                        "batch_size": 64,
+                        "input_len": 4096,
+                        "output_len": 1536,
+                        "tokens_per_s": floor,
+                    }
+                ],
+            )
+            row["total_output_tokens"] -= 1
+            output.write_text(json.dumps(row) + "\n")
+            with self.assertRaisesRegex(ValueError, "did not generate"):
+                check_one_batch_results(output, case, engine="one_batch_server")
+
+    def test_manual_workflow_selects_the_light_perf_board_and_width(self):
+        import yaml
+
+        workflow = yaml.load(
+            (REPO_ROOT / ".github/workflows/light-perf-ppu.yml").read_text(),
+            Loader=yaml.BaseLoader,
+        )
+        self.assertEqual(set(workflow["on"]), {"workflow_dispatch"})
+        job = workflow["jobs"]["light-perf"]
+        self.assertEqual(job["uses"], "./.github/workflows/nightly-test-ppu.yml")
+        self.assertEqual(
+            select(job["with"]["tier"], job["with"]["model_filter"]),
+            {"include": [{"model": "qwen3.8-27b", "ppu_count": 2, "board": "ZW-M890P"}]},
+        )
+        self.assertEqual(
+            select("light_perf", "qwen3.8-27b-810e"),
+            {"include": [{"model": "qwen3.8-27b-810e", "ppu_count": 1, "board": "OAM-810E"}]},
+        )
+        policy_path = DEFAULT_POLICY_ROOT / "models/qwen3.8-27b-810e.yaml"
+        policy = _load_yaml(policy_path)
+        for case in policy["tiers"]["light_perf"]["cases"]:
+            resolved = resolve_recipe(
+                REPO_ROOT / policy["recipe"],
+                policy_path=policy_path,
+                tier="light_perf",
+                preset=case["preset"],
+            )
+            self.assertEqual(resolved["ppu_count"], 1)
+            self.assertEqual(resolved["hardware"], "zhenwu_810e")
+            self.assertTrue(resolved["dummy_weights"])
+        nightly = yaml.load(
+            (REPO_ROOT / ".github/workflows/nightly-test-ppu.yml").read_text(),
+            Loader=yaml.BaseLoader,
+        )
+        dispatch = nightly["on"]["workflow_dispatch"]["inputs"]
+        self.assertEqual(dispatch["tier"]["type"], "choice")
+        self.assertEqual(dispatch["tier"]["default"], "model_sanity")
+        self.assertIn("light_perf", dispatch["tier"]["options"])
+        self.assertIn("model_filter", dispatch)
+        dispatcher = yaml.load(
+            (REPO_ROOT / ".github/workflows/nightly-dispatch-ppu.yml").read_text(),
+            Loader=yaml.BaseLoader,
+        )
+        dispatch = dispatcher["on"]["workflow_dispatch"]["inputs"]
+        self.assertEqual(dispatch["tier"]["default"], "model_sanity")
+        self.assertIn("light_perf", dispatch["tier"]["options"])
+        jobs = dispatcher["jobs"]
+        light_perf = jobs["light-perf"]
+        self.assertEqual(light_perf["uses"], job["uses"])
+        self.assertEqual(light_perf["with"]["ref"], "${{ github.sha }}")
+        self.assertEqual(light_perf["with"]["tier"], "light_perf")
+        self.assertEqual(light_perf["with"]["model_filter"], "${{ inputs.model_filter || '' }}")
+        self.assertEqual(dispatch["model_filter"]["default"], "")
+        self.assertEqual(
+            {entry["model"] for entry in select("light_perf", "")["include"]},
+            {
+                path.stem
+                for path in (DEFAULT_POLICY_ROOT / "models").glob("*.yaml")
+                if "light_perf" in _load_yaml(path).get("tiers", {})
+            },
+        )
+        self.assertIn("github.event_name == 'workflow_dispatch'", light_perf["if"])
+        self.assertIn("inputs.tier != 'light_perf'", jobs["plan"]["if"])
+
+        unit_test = jobs["unit-test"]
+        self.assertIn("unit_test", dispatch["tier"]["options"])
+        self.assertEqual(unit_test["uses"], light_perf["uses"])
+        self.assertEqual(unit_test["with"]["ref"], "${{ github.sha }}")
+        self.assertEqual(unit_test["with"]["tier"], "unit_test")
+        self.assertIn("github.event_name == 'workflow_dispatch'", unit_test["if"])
+        self.assertIn("inputs.tier != 'unit_test'", jobs["plan"]["if"])
+        self.assertEqual(
+            nightly["jobs"]["cpu-unit-test"]["strategy"]["matrix"]["shard"],
+            ["0", "1"],
+        )
+
+    def test_report_renders_throughput_in_job_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            source = root / "scratch"
+            measurements = source / "results/one-batch-fixture"
+            measurements.mkdir(parents=True)
+            root.joinpath("archive").mkdir(mode=0o700)
+            source.joinpath("launcher.log").touch()
+            source.joinpath("provenance.json").write_text(json.dumps({
+                "runtime_image": "@sha256:" + "b" * 64,
+                "recipe_tree_sha256": "c" * 64,
+            }))
+            case_id = "qwen3_8_27b_bf16_tp2_prefill"
+            relative = f"one-batch-fixture/{case_id}.jsonl"
+            row = {
+                "batch_size": 1,
+                "input_len": 4096,
+                "output_len": 1,
+                "tokens_per_s": 10229.67,
+            }
+            throughput = {"metric": "prefill_throughput", "rows": [row]}
+            measurements.joinpath(f"{case_id}.jsonl").write_text(
+                json.dumps({**row, "private_detail": "/private/benchmark"}) + "\n"
+            )
+            source.joinpath("results/summary.json").write_text(json.dumps({
+                "outcome": "pass",
+                "queue_s": 0,
+                "cases": {case_id: {
+                    "passed": True,
+                    "results": relative,
+                    "throughput": throughput,
+                }},
+            }))
+            public = root / "public.json"
+            with (
+                patch.dict(os.environ, {
+                    "TIER": "light_perf",
+                    "MODEL_KEY": "qwen3.8-27b",
+                    "PPU_CI_SOURCE_SHA": "a" * 40,
+                    "GITHUB_RUN_ID": "12345",
+                    "GITHUB_RUN_ATTEMPT": "1",
+                    "GITHUB_WORKSPACE": str(root / "workspace"),
+                    "RUNNER_TEMP": str(root / "runner-temp"),
+                    "PPU_CI_PRIVATE_RESULTS_ROOT": str(root / "archive"),
+                    "PPU_CI_ARTIFACT_DIR": str(source),
+                    "PPU_CI_SKIP_WHEEL_INSTALL": "false",
+                    "RECIPE_OUTCOME": "success",
+                }),
+                patch.object(sys, "argv", ["recipe_report", str(public)]),
+            ):
+                self.assertEqual(report_recipe(), 0)
+            payload = json.loads(public.read_text())
+            self.assertEqual(payload["case_status"], {case_id: True})
+            self.assertNotIn(relative, public.read_text())
+            artifact = root / "artifact.json"
+            summary = root / "job-summary.md"
+            console = io.StringIO()
+            publish(payload, artifact, summary, console)
+            evidence = json.loads(artifact.read_text())
+            validate(evidence)
+            self.assertNotIn("throughput", evidence)
+            self.assertEqual(json.loads(console.getvalue()), evidence)
+            self.assertIn(
+                f"| `{case_id}` | 1 | 4096 | 1 | `prefill_throughput` | 10229.67 |",
+                summary.read_text(),
+            )
+            self.assertNotIn("/private/benchmark", summary.read_text())
+            with self.assertRaisesRegex(ValueError, "invalid Light Perf throughput measurement"):
+                publish(
+                    {
+                        **payload,
+                        "throughput": {
+                            case_id: {
+                                **throughput,
+                                "rows": [{**row, "tokens_per_s": "invalid"}],
+                            }
+                        },
+                    },
+                    artifact,
+                    summary,
+                    console,
+                )
+            retained = root / "archive/sglang/logs/sglang-for-sail/12345-1/aaaaaaaaaaaa/light_perf"
+            self.assertTrue((retained / "qwen3.8-27b/results" / relative).is_file())
+            with self.assertRaisesRegex(ValueError, "lacks evidence"):
+                validate({**evidence, "case_status": {case_id: False}})
+
+    def test_qwen_tp2_recipe_to_benchmark_results(self):
+        policy = DEFAULT_POLICY_ROOT / "models/qwen3.8-27b.yaml"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            assets = root / "assets.json"
+            assets.write_text(json.dumps({"qwen3.8-27b": directory}))
+            for throughput, outcome in [(9500, "pass"), (9000, "fail")]:
+                results = root / outcome
+                results.mkdir()
+
+                def benchmark(argv, **kwargs):
+                    def values(flag):
+                        index = argv.index(flag) + 1
+                        return list(
+                            itertools.takewhile(
+                                lambda arg: not arg.startswith("--"), argv[index:]
+                            )
+                        )
+
+                    self.assertEqual(argv[4], "sglang.benchmark.one_batch")
+                    self.assertEqual(values("--model-path"), [directory])
+                    self.assertEqual(values("--tp-size"), ["2"])
+                    self.assertEqual(values("--dtype"), ["bfloat16"])
+                    self.assertEqual(values("--load-format"), ["dummy"])
+                    self.assertEqual(values("--attention-backend"), ["fa3"])
+                    self.assertEqual(values("--page-size"), ["64"])
+                    self.assertEqual(values("--mamba-ssm-dtype"), ["bfloat16"])
+                    for flag in (
+                        "--quantization", "--context-length", "--host", "--enable-metrics"
+                    ):
+                        self.assertNotIn(flag, argv)
+                    (run_name,) = values("--run-name")
+                    input_lengths = list(map(int, values("--input-len")))
+                    if run_name.endswith("_prefill"):
+                        self.assertEqual(run_name, "qwen3_8_27b_bf16_tp2_prefill")
+                        self.assertEqual(input_lengths, [4096, 16384, 65536, 102400])
+                        self.assertEqual(values("--batch-size"), ["1"])
+                        self.assertEqual(values("--output-len"), ["1"])
+                        self.assertEqual(values("--max-total-tokens"), ["106496"])
+                        self.assertEqual(values("--mem-fraction-static"), ["0.7"])
+                    else:
+                        self.assertEqual(run_name, "qwen3_8_27b_bf16_tp2_decode")
+                        self.assertEqual(input_lengths, [4096])
+                        self.assertEqual(values("--batch-size"), ["16"])
+                        self.assertEqual(values("--output-len"), ["1536"])
+                        self.assertEqual(values("--mem-fraction-static"), ["0.8"])
+                    output = Path(*values("--result-filename"))
+                    rows = [
+                        {
+                            "run_name": run_name,
+                            "batch_size": int(values("--batch-size")[0]),
+                            "input_len": length,
+                            "output_len": int(values("--output-len")[0]),
+                            "prefill_throughput": throughput,
+                            "median_decode_throughput": throughput,
+                        }
+                        for length in input_lengths
+                    ]
+                    output.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+                with (
+                    patch("recipe_runner.RESULTS", results),
+                    patch.dict(os.environ, {"RECIPE_PPU_COUNT": "2"}),
+                    patch("recipe_runner.subprocess.run", side_effect=benchmark) as launch,
+                ):
+                    summary = run_light_perf(policy, assets, 0)
+                self.assertEqual(launch.call_count, 2)
+                self.assertEqual(summary["outcome"], outcome)
+                self.assertEqual(
+                    [result["passed"] for result in summary["cases"].values()],
+                    [outcome == "pass", True],
+                )
+                self.assertEqual(
+                    [
+                        (result["throughput"]["metric"], len(result["throughput"]["rows"]))
+                        for result in summary["cases"].values()
+                    ],
+                    [("prefill_throughput", 4), ("median_decode_throughput", 1)],
+                )
+                for result in summary["cases"].values():
+                    self.assertTrue(
+                        all(
+                            row["tokens_per_s"] == throughput
+                            for row in result["throughput"]["rows"]
+                        )
+                    )
+
+            with (
+                patch.dict(os.environ, {"RECIPE_PPU_COUNT": "1"}),
+                patch("recipe_runner.subprocess.run") as launch,
+            ):
+                with self.assertRaisesRegex(ValueError, "allocation has 1"):
+                    run_light_perf(policy, assets, 0)
+                launch.assert_not_called()
+
+    def test_missing_prefill_shape_fails(self):
+        policy = _load_yaml(DEFAULT_POLICY_ROOT / "models/qwen3.8-27b.yaml")
+        case = policy["tiers"]["light_perf"]["cases"][0]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "result.jsonl"
+            output.touch()
+            with self.assertRaisesRegex(ValueError, "missing one_batch results"):
+                check_one_batch_results(output, case)
+
+    def test_prefill_thresholds_must_cover_every_input_length(self):
+        path = DEFAULT_POLICY_ROOT / "models/qwen3.8-27b.yaml"
+        policy = _load_yaml(path)
+        case = policy["tiers"]["light_perf"]["cases"][0]
+        case["threshold"]["min_tokens_per_s"].pop(4096)
+        with self.assertRaisesRegex(ValidationError, "must cover every input length"):
+            validate_policy_structure(policy, context=str(path))
 
 
 def fast_result():
@@ -578,6 +923,11 @@ class RecipeContractTest(unittest.TestCase):
                 shard.unlink()
                 with self.assertRaisesRegex(ValueError, "missing shards"):
                     cached_model_path(repo_id, revision)
+                (checkpoint / "model.safetensors.index.json").unlink()
+                self.assertEqual(
+                    cached_model_path(repo_id, revision, require_weights=False),
+                    (str(checkpoint.resolve()), revision),
+                )
 
     def test_kimi_snapshot_accepts_only_complete_tiktoken_metadata(self):
         repo_id = "T-HEAD/Kimi-K2.6-MXFP4-FP8"
@@ -1755,13 +2105,15 @@ class ClusterTransportTest(unittest.TestCase):
             ("deepseek-v4.1-flash", 8, False),
             ("qwen3.8-27b", 2, False),
             ("qwen3.8-flash-next-tp4", 4, False),
+            ("ppu-unit-0", 1, False),
             ("glm-5.3", 8, True),
         ):
             with (
                 self.subTest(model=model, tampered=tampered),
                 tempfile.TemporaryDirectory() as temp,
             ):
-                result = dict(fast_result(), model=model)
+                tier = "unit_test" if model == "ppu-unit-0" else "fast_sanity"
+                result = dict(fast_result(), model=model, tier=tier)
                 root = Path(temp)
                 workspace = root / "checkout"
                 staging = root / "staging"
@@ -1787,6 +2139,11 @@ class ClusterTransportTest(unittest.TestCase):
                     "layer_override": None,
                     "config_digest": result["config_digest"],
                 }
+                if tier == "unit_test":
+                    (workspace / "unit-test-deps").mkdir()
+                    for key in set(summary) - {"outcome"}:
+                        del summary[key]
+                        result.pop(key, None)
                 if tampered:
                     summary["diagnostic"] = injected
                 (workspace / "fixture.json").write_text(json.dumps(summary))
@@ -1844,8 +2201,9 @@ class ClusterTransportTest(unittest.TestCase):
                             os.environ["PATH"],
                         )
                     ),
-                    "TIER": "fast_sanity",
+                    "TIER": tier,
                     "MODEL_KEY": model,
+                    "PPU_CI_BOARD": "ZW-M890P",
                     "RECIPE_PPU_COUNT": str(width),
                     "GITHUB_OUTPUT": str(root / "gha-output"),
                     "PPU_PUBLIC_SUMMARY": str(root / "gha-summary"),
@@ -1913,7 +2271,9 @@ class ClusterTransportTest(unittest.TestCase):
                 if not tampered:
                     archived_index = (
                         retained
-                        / "sglang/logs/sglang-for-sail/12-1/aaaaaaaaaaaa/fast_sanity"
+                        / "sglang/logs/sglang-for-sail/12-1"
+                        / result["source_sha"][:12]
+                        / tier
                         / model
                         / "index.json"
                     )

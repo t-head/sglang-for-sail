@@ -20,6 +20,8 @@ from sglang.test.ci.ci_register import register_ppu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_ppu_ci(est_time=120, suite="extra-test-1-gpu-ppu")
+# backend-specific: cover this path with the SAIL runtime and device kernels.
+register_ppu_ci(est_time=120, suite="extra-unit-test-1-gpu-ppu")
 
 PAGE = 128
 HEAD_DIM = 128

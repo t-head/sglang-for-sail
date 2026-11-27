@@ -9,6 +9,7 @@ from sglang.srt.utils import is_sail
 from sglang.test.ci.ci_register import register_ppu_ci
 
 register_ppu_ci(est_time=120, suite="extra-test-1-gpu-ppu")
+register_ppu_ci(est_time=120, suite="extra-unit-test-1-gpu-ppu")
 
 pytestmark = pytest.mark.skipif(not is_sail(), reason="PPU-only kernel")
 
