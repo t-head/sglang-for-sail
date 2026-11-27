@@ -37,7 +37,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
+    policies::{completion_hook, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
@@ -688,7 +688,14 @@ impl PDRouter {
     ) -> (Response, Option<Arc<dyn Worker>>) {
         // Count the request from dispatch so load-based policies see it before
         // upstream headers arrive; streaming responses attach their own guards.
-        let _prefill_guard = WorkerLoadGuard::new(prefill.clone(), headers);
+        // prefill_aware keeps a per-dispatch ledger that is only released through
+        // its completion hook, so PD dispatches must hand it one too.
+        let prefill_policy = self.policy_registry.get_prefill_policy();
+        let _prefill_guard = WorkerLoadGuard::with_on_drop(
+            prefill.clone(),
+            headers,
+            completion_hook(&prefill_policy, prefill.as_ref(), None),
+        );
 
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
@@ -745,7 +752,12 @@ impl PDRouter {
                     .await
                     .map_err(Self::handle_server_selection_error)?,
             };
-            let decode_guard = WorkerLoadGuard::new(decode.clone(), headers);
+            let decode_policy = self.policy_registry.get_decode_policy();
+            let decode_guard = WorkerLoadGuard::with_on_drop(
+                decode.clone(),
+                headers,
+                completion_hook(&decode_policy, decode.as_ref(), None),
+            );
             let prepared_decode = async {
                 let body = Self::inject_prefill_dp_rank_for_decode(
                     Cow::Borrowed(&json_request),
@@ -1304,9 +1316,19 @@ impl PDRouter {
         let stream = UnboundedReceiverStream::new(rx);
         let body = Body::from_stream(stream);
 
+        let prefill_policy = self.policy_registry.get_prefill_policy();
+        let decode_policy = self.policy_registry.get_decode_policy();
         let guards = vec![
-            WorkerLoadGuard::new(prefill, headers.as_ref()),
-            WorkerLoadGuard::new(decode, headers.as_ref()),
+            WorkerLoadGuard::with_on_drop(
+                prefill.clone(),
+                headers.as_ref(),
+                completion_hook(&prefill_policy, prefill.as_ref(), None),
+            ),
+            WorkerLoadGuard::with_on_drop(
+                decode.clone(),
+                headers.as_ref(),
+                completion_hook(&decode_policy, decode.as_ref(), None),
+            ),
         ];
 
         let mut response = Response::new(body);
