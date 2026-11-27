@@ -16,6 +16,7 @@ from sglang.kernels.ops.attention.dsv4.index_logits import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_from_metadata
+from sglang.srt.utils import is_sail
 
 from .scoring import (
     decode_score_chunks,
@@ -93,6 +94,9 @@ class FullTopKIndexer:
     def _deep_gemm_decode(self, inputs: DecodeInputs) -> None:
         data = get_deep_gemm_decode_data(inputs, self.token_to_kv_pool)
         metadata = inputs.paged_metadata
+        use_bf16_v2 = (
+            is_sail() and not inputs.is_verify and envs.SGLANG_OPT_DSV41_TOPK_V2.get()
+        )
         if isinstance(metadata.deep_gemm_metadata, list):
             topk_plans = metadata.topk_metadata_chunks
             assert not metadata.use_topk_v2 or topk_plans is not None
@@ -112,7 +116,6 @@ class FullTopKIndexer:
                         else None
                     ),
                 )
-                # TODO(dark): add bf16 topk
                 topk_transform_paged_from_metadata(
                     logits,
                     metadata,
@@ -121,6 +124,7 @@ class FullTopKIndexer:
                     topk_metadata=(
                         topk_plans[chunk_idx] if topk_plans is not None else None
                     ),
+                    use_bf16_v2=use_bf16_v2,
                 )
                 del logits  # release this chunk's logits before the next is scored
             return
@@ -135,9 +139,11 @@ class FullTopKIndexer:
             metadata.max_compressed_seq_len,
             indices=metadata.request_indices,
         )
-        # TODO(dark): add bf16 topk
         topk_transform_paged_from_metadata(
-            logits, metadata, inputs.out_page_indices, None
+            logits,
+            metadata,
+            inputs.out_page_indices,
+            use_bf16_v2=use_bf16_v2,
         )
 
     def _torch_decode(self, inputs: DecodeInputs) -> None:

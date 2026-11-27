@@ -11,7 +11,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.utils import is_xpu
+from sglang.srt.utils import is_sail, is_xpu
 
 from .candidate_table import CANDIDATE_BLOCK_SIZE
 from .utils import make_name
@@ -29,16 +29,20 @@ def _jit_topk_v1_module():
 
 
 @cache_once
-def _jit_topk_v2_module(stable_ties: bool = False):
+def _jit_topk_v2_module(stable_ties: bool = False, bf16_scores: bool = False):
     from sglang.kernels.jit.utils.occupancy import (
         NoSchedulableClustersError,
         get_max_active_clusters,
     )
 
-    args = make_cpp_args(is_arch_support_pdl(), stable_ties)
+    if bf16_scores and not is_sail():
+        raise RuntimeError("The BF16 TopK v2 opt-in requires PPU")
+    args = make_cpp_args(is_arch_support_pdl() and not bf16_scores, stable_ties)
     extra_cuda_cflags = [f"-DSGL_TOPK_STABLE_TIES={int(stable_ties)}"]
+    if bf16_scores:
+        extra_cuda_cflags.append("-DSGL_TOPK_SCORE_BF16")
     # Enable each cluster path only when its occupancy probe reports capacity.
-    if is_arch_support_pdl():  # set the persistent cluster size after hopper
+    if is_arch_support_pdl() and not bf16_scores:
         for cluster_size, occupancy in ((8, 2), (16, 1)):
             try:
                 max_active_clusters = get_max_active_clusters(
@@ -60,9 +64,15 @@ def _jit_topk_v2_module(stable_ties: bool = False):
         ("topk_transform_kpool", f"{kernel}::transform_kpool"),
         ("topk_transform_kpool_ragged", f"{kernel}::transform_kpool_ragged"),
     ]
+    if bf16_scores:
+        wrappers = [
+            ("topk_transform_paged", f"{kernel}::transform_paged"),
+            ("topk_transform_ragged", f"{kernel}::transform_ragged"),
+        ]
     return load_jit(
         make_name("topk_v2"),
         *args,
+        *(("bf16",) if bf16_scores else ()),
         extra_cuda_cflags=extra_cuda_cflags,
         cuda_files=["deepseek_v4/topk_v2.cuh"],
         cuda_wrappers=wrappers,
@@ -256,6 +266,27 @@ def topk_transform_ragged_v2(
         return
     module = _topk_v2_module(stable_ties)
     module.topk_transform_ragged(scores, seq_lens, row_starts, out_offsets, out_indices)
+
+
+def topk_transform_ragged_bf16_v2(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    out_offsets: torch.Tensor,
+    out_indices: torch.Tensor,
+    row_starts: Optional[torch.Tensor] = None,
+) -> None:
+    """PPU BF16 counterpart of :func:`topk_transform_ragged_v2`.
+
+    Read BF16 scores directly, without a full FP32 conversion. The same window,
+    offset, padding and in-place head-masking contract applies. Equal-score
+    membership and output order need not match other TopK implementations.
+    """
+    if scores.shape[0] == 0:
+        return
+    _jit_topk_v2_module(bf16_scores=True).topk_transform_ragged(
+        scores, seq_lens, row_starts, out_offsets, out_indices
+    )
 
 
 def topk_transform_candidates(
@@ -503,6 +534,54 @@ def topk_transform_sparse(
     published blocks as pool slots / 8, compressed positions for logical ids."""
     topk_transform_bf16_small(
         logits, valid_lens, blocks, out_indices, CANDIDATE_BLOCK_SIZE
+    )
+
+
+def topk_transform_sparse_bf16_v2(
+    logits: torch.Tensor,
+    valid_lens: torch.Tensor,
+    blocks: torch.Tensor,
+    out_indices: torch.Tensor,
+) -> None:
+    """PPU BF16 v2 selection fused with the sparse block-to-slot transform.
+
+    This operator does not choose a model phase or read the opt-in flag. The
+    V4.1 consumers opt in explicitly. Equal-score membership and output order
+    are not guaranteed to match the legacy kernel.
+    """
+    topk_transform_paged_bf16_v2(
+        logits, valid_lens, blocks, out_indices, CANDIDATE_BLOCK_SIZE
+    )
+
+
+def topk_transform_paged_bf16_v2(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+) -> None:
+    """PPU BF16 v2 selection and logical-to-physical page mapping.
+
+    Output slots are unordered and padded with -1. The caller selects the
+    provider independently of this operator.
+    """
+    if scores.shape[0] == 0:
+        return
+    module = _jit_topk_v2_module(bf16_scores=True)
+    # The PPU-only build disables clusters, so this allocation is never read
+    # and no planning kernel is needed. Allocations are CUDA-graph compatible.
+    metadata = torch.empty(
+        (scores.shape[0] + 1, 2), dtype=torch.int32, device=scores.device
+    )
+    module.topk_transform_paged(
+        scores,
+        seq_lens.reshape(-1).to(torch.int32).contiguous(),
+        page_table,
+        out_page_indices,
+        page_size,
+        metadata,
+        None,
     )
 
 

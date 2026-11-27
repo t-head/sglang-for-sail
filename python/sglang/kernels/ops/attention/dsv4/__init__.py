@@ -12,6 +12,33 @@ register_kernel(
     )
 )
 
+register_kernel(
+    KernelSpec(
+        op="attention.topk_transform_paged_bf16_v2",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsv4.topk:topk_transform_paged_bf16_v2",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="attention.topk_transform_sparse_bf16_v2",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsv4.topk:topk_transform_sparse_bf16_v2",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="attention.topk_transform_ragged_bf16_v2",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsv4.topk:topk_transform_ragged_bf16_v2",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+
 # --- merged from sglang.kernels.ops.attention.dsv4 (RFC #29630 Phase 4) ---
 from .attn import (
     dequantize_k_cache_paged_cuda,
@@ -43,7 +70,9 @@ from .topk import (
     topk_transform_kpool_ragged_v2,
     topk_transform_kpool_v2,
     topk_transform_paged,
+    topk_transform_paged_bf16_v2,
     topk_transform_paged_v2,
+    topk_transform_ragged_bf16_v2,
     topk_transform_ragged_v2,
 )
 from .utils import make_name
@@ -70,8 +99,10 @@ __all__ = [
     "topk_transform_kpool_ragged_v2",
     "topk_transform_candidates",
     "topk_transform_512_bf16",
+    "topk_transform_paged_bf16_v2",
     "topk_transform_paged_v2",
     "topk_transform_ragged_v2",
+    "topk_transform_ragged_bf16_v2",
     "topk_transform_candidates",
     "top_k_per_row_prefill",
     "top_k_per_row_prefill_bf16",

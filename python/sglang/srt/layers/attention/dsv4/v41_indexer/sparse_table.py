@@ -4,7 +4,7 @@ a consumer scores only those blocks out of the index-K pool."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import msgspec
 import torch
@@ -27,10 +27,12 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     topk_transform_candidates,
     topk_transform_paged,
     topk_transform_sparse,
+    topk_transform_sparse_bf16_v2,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_bf16
 from sglang.srt.layers.attention.dsv4.metadata import expand_index_page_table
+from sglang.srt.utils import is_sail
 from sglang.srt.utils.common import async_h2d
 
 from .scoring import (
@@ -53,6 +55,19 @@ from .types import (
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+
+def _sparse_topk_transform(
+    logits: torch.Tensor, *, is_verify: bool = False
+) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], None]:
+    if (
+        not is_verify
+        and logits.dtype == torch.bfloat16
+        and is_sail()
+        and envs.SGLANG_OPT_DSV41_TOPK_V2.get()
+    ):
+        return topk_transform_sparse_bf16_v2
+    return topk_transform_sparse
 
 
 class _SparseTable(CandidateMetadata, msgspec.Struct):
@@ -202,14 +217,15 @@ class SparseTableBackend:
         )
         logits = _prefill_table_logits(published, q_fp4, q_sf, inputs.weights, k_cache)
         topk = min(indexer.index_topk, published.blocks.shape[1] * CANDIDATE_BLOCK_SIZE)
+        transform_topk = _sparse_topk_transform(logits)
 
         def transform(blocks: torch.Tensor, out: torch.Tensor) -> None:
             target = out[:rows, :topk]
             if target.is_contiguous():
-                topk_transform_sparse(logits, published.valid_lens, blocks, target)
+                transform_topk(logits, published.valid_lens, blocks, target)
                 return
             tmp = torch.empty((rows, topk), dtype=torch.int32, device=out.device)
-            topk_transform_sparse(logits, published.valid_lens, blocks, tmp)
+            transform_topk(logits, published.valid_lens, blocks, tmp)
             target.copy_(tmp)
 
         if inputs.out_page_indices is not None:
@@ -434,7 +450,8 @@ class SparseTableBackend:
             published.schedule,
             published.blocks.shape[1],
         )
-        topk_transform_sparse(
+        select_topk = _sparse_topk_transform(logits, is_verify=inputs.is_verify)
+        select_topk(
             logits, published.valid_lens, published.phys_blocks, inputs.out_page_indices
         )
 
@@ -590,4 +607,5 @@ def select_prefill_table(
 ) -> None:
     logits = _prefill_table_logits(table, data.q_fp4, data.q_sf, data.weights, k_cache)
     # request-relative compressed positions, -1 padded
-    topk_transform_sparse(logits, table.valid_lens, table.blocks, out_positions)
+    select_topk = _sparse_topk_transform(logits)
+    select_topk(logits, table.valid_lens, table.blocks, out_positions)
