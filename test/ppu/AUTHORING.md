@@ -51,11 +51,13 @@ following violations:
   `VLLM_USE_MODELSCOPE` are forbidden in recipes. Lower-level runtime/SDK variables
   (`DG_*`, `HGGC_*`, and `SGLANG_NSA_DUAL_STREAM`) are allowed only when explicitly
   declared in `ppu.external_env`.
-- **No private infrastructure or unreleased models**: Public recipes must never contain
-  local/shared filesystem paths, internal domains or mirrors, IPv4 literals, physical
-  hostnames, physical RDMA/IB NIC interface names, credentials, or non-public model
-  identifiers. Use logical `ppu.assets`, public Hugging Face `owner/name` repo IDs, and
-  topology placeholders instead.
+- **No private infrastructure, credentials, or unreleased models**: Public recipes must
+  never contain local/shared filesystem paths, internal domains or mirrors, IPv4
+  literals, physical hostnames, physical RDMA/IB NIC interface names, credential-bearing
+  CLI flags (`--api-key`, `--admin-api-key`, `--ssl-keyfile*`, `--*password*`,
+  `--*secret*`, `--*token*`) or secret environment variables (`*_API_KEY`, `*_SECRET`,
+  `*_TOKEN`, `*_PASSWORD`), or non-public model identifiers. Use logical `ppu.assets`,
+  public Hugging Face `owner/name` repo IDs, and topology placeholders instead.
 
 ## 3. Hardware x Precision Binding Contract
 
@@ -93,8 +95,8 @@ across models and frameworks:
 | --- | --- | --- | --- |
 | `prefill` | `single_node` (`nodes: 1`) | Prefill-optimized single-node layout (e.g., `spec_decoding: false`, `--disable-prefill-cuda-graph`) | None (placeholders, multi-node flags, and `--disaggregation-*` flags forbidden) |
 | `decode` | `single_node` (`nodes: 1`) | Decode-optimized single-node layout (e.g., TP8 with NEXTN / speculative decoding enabled) | None (placeholders, multi-node flags, and `--disaggregation-*` flags forbidden) |
-| `decode_ep` | `multi_node_ep` (`nodes >= 2`) | Multi-node Attention-DP + Expert-Parallel decode layout (e.g., 4-node `--tp-size 32 --attn-dp-size 32 --moe-a2a-backend deepep`) | Must enable expert parallelism (`--ep-size > 1` or `--moe-a2a-backend != 'none'`), match full topology capacity (`DP * TP * PP == nodes * devices_per_node` with `--dp-size 1` and valid per-node TP/PP rank ranges within `devices_per_node`), and wire `--nnodes <nodes>`, `--node-rank "{node_rank}"`, and `--dist-init-addr "{master_addr}:{master_port}"` |
-| `pd_prefill` + `pd_decode` | `pd_disagg` (paired roles `prefill` + `decode`) | Disaggregated prefill/decode server pair behind `sglang_router.launch_router --pd-disaggregation` | Must be declared as a pair resolving to identical `(variant, hardware)` targets and matching wire settings (`--disaggregation-transfer-backend`, `MOONCAKE_PROTOCOL`, `--page-size`, `--kv-cache-dtype`, and `--dsv4-attn-backend` / `SGLANG_DSV4_KV_LAYOUT`) with `--disaggregation-mode prefill` / `decode` (`fake` transfer backend is decode-only); for `mooncake` (default), wire `{kv_ip}` via `SGLANG_HOST_IP`, `{ib_devices}` via `--disaggregation-ib-device` (either `"{ib_devices}"` or a per-GPU JSON map covering `0..local_gpus-1`), and `{kv_port}` via `--disaggregation-bootstrap-port` on `pd_prefill` (`pd_decode` receives prefill bootstrap endpoints per request from `sglang_router` and must not set `{kv_port}`). Sub-node splits (such as 4P + 4D on an 8-card node) set `devices_per_node: 4` on each role |
+| `decode_ep` | `multi_node_ep` (`nodes >= 2`) | Multi-node Attention-DP + Expert-Parallel decode layout (e.g., 4-node `--tp-size 32 --attn-dp-size 32 --moe-a2a-backend deepep`) | Must enable expert parallelism (`--ep-size > 1` or `--moe-a2a-backend != 'none'`), match full topology capacity (`DP * TP * PP == nodes * devices_per_node` with `--dp-size 1`, valid per-node TP/PP rank ranges within `devices_per_node`, `--ep-size * --moe-dp-size == --tp-size` when `--ep-size > 1` and `--moe-dp-size > 1`, and compatible PP/speculation flags), and wire `--nnodes <nodes>`, `--node-rank "{node_rank}"`, and `--dist-init-addr "{master_addr}:{master_port}"` |
+| `pd_prefill` + `pd_decode` | `pd_disagg` (paired roles `prefill` + `decode`) | Disaggregated prefill/decode server pair behind `sglang_router.launch_router --pd-disaggregation` | Must be declared as a pair resolving to identical `(variant, hardware)` targets, compatible rank-mapping geometry (`pd_decode` `--attn-cp-size == 1`, `pd_decode` `--pp-size` equal to `pd_prefill` `--pp-size` or `1`, integer-multiple attention TP sizes with exact equality under `--enable-kv-cache-sharding`, and per-role `prefill_complete` eligibility when enabled), and matching wire settings (`--disaggregation-transfer-backend`, `--disaggregation-decode-allocation-policy`, `MOONCAKE_PROTOCOL`, effective model-normalized `--page-size`, `--kv-cache-dtype`, and `--dsv4-attn-backend` / `SGLANG_DSV4_KV_LAYOUT`) with `--disaggregation-mode prefill` / `decode` (`fake` transfer backend is decode-only); for `mooncake` (default), wire `{kv_ip}` via `SGLANG_HOST_IP`, `{ib_devices}` via `--disaggregation-ib-device` (either `"{ib_devices}"` or a per-GPU JSON map covering the launched visible GPU IDs), and `{kv_port}` via `--disaggregation-bootstrap-port` on `pd_prefill` (`pd_decode` receives prefill bootstrap endpoints per request from `sglang_router` and must not set `{kv_port}`). Sub-node splits (such as 4P + 4D on an 8-card node) set `devices_per_node: 4` on each role |
 
 Specialized single-node slots already in use by existing recipes (`dp_ep_low_latency`,
 `prefill_long`, `eval_longctx`, `decode_nographs`, `model_sanity`, `tp8`) remain accepted

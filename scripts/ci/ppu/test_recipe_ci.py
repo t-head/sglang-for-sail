@@ -2791,6 +2791,24 @@ def _sample_sglang_parser() -> argparse.ArgumentParser:
         "--disaggregation-transfer-backend",
         "--disaggregation-ib-device",
         "--disaggregation-bootstrap-port",
+        "--disaggregation-decode-allocation-policy",
+        "--disaggregation-decode-host-receive-threshold",
+        "--base-gpu-id",
+        "--gpu-id-step",
+        "--moe-dp-size",
+        "--dcp-size",
+        "--decode-context-parallel-size",
+        "--shared-experts-tp-size",
+        "--decoupled-spec-role",
+        "--scheduler-recv-interval",
+        "--hicache-write-policy",
+        "--hicache-storage-backend",
+        "--api-key",
+        "--admin-api-key",
+        "--ssl-keyfile",
+        "--ssl-certfile",
+        "--ssl-ca-certs",
+        "--ssl-keyfile-password",
         "--load-format",
         "--json-model-override-args",
         "--cp-strategy",
@@ -2811,6 +2829,14 @@ def _sample_sglang_parser() -> argparse.ArgumentParser:
         "--ple-offload-embedding",
         "--enable-prefill-cp",
         "--enable-deepseek-v4-fp4-indexer",
+        "--enable-kv-cache-sharding",
+        "--enable-overlap-schedule",
+        "--enable-multi-layer-eagle",
+        "--min-free-slots-delay",
+        "--enable-pd-role-switch",
+        "--enable-hisparse",
+        "--disaggregation-decode-enable-radix-cache",
+        "--enable-hierarchical-cache",
     ):
         parser.add_argument(bflag, action="store_true")
     return parser
@@ -2875,7 +2901,6 @@ class PresetCatalogContractTest(unittest.TestCase):
                 ("fp8", "pd_prefill", "zhenwu_m890"),
                 ("fp8", "pd_decode", "zhenwu_m890"),
                 ("bf16_810e", None, "zhenwu_810e"),
-                ("bf16_810e", "prefill", "zhenwu_810e"),
             ],
         )
         report = validate_paths(
@@ -2884,7 +2909,7 @@ class PresetCatalogContractTest(unittest.TestCase):
             parser=_sample_sglang_parser(),
         )
         self.assertTrue(report["parser_checked"])
-        self.assertEqual(report["checked_combinations"], 14)
+        self.assertEqual(report["checked_combinations"], 13)
 
         fp8 = resolve_recipe(glm_path, variant="fp8", preset="decode")
         self.assertEqual(fp8["hardware"], "zhenwu_m890")
@@ -2899,18 +2924,27 @@ class PresetCatalogContractTest(unittest.TestCase):
             fp8["enabled_features"], ["tool_calling", "reasoning", "spec_decoding"]
         )
 
-        bf16_810e = resolve_recipe(glm_path, variant="bf16_810e", preset="prefill")
+        bf16_810e = resolve_recipe(glm_path, variant="bf16_810e")
         self.assertEqual(bf16_810e["hardware"], "zhenwu_810e")
-        self.assertEqual(bf16_810e["ppu_count"], 16)
+        self.assertEqual(bf16_810e["ppu_count"], 32)
+        self.assertEqual(
+            bf16_810e["topology"],
+            {"kind": "multi_node_ep", "nodes": 2, "devices_per_node": 16},
+        )
         self.assertEqual(
             bf16_810e["hf_model_id"],
             "zai-org/GLM-5.3-BF16",
         )
         self.assertEqual(bf16_810e["golden_model_key"], "glm_5_3_bf16_810e")
-        self.assertEqual(
-            bf16_810e["flags"][bf16_810e["flags"].index("--mem-fraction-static") + 1],
-            "0.90",
+        mem_frac = float(
+            bf16_810e["flags"][bf16_810e["flags"].index("--mem-fraction-static") + 1]
         )
+        self.assertEqual(mem_frac, 0.90)
+        # Published GLM-5.3-BF16 checkpoint totals 1,506,664,539,392 bytes (~1.51 TB);
+        # 2x16 810E cards leave >=472 GB (64 GiB/card) to >=1,462 GB (96 GiB/card) for KV cache.
+        glm53_bf16_total_bytes = 1_506_664_539_392
+        static_budget_64gib = bf16_810e["ppu_count"] * 64 * (1024**3) * mem_frac
+        self.assertGreater(static_budget_64gib - glm53_bf16_total_bytes, 400 * (10**9))
         self.assertNotIn("--speculative-algorithm", bf16_810e["flags"])
 
         # Missing or empty variants on sglang recipes must fail closed.
@@ -3378,7 +3412,7 @@ class PresetCatalogContractTest(unittest.TestCase):
                 "glm-5.3-810e": {
                     "hardware": "zhenwu_810e",
                     "variant": "w8a8_int8",
-                    "preset": "prefill",
+                    "preset": None,
                 },
                 "glm-5.3-tp16": {"preset": "tp8"},
                 "glm-5.3-tp1": {"preset": "model_sanity"},
@@ -3389,7 +3423,10 @@ class PresetCatalogContractTest(unittest.TestCase):
                     pol["hardware"] = overrides["hardware"]
                 if "variant" in overrides:
                     pol["variant"] = overrides["variant"]
-                pol["tiers"]["fast_sanity"]["preset"] = overrides["preset"]
+                if overrides["preset"] is None:
+                    pol["tiers"]["fast_sanity"].pop("preset", None)
+                else:
+                    pol["tiers"]["fast_sanity"]["preset"] = overrides["preset"]
                 (root / f"test/ppu/policy/models/{slug}.yaml").write_text(
                     yaml.safe_dump(pol, sort_keys=False)
                 )
@@ -3983,22 +4020,53 @@ class PresetCatalogContractTest(unittest.TestCase):
         ):
             validate_serving_recipe_structure(disjoint_pd, context="disjoint_pd")
 
-        bad_page = copy.deepcopy(glm_doc)
-        bad_page["presets"]["pd_decode"]["args"] = [
-            *bad_page["presets"]["pd_decode"]["args"],
+        # DSA model normalization: omitted, 64, and 128 all normalize to 64 * index_kpool on SAIL.
+        dsa_omitted_page = copy.deepcopy(glm_doc)
+        dsa_omitted_page["presets"]["pd_decode"]["remove_args"] = ["--page-size"]
+        validate_serving_recipe_structure(dsa_omitted_page, context="dsa_omitted_page")
+
+        dsa_128_page = copy.deepcopy(glm_doc)
+        dsa_128_page["presets"]["pd_decode"]["args"] = [
+            *dsa_128_page["presets"]["pd_decode"]["args"],
+            "--page-size",
+            "128",
+        ]
+        validate_serving_recipe_structure(dsa_128_page, context="dsa_128_page")
+
+        bad_dsa_kpool = copy.deepcopy(glm_doc)
+        bad_dsa_kpool["presets"]["pd_decode"]["json_args"] = {
+            "--json-model-override-args": {"index_kpool": 2}
+        }
+        with self.assertRaisesRegex(ValidationError, "--page-size mismatch"):
+            validate_serving_recipe_structure(bad_dsa_kpool, context="bad_dsa_kpool")
+
+        # Non-DSA models still reject raw or omitted page-size mismatches.
+        dsv41_doc = _load_yaml(
+            REPO_ROOT / "test/ppu/recipes/deepseek-ai/DeepSeek-V4.1-Flash.yaml"
+        )
+        non_dsa_pd = copy.deepcopy(dsv41_doc)
+        non_dsa_pd["presets"] = {
+            "pd_prefill": copy.deepcopy(glm_doc["presets"]["pd_prefill"]),
+            "pd_decode": copy.deepcopy(glm_doc["presets"]["pd_decode"]),
+        }
+        non_dsa_pd["presets"]["pd_prefill"]["select"] = {"features": {}}
+        non_dsa_pd["presets"]["pd_decode"]["select"] = {"features": {}}
+        bad_non_dsa_page = copy.deepcopy(non_dsa_pd)
+        bad_non_dsa_page["presets"]["pd_decode"]["args"] = [
+            *bad_non_dsa_page["presets"]["pd_decode"]["args"],
             "--page-size",
             "128",
         ]
         with self.assertRaisesRegex(ValidationError, "--page-size mismatch"):
-            validate_serving_recipe_structure(bad_page, context="bad_pd_page")
-
-        ok_page = copy.deepcopy(bad_page)
-        ok_page["presets"]["pd_prefill"]["args"] = [
-            *ok_page["presets"]["pd_prefill"]["args"],
-            "--page-size",
-            "128",
-        ]
-        validate_serving_recipe_structure(ok_page, context="ok_pd_page")
+            validate_serving_recipe_structure(
+                bad_non_dsa_page, context="bad_non_dsa_page"
+            )
+        omitted_non_dsa_page = copy.deepcopy(non_dsa_pd)
+        omitted_non_dsa_page["presets"]["pd_decode"]["remove_args"] = ["--page-size"]
+        with self.assertRaisesRegex(ValidationError, "--page-size mismatch"):
+            validate_serving_recipe_structure(
+                omitted_non_dsa_page, context="omitted_non_dsa_page"
+            )
 
         bad_kv_dtype = copy.deepcopy(glm_doc)
         bad_kv_dtype["presets"]["pd_decode"]["args"] = [
@@ -4113,6 +4181,303 @@ class PresetCatalogContractTest(unittest.TestCase):
             substitute_validation_placeholders(
                 ["--json-model-override-args", "{not-json"], {}
             )
+
+    def test_audit_regressions_gpu_placement_pd_geometry_pp_spec_moe_dp_and_credentials(
+        self,
+    ):
+        glm_path = REPO_ROOT / "test/ppu/recipes/zai-org/GLM-5.3.yaml"
+        glm_doc = _load_yaml(glm_path)
+
+        # 1. Co-located 4P+4D GPU placement: GPUs 4..7 IB map passes; 0..3 IB map fails;
+        #    offset single-node TP8 (--base-gpu-id 1) fails validation and Fast Sanity admission.
+        colocated_4p4d = copy.deepcopy(glm_doc)
+        colocated_4p4d["presets"]["pd_prefill"]["topology"]["devices_per_node"] = 4
+        colocated_4p4d["presets"]["pd_prefill"]["tp"] = 4
+        colocated_4p4d["presets"]["pd_prefill"]["args"][
+            colocated_4p4d["presets"]["pd_prefill"]["args"].index(
+                "--disaggregation-ib-device"
+            )
+            + 1
+        ] = json.dumps({str(i): "{ib_devices}" for i in range(0, 4)})
+        colocated_4p4d["presets"]["pd_decode"]["topology"]["devices_per_node"] = 4
+        colocated_4p4d["presets"]["pd_decode"]["tp"] = 4
+        d_args = colocated_4p4d["presets"]["pd_decode"]["args"]
+        d_args[d_args.index("--attn-dp-size") + 1] = "4"
+        d_args[d_args.index("--disaggregation-ib-device") + 1] = json.dumps(
+            {str(i): "{ib_devices}" for i in range(4, 8)}
+        )
+        d_args.extend(["--base-gpu-id", "4"])
+        validate_serving_recipe_structure(colocated_4p4d, context="colocated_4p4d_ok")
+
+        bad_colocated_ib = copy.deepcopy(colocated_4p4d)
+        bad_d_args = bad_colocated_ib["presets"]["pd_decode"]["args"]
+        bad_d_args[bad_d_args.index("--disaggregation-ib-device") + 1] = json.dumps(
+            {str(i): "{ib_devices}" for i in range(0, 4)}
+        )
+        with self.assertRaisesRegex(
+            ValidationError, "must cover launched local GPUs \\[4, 5, 6, 7\\]"
+        ):
+            validate_serving_recipe_structure(
+                bad_colocated_ib, context="bad_colocated_ib"
+            )
+
+        bad_offset_tp8 = copy.deepcopy(glm_doc)
+        bad_offset_tp8["presets"]["decode"]["args"] = ["--base-gpu-id", "1"]
+        with self.assertRaisesRegex(
+            ValidationError,
+            "launched local GPU IDs .* exceed topology.devices_per_node",
+        ):
+            validate_serving_recipe_structure(bad_offset_tp8, context="bad_offset_tp8")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shutil.copytree(REPO_ROOT / "test/ppu", root / "test/ppu")
+            rec_file = root / "test/ppu/recipes/zai-org/GLM-5.3.yaml"
+            pol_file = root / "test/ppu/policy/models/glm-5.3.yaml"
+            rec_doc = _load_yaml(rec_file)
+            rec_doc["presets"]["decode"]["args"] = ["--base-gpu-id", "1"]
+            rec_file.write_text(yaml.safe_dump(rec_doc, sort_keys=False))
+            pol_doc = _load_yaml(pol_file)
+            pol_doc["tiers"]["fast_sanity"]["preset"] = "decode"
+            pol_file.write_text(yaml.safe_dump(pol_doc, sort_keys=False))
+            with (
+                patch("ppu_recipe.REPO_ROOT", root),
+                patch("recipe_select.REPO_ROOT", root),
+            ):
+                with self.assertRaisesRegex(
+                    ValidationError,
+                    "launched local GPU IDs .* exceed topology.devices_per_node",
+                ):
+                    select("fast_sanity", "glm-5.3")
+
+        # 2. PD decode allocation policy parity & prefill_complete role eligibility.
+        mismatch_alloc = copy.deepcopy(glm_doc)
+        mismatch_alloc["presets"]["pd_decode"]["args"].extend(
+            ["--disaggregation-decode-allocation-policy", "prefill_complete"]
+        )
+        with self.assertRaisesRegex(
+            ValidationError, "--disaggregation-decode-allocation-policy mismatch"
+        ):
+            validate_serving_recipe_structure(mismatch_alloc, context="mismatch_alloc")
+
+        bad_prefill_complete = copy.deepcopy(mismatch_alloc)
+        bad_prefill_complete["presets"]["pd_prefill"]["args"].extend(
+            ["--disaggregation-decode-allocation-policy", "prefill_complete"]
+        )
+        with self.assertRaisesRegex(
+            ValidationError, "requires --tp-size \\(8\\) == --attn-dp-size \\(1\\)"
+        ):
+            validate_serving_recipe_structure(
+                bad_prefill_complete, context="bad_prefill_complete"
+            )
+
+        ok_prefill_complete = copy.deepcopy(bad_prefill_complete)
+        ok_prefill_complete["presets"]["pd_prefill"]["args"].extend(
+            [
+                "--attn-dp-size",
+                "8",
+                "--enable-dp-lm-head",
+                "--moe-a2a-backend",
+                "deepep",
+                "--deepep-mode",
+                "auto",
+                "--moe-dense-tp-size",
+                "1",
+            ]
+        )
+        validate_serving_recipe_structure(
+            ok_prefill_complete, context="ok_prefill_complete"
+        )
+
+        # 3. PD peer parallel geometry: PP1/PP2, Decode CP2, and KV sharding TP8 vs TP1.
+        bad_pd_pp = copy.deepcopy(glm_doc)
+        bad_pd_pp["presets"]["pd_decode"]["select"]["features"]["spec_decoding"] = False
+        bad_pd_pp["presets"]["pd_decode"]["topology"] = {
+            "kind": "pd_disagg",
+            "nodes": 2,
+            "devices_per_node": 8,
+            "role": "decode",
+        }
+        bad_pd_pp["presets"]["pd_decode"]["args"].extend(
+            [
+                "--pp-size",
+                "2",
+                "--nnodes",
+                "2",
+                "--node-rank",
+                "{node_rank}",
+                "--dist-init-addr",
+                "{master_addr}:{master_port}",
+            ]
+        )
+        with self.assertRaisesRegex(ValidationError, "--pp-size incompatible"):
+            validate_serving_recipe_structure(bad_pd_pp, context="bad_pd_pp")
+
+        ok_pd_pp = copy.deepcopy(glm_doc)
+        ok_pd_pp["presets"]["pd_prefill"]["topology"] = {
+            "kind": "pd_disagg",
+            "nodes": 2,
+            "devices_per_node": 8,
+            "role": "prefill",
+        }
+        ok_pd_pp["presets"]["pd_prefill"]["args"].extend(
+            [
+                "--pp-size",
+                "2",
+                "--nnodes",
+                "2",
+                "--node-rank",
+                "{node_rank}",
+                "--dist-init-addr",
+                "{master_addr}:{master_port}",
+            ]
+        )
+        validate_serving_recipe_structure(ok_pd_pp, context="ok_pd_pp")
+
+        bad_decode_cp = copy.deepcopy(glm_doc)
+        dec_cp_args = bad_decode_cp["presets"]["pd_decode"]["args"]
+        dec_cp_args[dec_cp_args.index("--attn-dp-size") + 1] = "4"
+        dec_cp_args.extend(["--attn-cp-size", "2"])
+        with self.assertRaisesRegex(
+            ValidationError, "pd_decode requires effective --attn-cp-size 1"
+        ):
+            validate_serving_recipe_structure(bad_decode_cp, context="bad_decode_cp")
+
+        ok_prefill_cp = copy.deepcopy(glm_doc)
+        ok_prefill_cp["presets"]["pd_prefill"]["args"].extend(["--attn-cp-size", "2"])
+        validate_serving_recipe_structure(ok_prefill_cp, context="ok_prefill_cp")
+
+        bad_kv_shard = copy.deepcopy(glm_doc)
+        bad_kv_shard["presets"]["pd_prefill"]["args"].append(
+            "--enable-kv-cache-sharding"
+        )
+        with self.assertRaisesRegex(
+            ValidationError,
+            "--enable-kv-cache-sharding without prefill CP requires matching attention TP sizes",
+        ):
+            validate_serving_recipe_structure(bad_kv_shard, context="bad_kv_shard")
+
+        ok_kv_shard = copy.deepcopy(bad_kv_shard)
+        ok_kv_shard["presets"]["pd_decode"]["args"] = [
+            "--disaggregation-mode",
+            "decode",
+            "--disaggregation-transfer-backend",
+            "mooncake",
+            "--disaggregation-ib-device",
+            "{ib_devices}",
+        ]
+        validate_serving_recipe_structure(ok_kv_shard, context="ok_kv_shard")
+
+        # 4. Multi-node EP option combinations: TP16xPP2 + NEXTN and TP32 + EP32xMoE-DP2.
+        bad_pp_spec = copy.deepcopy(glm_doc)
+        bad_pp_spec["presets"]["decode_ep"]["tp"] = 16
+        bad_pp_spec["presets"]["decode_ep"]["args"] = [
+            "--pp-size",
+            "2",
+            "--attn-dp-size",
+            "16",
+            "--enable-dp-lm-head",
+            "--moe-a2a-backend",
+            "deepep",
+            "--deepep-mode",
+            "low_latency",
+            "--moe-dense-tp-size",
+            "1",
+            "--nnodes",
+            "4",
+            "--node-rank",
+            "{node_rank}",
+            "--dist-init-addr",
+            "{master_addr}:{master_port}",
+        ]
+        with self.assertRaisesRegex(
+            ValidationError,
+            "--pp-size > 1 .* with --speculative-algorithm 'NEXTN' requires --disaggregation-mode prefill",
+        ):
+            validate_serving_recipe_structure(bad_pp_spec, context="bad_pp_spec")
+
+        ok_pp_nospec = copy.deepcopy(bad_pp_spec)
+        ok_pp_nospec["presets"]["decode_ep"]["select"]["features"]["spec_decoding"] = (
+            False
+        )
+        validate_serving_recipe_structure(ok_pp_nospec, context="ok_pp_nospec")
+
+        bad_moe_dp = copy.deepcopy(glm_doc)
+        bad_moe_dp["presets"]["decode_ep"]["args"] = [
+            "--attn-dp-size",
+            "16",
+            "--attn-cp-size",
+            "2",
+            "--moe-dp-size",
+            "2",
+            "--ep-size",
+            "32",
+            "--enable-dp-lm-head",
+            "--moe-a2a-backend",
+            "deepep",
+            "--deepep-mode",
+            "low_latency",
+            "--nnodes",
+            "4",
+            "--node-rank",
+            "{node_rank}",
+            "--dist-init-addr",
+            "{master_addr}:{master_port}",
+        ]
+        with self.assertRaisesRegex(
+            ValidationError,
+            "--ep-size \\* --moe-dp-size \\(32 \\* 2\\) must not exceed",
+        ):
+            validate_serving_recipe_structure(bad_moe_dp, context="bad_moe_dp")
+
+        ok_moe_dp = copy.deepcopy(bad_moe_dp)
+        ok_ep_args = ok_moe_dp["presets"]["decode_ep"]["args"]
+        ok_ep_args[ok_ep_args.index("--ep-size") + 1] = "16"
+        validate_serving_recipe_structure(ok_moe_dp, context="ok_moe_dp")
+
+        # 5. Credential-bearing CLI flags and secret env vars blocked before validation & catalog render.
+        sentinel = "AUDIT_SYNTHETIC_DO_NOT_USE"
+        for cred_flag in (
+            ["--api-key", sentinel],
+            [f"--api-key={sentinel}"],
+            ["--admin-api-key", sentinel],
+            ["--ssl-keyfile-password", sentinel],
+        ):
+            bad_cred = copy.deepcopy(glm_doc)
+            bad_cred["variants"]["fp8"]["extra_args"].extend(cred_flag)
+            with self.assertRaisesRegex(
+                ValidationError, "credential/secret CLI flag .* is forbidden"
+            ) as ctx:
+                validate_serving_recipe_structure(bad_cred, context="bad_cred")
+            self.assertNotIn(sentinel, str(ctx.exception))
+
+        bad_cred_env = copy.deepcopy(glm_doc)
+        bad_cred_env["variants"]["fp8"]["extra_env"]["SGLANG_ADMIN_API_KEY"] = sentinel
+        with self.assertRaisesRegex(
+            ValidationError, "credential/secret env .* is forbidden"
+        ) as env_ctx:
+            validate_serving_recipe_structure(bad_cred_env, context="bad_cred_env")
+        self.assertNotIn(sentinel, str(env_ctx.exception))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shutil.copytree(REPO_ROOT / "test/ppu", root / "test/ppu")
+            rec_file = root / "test/ppu/recipes/zai-org/GLM-5.3.yaml"
+            rec_doc = _load_yaml(rec_file)
+            rec_doc["variants"]["fp8"]["extra_args"].extend(["--api-key", sentinel])
+            rec_file.write_text(yaml.safe_dump(rec_doc, sort_keys=False))
+            with (
+                patch("ppu_recipe.REPO_ROOT", root),
+                patch("recipe_select.REPO_ROOT", root),
+            ):
+                with self.assertRaisesRegex(
+                    ValidationError, "credential/secret CLI flag .* is forbidden"
+                ):
+                    validate_paths([rec_file], sglang_parser_mode="skip")
+                with self.assertRaisesRegex(
+                    ValidationError, "credential/secret CLI flag .* is forbidden"
+                ):
+                    render_ci_matrix_markdown()
 
 
 if __name__ == "__main__":
