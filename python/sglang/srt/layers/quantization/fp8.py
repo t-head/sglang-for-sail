@@ -77,6 +77,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     resolve_mxfp8_dense_gemm_backend,
     unshuffle_aiter_fp8_weight,
     use_aiter_bpreshuffle_gemm,
+    use_ppu_fp8_dense_proj,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
@@ -1160,6 +1161,7 @@ class Fp8LinearMethod(LinearMethodBase):
             if not self.is_checkpoint_fp8_serialized:
                 if (
                     self.cutlass_fp8_supported
+                    or use_ppu_fp8_dense_proj()
                     or _is_xpu
                     or self.use_marlin
                     or (_use_aiter and self.use_aiter_fp8_per_token)
@@ -1169,7 +1171,11 @@ class Fp8LinearMethod(LinearMethodBase):
                     qweight, weight_scale = per_token_group_quant_fp8(
                         layer.weight, layer.weight.shape[-1]
                     )
-                    weight_scale = weight_scale.t().contiguous()
+                    weight_scale = (
+                        weight_scale.contiguous()
+                        if use_ppu_fp8_dense_proj()
+                        else weight_scale.t().contiguous()
+                    )
                     if _use_aiter and self.use_aiter_fp8_per_token:
                         self.use_per_token_if_dynamic = True
                         if use_aiter_bpreshuffle_gemm(qweight.shape[0]):

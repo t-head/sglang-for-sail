@@ -70,6 +70,15 @@ _is_gfx1250_supported = is_gfx1250_supported()
 _is_musa = is_musa()
 _is_sail = is_sail()
 
+
+def use_ppu_fp8_dense_proj() -> bool:
+    return (
+        envs.SGLANG_PPU_ENABLE_FP8_DENSE_PROJ.get()
+        and _is_sail
+        and get_device_sm() >= 89
+        and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+    )
+
 # gfx1250 (RDNA4) cannot compile the AITER CK quant/GEMM kernels, and even when
 # CK builds it lacks the MFMA/WMMA instructions those kernels rely on. Force the
 # pure-triton block-fp8 path on gfx1250.

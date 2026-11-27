@@ -56,6 +56,8 @@ from sglang.srt.layers.moe.utils import (
     get_moe_runner_backend,
     get_num_fused_shared_experts,
 )
+from sglang.srt.layers.quantization import Fp8Config
+from sglang.srt.layers.quantization.fp8_utils import use_ppu_fp8_dense_proj
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -417,8 +419,29 @@ class Glm5NextLinearAttention(nn.Module):
 
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
+        source_projs = [
+            name
+            for fused_proj in ("fused_qkvbfg_a_proj", "fused_fg_b_proj")
+            for name in self._PACKED_MODULES_MAPPING[fused_proj]
+        ] + ["o_proj"]
+        use_fp8_dense_proj = (
+            quant_config is not None
+            and quant_config.get_name() == "compressed_tensors"
+            and use_ppu_fp8_dense_proj()
+            and all(
+                quant_config.is_linear_unquantized(add_prefix(name, prefix))
+                for name in source_projs
+            )
+        )
+        if use_fp8_dense_proj:
+            quant_config = Fp8Config(is_checkpoint_fp8_serialized=False)
 
-        self.do_fuse_qkvbfg = self._can_fuse_proj(
+        self.do_fuse_qkvbfg = (
+            use_fp8_dense_proj
+            and self._can_fuse_proj(
+                None, prefix, "fused_qkvbfg_a_proj", "fused_fg_b_proj"
+            )
+        ) or self._can_fuse_proj(
             quant_config, prefix, "fused_qkvbfg_a_proj", "fused_fg_b_proj"
         )
         self.fuse_bfg = not self.do_fuse_qkvbfg and self._can_fuse_proj(
@@ -437,7 +460,7 @@ class Glm5NextLinearAttention(nn.Module):
                 self.hidden_size,
                 self.qkvb_sizes,
                 self.fg_sizes,
-                quant_config=None,
+                quant_config=quant_config if use_fp8_dense_proj else None,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
                 parallel_group=head_parallel_group,
             )
@@ -451,6 +474,7 @@ class Glm5NextLinearAttention(nn.Module):
                 self.head_dim,
                 projection_size,
                 dtype=self.fused_qkvbfg_a_proj.params_dtype,
+                quant_config=quant_config if use_fp8_dense_proj else None,
                 parallel_group=head_parallel_group,
             )
         else:

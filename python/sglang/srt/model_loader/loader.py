@@ -1359,7 +1359,8 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                 continue
             rebuild = model.original_weights_rebuild_keys[name]
             layer = model.get_submodule(name.rpartition(".")[0])
-            per_channel = layer.weight_scale.shape == (1, rebuild["shape"][0])
+            n = rebuild["shape"][0]
+            per_channel = layer.weight_scale.shape in ((1, n), (n, 1))
             if name in complete_params:
                 row_masks[name] = (None, per_channel)
                 continue
@@ -1432,6 +1433,12 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     data, rebuild["shape"], rebuild["stride"]
                 )
                 if per_channel:
+                    weight_scale = layer.weight_scale.data
+                    scale_by_row = (
+                        weight_scale.t()
+                        if weight_scale.shape == (1, staging.shape[0])
+                        else weight_scale
+                    )
                     # Untouched rows never pass through dequantization.
                     if complete:
                         ranges = [(0, staging.shape[0])]
@@ -1444,7 +1451,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                             staging[begin:end],
                             staging.shape[-1],
                             output_q=local_weight[begin:end],
-                            output_s=layer.weight_scale.data[:, begin:end].t(),
+                            output_s=scale_by_row[begin:end],
                         )
                 else:
                     _, scale = input_to_float8(

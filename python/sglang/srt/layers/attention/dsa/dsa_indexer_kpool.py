@@ -59,6 +59,8 @@ from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.quantization import Fp8Config
+from sglang.srt.layers.quantization.fp8_utils import use_ppu_fp8_dense_proj
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -223,11 +225,19 @@ class IndexerKPool(MultiPlatformOp):
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
 
+        wq_b_quant_config = (
+            Fp8Config(is_checkpoint_fp8_serialized=False)
+            if quant_config is not None
+            and quant_config.get_name() == "compressed_tensors"
+            and use_ppu_fp8_dense_proj()
+            and quant_config.is_linear_unquantized(add_prefix("wq_b", prefix))
+            else quant_config
+        )
         self.wq_b = ReplicatedLinear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
             bias=False,
-            quant_config=quant_config,
+            quant_config=wq_b_quant_config,
             prefix=add_prefix("wq_b", prefix),
         )
 
