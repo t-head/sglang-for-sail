@@ -164,8 +164,23 @@ jobs:
         with:
           python-version: '3.12'
       - name: Run Recipe and PPU infrastructure selftests
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          BASE_REPO: ${{ github.repository }}
         run: |
           python3 -m pip install --quiet PyYAML huggingface-hub
+          python3 -B scripts/ci/ppu/ppu_recipe.py validate --all --sglang-parser skip
+          python3 -B scripts/ci/ppu/ppu_recipe.py render-matrix --check
+          if [[ "$EVENT_NAME" == "pull_request_target" && -n "$BASE_SHA" ]]; then
+            if git fetch --depth=1 "https://github.com/${BASE_REPO}.git" "$BASE_SHA" >/dev/null 2>&1; then
+              python3 -B scripts/ci/ppu/ppu_recipe.py diff \
+                --base-ref "$BASE_SHA" \
+                --no-merge-base \
+                --only-when-changed \
+                --include-signoff-hint >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
           python3 -B -m unittest discover -s scripts/ci/ppu -p 'test_recipe*.py'
           node --test scripts/ci/ppu/test_ppu_approval.cjs
           bash scripts/ci/ppu/run_selftests.sh

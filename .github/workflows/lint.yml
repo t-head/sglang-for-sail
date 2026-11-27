@@ -60,6 +60,34 @@ jobs:
       - name: Run pre-commit checks
         run: SKIP=no-commit-to-branch pre-commit run --all-files --show-diff-on-failure
 
+      - name: Validate PPU recipes and render PR command diff
+        if: ${{ !cancelled() }}
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+        run: |
+          set -euo pipefail
+          python3 -B scripts/ci/ppu/ppu_recipe.py validate --all --sglang-parser skip
+          python3 -B scripts/ci/ppu/ppu_recipe.py render-matrix --check
+          if [[ "$EVENT_NAME" == "pull_request" && -n "$BASE_SHA" ]]; then
+            python3 -B scripts/ci/ppu/ppu_recipe.py diff \
+              --base-ref "${BASE_SHA}" \
+              --only-when-changed \
+              --include-signoff-hint >> "$GITHUB_STEP_SUMMARY"
+            changed_model_paths="$(git diff --name-only "${BASE_SHA}...HEAD" -- \
+              test/ppu/recipes test/ppu/policy test/srt/models)"
+            if [ -n "$changed_model_paths" ]; then
+              echo "::notice title=Model Recipe Sign-off Checklist::Model recipe/policy/test paths changed. Complete the 3-item Model Recipe Sign-off checklist in .github/pull_request_template.md (see test/ppu/AUTHORING.md)."
+              if ! grep -qE '^test/ppu/(recipes|policy)/' <<< "$changed_model_paths"; then
+                {
+                  echo "### Model Recipe Sign-off Reminder"
+                  echo ""
+                  echo "Legacy model test paths changed without \`test/ppu/\` updates. Complete the 3-item Model Recipe Sign-off checklist in \`.github/pull_request_template.md\` and see \`test/ppu/AUTHORING.md\`."
+                } >> "$GITHUB_STEP_SUMMARY"
+              fi
+            fi
+          fi
+
       - name: Run lychee docs checks (offline references)
         uses: lycheeverse/lychee-action@8646ba30535128ac92d33dfc9133794bfdd9b411 # v2
         with:
