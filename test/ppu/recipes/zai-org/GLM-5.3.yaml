@@ -90,8 +90,8 @@ variants:
     precision: bf16
     hardware: zhenwu_810e
     topology:
-      kind: single_node
-      nodes: 1
+      kind: multi_node_ep
+      nodes: 2
       devices_per_node: 16
     assets:
       model: glm-5.3-bf16
@@ -101,7 +101,19 @@ variants:
     served_name: glm-5.3-bf16
     extra_args:
       - --tp-size
-      - "16"
+      - "32"
+      - --ep-size
+      - "32"
+      - --nnodes
+      - "2"
+      - --node-rank
+      - "{node_rank}"
+      - --dist-init-addr
+      - "{master_addr}:{master_port}"
+      - --dist-timeout
+      - "3600"
+      - --watchdog-timeout
+      - "3600"
     extra_env: {}
 hardware_overrides:
   zhenwu_m890:
@@ -114,6 +126,7 @@ hardware_overrides:
     extra_env: {}
 presets:
   prefill:
+    hardware: zhenwu_m890
     select:
       features:
         tool_calling: true
@@ -238,7 +251,8 @@ presets:
 notes: >-
   Reference #0 full-scenario serving recipe for zai-org/GLM-5.3 across Zhenwu
   M890 (default mxfp4 and public fp8 zai-org/GLM-5.3) and Zhenwu 810E (public
-  bf16_810e zai-org/GLM-5.3-BF16) variants, covering prefill (TP8/TP16 without
+  2-node 32-card bf16_810e zai-org/GLM-5.3-BF16 sized for ~1.51 TB BF16 weights
+  plus KV cache headroom) variants, covering single-node prefill (TP8 without
   NEXTN), single-node decode (TP8 with NEXTN), 4-node TP32+AttnDP32+DeepEP
   decode_ep, and paired Mooncake pd_prefill/pd_decode disaggregation presets.
   Baseline default resolution remains unchanged for online PR fast_sanity and

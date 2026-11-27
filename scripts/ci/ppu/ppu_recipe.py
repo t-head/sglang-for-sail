@@ -88,10 +88,17 @@ MULTI_NODE_LAUNCH_FLAGS = frozenset(
 PD_DISAGG_FLAGS = frozenset(
     {
         "--disaggregation-bootstrap-port",
+        "--disaggregation-decode-allocation-policy",
         "--disaggregation-decode-dp",
+        "--disaggregation-decode-enable-fake-auto",
+        "--disaggregation-decode-enable-offload-kvcache",
+        "--disaggregation-decode-enable-radix-cache",
+        "--disaggregation-decode-host-receive-threshold",
+        "--disaggregation-decode-polling-interval",
         "--disaggregation-decode-tp",
         "--disaggregation-ib-device",
         "--disaggregation-mode",
+        "--disaggregation-prefill-pp",
         "--disaggregation-transfer-backend",
         "--kv-transfer-config",
     }
@@ -99,6 +106,7 @@ PD_DISAGG_FLAGS = frozenset(
 SUPPORTED_DISAGG_BACKENDS = frozenset(
     {"mooncake", "mooncake_tcp", "nixl", "ascend", "mori", "fake"}
 )
+SUPPORTED_DISAGG_ALLOC_POLICIES = frozenset({"early", "prefill_complete"})
 _UNSET: Any = object()
 
 ALLOWED_ENV_PREFIXES = (
@@ -116,20 +124,88 @@ ALLOWED_ENV_PREFIXES = (
 FORBIDDEN_RECIPE_ENV = frozenset(
     {
         "CUDA_VISIBLE_DEVICES",
+        "EXA_API_KEY",
         "HF_DATASETS_CACHE",
         "HF_DATASETS_OFFLINE",
         "HF_HOME",
         "HF_HUB_OFFLINE",
         "HF_MODULES_CACHE",
+        "HF_TOKEN",
+        "HUGGING_FACE_HUB_TOKEN",
         "NVIDIA_VISIBLE_DEVICES",
+        "OPENAI_API_KEY",
+        "SGLANG_ADMIN_API_KEY",
+        "SGLANG_API_KEY",
         "SGLANG_USE_MODELSCOPE",
         "SGLANG_WARMUP_TIMEOUT",
         "TRANSFORMERS_OFFLINE",
+        "VLLM_API_KEY",
         "VLLM_SERVER_DEV_MODE",
         "VLLM_USE_MODELSCOPE",
         "VLLM_USE_RUST_BENCH",
         "VLLM_USE_RUST_FRONTEND",
     }
+)
+# Authoritative SGLang ServerArgs fields carrying credentials or storage secrets
+# (mirrors sglang.srt.server_args.SERVER_ARGS_SECRET_FIELD_NAMES plus TLS/watermark/decrypted config fields).
+SGLANG_SENSITIVE_DEST_NAMES = frozenset(
+    {
+        "admin_api_key",
+        "api_key",
+        "decrypted_config_file",
+        "decrypted_draft_config_file",
+        "hicache_storage_backend_extra_config",
+        "ssl_ca_certs",
+        "ssl_certfile",
+        "ssl_keyfile",
+        "ssl_keyfile_password",
+        "unified_cache_external_linker_config",
+        "watermark_config",
+    }
+)
+FORBIDDEN_CREDENTIAL_FLAGS = frozenset(
+    {
+        "--admin-api-key",
+        "--api-key",
+        "--decrypted-config-file",
+        "--decrypted-draft-config-file",
+        "--hicache-storage-backend-extra-config",
+        "--ssl-ca-certs",
+        "--ssl-certfile",
+        "--ssl-keyfile",
+        "--ssl-keyfile-password",
+        "--unified-cache-external-linker-config",
+        "--watermark-config",
+    }
+)
+# Exact minimum unambiguous argparse(allow_abbrev=True) prefixes (target_flag, min_prefix)
+# against SGLang ServerArgs long options.
+_SENSITIVE_ARGPARSE_ABBREV_RULES: tuple[tuple[str, str], ...] = (
+    ("--admin-api-key", "--ad"),
+    ("--api-key", "--ap"),
+    ("--decrypted-config-file", "--decrypted"),
+    ("--decrypted-draft-config-file", "--decrypted"),
+    ("--hicache-storage-backend-extra-config", "--hicache-storage-backend-"),
+    ("--ssl-ca-certs", "--ssl"),
+    ("--ssl-certfile", "--ssl"),
+    ("--ssl-keyfile", "--ssl"),
+    ("--ssl-keyfile-password", "--ssl"),
+    ("--unified-cache-external-linker-config", "--unified-cache-external-linker-c"),
+    ("--watermark-config", "--wate"),
+)
+_CREDENTIAL_FLAG_RE = re.compile(
+    r"^--(?:[a-z0-9-]+-)?(?:"
+    r"api-keys?|passwords?|passwds?|secrets?|credentials?|private-keys?|certfiles?|keyfiles?|ca-certs"
+    r"|(?:access|api|auth|bearer|client|hf|hub|id|jwt|oauth|pat|refresh|router|secret|service|session)-tokens?"
+    r")$"
+    r"|^--tokens?$"
+    r"|^--(?:hicache-storage-(?:[a-z0-9-]+-)?extra-config|(?:unified-cache-)?external-linker-(?:[a-z0-9-]+-)?config)$",
+    re.I,
+)
+_CREDENTIAL_ENV_RE = re.compile(
+    r"(?:^|_)(?:API_KEY|PASSWORD|PASSWD|SECRET|ACCESS_TOKEN|AUTH_TOKEN|HF_TOKEN|HUB_TOKEN|PRIVATE_KEY)S?$"
+    r"|(?:^|_)TOKEN$",
+    re.I,
 )
 EXTERNAL_ENV_PREFIXES = ("DG_", "HGGC_")
 EXTERNAL_ENV_EXACT = frozenset({"SGLANG_NSA_DUAL_STREAM"})
@@ -293,9 +369,9 @@ _SENSITIVE_ENV_KEY_RE = re.compile(
     re.I,
 )
 _CRED_VAL_PAT = (
-    r"(?:(?:[=:]\s*|[`'\"]?\s*,\s*[`'\"]?|\s+)(?:\{[^\r\n`|]*\}|'[^\r\n']*'|'[^\r\n']*|"
+    r"(?:(?:[=:]\s*|[`'\"]?\s*,\s*[`'\"]?|\s+)(?!--)(?:\{[^\r\n`|]*\}|'[^\r\n']*'|'[^\r\n']*|"
     + r'"[^\r\n"]*"|"[^\r\n"]*|'
-    + r"[^\s,`'\";\]|]+))?"
+    + r"[^\s,`'\";\]|)]+))"
 )
 _CRED_KEY_ALTS = (
     r"API[-_]?KEY|API[-_]?SECRET|API[-_]?TOKEN|AUTH[-_]?TOKEN|BEARER[-_]?TOKEN"
@@ -897,6 +973,439 @@ def _parse_pos_int_flag(flag_name: str, raw: str | None, *, context: str) -> int
     return val
 
 
+def _parse_nonneg_int_flag(
+    flag_name: str, raw: str | None, *, context: str
+) -> int | None:
+    if raw is None:
+        return None
+    try:
+        val = int(raw)
+    except ValueError as exc:
+        raise ValidationError(
+            f"{context}: {flag_name} must be a non-negative int, got {raw!r}"
+        ) from exc
+    if val < 0:
+        raise ValidationError(
+            f"{context}: {flag_name} must be a non-negative int, got {raw!r}"
+        )
+    return val
+
+
+def _is_credential_flag(flag: str) -> bool:
+    opt = flag.split("=", 1)[0].strip().lower().replace("_", "-")
+    if opt in FORBIDDEN_CREDENTIAL_FLAGS or _CREDENTIAL_FLAG_RE.fullmatch(opt):
+        return True
+    return any(
+        opt.startswith(min_prefix) and target.startswith(opt)
+        for target, min_prefix in _SENSITIVE_ARGPARSE_ABBREV_RULES
+    )
+
+
+_SUSPECT_SENSITIVE_DEST_RE = re.compile(
+    r"(?:^|_)(?:api_key|password|passwd|secret|private_key|keyfile|certfile|ca_certs|credential)s?(?:$|_)"
+    r"|(?:hicache_storage|external_linker).*(?:config|secret|token|auth|password|cred)"
+    r"|^watermark_(?:config|key)"
+    r"|^decrypted_.*config",
+    re.I,
+)
+
+
+def verify_secret_flag_registry_parity(
+    parser: argparse.ArgumentParser | None = None,
+    *,
+    secret_field_names: frozenset[str] | set[str] | None = None,
+) -> dict[str, Any]:
+    """Verify static credential-flag coverage against SGLang ``ServerArgs`` without drift."""
+    if parser is None or secret_field_names is None:
+        sa_mod = importlib.import_module("sglang.srt.server_args")
+        if secret_field_names is None:
+            secret_field_names = frozenset(sa_mod.SERVER_ARGS_SECRET_FIELD_NAMES)
+        if parser is None:
+            parser = argparse.ArgumentParser(prog="sglang serve", allow_abbrev=True)
+            sa_mod.ServerArgs.add_cli_args(parser)
+
+    missing_secret_dests = sorted(set(secret_field_names) - SGLANG_SENSITIVE_DEST_NAMES)
+    if missing_secret_dests:
+        raise ValidationError(
+            "SGLang ServerArgs secret field drift: static SGLANG_SENSITIVE_DEST_NAMES "
+            f"is missing {missing_secret_dests}"
+        )
+
+    option_actions: Mapping[str, argparse.Action] = getattr(
+        parser, "_option_string_actions", {}
+    )
+    long_options = [opt for opt in option_actions if opt.startswith("--")]
+    if not long_options:
+        raise ValidationError("SGLang parser registered no long CLI options")
+
+    expected_sensitive_dests = set(secret_field_names) | (
+        set(SGLANG_SENSITIVE_DEST_NAMES) & {act.dest for act in option_actions.values()}
+    )
+    untracked_dests = sorted(
+        {
+            act.dest
+            for opt, act in option_actions.items()
+            if opt.startswith("--")
+            and _SUSPECT_SENSITIVE_DEST_RE.search(act.dest)
+            and act.dest not in SGLANG_SENSITIVE_DEST_NAMES
+        }
+    )
+    if untracked_dests:
+        raise ValidationError(
+            "SGLang ServerArgs sensitive option drift: untracked sensitive dest(s) "
+            f"{untracked_dests}"
+        )
+
+    checked_prefixes = 0
+    for opt, act in sorted(option_actions.items()):
+        if not opt.startswith("--"):
+            continue
+        if act.dest in expected_sensitive_dests:
+            if not _is_credential_flag(opt):
+                raise ValidationError(
+                    f"static _is_credential_flag missed sensitive option {opt!r} (dest={act.dest!r})"
+                )
+            for k in range(3, len(opt) + 1):
+                prefix = opt[:k]
+                if prefix in option_actions:
+                    resolves_to_sensitive = (
+                        option_actions[prefix].dest in expected_sensitive_dests
+                    )
+                else:
+                    matched_actions = {
+                        cand_act
+                        for cand_opt, cand_act in option_actions.items()
+                        if cand_opt.startswith(prefix)
+                    }
+                    resolves_to_sensitive = (
+                        len(matched_actions) == 1
+                        and next(iter(matched_actions)).dest in expected_sensitive_dests
+                    )
+                if resolves_to_sensitive:
+                    checked_prefixes += 1
+                    if not _is_credential_flag(prefix):
+                        raise ValidationError(
+                            f"static _is_credential_flag missed unambiguous argparse abbreviation "
+                            f"{prefix!r} -> {opt!r} (dest={act.dest!r})"
+                        )
+        elif _is_credential_flag(opt):
+            raise ValidationError(
+                f"static _is_credential_flag falsely blocked non-sensitive ServerArgs option "
+                f"{opt!r} (dest={act.dest!r})"
+            )
+
+    return {
+        "secret_dests": sorted(expected_sensitive_dests),
+        "checked_long_options": len(long_options),
+        "checked_unambiguous_prefixes": checked_prefixes,
+    }
+
+
+def _is_credential_env(name: str) -> bool:
+    return bool(_CREDENTIAL_ENV_RE.search(name.strip()))
+
+
+def _parse_sglang_env_bool(
+    server_env: Mapping[str, str],
+    key: str,
+    *,
+    default: bool = False,
+    context: str,
+) -> bool:
+    """Parse boolean env var matching SGLang ``EnvBool.parse`` exactly."""
+    if key not in server_env:
+        return default
+    raw = server_env[key]
+    lowered = raw.lower()
+    if lowered in {"true", "1", "yes", "y"}:
+        return True
+    if lowered in {"false", "0", "no", "n"}:
+        return False
+    raise ValidationError(
+        f"{context}: env {key} must be a valid SGLang boolean "
+        f"(true/1/yes/y or false/0/no/n), got {raw!r}"
+    )
+
+
+def _runtime_prefill_complete_uses_legacy_dp_attention() -> bool:
+    """Detect whether the candidate SGLang branch checks ``enable_dp_attention`` in ``_validate_prefill_complete``."""
+    hook_path = (
+        Path(__file__).resolve().parents[3]
+        / "python"
+        / "sglang"
+        / "srt"
+        / "arg_groups"
+        / "pd_disaggregation_hook.py"
+    )
+    try:
+        src = hook_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return "cfg.dp_size if cfg.enable_dp_attention else 1" in src
+
+
+_DSA_MODEL_PREFIXES: tuple[str, ...] = (
+    "zai-org/glm-5",
+    "t-head/glm-5",
+    "deepseek-ai/deepseek-v3.2",
+    "t-head/deepseek-v3.2",
+)
+_VERIFIED_MLA_CHECKPOINT_PREFIXES: tuple[str, ...] = (
+    *_DSA_MODEL_PREFIXES,
+    "deepseek-ai/deepseek-v2",
+    "t-head/deepseek-v2",
+    "deepseek-ai/deepseek-v3",
+    "deepseek-ai/deepseek-v4",
+    "deepseek-ai/deepseek-r1",
+    "t-head/deepseek-v3",
+    "t-head/deepseek-v4",
+    "t-head/deepseek-r1",
+    "moonshotai/kimi-k2",
+    "t-head/kimi-k2",
+    "moonshotai/kimi-linear",
+    "t-head/kimi-linear",
+    "moonshotai/kimi-vl",
+    "t-head/kimi-vl",
+)
+_VERIFIED_NON_MLA_CHECKPOINT_PREFIXES: tuple[str, ...] = (
+    "deepseek-ai/deepseek-r1-distill-",
+    "t-head/deepseek-r1-distill-",
+    "qwen/qwen2",
+    "qwen/qwen3",
+    "t-head/qwen2",
+    "t-head/qwen3",
+    "minimaxai/minimax-",
+    "t-head/minimax-",
+    "meta-llama/llama-",
+    "mistralai/mistral-7b",
+    "mistralai/mixtral-",
+    "zai-org/glm-4-",
+)
+_VERIFIED_MLA_HF_ARCHITECTURES: frozenset[str] = frozenset(
+    {
+        "BailingMoeV2_5ForCausalLM",
+        "BailingMoeV3ForCausalLM",
+        "BailingMoeV3VLForConditionalGeneration",
+        "DeepseekV2ForCausalLM",
+        "DeepseekV32ForCausalLM",
+        "DeepseekV3ForCausalLM",
+        "DeepseekV3ForCausalLMNextN",
+        "DeepseekV4ForCausalLM",
+        "DeepseekV4ForCausalLMDSpark",
+        "DeepseekV4ForCausalLMNextN",
+        "DeepseekVL2ForCausalLM",
+        "Dots3NoteForCausalLM",
+        "DotsVLMForCausalLM",
+        "GigaChat35ForCausalLM",
+        "Glm4MoeLiteForCausalLM",
+        "Glm5NextForConditionalGeneration",
+        "GlmMoeDsaForCausalLM",
+        "HYV4ForCausalLM",
+        "KimiK25ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
+        "KimiK3ForConditionalGeneration",
+        "KimiK3LinearForCausalLM",
+        "KimiLinearForCausalLM",
+        "KimiVLForConditionalGeneration",
+        "LongcatFlashForCausalLM",
+        "MiniCPM3ForCausalLM",
+        "MistralLarge3ForCausalLM",
+        "SarvamMLAForCausalLM",
+        "Xing4_0ForCausalLM",
+    }
+)
+_VERIFIED_NON_MLA_HF_ARCHITECTURES: frozenset[str] = frozenset(
+    {
+        "Glm4ForCausalLM",
+        "Glm4MoeForCausalLM",
+        "LlamaForCausalLM",
+        "MiniMaxForCausalLM",
+        "MiniMaxM1ForCausalLM",
+        "MiniMaxText01ForCausalLM",
+        "MistralForCausalLM",
+        "MixtralForCausalLM",
+        "Qwen2ForCausalLM",
+        "Qwen2MoeForCausalLM",
+        "Qwen3ForCausalLM",
+        "Qwen3MoeForCausalLM",
+        "Qwen3NextForCausalLM",
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5MoeForCausalLM",
+    }
+)
+
+
+def _classify_checkpoint_kv_arch(
+    bound_hf_model_id: str | None,
+    *,
+    resolved_model: str | None = None,
+) -> str:
+    """Classify bound checkpoint KV architecture as ``'mla'``, ``'non_mla'``, or ``'unknown'``.
+
+    An explicit ``bound_hf_model_id`` is mandatory for MLA admission; logical
+    ``model.model_id``, CLI ``--attention-backend`` strings, and local ``assets_map``
+    metadata never upgrade an unbound or unverified checkpoint to ``'mla'``.
+    """
+    if not isinstance(bound_hf_model_id, str) or not bound_hf_model_id.strip():
+        return "unknown"
+    lowered = bound_hf_model_id.strip().lower()
+    if any(
+        lowered.startswith(prefix) for prefix in _VERIFIED_NON_MLA_CHECKPOINT_PREFIXES
+    ):
+        return "non_mla"
+    if not any(
+        lowered.startswith(prefix) for prefix in _VERIFIED_MLA_CHECKPOINT_PREFIXES
+    ):
+        return "unknown"
+
+    if isinstance(resolved_model, str) and resolved_model.strip():
+        candidate_dir = Path(resolved_model)
+        cfg_file = candidate_dir / "config.json"
+        if candidate_dir.is_dir() and cfg_file.is_file():
+            try:
+                cfg_obj = json.loads(cfg_file.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                cfg_obj = None
+            if isinstance(cfg_obj, dict) and isinstance(
+                cfg_obj.get("architectures"), list
+            ):
+                archs = {
+                    str(item)
+                    for item in cfg_obj["architectures"]
+                    if isinstance(item, str)
+                }
+                if archs & _VERIFIED_NON_MLA_HF_ARCHITECTURES:
+                    return "non_mla"
+                if archs and not (archs & _VERIFIED_MLA_HF_ARCHITECTURES):
+                    return "unknown"
+    return "mla"
+
+
+def _is_mla_model(
+    model_id: str | None,
+    hf_model_id: str | None,
+    entries: Sequence[tuple[str, str | None, bool]] = (),
+    *,
+    resolved_model: str | None = None,
+) -> bool:
+    """Return True iff the bound checkpoint has a verified MLA or hybrid-MLA KV architecture."""
+    del model_id, entries
+    return (
+        _classify_checkpoint_kv_arch(hf_model_id, resolved_model=resolved_model)
+        == "mla"
+    )
+
+
+def _is_deepseek_dsa_model(
+    model_id: str | None,
+    hf_model_id: str | None,
+    entries: Sequence[tuple[str, str | None, bool]],
+) -> bool:
+    """Return True when the target model uses SGLang DeepSeek/GLM DSA overrides."""
+    for candidate in (model_id, hf_model_id):
+        if isinstance(candidate, str):
+            lowered = candidate.strip().lower()
+            if any(lowered.startswith(prefix) for prefix in _DSA_MODEL_PREFIXES):
+                return True
+    for attn_flag in (
+        "--attention-backend",
+        "--prefill-attention-backend",
+        "--decode-attention-backend",
+    ):
+        val = (_flag_value(entries, attn_flag) or "").strip().lower()
+        if val == "dsa":
+            return True
+    if any(
+        flag in {"--dsa-prefill-backend", "--dsa-decode-backend"}
+        for flag, _, _ in entries
+    ):
+        return True
+    return False
+
+
+def _extract_json_model_overrides(
+    entries: Sequence[tuple[str, str | None, bool]],
+) -> dict[str, Any]:
+    raw = _flag_value(entries, "--json-model-override-args")
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _compute_launched_gpu_ids(
+    entries: Sequence[tuple[str, str | None, bool]],
+    *,
+    dp_val: int,
+    tp_val: int,
+    pp_val: int,
+    topo_nodes: int,
+    context: str,
+) -> list[int]:
+    """Compute visible per-node GPU IDs matching SGLang ``compute_local_gpu_id``."""
+    base_gpu_id = (
+        _parse_nonneg_int_flag(
+            "--base-gpu-id", _flag_value(entries, "--base-gpu-id"), context=context
+        )
+        if _flag_value(entries, "--base-gpu-id") is not None
+        else 0
+    )
+    gpu_id_step = (
+        _parse_pos_int_flag(
+            "--gpu-id-step", _flag_value(entries, "--gpu-id-step"), context=context
+        )
+        or 1
+    )
+    pp_size_per_node = pp_val if topo_nodes == 1 else max(pp_val // topo_nodes, 1)
+    nnodes_per_pp_rank = 1 if topo_nodes == 1 else max(topo_nodes // pp_val, 1)
+    tp_size_per_node = tp_val // nnodes_per_pp_rank
+    launched: list[int] = []
+    for dp_rank in range(dp_val):
+        dp_base = int(base_gpu_id) + dp_rank * tp_val * pp_val * gpu_id_step
+        for pp_local in range(pp_size_per_node):
+            for tp_local in range(tp_size_per_node):
+                launched.append(
+                    dp_base + pp_local * tp_size_per_node + tp_local * gpu_id_step
+                )
+    if len(set(launched)) != len(launched):
+        raise ValidationError(
+            f"{context}: SGLang worker GPU ID assignment has duplicate local GPU IDs: {launched}"
+        )
+    return launched
+
+
+def resolve_launched_gpu_ids(resolved: Mapping[str, Any], *, context: str) -> list[int]:
+    """Return per-node GPU IDs from resolver output (or recompute using effective TP/PP/DP)."""
+    raw_launched = resolved.get("launched_gpu_ids")
+    if isinstance(raw_launched, list) and all(type(x) is int for x in raw_launched):
+        return list(raw_launched)
+    entries = _parse_flag_entries(list(resolved.get("flags", [])))
+    topo_nodes = int(resolved.get("topology", {}).get("nodes", 1))
+    if "tp_size" in resolved and "pp_size" in resolved:
+        dp_val = max(int(resolved.get("dp_size", 1)), 1)
+        tp_val = max(int(resolved["tp_size"]), 1)
+        pp_val = max(int(resolved["pp_size"]), 1)
+    elif entries:
+        _, dp_val, tp_val, pp_val, _, _ = _compute_sglang_parallelism(
+            entries, topo_nodes=topo_nodes, context=context
+        )
+    else:
+        dp_val = max(int(resolved.get("dp_size", 1)), 1)
+        tp_val = max(int(resolved["ppu_count"]) // dp_val, 1)
+        pp_val = 1
+    return _compute_launched_gpu_ids(
+        entries,
+        dp_val=dp_val,
+        tp_val=tp_val,
+        pp_val=pp_val,
+        topo_nodes=topo_nodes,
+        context=context,
+    )
+
+
 def _validate_multinode_tp_pp_layout(
     *,
     tp_val: int,
@@ -1045,6 +1554,249 @@ def _compute_sglang_parallelism(
     return ppu_count, dp_val, tp_val, pp_val, attn_dp_val, ep_enabled
 
 
+def _compute_effective_parallel_geometry(
+    entries: Sequence[tuple[str, str | None, bool]],
+    *,
+    model_id: str | None,
+    hf_model_id: str | None,
+    context: str,
+) -> dict[str, Any]:
+    """Compute effective SGLang TP/PP/DP/EP/CP/MoE-DP/DCP geometry after model & CP hooks."""
+    dp_val = (
+        _parse_pos_int_flag(
+            "--dp-size",
+            _flag_value(entries, "--dp-size", "--data-parallel-size"),
+            context=context,
+        )
+        or 1
+    )
+    tp_val = (
+        _parse_pos_int_flag(
+            "--tp-size",
+            _flag_value(entries, "--tp-size", "--tensor-parallel-size"),
+            context=context,
+        )
+        or 1
+    )
+    pp_val = (
+        _parse_pos_int_flag(
+            "--pp-size",
+            _flag_value(entries, "--pp-size", "--pipeline-parallel-size"),
+            context=context,
+        )
+        or 1
+    )
+    raw_ep_val = (
+        _parse_pos_int_flag(
+            "--ep-size",
+            _flag_value(entries, "--ep-size", "--expert-parallel-size", "--ep"),
+            context=context,
+        )
+        or 1
+    )
+    attn_dp_val = (
+        _parse_pos_int_flag(
+            "--attn-dp-size",
+            _flag_value(entries, "--attn-dp-size", "--attention-data-parallel-size"),
+            context=context,
+        )
+        or 1
+    )
+    raw_attn_cp = (
+        _parse_pos_int_flag(
+            "--attn-cp-size",
+            _flag_value(entries, "--attn-cp-size", "--attention-context-parallel-size"),
+            context=context,
+        )
+        or 1
+    )
+    moe_dp_val = (
+        _parse_pos_int_flag(
+            "--moe-dp-size",
+            _flag_value(entries, "--moe-dp-size", "--moe-data-parallel-size"),
+            context=context,
+        )
+        or 1
+    )
+    dcp_val = (
+        _parse_pos_int_flag(
+            "--dcp-size",
+            _flag_value(entries, "--dcp-size", "--decode-context-parallel-size"),
+            context=context,
+        )
+        or 1
+    )
+    flag_names = {flag for flag, _, _ in entries}
+    enable_prefill_cp = "--enable-prefill-cp" in flag_names
+    cp_strategy = (_flag_value(entries, "--cp-strategy") or "").strip()
+    if enable_prefill_cp and not cp_strategy:
+        raise ValidationError(f"{context}: --enable-prefill-cp requires --cp-strategy")
+
+    is_dsa = _is_deepseek_dsa_model(model_id, hf_model_id, entries)
+    eff_ep_val = raw_ep_val
+    eff_attn_cp = raw_attn_cp
+    if is_dsa and enable_prefill_cp:
+        if cp_strategy == "zigzag":
+            if dp_val != 1:
+                raise ValidationError(
+                    f"{context}: zigzag context parallelism on DSA requires --dp-size 1, got {dp_val}"
+                )
+            eff_ep_val = tp_val
+        if not (cp_strategy == "interleave" and raw_attn_cp > 1):
+            eff_attn_cp = max(tp_val // attn_dp_val, 1)
+
+    if tp_val % (attn_dp_val * eff_attn_cp) != 0:
+        raise ValidationError(
+            f"{context}: --tp-size ({tp_val}) must be divisible by effective "
+            f"--attn-dp-size * --attn-cp-size ({attn_dp_val} * {eff_attn_cp})"
+        )
+    attn_tp_val = tp_val // (attn_dp_val * eff_attn_cp)
+
+    if moe_dp_val > 1:
+        if tp_val % moe_dp_val != 0:
+            raise ValidationError(
+                f"{context}: --tp-size ({tp_val}) must be divisible by --moe-dp-size ({moe_dp_val})"
+            )
+        if eff_ep_val * moe_dp_val > tp_val:
+            raise ValidationError(
+                f"{context}: --ep-size * --moe-dp-size ({eff_ep_val} * {moe_dp_val}) "
+                f"must not exceed --tp-size ({tp_val})"
+            )
+        if pp_val != 1:
+            raise ValidationError(
+                f"{context}: --moe-dp-size > 1 ({moe_dp_val}) requires --pp-size 1, got {pp_val}"
+            )
+        if eff_ep_val > 1 and eff_ep_val * moe_dp_val != tp_val:
+            raise ValidationError(
+                f"{context}: when --ep-size > 1 and --moe-dp-size > 1, "
+                f"--ep-size * --moe-dp-size ({eff_ep_val} * {moe_dp_val}) must equal --tp-size ({tp_val})"
+            )
+        if "--enable-aiter-allreduce-fusion" in flag_names:
+            raise ValidationError(
+                f"{context}: --moe-dp-size > 1 is incompatible with --enable-aiter-allreduce-fusion"
+            )
+    if eff_attn_cp != moe_dp_val and moe_dp_val != 1:
+        raise ValidationError(
+            f"{context}: when --attn-cp-size ({eff_attn_cp}) != --moe-dp-size ({moe_dp_val}), "
+            f"--moe-dp-size must be 1"
+        )
+
+    shared_experts_tp = _parse_pos_int_flag(
+        "--shared-experts-tp-size",
+        _flag_value(entries, "--shared-experts-tp-size"),
+        context=context,
+    )
+    if (
+        shared_experts_tp is not None
+        and (tp_val // attn_dp_val) % shared_experts_tp != 0
+    ):
+        raise ValidationError(
+            f"{context}: (--tp-size // --attn-dp-size) ({tp_val // attn_dp_val}) must be "
+            f"divisible by --shared-experts-tp-size ({shared_experts_tp})"
+        )
+
+    if dcp_val > 1:
+        if enable_prefill_cp:
+            raise ValidationError(
+                f"{context}: --dcp-size > 1 ({dcp_val}) does not support --enable-prefill-cp"
+            )
+        if tp_val % dcp_val != 0 or attn_tp_val % dcp_val != 0:
+            raise ValidationError(
+                f"{context}: attention TP size ({attn_tp_val}) and --tp-size ({tp_val}) "
+                f"must be divisible by --dcp-size ({dcp_val})"
+            )
+
+    return {
+        "dp_size": dp_val,
+        "tp_size": tp_val,
+        "pp_size": pp_val,
+        "ep_size": eff_ep_val,
+        "attn_dp_size": attn_dp_val,
+        "attn_cp_size": eff_attn_cp,
+        "attn_tp_size": attn_tp_val,
+        "moe_dp_size": moe_dp_val,
+        "dcp_size": dcp_val,
+        "enable_prefill_cp": enable_prefill_cp,
+        "enable_kv_cache_sharding": "--enable-kv-cache-sharding" in flag_names,
+        "is_dsa": is_dsa,
+        "is_mla": _is_mla_model(model_id, hf_model_id, entries),
+    }
+
+
+def _validate_pp_and_speculative_compat(
+    entries: Sequence[tuple[str, str | None, bool]],
+    server_env: Mapping[str, str],
+    *,
+    pp_val: int,
+    attn_dp_val: int,
+    context: str,
+) -> None:
+    """Enforce SGLang ``check_pipeline_parallel_compat`` invariants when ``--pp-size > 1``."""
+    if pp_val <= 1:
+        return
+    flag_names = {flag for flag, _, _ in entries}
+    if "--enable-overlap-schedule" in flag_names:
+        raise ValidationError(
+            f"{context}: --pp-size > 1 ({pp_val}) is incompatible with --enable-overlap-schedule"
+        )
+    if "--min-free-slots-delay" in flag_names:
+        raise ValidationError(
+            f"{context}: --pp-size > 1 ({pp_val}) is incompatible with --min-free-slots-delay"
+        )
+    recv_interval = _parse_pos_int_flag(
+        "--scheduler-recv-interval",
+        _flag_value(entries, "--scheduler-recv-interval"),
+        context=context,
+    )
+    if recv_interval is not None and recv_interval > 1:
+        raise ValidationError(
+            f"{context}: --pp-size > 1 ({pp_val}) requires --scheduler-recv-interval 1, got {recv_interval}"
+        )
+
+    spec_algo = (_flag_value(entries, "--speculative-algorithm") or "").strip()
+    if not spec_algo or spec_algo.lower() in {"none", "null"}:
+        return
+    if "--enable-multi-layer-eagle" in flag_names:
+        raise ValidationError(
+            f"{context}: --pp-size > 1 ({pp_val}) is incompatible with --enable-multi-layer-eagle"
+        )
+    disagg_mode = (_flag_value(entries, "--disaggregation-mode") or "null").strip()
+    pp_spec = _parse_sglang_env_bool(
+        server_env, "SGLANG_ENABLE_PP_SPEC", default=False, context=context
+    )
+    algo_norm = "EAGLE" if spec_algo.upper() == "NEXTN" else spec_algo.upper()
+    if algo_norm in {"DSPARK", "DFLASH"}:
+        if disagg_mode != "prefill" or pp_spec:
+            raise ValidationError(
+                f"{context}: --pp-size > 1 ({pp_val}) with --speculative-algorithm {spec_algo!r} "
+                f"is only supported on --disaggregation-mode prefill without SGLANG_ENABLE_PP_SPEC"
+            )
+        return
+    if algo_norm != "EAGLE":
+        raise ValidationError(
+            f"{context}: --pp-size > 1 ({pp_val}) does not support --speculative-algorithm {spec_algo!r}"
+        )
+    if pp_spec:
+        if disagg_mode != "null":
+            raise ValidationError(
+                f"{context}: SGLANG_ENABLE_PP_SPEC with --pp-size > 1 requires non-disaggregated serving"
+            )
+        if attn_dp_val > 1:
+            raise ValidationError(
+                f"{context}: SGLANG_ENABLE_PP_SPEC with --pp-size > 1 does not support --attn-dp-size > 1 ({attn_dp_val})"
+            )
+        if flag_names & {"--speculative-adaptive", "--enable-return-routed-experts"}:
+            raise ValidationError(
+                f"{context}: SGLANG_ENABLE_PP_SPEC with --pp-size > 1 is incompatible with "
+                f"adaptive speculation and --enable-return-routed-experts"
+            )
+    elif disagg_mode != "prefill":
+        raise ValidationError(
+            f"{context}: --pp-size > 1 ({pp_val}) with --speculative-algorithm {spec_algo!r} "
+            f"requires --disaggregation-mode prefill or SGLANG_ENABLE_PP_SPEC=1"
+        )
+
+
 def _validate_resolved_topology_and_placeholders(
     resolved: Mapping[str, Any],
     *,
@@ -1077,10 +1829,33 @@ def _validate_resolved_topology_and_placeholders(
 
     entries = _parse_flag_entries(flags)
     flag_names = {name for name, _, _ in entries}
-    calc_ppu_count, _, _, _, _, ep_enabled = _compute_sglang_parallelism(
+    calc_ppu_count, dp_val, tp_val, pp_val, attn_dp_val, ep_enabled = (
+        _compute_sglang_parallelism(
+            entries,
+            topo_nodes=topo_nodes,
+            devices_per_node=topo_devices_per_node,
+            context=context,
+        )
+    )
+    geom = _compute_effective_parallel_geometry(
         entries,
+        model_id=resolved.get("model_id"),
+        hf_model_id=resolved.get("hf_model_id"),
+        context=context,
+    )
+    _validate_pp_and_speculative_compat(
+        entries,
+        server_env,
+        pp_val=pp_val,
+        attn_dp_val=attn_dp_val,
+        context=context,
+    )
+    launched_gpu_ids = _compute_launched_gpu_ids(
+        entries,
+        dp_val=dp_val,
+        tp_val=tp_val,
+        pp_val=pp_val,
         topo_nodes=topo_nodes,
-        devices_per_node=topo_devices_per_node,
         context=context,
     )
     ppu_count = max(int(resolved["ppu_count"]), calc_ppu_count)
@@ -1095,7 +1870,27 @@ def _validate_resolved_topology_and_placeholders(
             f"{context}: topology.nodes ({topo_nodes}) must evenly divide effective "
             f"SGLang world size ({ppu_count})"
         )
-    local_gpu_count = ppu_count // topo_nodes
+    if topo_kind != "pd_disagg":
+        if launched_gpu_ids and max(launched_gpu_ids) >= topo_devices_per_node:
+            raise ValidationError(
+                f"{context}: launched local GPU IDs {launched_gpu_ids} exceed "
+                f"topology.devices_per_node ({topo_devices_per_node}; valid visible GPUs 0..{topo_devices_per_node - 1})"
+            )
+    else:
+        host_gpu_limit = max(
+            topo_devices_per_node,
+            16 if resolved.get("hardware") == "zhenwu_810e" else 8,
+        )
+        if len(launched_gpu_ids) > topo_devices_per_node:
+            raise ValidationError(
+                f"{context}: pd_disagg launches {len(launched_gpu_ids)} local workers, "
+                f"exceeding topology.devices_per_node ({topo_devices_per_node})"
+            )
+        if launched_gpu_ids and max(launched_gpu_ids) >= host_gpu_limit:
+            raise ValidationError(
+                f"{context}: pd_disagg launched local GPU IDs {launched_gpu_ids} exceed "
+                f"host GPU limit ({host_gpu_limit}; valid visible GPUs 0..{host_gpu_limit - 1})"
+            )
 
     placeholders = _extract_placeholders_from_flags_and_env(flags, server_env)
     unknown = sorted(placeholders - set(TOPOLOGY_PLACEHOLDERS))
@@ -1136,14 +1931,14 @@ def _validate_resolved_topology_and_placeholders(
                         f"{context}: per-GPU --disaggregation-ib-device JSON map must map "
                         f"canonical numeric GPU ID strings to exact '{{ib_devices}}', got {ib_dev!r}"
                     )
-                expected_gpus = set(range(local_gpu_count))
+                expected_gpus = set(launched_gpu_ids)
                 configured_gpus = {int(k) for k in parsed_ib}
                 if configured_gpus != expected_gpus:
                     missing_gpus = sorted(expected_gpus - configured_gpus)
                     extra_gpus = sorted(configured_gpus - expected_gpus)
                     raise ValidationError(
                         f"{context}: per-GPU --disaggregation-ib-device JSON map must cover "
-                        f"all {local_gpu_count} local GPUs (0..{local_gpu_count - 1}); "
+                        f"launched local GPUs {sorted(expected_gpus)}; "
                         f"missing={missing_gpus}, extra={extra_gpus}"
                     )
                 return
@@ -1295,6 +2090,122 @@ def _validate_resolved_topology_and_placeholders(
                 f"{context}: SGLang pd_prefill does not support --disaggregation-transfer-backend "
                 f"'fake' (fake transfer backend is decode-only)"
             )
+        if role == "decode" and (
+            geom["attn_cp_size"] != 1 or geom["enable_prefill_cp"]
+        ):
+            raise ValidationError(
+                f"{context}: SGLang pd_decode requires effective --attn-cp-size 1 "
+                f"(and must not set --enable-prefill-cp), got {geom['attn_cp_size']}"
+            )
+        if geom["is_dsa"] and geom["dcp_size"] > 1:
+            raise ValidationError(
+                f"{context}: --dcp-size > 1 ({geom['dcp_size']}) is not supported with "
+                f"PD disaggregation on DeepSeek/GLM DSA models"
+            )
+
+        alloc_policy = (
+            _flag_value(entries, "--disaggregation-decode-allocation-policy") or "early"
+        ).strip()
+        if alloc_policy not in SUPPORTED_DISAGG_ALLOC_POLICIES:
+            raise ValidationError(
+                f"{context}: unsupported --disaggregation-decode-allocation-policy "
+                f"{alloc_policy!r}; expected one of {sorted(SUPPORTED_DISAGG_ALLOC_POLICIES)}"
+            )
+        if alloc_policy == "prefill_complete":
+            if transfer_backend not in {"mooncake", "mooncake_tcp"}:
+                raise ValidationError(
+                    f"{context}: --disaggregation-decode-allocation-policy 'prefill_complete' "
+                    f"requires transfer backend 'mooncake' or 'mooncake_tcp', got {transfer_backend!r}"
+                )
+            if (
+                geom["pp_size"] != 1
+                or geom["attn_cp_size"] != 1
+                or geom["dcp_size"] != 1
+            ):
+                raise ValidationError(
+                    f"{context}: --disaggregation-decode-allocation-policy 'prefill_complete' "
+                    f"requires --pp-size 1, --attn-cp-size 1, and --dcp-size 1, got "
+                    f"pp={geom['pp_size']}, attn_cp={geom['attn_cp_size']}, dcp={geom['dcp_size']}"
+                )
+            eff_pc_attn_dp = (
+                1
+                if _runtime_prefill_complete_uses_legacy_dp_attention()
+                else geom["attn_dp_size"]
+            )
+            if geom["tp_size"] != eff_pc_attn_dp:
+                raise ValidationError(
+                    f"{context}: --disaggregation-decode-allocation-policy 'prefill_complete' "
+                    f"requires --tp-size ({geom['tp_size']}) == effective attention DP "
+                    f"({eff_pc_attn_dp}) on this SGLang branch (attention TP must be 1)"
+                )
+            if (
+                _flag_value(entries, "--decoupled-spec-role") or "null"
+            ).strip() != "null":
+                raise ValidationError(
+                    f"{context}: 'prefill_complete' is incompatible with --decoupled-spec-role"
+                )
+            bad_pc_flags = sorted(
+                flag_names
+                & {
+                    "--enable-pdmux",
+                    "--enable-pd-role-switch",
+                    "--encoder-only",
+                    "--language-only",
+                    "--enable-hisparse",
+                }
+            )
+            if bad_pc_flags:
+                raise ValidationError(
+                    f"{context}: 'prefill_complete' is incompatible with {', '.join(bad_pc_flags)}"
+                )
+            host_recv_raw = _flag_value(
+                entries, "--disaggregation-decode-host-receive-threshold"
+            )
+            if host_recv_raw is not None:
+                try:
+                    host_recv = float(host_recv_raw)
+                except ValueError as exc:
+                    raise ValidationError(
+                        f"{context}: --disaggregation-decode-host-receive-threshold must be a float, got {host_recv_raw!r}"
+                    ) from exc
+                if not math.isfinite(host_recv) or host_recv < 1.0:
+                    raise ValidationError(
+                        f"{context}: 'prefill_complete' requires --disaggregation-decode-host-receive-threshold >= 1.0, got {host_recv_raw!r}"
+                    )
+            if role == "decode":
+                bad_dec_pc = sorted(
+                    flag_names
+                    & {
+                        "--disaggregation-decode-enable-radix-cache",
+                        "--enable-hierarchical-cache",
+                    }
+                )
+                if bad_dec_pc:
+                    raise ValidationError(
+                        f"{context}: pd_decode with 'prefill_complete' is incompatible with {', '.join(bad_dec_pc)}"
+                    )
+            elif role == "prefill" and "--enable-hierarchical-cache" in flag_names:
+                if "--hicache-storage-backend" in flag_names:
+                    raise ValidationError(
+                        f"{context}: pd_prefill with 'prefill_complete' and HiCache must not set --hicache-storage-backend"
+                    )
+                if (
+                    _flag_value(entries, "--hicache-write-policy") or ""
+                ).strip() != "write_back":
+                    raise ValidationError(
+                        f"{context}: pd_prefill with 'prefill_complete' and HiCache requires --hicache-write-policy 'write_back'"
+                    )
+            if _parse_sglang_env_bool(
+                server_env,
+                "SGLANG_DISAGG_STAGING_BUFFER",
+                default=False,
+                context=context,
+            ) or _parse_sglang_env_bool(
+                server_env, "SGLANG_RUST_SERVER", default=False, context=context
+            ):
+                raise ValidationError(
+                    f"{context}: 'prefill_complete' is incompatible with SGLANG_DISAGG_STAGING_BUFFER and SGLANG_RUST_SERVER"
+                )
 
         required_pd_ph = (
             PD_DISAGG_DECODE_REQUIRED_PLACEHOLDERS
@@ -1691,6 +2602,7 @@ def _resolve_recipe_from_doc(
     eff_identity = _effective_variant_identity(ppu_blk, model_blk, var_blk)
     eff_assets = eff_identity["assets"]
     asset_name = eff_assets["model"]
+    bound_hf_model_id = var_blk.get("hf_model_id") or ppu_blk.get("hf_model_id")
     hf_model_id = eff_identity["hf_model_id"]
     resolved_model = assets_map.get(asset_name, hf_model_id)
     resolved_tokenizer = assets_map.get(eff_assets["tokenizer"], resolved_model)
@@ -1717,10 +2629,18 @@ def _resolve_recipe_from_doc(
         *flags_only,
     ]
 
-    ppu_count, dp_val, _, _, attn_dp_val, _ = _compute_sglang_parallelism(
+    ppu_count, dp_val, tp_val, pp_val, attn_dp_val, _ = _compute_sglang_parallelism(
         ordered,
         topo_nodes=int(eff_topology["nodes"]),
         devices_per_node=int(eff_topology["devices_per_node"]),
+        context=recipe_label,
+    )
+    launched_gpu_ids = _compute_launched_gpu_ids(
+        ordered,
+        dp_val=dp_val,
+        tp_val=tp_val,
+        pp_val=pp_val,
+        topo_nodes=int(eff_topology["nodes"]),
         context=recipe_label,
     )
 
@@ -1756,9 +2676,13 @@ def _resolve_recipe_from_doc(
         "server_env": server_env,
         "ppu_count": ppu_count,
         "dp_size": dp_val,
+        "tp_size": tp_val,
+        "pp_size": pp_val,
         "attn_dp_size": attn_dp_val,
+        "launched_gpu_ids": launched_gpu_ids,
         "model_id": model_blk["model_id"],
         "hf_model_id": hf_model_id,
+        "bound_hf_model_id": bound_hf_model_id,
         "assets": copy.deepcopy(eff_assets),
         "resolved_model": resolved_model,
         "resolved_tokenizer": resolved_tokenizer,
@@ -1783,6 +2707,44 @@ def _resolve_recipe_from_doc(
     return result
 
 
+def _effective_pd_page_size(
+    resolved: Mapping[str, Any],
+    entries: Sequence[tuple[str, str | None, bool]],
+    *,
+    context: str,
+) -> int:
+    """Return effective KV ``page_size`` on SAIL after SGLang model overrides."""
+    explicit_page = _parse_pos_int_flag(
+        "--page-size", _flag_value(entries, "--page-size"), context=context
+    )
+    if _is_deepseek_dsa_model(
+        resolved.get("model_id"), resolved.get("hf_model_id"), entries
+    ):
+        attn_backend = (
+            (_flag_value(entries, "--attention-backend") or "").strip().lower()
+        )
+        nsa_prefill = (
+            (_flag_value(entries, "--nsa-prefill-backend") or "").strip().lower()
+        )
+        nsa_decode = (
+            (_flag_value(entries, "--nsa-decode-backend") or "").strip().lower()
+        )
+        if (
+            attn_backend == "nsa"
+            and nsa_prefill == "flashmla_auto"
+            and nsa_decode == "fa3"
+        ):
+            return 1
+        json_overrides = _extract_json_model_overrides(entries)
+        raw_kpool = json_overrides.get("index_kpool", 1)
+        if type(raw_kpool) is not int or raw_kpool <= 0:
+            raise ValidationError(
+                f"{context}: --json-model-override-args index_kpool must be a positive int, got {raw_kpool!r}"
+            )
+        return 64 * raw_kpool
+    return explicit_page or 1
+
+
 def _validate_pd_disagg_pair(
     prefill_res: Mapping[str, Any],
     decode_res: Mapping[str, Any],
@@ -1805,6 +2767,18 @@ def _validate_pd_disagg_pair(
             f"--disaggregation-transfer-backend, got {p_backend!r} vs {d_backend!r}"
         )
 
+    p_alloc = (
+        _flag_value(p_entries, "--disaggregation-decode-allocation-policy") or "early"
+    ).strip()
+    d_alloc = (
+        _flag_value(d_entries, "--disaggregation-decode-allocation-policy") or "early"
+    ).strip()
+    if p_alloc != d_alloc:
+        raise ValidationError(
+            f"{context}: pd_prefill and pd_decode --disaggregation-decode-allocation-policy "
+            f"mismatch ({p_alloc!r} vs {d_alloc!r})"
+        )
+
     if p_backend == "mooncake":
         p_proto = (
             prefill_res["server_env"].get("MOONCAKE_PROTOCOL", "rdma").strip().lower()
@@ -1818,23 +2792,158 @@ def _validate_pd_disagg_pair(
                 f"got {p_proto!r} vs {d_proto!r}"
             )
 
-    p_page = (
-        _parse_pos_int_flag(
-            "--page-size", _flag_value(p_entries, "--page-size"), context=context
-        )
-        or 1
+    p_page = _effective_pd_page_size(
+        prefill_res, p_entries, context=f"{context}.pd_prefill"
     )
-    d_page = (
-        _parse_pos_int_flag(
-            "--page-size", _flag_value(d_entries, "--page-size"), context=context
-        )
-        or 1
+    d_page = _effective_pd_page_size(
+        decode_res, d_entries, context=f"{context}.pd_decode"
     )
     if p_page != d_page:
         raise ValidationError(
             f"{context}: pd_prefill and pd_decode --page-size mismatch "
             f"({p_page} vs {d_page}); SGLang disaggregation requires identical KV page sizes"
         )
+
+    p_geom = _compute_effective_parallel_geometry(
+        p_entries,
+        model_id=prefill_res.get("model_id"),
+        hf_model_id=prefill_res.get("hf_model_id"),
+        context=f"{context}.pd_prefill",
+    )
+    d_geom = _compute_effective_parallel_geometry(
+        d_entries,
+        model_id=decode_res.get("model_id"),
+        hf_model_id=decode_res.get("hf_model_id"),
+        context=f"{context}.pd_decode",
+    )
+    if d_geom["attn_cp_size"] != 1 or d_geom["enable_prefill_cp"]:
+        raise ValidationError(
+            f"{context}: pd_decode requires effective --attn-cp-size 1, got {d_geom['attn_cp_size']}"
+        )
+    if d_geom["pp_size"] != p_geom["pp_size"] and d_geom["pp_size"] != 1:
+        raise ValidationError(
+            f"{context}: pd_prefill and pd_decode --pp-size incompatible "
+            f"(prefill={p_geom['pp_size']}, decode={d_geom['pp_size']}; "
+            f"decode --pp-size must equal prefill --pp-size or 1)"
+        )
+    p_attn_tp = int(p_geom["attn_tp_size"])
+    d_attn_tp = int(d_geom["attn_tp_size"])
+    is_minimax = "minimax" in str(prefill_res.get("model_id", "")).lower() or (
+        "minimax" in str(prefill_res.get("hf_model_id", "")).lower()
+    )
+    if is_minimax and p_attn_tp != d_attn_tp:
+        raise ValidationError(
+            f"{context}: MiniMax PD disaggregation requires matching attention TP sizes, "
+            f"got prefill={p_attn_tp} vs decode={d_attn_tp}"
+        )
+    if p_geom["enable_kv_cache_sharding"] and p_geom["attn_cp_size"] == 1:
+        if p_attn_tp != d_attn_tp:
+            raise ValidationError(
+                f"{context}: pd_prefill --enable-kv-cache-sharding without prefill CP requires "
+                f"matching attention TP sizes, got prefill={p_attn_tp} vs decode={d_attn_tp}"
+            )
+    if max(p_attn_tp, d_attn_tp) % min(p_attn_tp, d_attn_tp) != 0:
+        raise ValidationError(
+            f"{context}: pd_prefill attention TP ({p_attn_tp}) and pd_decode attention TP "
+            f"({d_attn_tp}) must be integer multiples"
+        )
+    p_dcp = int(p_geom["dcp_size"])
+    d_dcp = int(d_geom["dcp_size"])
+    if p_dcp != d_dcp and p_dcp != 1:
+        raise ValidationError(
+            f"{context}: unsupported PD DCP topology ({p_dcp} -> {d_dcp}); "
+            f"pd_prefill --dcp-size > 1 requires matching pd_decode --dcp-size"
+        )
+    if p_dcp > 1 or d_dcp > 1:
+        if p_dcp == d_dcp and p_attn_tp != d_attn_tp:
+            raise ValidationError(
+                f"{context}: PD peers with matching --dcp-size ({p_dcp}) require "
+                f"equal attention TP sizes, got prefill={p_attn_tp} vs decode={d_attn_tp}"
+            )
+        if d_dcp > 1:
+            d_bound_ckpt = (
+                decode_res["bound_hf_model_id"]
+                if "bound_hf_model_id" in decode_res
+                else decode_res.get("hf_model_id")
+            )
+            p_bound_ckpt = (
+                prefill_res["bound_hf_model_id"]
+                if "bound_hf_model_id" in prefill_res
+                else prefill_res.get("hf_model_id")
+            )
+            if not d_bound_ckpt or not p_bound_ckpt:
+                raise ValidationError(
+                    f"{context}: insufficient KV architecture evidence to admit "
+                    f"pd_decode --dcp-size > 1 ({d_dcp}): effective variant "
+                    f"{decode_res.get('variant')!r} binds no explicit hf_model_id "
+                    f"checkpoint (logical model.model_id, attention-backend flags, and "
+                    f"local assets_map paths cannot stand alone as MLA evidence)"
+                )
+            d_kv_arch = _classify_checkpoint_kv_arch(
+                d_bound_ckpt, resolved_model=decode_res.get("resolved_model")
+            )
+            p_kv_arch = _classify_checkpoint_kv_arch(
+                p_bound_ckpt, resolved_model=prefill_res.get("resolved_model")
+            )
+            if d_kv_arch == "non_mla" or p_kv_arch == "non_mla":
+                bad_ckpt = d_bound_ckpt if d_kv_arch == "non_mla" else p_bound_ckpt
+                raise ValidationError(
+                    f"{context}: checkpoint {bad_ckpt!r} uses non-MLA KV architecture; "
+                    f"pd_decode --dcp-size > 1 ({d_dcp}) requires an MLA or hybrid-MLA checkpoint"
+                )
+            if d_kv_arch != "mla" or p_kv_arch != "mla":
+                missing_ckpt = d_bound_ckpt if d_kv_arch != "mla" else p_bound_ckpt
+                raise ValidationError(
+                    f"{context}: insufficient KV architecture evidence for checkpoint "
+                    f"{missing_ckpt!r} to admit pd_decode --dcp-size > 1 ({d_dcp}); "
+                    f"logical model.model_id and attention-backend flags cannot stand "
+                    f"alone as MLA evidence"
+                )
+            if p_geom["attn_cp_size"] > 1:
+                raise ValidationError(
+                    f"{context}: pd_decode --dcp-size > 1 ({d_dcp}) is incompatible "
+                    f"with pd_prefill --attn-cp-size > 1 ({p_geom['attn_cp_size']})"
+                )
+            if p_geom["enable_kv_cache_sharding"]:
+                raise ValidationError(
+                    f"{context}: pd_decode --dcp-size > 1 ({d_dcp}) is incompatible "
+                    f"with pd_prefill --enable-kv-cache-sharding"
+                )
+
+    p_nodes = int(prefill_res["topology"]["nodes"])
+    d_nodes = int(decode_res["topology"]["nodes"])
+    if p_nodes == 1 and d_nodes == 1:
+        p_base = _flag_value(p_entries, "--base-gpu-id")
+        d_base = _flag_value(d_entries, "--base-gpu-id")
+        if (p_base is not None and int(p_base) > 0) or (
+            d_base is not None and int(d_base) > 0
+        ):
+            p_gpus = set(
+                _compute_launched_gpu_ids(
+                    p_entries,
+                    dp_val=p_geom["dp_size"],
+                    tp_val=p_geom["tp_size"],
+                    pp_val=p_geom["pp_size"],
+                    topo_nodes=1,
+                    context=f"{context}.pd_prefill",
+                )
+            )
+            d_gpus = set(
+                _compute_launched_gpu_ids(
+                    d_entries,
+                    dp_val=d_geom["dp_size"],
+                    tp_val=d_geom["tp_size"],
+                    pp_val=d_geom["pp_size"],
+                    topo_nodes=1,
+                    context=f"{context}.pd_decode",
+                )
+            )
+            overlap = sorted(p_gpus & d_gpus)
+            if overlap:
+                raise ValidationError(
+                    f"{context}: co-located single-node pd_prefill and pd_decode overlap on "
+                    f"local GPU IDs {overlap}"
+                )
 
     p_kv_dtype = (_flag_value(p_entries, "--kv-cache-dtype") or "auto").strip().lower()
     d_kv_dtype = (_flag_value(d_entries, "--kv-cache-dtype") or "auto").strip().lower()
@@ -2017,9 +3126,9 @@ def _validate_env_block(
 ) -> None:
     checked = _check_str_dict(env, context=context)
     for name, val in checked.items():
-        if _SENSITIVE_ENV_KEY_RE.search(name):
+        if _is_credential_env(name) or _SENSITIVE_ENV_KEY_RE.search(name):
             raise ValidationError(
-                f"{context}: credential env var {_safe_diag_repr(name)} must not be set in recipe"
+                f"{context}: credential/secret env {_safe_diag_repr(name)} is forbidden in public recipes"
             )
         if name in FORBIDDEN_RECIPE_ENV:
             raise ValidationError(
@@ -2087,9 +3196,9 @@ def _validate_flag_list(
 ) -> None:
     raw = _check_str_list(tokens, context=context)
     for flag, val, _ in _parse_flag_entries(raw):
-        if _is_auth_cli_flag(flag):
+        if _is_credential_flag(flag) or _is_auth_cli_flag(flag):
             raise ValidationError(
-                f"{context}: plaintext auth credential flag is forbidden in recipe/policy"
+                f"{context}: credential/secret CLI flag {_safe_diag_repr(flag)} is forbidden in public recipes"
             )
         if not allow_policy_flags and flag in FORBIDDEN_RECIPE_FLAGS:
             raise ValidationError(f"{context}: framework runner owns {flag}")
@@ -3002,10 +4111,14 @@ def validate_policy_structure(
 
 
 def _build_sglang_serve_parser() -> argparse.ArgumentParser:
-    """Register the installed candidate's actual SGLang options."""
-    server_args = importlib.import_module("sglang.srt.server_args").ServerArgs
+    """Register the installed candidate's actual SGLang options and check secret-flag parity."""
+    sa_mod = importlib.import_module("sglang.srt.server_args")
     parser = argparse.ArgumentParser(prog="sglang", allow_abbrev=False)
-    server_args.add_cli_args(parser)
+    sa_mod.ServerArgs.add_cli_args(parser)
+    verify_secret_flag_registry_parity(
+        parser,
+        secret_field_names=frozenset(sa_mod.SERVER_ARGS_SECRET_FIELD_NAMES),
+    )
     return parser
 
 
@@ -3461,6 +4574,16 @@ def _format_features(resolved: dict[str, Any]) -> str:
 
 
 def _format_flags_and_env(flags: list[str], server_env: dict[str, str]) -> str:
+    for flag, _, _ in _parse_flag_entries(list(flags)):
+        if _is_credential_flag(flag):
+            raise ValidationError(
+                f"catalog_render: credential/secret CLI flag {flag!r} is forbidden in public output"
+            )
+    for env_key in server_env:
+        if _is_credential_env(env_key):
+            raise ValidationError(
+                f"catalog_render: credential/secret env {env_key!r} is forbidden in public output"
+            )
     parts: list[str] = []
     if flags:
         parts.append(_md_code(shlex.join(flags)))
@@ -3844,7 +4967,9 @@ def render_ci_matrix_markdown(*, base_dir: Path | None = None) -> str:
         ]
     )
 
-    return "\n".join(lines) + "\n"
+    rendered = "\n".join(lines) + "\n"
+    redact_and_verify_public_payload(rendered, allow_loopback=False)
+    return rendered
 
 
 @contextlib.contextmanager

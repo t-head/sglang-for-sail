@@ -8,7 +8,13 @@ import json
 import re
 from pathlib import Path
 
-from ppu_recipe import REPO_ROOT, _load_yaml, resolve_recipe, validate_paths
+from ppu_recipe import (
+    REPO_ROOT,
+    _load_yaml,
+    resolve_launched_gpu_ids,
+    resolve_recipe,
+    validate_paths,
+)
 
 SINGLE_NODE_MAX_DEVICES_BY_HARDWARE: dict[str, int] = {
     "zhenwu_m890": 8,
@@ -52,6 +58,9 @@ def cluster_width(
         or topology["devices_per_node"] != width
         or width not in allowed_widths
     ):
+        raise ValueError(f"unsupported cluster topology for policy {policy_path.stem}")
+    launched_gpus = resolve_launched_gpu_ids(resolved, context=policy_path.stem)
+    if launched_gpus != list(range(width)):
         raise ValueError(f"unsupported cluster topology for policy {policy_path.stem}")
     return width
 
