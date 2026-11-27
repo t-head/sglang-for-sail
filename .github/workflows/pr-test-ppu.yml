@@ -102,7 +102,10 @@ jobs:
       ref: ${{ needs.pr-gate.outputs.sha }}
       run_all_tests: false
       run_legacy_sanity: false
-    secrets: inherit
+    secrets:
+      PPU_CI_K8S_RUNTIME_DIGEST: ${{ secrets.PPU_CI_K8S_RUNTIME_DIGEST }}
+      PPU_CI_RECIPE_IMAGE_REPO: ${{ secrets.PPU_CI_RECIPE_IMAGE_REPO }}
+      PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS: ${{ secrets.PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS }}
 
   yuhe-v100:
     needs: pr-gate
@@ -115,7 +118,10 @@ jobs:
       ref: ${{ needs.pr-gate.outputs.sha }}
       run_all_tests: false
       run_legacy_sanity: false
-    secrets: inherit
+    secrets:
+      PPU_CI_K8S_RUNTIME_DIGEST: ${{ secrets.PPU_CI_K8S_RUNTIME_DIGEST }}
+      PPU_CI_RECIPE_IMAGE_REPO: ${{ secrets.PPU_CI_RECIPE_IMAGE_REPO }}
+      PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS: ${{ secrets.PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS }}
 
   legacy-call:
     # Reusable workflows inherit the event of the caller. Only workflow_call
