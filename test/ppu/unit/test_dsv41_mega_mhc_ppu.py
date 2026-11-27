@@ -1,6 +1,6 @@
 """PPU numerical and CUDA Graph acceptance tests for shifted MegaMHC.
 
-Run on PPU SM89+ with a compatible DeepGEMM mega_mhc backend installed.
+Run on PPU SM80+ with a compatible DeepGEMM mega_mhc backend installed.
 The FP32 reference follows DeepGEMM's third-party/tilelang_ops/ref_mhc.py.
 """
 
@@ -21,8 +21,8 @@ class TestMegaMHCPPU(CustomTestCase):
             raise unittest.SkipTest("PPU is required")
         from sglang.srt.utils import get_device_sm, is_sail
 
-        if not is_sail() or get_device_sm() < 89:
-            raise unittest.SkipTest("SAIL SM89+ is required")
+        if not is_sail() or get_device_sm() < 80:
+            raise unittest.SkipTest("SAIL SM80+ is required")
         from sglang.kernels.ops.layernorm.mhc_mega import can_use_mega_mhc_prefill
         from sglang.srt.environ import envs
         from sglang.srt.models import deepseek_v4_mhc as mhc
