@@ -2580,6 +2580,61 @@ exit 1
             "${{ inputs.tier == 'fast_sanity' && 32 || 4 }}",
         )
 
+    def test_ppu_workflows_declare_minimal_secrets_and_fork_checkout_policy(self):
+        import yaml
+
+        expected_secrets = {
+            "PPU_CI_K8S_RUNTIME_DIGEST",
+            "PPU_CI_RECIPE_IMAGE_REPO",
+            "PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS",
+        }
+        pr_wf = yaml.load(
+            (REPO_ROOT / ".github/workflows/pr-test-ppu.yml").read_text(
+                encoding="utf-8"
+            ),
+            Loader=yaml.BaseLoader,
+        )
+        call_secrets = pr_wf["on"]["workflow_call"]["secrets"]
+        self.assertEqual(set(call_secrets.keys()), expected_secrets)
+        for key, cfg in call_secrets.items():
+            self.assertEqual(str(cfg.get("required", "")).lower(), "false", key)
+            self.assertFalse(key.startswith("PPU_CI_NOTIFY_"))
+
+        expected_counts = {"pr-test-ppu.yml": 4, "nightly-test-ppu.yml": 3}
+        for filename, expected_candidate_count in expected_counts.items():
+            wf = yaml.load(
+                (REPO_ROOT / ".github/workflows" / filename).read_text(
+                    encoding="utf-8"
+                ),
+                Loader=yaml.BaseLoader,
+            )
+            candidate_count = 0
+            for job_id, job in wf["jobs"].items():
+                for step in job.get("steps", []):
+                    if not str(step.get("uses", "")).startswith("actions/checkout"):
+                        continue
+                    with_cfg = step.get("with") or {}
+                    repo_expr = str(with_cfg.get("repository", ""))
+                    if "github.event.pull_request.head.repo.full_name" in repo_expr:
+                        candidate_count += 1
+                        self.assertEqual(
+                            str(with_cfg.get("persist-credentials", "")).lower(),
+                            "false",
+                            f"{filename}:{job_id}",
+                        )
+                        self.assertEqual(
+                            with_cfg.get("allow-unsafe-pr-checkout"),
+                            "${{ github.event_name == 'pull_request_target' }}",
+                            f"{filename}:{job_id}",
+                        )
+                    else:
+                        self.assertNotIn(
+                            "allow-unsafe-pr-checkout",
+                            with_cfg,
+                            f"{filename}:{job_id}",
+                        )
+            self.assertEqual(candidate_count, expected_candidate_count, filename)
+
 
 if __name__ == "__main__":
     unittest.main()

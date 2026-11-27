@@ -42,6 +42,13 @@ on:
         description: "Run only the single-device DFlash and EAGLE3 checks"
         type: boolean
         default: false
+    secrets:
+      PPU_CI_K8S_RUNTIME_DIGEST:
+        required: false
+      PPU_CI_RECIPE_IMAGE_REPO:
+        required: false
+      PPU_CI_RECIPE_ALLOWED_IMAGE_REPOS:
+        required: false
 
 permissions:
   actions: read
@@ -160,6 +167,7 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ needs.check-changes.outputs.source-sha }}
           persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -186,6 +194,7 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ needs.check-changes.outputs.source-sha }}
           persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
       - name: Fetch pinned Cluster Run backend
         uses: actions/checkout@v4
         with:
@@ -235,6 +244,7 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ needs.check-changes.outputs.source-sha }}
           persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
 
       - name: Build native SAIL wheels
         run: |
@@ -283,6 +293,7 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ needs.check-changes.outputs.source-sha }}
           persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
       - name: Download the matching PPU wheel artifact
         uses: actions/download-artifact@v4
         with:
