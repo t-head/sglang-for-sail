@@ -5731,6 +5731,11 @@ class DeepseekV4ForCausalLM(
             if isinstance(layer, DeepseekV4PlatformDecoderLayer):
                 layer.bind_next(layers[i + 1] if i + 1 < len(layers) else None)
 
+        # Dummy loads also need to map Engram shards before the first forward.
+        for i, layer in enumerate(layers):
+            if getattr(layer, "engram", None) is not None:
+                layer.engram.embed.finish_load(label=f"layer {i}")
+
     def precompile_kernels_after_loading(self) -> None:
         from sglang.srt.layers.moe.mega_moe import (
             build_mega_moe_shared_weights,
@@ -6303,9 +6308,6 @@ class DeepseekV4ForCausalLM(
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
         if not is_nextn:
-            for i, layer in enumerate(self.model.layers):
-                if getattr(layer, "engram", None) is not None:
-                    layer.engram.embed.finish_load(label=f"layer {i}")
             self._prewarm_mhc_kernels()
 
     def get_embed_and_head(self):
