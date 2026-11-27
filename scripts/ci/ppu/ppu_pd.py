@@ -1,6 +1,5 @@
 import hashlib
 import json
-import sys
 from pathlib import Path
 
 import yaml
@@ -104,10 +103,3 @@ def load_pd_config(path=PD_CONFIG_PATH):
 
 def config_digest(config):
     return hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
-
-
-if __name__ == "__main__":
-    if sys.argv[1:] != ["device-count", "deepseek-v41-flash-1p1d"]:
-        raise SystemExit(2)
-    config = load_pd_config()
-    print(next(iter(config["nodes"].values()))["devices"])

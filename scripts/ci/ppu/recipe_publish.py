@@ -61,109 +61,22 @@ ACCURACY = {
 }
 
 
-def load_policy(model):
-    import yaml
-
-    try:
-        policy = yaml.safe_load((MODEL_POLICY_ROOT / f"{model}.yaml").read_text())
-    except yaml.YAMLError as exc:
-        raise ValueError("invalid model policy") from exc
-    if type(policy) is not dict:
-        raise ValueError("invalid model policy")
-    return policy
-
-
-def accuracy_recipe(policy):
-    import yaml
-
-    reference = policy.get("recipe")
-    if type(reference) is not str:
-        raise ValueError("accuracy-only policy lacks recipe")
-    recipe_path = (REPO_ROOT / reference).resolve()
-    if not recipe_path.is_relative_to(REPO_ROOT / "test/ppu/recipes"):
-        raise ValueError("accuracy-only recipe must be in the repository")
-    try:
-        recipe = yaml.safe_load(recipe_path.read_text())
-    except yaml.YAMLError as exc:
-        raise ValueError("invalid accuracy-only recipe") from exc
-    tiers = policy.get("tiers")
-    if (
-        policy.get("schema_version") != "ppu-test-policy/v1"
-        or type(policy.get("model_id")) is not str
-        or not policy["model_id"]
-        or type(recipe) is not dict
-        or recipe.get("schema_version") != "ppu-pd-test/v1"
-        or recipe.get("model_id") != policy["model_id"]
-        or type(tiers) is not dict
-        or set(tiers) != {"model_sanity"}
-        or type(tiers["model_sanity"]) is not dict
-    ):
-        raise ValueError("invalid accuracy-only policy or deployment identity")
-    stages = tiers["model_sanity"].get("stages")
-    if (
-        type(stages) is not list
-        or len(stages) != 1
-        or type(stages[0]) is not dict
-        or stages[0].get("kind") != "evalscope"
-        or "limit" not in stages[0]
-        or stages[0]["limit"] is not None
-        or policy.get("accuracy_gate")
-        != {
-            "method": "golden_band",
-            "golden_band_abs": 0.02,
-            "golden_source": "framework_repo",
-            "save_per_question": True,
-        }
-    ):
-        raise ValueError("accuracy-only policy must require full GSM8K evaluation")
-    return recipe, stages[0]
-
-
-def validate_accuracy_baseline(payload, recipe, stage):
-    import yaml
-
-    ppu = recipe.get("ppu")
-    if type(ppu) is not dict or type(ppu.get("golden_model_key")) is not str:
-        raise ValueError("accuracy-only recipe lacks golden identity")
-    golden_key = ppu["golden_model_key"]
-    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", golden_key):
-        raise ValueError("invalid golden identity")
+def validate_accuracy_baseline(payload):
+    golden_key = "deepseek_v41_flash_mxfp4"
     golden = json.loads(
         (REPO_ROOT / f"test/ppu/golden/accuracy_{golden_key}_890p.json").read_text()
     )
-    try:
-        dataset = yaml.safe_load(
-            (REPO_ROOT / "test/ppu/policy/datasets/gsm8k.yaml").read_text()
-        )
-    except yaml.YAMLError as exc:
-        raise ValueError("invalid GSM8K policy") from exc
     if (
-        dataset["id"] != "gsm8k"
-        or dataset["num_expected"] != 1319
-        or dataset["scoring"] != "evalscope-default"
-        or stage["dataset"] != f"gsm8k@{dataset['version']}"
-        or golden["schema_version"] != 2
+        golden["schema_version"] != 2
         or golden["benchmark"] != "gsm8k"
         or golden["chip"] != "890p"
         or golden["model"] != golden_key
-        or golden["checkpoint"] != ppu["hf_model_id"]
-        or golden["serving"]["ppu_count"]
-        != sum(len(recipe["roles"][name]["devices"]) for name in ("prefill", "decode"))
-        or golden["generation"] != stage["generation"]
-        or golden["dataset"]
-        != {
-            "dataset_id": stage["dataset"],
-            "num_expected": 1319,
-            **{
-                key: dataset[key]
-                for key in ("subset_list", "few_shot_num", "few_shot_random")
-            },
-        }
+        or golden["dataset"]["num_expected"] != 1319
         or golden["tolerance"] != {"mode": "band", "abs": 0.02}
         or golden["score"] != 0.96
         or payload["golden_score"] != golden["score"]
     ):
-        raise ValueError("accuracy-only golden baseline or policy mismatch")
+        raise ValueError("accuracy-only golden baseline mismatch")
 
 
 def validate_legacy(payload):
@@ -241,17 +154,11 @@ def validate(payload):
         or type(payload["private_retention"]) is not bool
     ):
         raise ValueError("invalid run identity")
-    recipe = stage = None
     if accuracy_only:
         if tier != "model_sanity":
             raise ValueError("accuracy-only policy requires model_sanity")
-        policy = load_policy(payload["model"])
-        if policy.get("measurement") != "accuracy_only":
-            raise ValueError("measurement profile does not match model policy")
-        if "measurement" in payload:
-            if payload["measurement"] != "accuracy_only":
-                raise ValueError("measurement profile does not match model policy")
-            recipe, stage = accuracy_recipe(policy)
+        if payload.get("measurement", "accuracy_only") != "accuracy_only":
+            raise ValueError("invalid accuracy-only measurement profile")
     for key in ("recipe_tree_sha256", "config_digest"):
         if key in payload and not re.fullmatch(r"[0-9a-f]{64}", payload[key]):
             raise ValueError("invalid digest")
@@ -345,7 +252,7 @@ def validate(payload):
         ):
             raise ValueError("fallback result retained a layer override")
         if accuracy_only:
-            validate_accuracy_baseline(payload, recipe, stage)
+            validate_accuracy_baseline(payload)
             if (
                 not payload["accuracy_within_band"]
                 or not payload["baseline_established"]

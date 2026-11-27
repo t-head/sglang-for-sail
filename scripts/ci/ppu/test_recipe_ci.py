@@ -1178,8 +1178,13 @@ class RecipeContractTest(unittest.TestCase):
                 self.assertEqual(task_config.call_args.kwargs["api_url"], "http://127.0.0.1:8008/v1")
                 self.assertEqual(result["golden_score"], 0.96)
                 self.assertTrue(result["accuracy_within_band"])
+                for changes in ({"hf_model_id": "wrong/model"}, {"ppu_count": 4}):
+                    with self.subTest(changes=changes), self.assertRaisesRegex(
+                        ValueError, "golden evaluation contract"
+                    ):
+                        evaluate(stage, {**forwarded, **changes})
                 with self.assertRaisesRegex(ValueError, "golden evaluation contract"):
-                    evaluate(stage, {**forwarded, "hf_model_id": "wrong/model"})
+                    evaluate({**stage, "generation": {"temperature": 0.0}}, forwarded)
 
     def test_old_model_eval_worker_keeps_existing_endpoint_and_payload(self):
         path = DEFAULT_POLICY_ROOT / "models/deepseek-v4-flash.yaml"
@@ -1271,9 +1276,7 @@ class RunEvidenceTest(unittest.TestCase):
 
     def test_non_pd_publication_keeps_original_dependencies_and_rejection_order(self):
         result = fast_result()
-        with patch("recipe_publish.load_policy", side_effect=AssertionError("PD-only")), patch(
-            "recipe_publish.Path.read_text", side_effect=AssertionError("no policy parsing")
-        ):
+        with patch("recipe_publish.Path.read_text", side_effect=AssertionError("no policy parsing")):
             validate(result)
         with self.assertRaisesRegex(ValueError, "unexpected result field"):
             validate({"tier": "fast_sanity", "unexpected": True})
@@ -1428,46 +1431,54 @@ class RunEvidenceTest(unittest.TestCase):
             with self.subTest(full_outcome=outcome), self.assertRaises(ValueError):
                 validate({**full, "outcome": outcome})
 
-    def test_accuracy_profile_requires_pd_recipe_and_matching_policy_identity(self):
-        policy_path = REPO_ROOT / "test/ppu/policy/models/deepseek-v41-flash-pd.yaml"
-        policy = yaml.safe_load(policy_path.read_text())
-        for changes in (
-            {"measurement": None},
-            {"model_id": "zai-org/GLM-5.3"},
-            {"recipe": "test/ppu/recipes/deepseek-ai/DeepSeek-V4.1-Flash.yaml"},
-            {"recipe": "../outside.yaml"},
-            {"tiers": {"model_sanity": {"stages": []}}},
-        ):
+    def test_accuracy_only_publish_and_verify_without_site_packages(self):
+        passed = self.accuracy_result()
+        failed = {
+            key: passed[key]
+            for key in ("schema", "model", "tier", "source_sha", "route", "private_retention")
+        }
+        failed.update(outcome="fail", failure_phase="server_startup")
+        command = [
+            sys.executable,
+            "-E",
+            "-S",
+            "-B",
+            str(REPO_ROOT / "scripts/ci/ppu/recipe_publish.py"),
+        ]
+        for result in (passed, failed):
             with (
-                self.subTest(changes=changes),
-                patch("recipe_publish.load_policy", return_value={**policy, **changes}),
-                self.assertRaises(ValueError),
+                self.subTest(outcome=result["outcome"]),
+                tempfile.TemporaryDirectory() as temp,
             ):
-                validate(self.accuracy_result())
-        for change in ("limit", "kind"):
-            altered = deepcopy(policy)
-            altered["tiers"]["model_sanity"]["stages"][0][change] = (
-                100 if change == "limit" else "bench"
-            )
-            with (
-                self.subTest(stage_change=change),
-                patch("recipe_publish.load_policy", return_value=altered),
-                self.assertRaises(ValueError),
-            ):
-                validate(self.accuracy_result())
+                root = Path(temp)
+                candidate = root / "candidate.json"
+                artifact = root / "public.json"
+                summary = root / "summary"
+                candidate.write_text(json.dumps(result))
+                published = subprocess.run(
+                    [*command, str(candidate), str(artifact), str(summary)],
+                    capture_output=True, text=True, timeout=30,
+                )
+                self.assertEqual(published.returncode, 0, published.stderr)
+                self.assertEqual(json.loads(published.stdout), result)
+                self.assertEqual(artifact.read_text(), published.stdout)
+                self.assertIn(published.stdout, summary.read_text())
+                verified = subprocess.run(
+                    [*command, "--verify-only", str(artifact)],
+                    env={**os.environ, "PPU_CI_SOURCE_SHA": result["source_sha"]},
+                    capture_output=True, text=True, timeout=30,
+                )
+                self.assertEqual(verified.returncode, 0, verified.stderr)
 
-    def test_accuracy_only_pass_checks_repository_golden_and_policy_baseline(self):
+    def test_accuracy_only_pass_checks_repository_golden(self):
         path = REPO_ROOT / "test/ppu/golden/accuracy_deepseek_v41_flash_mxfp4_890p.json"
         golden = json.loads(path.read_text())
         original_read = Path.read_text
         for changes in (
             {"score": 0.94},
             {"model": "glm-5.3"},
-            {"checkpoint": "unmatched-checkpoint"},
             {"dataset": {**golden["dataset"], "num_expected": 100}},
             {"tolerance": {"mode": "band", "abs": 0.03}},
-            {"generation": {"temperature": 0.0}},
-            {"serving": {"ppu_count": 4}},
         ):
             altered = json.dumps({**golden, **changes})
 
@@ -1482,21 +1493,6 @@ class RunEvidenceTest(unittest.TestCase):
                 self.assertRaises(ValueError),
             ):
                 validate(self.accuracy_result())
-        policy_path = REPO_ROOT / "test/ppu/policy/models/deepseek-v41-flash-pd.yaml"
-        policy = yaml.safe_load(policy_path.read_text())
-        with (
-            patch(
-                "recipe_publish.load_policy",
-                return_value={
-                    **policy,
-                    "accuracy_gate": {
-                        **policy["accuracy_gate"], "golden_band_abs": 0.03,
-                    },
-                },
-            ),
-            self.assertRaises(ValueError),
-        ):
-            validate(self.accuracy_result())
 
     def test_private_retention_preserves_optional_pd_files_with_digests(self):
         names = (

@@ -1504,10 +1504,7 @@ def validate_paths(
                 for label, flag_set in _collect_all_recipe_flag_sets(rpath, rdoc):
                     validate_flags_with_parser(active_parser, flag_set, context=label)
                     checked_flag_sets += 1
-                if rdoc.get("schema_version") == PD_SCHEMA:
-                    parser_checked = True
-                else:
-                    parser_checked = checked_flag_sets > 0
+                parser_checked = checked_flag_sets > 0
 
     return {
         "validated_files": validated,

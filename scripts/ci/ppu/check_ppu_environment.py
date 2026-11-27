@@ -1,7 +1,6 @@
 """Validate the PPU runner environment without importing SGLang."""
 
 import argparse
-import hashlib
 import importlib
 import json
 import os
@@ -280,12 +279,10 @@ def check_pd_runtime():
             versions[name] = metadata.version(name)
         except metadata.PackageNotFoundError:
             pass
-    test = root / "test/ppu/e2e/test_deepseek_v41_flash_pd_ppu.py"
     return {
         "code_source": code_source,
         "sglang_import": str(origin),
         "versions": versions,
-        "test_sha256": hashlib.sha256(test.read_bytes()).hexdigest(),
         "jit_dir": os.environ["PPU_CI_RECIPE_JIT_DIR"],
     }
 
