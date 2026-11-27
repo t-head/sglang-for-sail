@@ -4,6 +4,7 @@ recipe: test/ppu/recipes/deepseek-ai/DeepSeek-V4.1-Flash.yaml
 hardware: zhenwu_m890
 tiers:
   fast_sanity:
+    preset: fast_sanity
     dummy_weights: true
     cache: enabled
     probe:
