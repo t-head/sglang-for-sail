@@ -35,6 +35,7 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.utils import get_num_fused_shared_experts
 from sglang.srt.layers.quantization import Fp8Config
+from sglang.srt.layers.quantization.fp8_utils import use_ppu_fp8_dense_proj
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -90,12 +91,22 @@ class DeepseekModelNextN(nn.Module):
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        eh_proj_quant_config = None
         if quant_config is not None and quant_config.get_name() == "quark":
+            eh_proj_quant_config = quant_config
+        elif (
+            quant_config is not None
+            and quant_config.get_name() == "compressed_tensors"
+            and use_ppu_fp8_dense_proj()
+            and quant_config.is_linear_unquantized(add_prefix("eh_proj", prefix))
+        ):
+            eh_proj_quant_config = Fp8Config(is_checkpoint_fp8_serialized=False)
+        if eh_proj_quant_config is not None:
             self.eh_proj = ReplicatedLinear(
                 2 * config.hidden_size,
                 config.hidden_size,
                 bias=False,
-                quant_config=quant_config,
+                quant_config=eh_proj_quant_config,
                 prefix=add_prefix("eh_proj", prefix),
             )
         else:

@@ -5,7 +5,10 @@ from unittest.mock import patch
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
+from sglang.srt.layers.quantization import fp8_utils
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.linear import ColumnParallelBatchedLinear
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.models import glm5_next
 from sglang.srt.runtime_context import get_context, get_parallel
@@ -45,6 +48,11 @@ class MockFp8Config:
         if all(name in self.ignored_layers for name in names):
             return UnquantizedLinearMethod()
         return MockQuantizedLinearMethod()
+
+
+class MockCompressedTensorsConfig(MockFp8Config):
+    def get_name(self):
+        return "compressed_tensors"
 
 
 def quark_mxfp4_config(excluded):
@@ -92,6 +100,82 @@ class TestGlm5NextBfgFusion(unittest.TestCase):
         )
         patcher.start()
         self.addCleanup(patcher.stop)
+
+    def test_batched_linear_preserves_module_apply(self):
+        layer = ColumnParallelBatchedLinear(2, 8, 16, dtype=torch.float32)
+        visited = []
+        self.assertIs(layer.apply(lambda module: visited.append(module)), layer)
+        self.assertIn(layer, visited)
+
+    def test_online_fp8_gate_requires_supported_ppu(self):
+        cases = (
+            (False, 89, True, False),
+            (True, 80, True, False),
+            (True, 89, False, False),
+            (True, 89, True, True),
+        )
+        for is_sail, sm, deepgemm, expected in cases:
+            with (
+                self.subTest(is_sail=is_sail, sm=sm, deepgemm=deepgemm),
+                envs.SGLANG_PPU_ENABLE_FP8_DENSE_PROJ.override(True),
+                patch.object(fp8_utils, "_is_sail", is_sail),
+                patch.object(fp8_utils, "get_device_sm", return_value=sm),
+                patch.object(
+                    fp8_utils.deep_gemm_wrapper,
+                    "ENABLE_JIT_DEEPGEMM",
+                    deepgemm,
+                ),
+            ):
+                self.assertEqual(fp8_utils.use_ppu_fp8_dense_proj(), expected)
+
+    def test_batched_fp8_restores_input_dtype(self):
+        with patch(
+            "sglang.srt.layers.quantization.fp8_utils.use_ppu_fp8_dense_proj",
+            return_value=True,
+        ):
+            layer = ColumnParallelBatchedLinear(
+                2, 8, 16, dtype=torch.float16, quant_config=MockFp8Config(())
+            )
+        layer.weight_scale = torch.nn.Parameter(torch.ones(2, 16, 1))
+        input = torch.randn(2, 3, 8, dtype=torch.float16)
+        with (
+            patch(
+                "sglang.kernels.ops.quantization.fp8_kernel.per_token_group_quant_fp8",
+                side_effect=lambda tensor, group_size: (
+                    torch.empty(
+                        tensor.shape, dtype=torch.float8_e4m3fn, device=tensor.device
+                    ),
+                    torch.ones(tensor.shape[0], 1, device=tensor.device),
+                ),
+            ),
+            patch(
+                "sglang.srt.layers.quantization.fp8_utils.gemm_nt_f8f8bf16"
+            ),
+        ):
+            self.assertEqual(layer(input).dtype, input.dtype)
+
+    def test_serialized_projection_blocks_online_fp8_conversion(self):
+        quant = MockCompressedTensorsConfig(QKV + BFG)
+        with patch.object(
+            envs.SGLANG_PPU_ENABLE_FP8_DENSE_PROJ, "get", return_value=True
+        ):
+            attention = glm5_next.Glm5NextLinearAttention(
+                layer_idx=0,
+                hidden_size=16,
+                config=SimpleNamespace(
+                    linear_attn_config={
+                        "head_dim": 8,
+                        "num_heads": 4,
+                        "short_conv_kernel_size": 4,
+                    }
+                ),
+                quant_config=quant,
+                prefix=PREFIX,
+            )
+        self.assertFalse(attention.do_fuse_qkvbfg)
+        self.assertIsInstance(
+            attention.o_proj.quant_method, MockQuantizedLinearMethod
+        )
 
     @torch.no_grad()
     def test_projection_loading_matches_unfused_reference(self):

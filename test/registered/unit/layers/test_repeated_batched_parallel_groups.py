@@ -92,6 +92,17 @@ def values(rows, columns, layer, offset=0):
     ).reshape(rows, columns).to(layer.weight.dtype) / 128
 
 
+def fake_per_token_quant(input, group_size, *, output_q=None, output_s=None):
+    del group_size
+    scale = input.float().abs().amax(dim=-1, keepdim=True).clamp(min=1e-12) / 448
+    quantized = (input.float() / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+    if output_q is not None:
+        output_q.copy_(quantized)
+        output_s.copy_(scale)
+        return output_q, output_s
+    return quantized, scale
+
+
 def load_projection(layer):
     rank, size = rank_size(layer)[0], rank_size(layer)[1]
     with parallel_scope(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0):
@@ -150,6 +161,74 @@ class TestRepeatedBatchedParallelGroups(CustomTestCase):
         self.addCleanup(reset_context)
         self.addCleanup(torch.set_default_dtype, torch.get_default_dtype())
         torch.set_default_dtype(torch.float32)
+
+    def test_batched_online_fp8_native_reload_preserves_storage(self):
+        publish(
+            ServerArgs(model_path="dummy", device="cpu", tp_size=1),
+            role="test",
+            ranks=SpawnRanks(world_rank=0),
+        )
+
+        def build():
+            with patch(
+                "sglang.srt.layers.quantization.fp8_utils.use_ppu_fp8_dense_proj",
+                return_value=True,
+            ):
+                return linear.ColumnParallelBatchedLinear(
+                    2,
+                    8,
+                    16,
+                    dtype=torch.bfloat16,
+                    quant_config=Fp8Config(is_checkpoint_fp8_serialized=False),
+                )
+
+        with patch(
+            "sglang.kernels.ops.quantization.fp8_kernel.per_token_group_quant_fp8",
+            side_effect=fake_per_token_quant,
+        ):
+            layer = build()
+            source_a = values(32, 8, layer, 0).reshape(2, 16, 8)
+            source_b = values(32, 8, layer, 7).reshape(2, 16, 8)
+            for shard in range(2):
+                layer.weight.weight_loader(layer.weight, source_a[shard], shard)
+            layer.process_weights_after_loading(layer)
+            initial_weight = layer.weight.clone()
+            initial_scale = layer.weight_scale.clone()
+            weight_pointer = layer.weight.data_ptr()
+            scale_pointer = layer.weight_scale.data_ptr()
+            self.assertTrue(callable(layer.weight.weight_loader))
+
+            layer.weight.weight_loader(layer.weight, source_b[0], 0)
+            self.assertEqual(layer.weight.data_ptr(), weight_pointer)
+            self.assertEqual(layer.weight_scale.data_ptr(), scale_pointer)
+
+            reference = build()
+            for shard in range(2):
+                reference.weight.weight_loader(
+                    reference.weight, source_b[shard], shard
+                )
+            reference.process_weights_after_loading(reference)
+            torch.testing.assert_close(
+                layer.weight[0], reference.weight[0], rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                layer.weight_scale[0], reference.weight_scale[0], rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                layer.weight[1], initial_weight[1], rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                layer.weight_scale[1], initial_scale[1], rtol=0, atol=0
+            )
+
+            layer.weight.weight_loader(layer.weight, source_b[1], 1)
+            layer.process_weights_after_loading(layer)
+            self.assertEqual(layer.weight.data_ptr(), weight_pointer)
+            self.assertEqual(layer.weight_scale.data_ptr(), scale_pointer)
+            torch.testing.assert_close(layer.weight, reference.weight, rtol=0, atol=0)
+            torch.testing.assert_close(
+                layer.weight_scale, reference.weight_scale, rtol=0, atol=0
+            )
 
     def test_helper_group_selection_frozen_reload_and_native_math(self):
         publish(

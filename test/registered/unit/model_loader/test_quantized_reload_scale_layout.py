@@ -162,7 +162,19 @@ def assert_same_parameters(actual, expected):
         )
 
 
-def check_reload(model, version=13, changed=False, per_tensor=False):
+def use_column_scales(model):
+    for module in model.modules():
+        scale = getattr(module, "weight_scale", None)
+        if scale is not None and scale.ndim == 2 and scale.shape[0] == 1:
+            scale.data = scale.data.t().contiguous()
+    return model
+
+
+def check_reload(
+    model, version=13, changed=False, per_tensor=False, column_scales=False
+):
+    if column_scales:
+        use_column_scales(model)
     kind, kv_heads = model.config.model_type, model.config.num_key_value_heads
     source = checkpoint(version, kind, kv_heads)
     pointers = {n: p.data_ptr() for n, p in model.named_parameters()}
@@ -175,6 +187,8 @@ def check_reload(model, version=13, changed=False, per_tensor=False):
     reference = build_model(
         kind, kv_heads=kv_heads, version=version, per_tensor=per_tensor
     )
+    if column_scales:
+        use_column_scales(reference)
     assert_same_parameters(model, reference)
     return model
 
@@ -216,6 +230,10 @@ class TestQuantizedReloadScaleLayout(CustomTestCase):
         check_reload(model, changed=True)
         check_reload(model, version=29, changed=True)
 
+    def test_column_scale_full_reload_matches_cold_load(self):
+        model = build_model("qwen3", kv_heads=1)
+        check_reload(model, changed=True, column_scales=True)
+
     def test_unequal_qkv_and_replicated_kv_match_cold_load(self):
         for kv_heads in (1, 2, 4):
             with self.subTest(kv_heads=kv_heads):
@@ -238,6 +256,25 @@ class TestQuantizedReloadScaleLayout(CustomTestCase):
                     assert_same_parameters(model, reference)
                     for name, param in model.named_parameters():
                         self.assertEqual(param.data_ptr(), pointers[name], name)
+
+    def test_column_scale_partial_updates_preserve_other_rows(self):
+        for shard in ("q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"):
+            with self.subTest(shard=shard):
+                model = use_column_scales(build_model("qwen3", kv_heads=1))
+                before = checkpoint(kind="qwen3", kv_heads=1)
+                update = {
+                    n: t for n, t in checkpoint(13, "qwen3", 1) if f".{shard}." in n
+                }
+                pointers = {n: p.data_ptr() for n, p in model.named_parameters()}
+                with loading_scope(True):
+                    model.load_weights(list(update.items()))
+                expected = [(n, update.get(n, t)) for n, t in before]
+                reference = use_column_scales(
+                    build_model("qwen3", kv_heads=1, weights=expected)
+                )
+                assert_same_parameters(model, reference)
+                for name, param in model.named_parameters():
+                    self.assertEqual(param.data_ptr(), pointers[name], name)
 
     def test_per_tensor_quantization_matches_native_cold_load(self):
         model = build_model("qwen3", kv_heads=1, per_tensor=True)

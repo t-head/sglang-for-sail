@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple
 
 import msgspec
@@ -40,9 +41,15 @@ from sglang.srt.layers.parameter import (
     RowvLLMParameter,
     _ColumnvLLMParameter,
 )
-from sglang.srt.layers.utils import pad_or_narrow_weight
+from sglang.srt.layers.utils import copy_or_rebind_param, pad_or_narrow_weight
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
-from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_cpu,
+    is_hip,
+    is_npu,
+    set_weight_attrs,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -1975,12 +1982,12 @@ class MergedColumnParallelRepeatedLinear(LinearBase):
 class ColumnParallelBatchedLinear(nn.Module):
     """Column parallel batched linear layer.
 
-    TODO: quantization is not supported yet.
     Args:
         batch: batch dimension of the linear layer.
         input_size: input dimension of the linear layer.
         output_size: output dimension of the linear layer.
         dtype: Data type for the parameters.
+        quant_config: Quantization configure.
         parallel_group: Select TP, attention TP, or an unsharded partition for
             the output dimension. The batch dimension remains unsharded.
     """
@@ -1992,6 +1999,7 @@ class ColumnParallelBatchedLinear(nn.Module):
         output_size: int,
         dtype: torch.dtype,
         *,
+        quant_config: Optional[QuantizationConfig] = None,
         parallel_group: Optional[LinearParallelGroup] = None,
     ):
         super().__init__()
@@ -2002,6 +2010,62 @@ class ColumnParallelBatchedLinear(nn.Module):
             requires_grad=False,
         )
         setattr(self.weight, "weight_loader", self.weight_loader)
+        from sglang.srt.layers.quantization.fp8_utils import use_ppu_fp8_dense_proj
+
+        self.quant_method = (
+            SimpleNamespace(
+                process_weights_after_loading=self.process_weights_after_loading,
+                apply=self._apply_fp8,
+            )
+            if quant_config is not None
+            and quant_config.get_name() == "fp8"
+            and use_ppu_fp8_dense_proj()
+            else None
+        )
+
+    def process_weights_after_loading(self, layer) -> None:
+        from sglang.kernels.ops.quantization.fp8_kernel import per_token_group_quant_fp8
+
+        if layer.weight.dtype == torch.float8_e4m3fn and hasattr(layer, "weight_scale"):
+            return
+        batch_size = layer.weight.shape[0]
+        qweight, weight_scale = per_token_group_quant_fp8(
+            layer.weight.view(-1, layer.weight.shape[-1]), layer.weight.shape[-1]
+        )
+        copy_or_rebind_param(
+            layer,
+            "weight",
+            qweight.view(batch_size, -1, layer.weight.shape[-1]),
+        )
+        copy_or_rebind_param(
+            layer,
+            "weight_scale",
+            weight_scale.view(batch_size, -1, 1),
+        )
+
+    def _apply_fp8(self, layer, input: torch.Tensor) -> torch.Tensor:
+        from sglang.kernels.ops.quantization.fp8_kernel import per_token_group_quant_fp8
+        from sglang.srt.layers.quantization.fp8_utils import gemm_nt_f8f8bf16
+
+        output = torch.empty(
+            (*input.shape[:-1], layer.weight.shape[1]),
+            dtype=torch.bfloat16,
+            device=input.device,
+        )
+        for index in range(layer.weight.shape[0]):
+            qinput, input_scale = per_token_group_quant_fp8(
+                input[index].contiguous(), input.shape[-1]
+            )
+            qinput = qinput.reshape(-1, input.shape[-1])
+            input_scale = input_scale.reshape(-1, 1)
+            gemm_nt_f8f8bf16(
+                qinput,
+                input_scale,
+                layer.weight[index],
+                layer.weight_scale[index],
+                output[index],
+            )
+        return output.to(input.dtype)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if SGLANG_PROFILE_NVTX:
@@ -2009,7 +2073,11 @@ class ColumnParallelBatchedLinear(nn.Module):
             nvtx_push_range_for_gemm(
                 "ColumnParallelBatchedLinear", input, tmp_weight, None, None, None
             )
-        output = torch.bmm(input, self.weight.transpose(-1, -2))
+        output = (
+            self.quant_method.apply(self, input)
+            if self.quant_method is not None
+            else torch.bmm(input, self.weight.transpose(-1, -2))
+        )
         if SGLANG_PROFILE_NVTX:
             nvtx_pop_range_for_gemm(output)
         return output
@@ -2021,4 +2089,17 @@ class ColumnParallelBatchedLinear(nn.Module):
         tp_rank, _ = get_group_rank_size(self.tp_group)
         start_idx = tp_rank * shard_size
         loaded_weight = loaded_weight.narrow(0, start_idx, shard_size)
-        param.data[loaded_shard_id].copy_(loaded_weight)
+        if param.dtype == torch.float8_e4m3fn:
+            from sglang.kernels.ops.quantization.fp8_kernel import (
+                per_token_group_quant_fp8,
+            )
+
+            source = loaded_weight.to(param.device).contiguous()
+            per_token_group_quant_fp8(
+                source,
+                source.shape[-1],
+                output_q=param.data[loaded_shard_id],
+                output_s=self.weight_scale.data[loaded_shard_id],
+            )
+        else:
+            param.data[loaded_shard_id].copy_(loaded_weight)
