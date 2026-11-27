@@ -322,6 +322,24 @@ class TestPPUCIWorkflow(unittest.TestCase):
         runtime = RUNNER.parent.parent / "scripts/ci/ppu/build_and_test.sh"
         self.assertNotIn("--hw cpu", runtime.read_text())
 
+    def test_lint_and_pr_workflows_wire_recipe_validation_and_command_diff(self):
+        lint_wf = yaml.load(
+            (RUNNER.parent.parent / ".github/workflows/lint.yml").read_text(),
+            Loader=yaml.BaseLoader,
+        )
+        lint_runs = "\n".join(
+            step.get("run", "") for step in lint_wf["jobs"]["lint"]["steps"]
+        )
+        self.assertIn("ppu_recipe.py validate --all --sglang-parser skip", lint_runs)
+        self.assertIn("ppu_recipe.py render-matrix --check", lint_runs)
+        self.assertIn("ppu_recipe.py diff", lint_runs)
+
+        selftests = self.jobs["ppu-ci-selftest"]
+        selftest_run = selftests["steps"][-1]["run"]
+        self.assertIn("ppu_recipe.py validate --all --sglang-parser skip", selftest_run)
+        self.assertIn("ppu_recipe.py render-matrix --check", selftest_run)
+        self.assertIn("ppu_recipe.py diff", selftest_run)
+
     def test_jobs_check_out_the_triggering_ref_and_verify_the_pinned_sha(self):
         check = self.jobs["check-changes"]
         self.assertIn("github.sha", check["steps"][0]["with"]["ref"])

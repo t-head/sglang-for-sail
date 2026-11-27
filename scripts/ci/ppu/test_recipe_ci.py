@@ -6,6 +6,7 @@ import copy
 import io
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -24,13 +25,16 @@ from ppu_recipe import (
     REPO_ROOT,
     ValidationError,
     _load_yaml,
+    _md_code,
     _scan_text,
     iter_recipe_catalog_entries,
 )
 from ppu_recipe import main as ppu_recipe_main
 from ppu_recipe import (
     render_ci_matrix_markdown,
+    render_resolved_diff_markdown,
     resolve_recipe,
+    scan_stray_serving_recipes,
     substitute_validation_placeholders,
     validate_flags_with_parser,
     validate_paths,
@@ -3357,7 +3361,13 @@ class PresetCatalogContractTest(unittest.TestCase):
                     "nodes": 1,
                     "devices_per_node": 16,
                 },
-                "hf_model_id": "zai-org/GLM-5.3-BF16",
+                "assets": {
+                    "model": "glm-5.3-w8a8-int8",
+                    "tokenizer": "glm-5.3-w8a8-int8",
+                },
+                "hf_model_id": "T-HEAD/GLM-5.3-W8A8-INT8",
+                "golden_model_key": "glm_5_3_w8a8_int8",
+                "served_name": "glm-5.3-w8a8-int8",
                 "extra_args": ["--tp-size", "16"],
             }
             glm_doc["presets"]["tp8"] = {
@@ -3482,6 +3492,7 @@ class PresetCatalogContractTest(unittest.TestCase):
                 if inherit_assets:
                     glm_doc = _load_yaml(glm_rec_path)
                     glm_doc["variants"]["fp8"].pop("assets", None)
+                    glm_doc["variants"]["fp8"]["allow_shared_fields"] = ["assets"]
                     glm_rec_path.write_text(yaml.safe_dump(glm_doc, sort_keys=False))
 
                 pol = _load_yaml(root / "test/ppu/policy/models/glm-5.3.yaml")
@@ -3935,6 +3946,7 @@ class PresetCatalogContractTest(unittest.TestCase):
             pol_path.write_text(yaml.safe_dump(orig_pol, sort_keys=False))
             flow_rec = copy.deepcopy(orig_rec)
             flow_rec["variants"]["default"]["hf_model_id"] = fp8_id
+            flow_rec["variants"]["fp8"]["allow_shared_fields"] = ["hf_model_id"]
             rec_path.write_text(json.dumps(flow_rec))
             cfg2, _ = _run_worker("json_recipe")
             self.assertEqual(cfg2["hf_model_id"], fp8_id)
@@ -3944,6 +3956,7 @@ class PresetCatalogContractTest(unittest.TestCase):
             dual_rec = copy.deepcopy(orig_rec)
             dual_rec["ppu"]["hf_model_id"] = fp8_id
             dual_rec["variants"]["default"]["hf_model_id"] = fp8_id
+            dual_rec["variants"]["fp8"]["allow_shared_fields"] = ["hf_model_id"]
             rec_path.write_text(yaml.safe_dump(dual_rec, sort_keys=False))
             cfg3, _ = _run_worker("dual_hf_id")
             self.assertEqual(cfg3["hf_model_id"], fp8_id)
@@ -4113,6 +4126,509 @@ class PresetCatalogContractTest(unittest.TestCase):
             substitute_validation_placeholders(
                 ["--json-model-override-args", "{not-json"], {}
             )
+
+    def test_multivariant_isolation_guard_and_allow_shared_fields(self):
+        glm_doc = _load_yaml(REPO_ROOT / "test/ppu/recipes/zai-org/GLM-5.3.yaml")
+        validate_serving_recipe_structure(glm_doc, context="glm_control")
+
+        # 1. Silent inheritance (omitting any isolated field on a non-default variant) fails closed.
+        for missing_field in (
+            "assets",
+            "hf_model_id",
+            "golden_model_key",
+            "served_name",
+        ):
+            bad = copy.deepcopy(glm_doc)
+            bad["variants"]["fp8"].pop(missing_field)
+            with self.assertRaisesRegex(
+                ValidationError,
+                rf"requires explicit '{missing_field}' on non-default variant 'fp8'",
+            ):
+                validate_serving_recipe_structure(bad, context="missing_field")
+
+        # 2. Explicit duplication of default/top-level values without allow_shared_fields fails closed.
+        dup_assets = copy.deepcopy(glm_doc)
+        dup_assets["variants"]["fp8"]["assets"] = copy.deepcopy(
+            glm_doc["ppu"]["assets"]
+        )
+        with self.assertRaisesRegex(ValidationError, r"assets\.model.*duplicates"):
+            validate_serving_recipe_structure(dup_assets, context="dup_assets")
+
+        for field, dup_val in (
+            ("hf_model_id", glm_doc["ppu"]["hf_model_id"]),
+            ("golden_model_key", glm_doc["ppu"]["golden_model_key"]),
+            ("served_name", glm_doc["ppu"]["served_name"]),
+        ):
+            dup = copy.deepcopy(glm_doc)
+            dup["variants"]["fp8"][field] = dup_val
+            with self.assertRaisesRegex(
+                ValidationError, rf"{field}.*duplicates default/top-level"
+            ):
+                validate_serving_recipe_structure(dup, context=f"dup_{field}")
+
+        # 3. Colliding values between two non-default variants fail closed.
+        sibling_dup = copy.deepcopy(glm_doc)
+        sibling_dup["variants"]["bf16_810e"]["served_name"] = sibling_dup["variants"][
+            "fp8"
+        ]["served_name"]
+        with self.assertRaisesRegex(
+            ValidationError,
+            r"served_name.*duplicates variant '(?:fp8|bf16_810e)'",
+        ):
+            validate_serving_recipe_structure(sibling_dup, context="sibling_dup")
+
+        # 4. Unsupported or duplicate allow_shared_fields fail closed.
+        bad_exempt = copy.deepcopy(glm_doc)
+        bad_exempt["variants"]["fp8"]["allow_shared_fields"] = ["precision"]
+        with self.assertRaisesRegex(
+            ValidationError, "allow_shared_fields has unsupported field"
+        ):
+            validate_serving_recipe_structure(bad_exempt, context="bad_exempt")
+
+        dup_exempt = copy.deepcopy(glm_doc)
+        dup_exempt["variants"]["fp8"]["allow_shared_fields"] = [
+            "served_name",
+            "served_name",
+        ]
+        with self.assertRaisesRegex(
+            ValidationError, "allow_shared_fields must not contain duplicates"
+        ):
+            validate_serving_recipe_structure(dup_exempt, context="dup_exempt")
+
+        # 5. Positive control: explicit allow_shared_fields permits intentional sharing only for listed fields.
+        shared_ok = copy.deepcopy(glm_doc)
+        shared_ok["variants"]["fp8"].pop("served_name")
+        shared_ok["variants"]["fp8"]["allow_shared_fields"] = ["served_name"]
+        validate_serving_recipe_structure(shared_ok, context="shared_ok")
+
+        shared_ok["variants"]["fp8"].pop("hf_model_id")
+        with self.assertRaisesRegex(ValidationError, "requires explicit 'hf_model_id'"):
+            validate_serving_recipe_structure(shared_ok, context="partial_exempt")
+
+        # 6. Fallback identity equivalence & exempted-sibling collision fail closed.
+        fallback_dup = copy.deepcopy(glm_doc)
+        for blk in (fallback_dup["ppu"], fallback_dup["variants"]["default"]):
+            blk.pop("golden_model_key", None)
+            blk.pop("served_name", None)
+            blk.pop("hf_model_id", None)
+        fallback_dup["variants"]["fp8"]["served_name"] = fallback_dup["ppu"]["assets"][
+            "model"
+        ]
+        with self.assertRaisesRegex(
+            ValidationError, r"served_name.*duplicates default/top-level value"
+        ):
+            validate_serving_recipe_structure(
+                fallback_dup, context="fallback_dup_served_name"
+            )
+
+        fallback_hf = copy.deepcopy(glm_doc)
+        for blk in (fallback_hf["ppu"], fallback_hf["variants"]["default"]):
+            blk.pop("hf_model_id", None)
+        with self.assertRaisesRegex(
+            ValidationError, r"hf_model_id.*duplicates default/top-level value"
+        ):
+            validate_serving_recipe_structure(fallback_hf, context="fallback_dup_hf")
+
+        exempt_collision = copy.deepcopy(glm_doc)
+        exempt_collision["variants"]["fp8"]["allow_shared_fields"] = [
+            "served_name",
+            "assets",
+        ]
+        exempt_collision["variants"]["bf16_810e"]["served_name"] = exempt_collision[
+            "variants"
+        ]["fp8"]["served_name"]
+        with self.assertRaisesRegex(
+            ValidationError, r"bf16_810e\.served_name.*duplicates variant 'fp8'"
+        ):
+            validate_serving_recipe_structure(
+                exempt_collision, context="exempt_collision"
+            )
+
+    def test_multivariant_assets_map_runtime_collision_isolation(self):
+        glm_doc = _load_yaml(REPO_ROOT / "test/ppu/recipes/zai-org/GLM-5.3.yaml")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            rec_path = tmp_dir / "GLM-5.3.yaml"
+            rec_path.write_text(yaml.safe_dump(glm_doc, sort_keys=False))
+
+            # 1. Colliding assets_map fails closed across resolve entrypoints (including trailing slash/dot).
+            colliding_map = tmp_dir / "colliding_assets.yaml"
+            colliding_map.write_text(
+                yaml.safe_dump(
+                    {
+                        "models": {
+                            "glm-5.3-mxfp4": "/models/glm-5.3-mxfp4",
+                            "glm-5.3-fp8": "/models/glm-5.3-fp8",
+                            "glm-5.3-bf16": "/models/./glm-5.3-fp8/",
+                        }
+                    },
+                    sort_keys=False,
+                )
+            )
+            for vname in ("default", "fp8", "bf16_810e"):
+                with self.assertRaisesRegex(
+                    ValidationError, r"assets_map resolves model asset.*colliding with"
+                ):
+                    resolve_recipe(
+                        rec_path, variant=vname, assets_map_path=colliding_map
+                    )
+
+            # Symlink aliases on disk also collide.
+            real_fp8 = tmp_dir / "real_fp8"
+            real_fp8.mkdir()
+            sym_bf16 = tmp_dir / "sym_bf16"
+            sym_bf16.symlink_to(real_fp8)
+            sym_map = tmp_dir / "symlink_assets.yaml"
+            sym_map.write_text(
+                yaml.safe_dump(
+                    {
+                        "glm-5.3-mxfp4": "/models/glm-5.3-mxfp4",
+                        "glm-5.3-fp8": str(real_fp8),
+                        "glm-5.3-bf16": str(sym_bf16),
+                    },
+                    sort_keys=False,
+                )
+            )
+            with self.assertRaisesRegex(
+                ValidationError, r"assets_map resolves model asset.*colliding with"
+            ):
+                resolve_recipe(rec_path, variant="bf16_810e", assets_map_path=sym_map)
+
+            # 2. Distinct paths pass as positive control.
+            distinct_map = tmp_dir / "distinct_assets.yaml"
+            distinct_map.write_text(
+                yaml.safe_dump(
+                    {
+                        "glm-5.3-mxfp4": "/models/glm-5.3-mxfp4",
+                        "glm-5.3-fp8": "/models/glm-5.3-fp8",
+                        "glm-5.3-bf16": "/models/glm-5.3-bf16",
+                    },
+                    sort_keys=False,
+                )
+            )
+            res_bf16 = resolve_recipe(
+                rec_path, variant="bf16_810e", assets_map_path=distinct_map
+            )
+            self.assertEqual(
+                res_bf16["argv"][res_bf16["argv"].index("--model-path") + 1],
+                "/models/glm-5.3-bf16",
+            )
+
+            # 3. Exempted variant may share checkpoint via assets_map, while unexempted sibling colliding with it fails.
+            exempt_rec = copy.deepcopy(glm_doc)
+            exempt_rec["variants"]["fp8"]["allow_shared_fields"] = ["assets"]
+            exempt_path = tmp_dir / "GLM-5.3-exempt.yaml"
+            exempt_path.write_text(yaml.safe_dump(exempt_rec, sort_keys=False))
+
+            shared_ok_map = tmp_dir / "shared_ok.yaml"
+            shared_ok_map.write_text(
+                yaml.safe_dump(
+                    {
+                        "glm-5.3-mxfp4": "/models/shared",
+                        "glm-5.3-fp8": "/models/shared/",
+                        "glm-5.3-bf16": "/models/bf16",
+                    },
+                    sort_keys=False,
+                )
+            )
+            res_shared = resolve_recipe(
+                exempt_path, variant="fp8", assets_map_path=shared_ok_map
+            )
+            self.assertEqual(
+                res_shared["argv"][res_shared["argv"].index("--model-path") + 1],
+                "/models/shared/",
+            )
+
+            shared_collide_map = tmp_dir / "shared_collide.yaml"
+            shared_collide_map.write_text(
+                yaml.safe_dump(
+                    {
+                        "glm-5.3-mxfp4": "/models/mxfp4",
+                        "glm-5.3-fp8": "/models/shared",
+                        "glm-5.3-bf16": "/models/shared/",
+                    },
+                    sort_keys=False,
+                )
+            )
+            with self.assertRaisesRegex(
+                ValidationError,
+                r"bf16_810e: assets_map resolves.*colliding with variant 'fp8'",
+            ):
+                resolve_recipe(
+                    exempt_path, variant="bf16_810e", assets_map_path=shared_collide_map
+                )
+
+    def test_stray_serving_recipe_scan_blocks_wild_copies_and_allows_repo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shutil.copytree(REPO_ROOT / "test/ppu", root / "test/ppu")
+            (root / "configs").mkdir()
+            (root / "configs/other.yaml").write_text(
+                "schema_version: custom/v1\nfoo: bar\n", encoding="utf-8"
+            )
+            valid_recipe = (root / "test/ppu/recipes/Qwen/Qwen3.8-27B.yaml").read_text(
+                encoding="utf-8"
+            )
+            escaped_recipe = valid_recipe.replace(
+                "schema_version: ppu-serving/v1",
+                'schema_version: "ppu-serving\\u002fv1"',
+                1,
+            )
+            quoted_unescaped = valid_recipe.replace(
+                "schema_version: ppu-serving/v1",
+                '"schema_version": ppu-serving/v1',
+                1,
+            )
+            quoted_escaped = valid_recipe.replace(
+                "schema_version: ppu-serving/v1",
+                '"schema_version": "ppu-serving\\u002fv1"',
+                1,
+            )
+            flow_escaped = json.dumps(
+                yaml.safe_load(valid_recipe), ensure_ascii=True
+            ).replace('"ppu-serving/v1"', '"ppu-serving\\u002fv1"', 1)
+
+            with patch("ppu_recipe.REPO_ROOT", root):
+                self.assertEqual(scan_stray_serving_recipes(root), [])
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(
+                        ppu_recipe_main(
+                            ["validate", "--all", "--sglang-parser", "skip"]
+                        ),
+                        0,
+                    )
+
+                stray = root / "test/ppu/candidate_case/light_perf/Qwen3.8-27B.yaml"
+                stray.parent.mkdir(parents=True)
+                stray.write_text(valid_recipe, encoding="utf-8")
+                err_all = io.StringIO()
+                with contextlib.redirect_stderr(err_all):
+                    rc_all = ppu_recipe_main(
+                        ["validate", "--all", "--sglang-parser", "skip"]
+                    )
+                self.assertEqual(rc_all, 1)
+                self.assertIn("stray 'ppu-serving/v1'", err_all.getvalue())
+                with self.assertRaisesRegex(ValidationError, "must reside under"):
+                    validate_paths([stray], sglang_parser_mode="skip")
+                stray.unlink()
+
+                for rel, body in (
+                    ("configs/multi.yml", "---\nfoo: 1\n---\n" + valid_recipe),
+                    ("test/ppu/recipes/Qwen/Stray.yml", valid_recipe),
+                    ("test/ppu/recipes/Qwen/.hidden.yaml", escaped_recipe),
+                    (
+                        "configs/tag_unescaped.yml",
+                        "---\nref: !Ref CommonSetting\n---\n" + quoted_unescaped,
+                    ),
+                    (
+                        "configs/tag_escaped.yaml",
+                        "---\nref: !Ref CommonSetting\n---\n" + quoted_escaped,
+                    ),
+                    (
+                        "configs/jinja_broken.yml",
+                        "---\nfoo: {{ broken }\n---\n" + quoted_escaped,
+                    ),
+                    (
+                        "configs/jinja_broken_inline_flow.yml",
+                        "---\nfoo: {{ broken }\n--- " + flow_escaped + "\n",
+                    ),
+                ):
+                    target = root / rel
+                    target.write_text(body, encoding="utf-8")
+                    with self.assertRaisesRegex(ValidationError, re.escape(rel)):
+                        scan_stray_serving_recipes(root)
+                    for cli_args in (
+                        ["validate", "--sglang-parser", "skip"],
+                        ["validate", "--all", "--sglang-parser", "skip"],
+                    ):
+                        err_cli = io.StringIO()
+                        with contextlib.redirect_stderr(err_cli):
+                            rc_cli = ppu_recipe_main(cli_args)
+                        self.assertEqual(rc_cli, 1)
+                        self.assertIn(rel, err_cli.getvalue())
+                    target.unlink()
+
+                benign_tag = root / "configs/tag_benign.yaml"
+                benign_tag.write_text(
+                    '---\nref: !Ref CommonSetting\n---\n"schema_version": custom/v1\n',
+                    encoding="utf-8",
+                )
+                self.assertEqual(scan_stray_serving_recipes(root), [])
+                benign_tag.unlink()
+
+    def test_resolved_command_diff_and_pr_template(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base_dir = root / "base"
+            head_dir = root / "head"
+            shutil.copytree(REPO_ROOT / "test/ppu", base_dir / "test/ppu")
+            shutil.copytree(REPO_ROOT / "test/ppu", head_dir / "test/ppu")
+
+            self.assertEqual(
+                render_resolved_diff_markdown(
+                    base_root=base_dir,
+                    head_root=head_dir,
+                    only_when_changed=True,
+                    include_signoff_hint=True,
+                ),
+                "",
+            )
+
+            qwen_head = head_dir / "test/ppu/recipes/Qwen/Qwen3.8-27B.yaml"
+            qwen_doc = _load_yaml(qwen_head)
+            qwen_doc["ppu"]["topology"]["devices_per_node"] = 4
+            qwen_doc["ppu"]["external_env"] = ["SGLANG_NSA_DUAL_STREAM"]
+            qwen_doc["model"]["base_args"] = [
+                "--tp-size",
+                "4",
+                "--dtype",
+                "bfloat16",
+                "--context-length",
+                "16384",
+                "--disable-custom-all-reduce",
+                "--trust-remote-code",
+            ]
+            qwen_doc["model"]["base_env"] = {"SGLANG_NSA_DUAL_STREAM": "1"}
+            qwen_head.write_text(yaml.safe_dump(qwen_doc, sort_keys=False))
+
+            qwen_pol_head = head_dir / "test/ppu/policy/models/qwen3.8-27b.yaml"
+            qwen_pol_doc = _load_yaml(qwen_pol_head)
+            glm_pol_doc = _load_yaml(head_dir / "test/ppu/policy/models/glm-5.3.yaml")
+            qwen_pol_doc["accuracy_gate"] = copy.deepcopy(glm_pol_doc["accuracy_gate"])
+            qwen_pol_doc["tiers"]["model_sanity"] = copy.deepcopy(
+                glm_pol_doc["tiers"]["model_sanity"]
+            )
+            qwen_pol_head.write_text(yaml.safe_dump(qwen_pol_doc, sort_keys=False))
+
+            diff_md = render_resolved_diff_markdown(
+                base_root=base_dir,
+                head_root=head_dir,
+                only_when_changed=True,
+                include_signoff_hint=True,
+            )
+            self.assertIn("## Resolved Command Diff (base -> head)", diff_md)
+            self.assertIn("test/ppu/recipes/Qwen/Qwen3.8-27B.yaml", diff_md)
+            self.assertIn("--tp-size 2", diff_md)
+            self.assertIn("--tp-size 4", diff_md)
+            self.assertIn("+ SGLANG_NSA_DUAL_STREAM=1", diff_md)
+            self.assertIn("`—` -> `model_sanity`", diff_md)
+            self.assertIn("### Model Recipe Sign-off Checklist", diff_md)
+
+            meta_head = root / "meta_head"
+            shutil.copytree(REPO_ROOT / "test/ppu", meta_head / "test/ppu")
+            glm_meta = meta_head / "test/ppu/recipes/zai-org/GLM-5.3.yaml"
+            glm_doc = _load_yaml(glm_meta)
+            glm_doc["notes"] = (glm_doc.get("notes", "") + " Updated note.").strip()
+            glm_meta.write_text(yaml.safe_dump(glm_doc, sort_keys=False))
+            meta_md = render_resolved_diff_markdown(
+                base_root=base_dir,
+                head_root=meta_head,
+                only_when_changed=True,
+            )
+            self.assertIn("_No resolved argv, env, or tier changes", meta_md)
+
+            git_repo = root / "git_repo"
+            shutil.copytree(REPO_ROOT / "test/ppu", git_repo / "test/ppu")
+            subprocess.run(["git", "init", "-q"], cwd=git_repo, check=True)
+            subprocess.run(
+                ["git", "config", "user.name", "Test"], cwd=git_repo, check=True
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.com"],
+                cwd=git_repo,
+                check=True,
+            )
+            subprocess.run(["git", "add", "."], cwd=git_repo, check=True)
+            subprocess.run(
+                ["git", "commit", "-q", "--no-verify", "-m", "base"],
+                cwd=git_repo,
+                check=True,
+            )
+            base_sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=git_repo, text=True
+            ).strip()
+            shutil.copy2(qwen_head, git_repo / "test/ppu/recipes/Qwen/Qwen3.8-27B.yaml")
+            cli_md = render_resolved_diff_markdown(
+                base_ref=base_sha,
+                repo_root=git_repo,
+                only_when_changed=True,
+            )
+            self.assertIn("--tp-size 4", cli_md)
+
+            out_buf = io.StringIO()
+            with contextlib.redirect_stdout(out_buf):
+                rc = ppu_recipe_main(
+                    [
+                        "diff",
+                        "--base-root",
+                        str(base_dir),
+                        "--head-root",
+                        str(head_dir),
+                        "--only-when-changed",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            self.assertIn("Resolved Command Diff", out_buf.getvalue())
+
+            tpl = (REPO_ROOT / ".github/pull_request_template.md").read_text(
+                encoding="utf-8"
+            )
+            for required in (
+                "Model Recipe Sign-off",
+                "Resolved Command Diff",
+                "HTTP 200",
+                "replaces_legacy_cases",
+            ):
+                self.assertIn(required, tpl)
+
+            self.assertEqual(_md_code("a``b"), "``` a``b ```")
+
+            leak_base = root / "leak_base"
+            shutil.copytree(REPO_ROOT / "test/ppu", leak_base / "test/ppu")
+            qwen_leak = leak_base / "test/ppu/recipes/Qwen/10.24.3.8.yaml"
+            qwen_leak.write_text(
+                (leak_base / "test/ppu/recipes/Qwen/Qwen3.8-27B.yaml").read_text(
+                    encoding="utf-8"
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValidationError, "ipv4_literal") as ctx:
+                render_resolved_diff_markdown(
+                    base_root=leak_base,
+                    head_root=base_dir,
+                    only_when_changed=True,
+                )
+            self.assertNotIn("10.24.3.8", str(ctx.exception))
+
+            fake_cred = "ghp_REVIEW_ONLY_12345678"
+            cred_rec = _load_yaml(REPO_ROOT / "test/ppu/recipes/zai-org/GLM-5.3.yaml")
+            cred_rec["ppu"]["served_name"] = fake_cred
+            cred_rec["variants"]["default"]["served_name"] = fake_cred
+            cred_rec["variants"]["fp8"]["served_name"] = fake_cred
+            with self.assertRaisesRegex(ValidationError, "redacted") as cred_ctx:
+                validate_serving_recipe_structure(cred_rec, context="cred_leak")
+            self.assertNotIn(fake_cred, str(cred_ctx.exception))
+
+            cred_cli = root / "cred_cli"
+            shutil.copytree(REPO_ROOT / "test/ppu", cred_cli / "test/ppu")
+            cred_rec_path = cred_cli / "test/ppu/recipes/zai-org/GLM-5.3.yaml"
+            cred_rec_path.write_text(yaml.safe_dump(cred_rec, sort_keys=False))
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts/ci/ppu/ppu_recipe.py"),
+                    "validate",
+                    str(cred_rec_path),
+                    "--sglang-parser",
+                    "skip",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 1)
+            self.assertNotIn(fake_cred, proc.stdout)
+            self.assertNotIn(fake_cred, proc.stderr)
 
 
 if __name__ == "__main__":
