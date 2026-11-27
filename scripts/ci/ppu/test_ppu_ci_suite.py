@@ -330,6 +330,12 @@ class TestPPUCIWorkflow(unittest.TestCase):
         lint_runs = "\n".join(
             step.get("run", "") for step in lint_wf["jobs"]["lint"]["steps"]
         )
+        recipe_step = next(
+            step
+            for step in lint_wf["jobs"]["lint"]["steps"]
+            if step.get("name") == "Validate PPU recipes and render PR command diff"
+        )
+        self.assertEqual(recipe_step.get("if"), "${{ !cancelled() }}")
         self.assertIn("ppu_recipe.py validate --all --sglang-parser skip", lint_runs)
         self.assertIn("ppu_recipe.py render-matrix --check", lint_runs)
         self.assertIn("ppu_recipe.py diff", lint_runs)
