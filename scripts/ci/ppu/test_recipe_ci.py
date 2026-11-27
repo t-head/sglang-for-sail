@@ -4615,6 +4615,92 @@ class PresetCatalogContractTest(unittest.TestCase):
                 _scan_text("Bearer secret_token_12345678", context="diff_line")
             )
 
+            # Cover all SGLang SERVER_ARGS_SECRET_FIELD_NAMES, WATERMARK_SECRET_FIELD_NAMES,
+            # argparse unambiguous prefixes, env vars, and generic auth suffixes without
+            # false-positives on non-secret server/tokenizer/cache flags.
+            admin_cred = "R2_REVIEW_ONLY_ADMIN_CREDENTIAL_123456789"
+            for secret_flags in (
+                ["--admin-api-key", admin_cred],
+                [f"--admin-api-key={admin_cred}"],
+                ["--admin-api", admin_cred],
+                ["--ssl-keyfile-password", admin_cred],
+                ["--hicache-storage-backend-extra-config", f'{{"ak":"{admin_cred}"}}'],
+                ["--unified-cache-external-linker-config", f'{{"sk":"{admin_cred}"}}'],
+                ["--watermark-key", admin_cred],
+                ["--watermark-key-b", admin_cred],
+                ["--watermark-config", f'{{"key":"{admin_cred}"}}'],
+            ):
+                sec_rec = _load_yaml(
+                    REPO_ROOT / "test/ppu/recipes/Qwen/Qwen3.8-27B.yaml"
+                )
+                sec_rec["model"]["base_args"] = [
+                    *sec_rec["model"]["base_args"],
+                    *secret_flags,
+                ]
+                with self.assertRaisesRegex(ValidationError, "auth credential"):
+                    validate_serving_recipe_structure(
+                        sec_rec, context="sgl_secret_flag"
+                    )
+                joined = " ".join(secret_flags)
+                self.assertTrue(_scan_text(joined, context="secret_scan"), secret_flags)
+                self.assertNotIn(admin_cred, _redact_error_text(joined))
+
+            env_rec = _load_yaml(REPO_ROOT / "test/ppu/recipes/Qwen/Qwen3.8-27B.yaml")
+            env_rec["model"]["base_env"] = {"SGLANG_ADMIN_API_KEY": admin_cred}
+            with self.assertRaisesRegex(ValidationError, "credential env var") as e_ctx:
+                validate_serving_recipe_structure(env_rec, context="sgl_secret_env")
+            self.assertNotIn(admin_cred, str(e_ctx.exception))
+            self.assertNotIn(
+                admin_cred, _redact_error_text(f"SGLANG_ADMIN_API_KEY={admin_cred}")
+            )
+
+            admin_base = root / "admin_base"
+            shutil.copytree(REPO_ROOT / "test/ppu", admin_base / "test/ppu")
+            qwen_admin = admin_base / "test/ppu/recipes/Qwen/Qwen3.8-27B.yaml"
+            admin_doc = _load_yaml(qwen_admin)
+            admin_doc["model"]["base_args"].extend(["--admin-api-key", admin_cred])
+            qwen_admin.write_text(
+                yaml.safe_dump(admin_doc, sort_keys=False), encoding="utf-8"
+            )
+            admin_diff_out = render_resolved_diff_markdown(
+                base_root=admin_base,
+                head_root=base_dir,
+                only_when_changed=True,
+            )
+            self.assertIn("<unresolved:", admin_diff_out)
+            self.assertNotIn(admin_cred, admin_diff_out)
+            with self.assertRaisesRegex(
+                ValidationError, "plaintext auth credential flag"
+            ) as head_admin_ctx:
+                render_resolved_diff_markdown(
+                    base_root=base_dir,
+                    head_root=admin_base,
+                    only_when_changed=True,
+                )
+            self.assertNotIn(
+                admin_cred, _redact_error_text(str(head_admin_ctx.exception))
+            )
+
+            # Non-secret server/cache/watermark/tokenizer flags must not be misclassified.
+            for safe_flags in (
+                ["--ssl-keyfile", "certs/server.pem"],
+                ["--hicache-storage-backend", "mooncake"],
+                ["--unified-cache-external-linker-backend", "local"],
+                ["--watermark-context-window", "4"],
+                ["--speculative-num-draft-tokens", "3"],
+            ):
+                safe_rec = _load_yaml(
+                    REPO_ROOT / "test/ppu/recipes/Qwen/Qwen3.8-27B.yaml"
+                )
+                safe_rec["model"]["base_args"] = [
+                    *safe_rec["model"]["base_args"],
+                    *safe_flags,
+                ]
+                validate_serving_recipe_structure(safe_rec, context="safe_non_secret")
+                self.assertEqual(
+                    _scan_text(" ".join(safe_flags), context="safe_scan"), []
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
