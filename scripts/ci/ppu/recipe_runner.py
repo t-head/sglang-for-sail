@@ -443,18 +443,36 @@ def run(policy_path, tier, queue_s):
     policy = _load_yaml(policy_path)
     recipe = REPO_ROOT / policy["recipe"]
     assets = RESULTS.parent / "assets.json"
-    recipe_ppu = _load_yaml(recipe)["ppu"]
+    effective = resolve_recipe(recipe, policy_path=policy_path, tier=tier)
     revision = os.environ.get("PPU_CI_HF_MODEL_REVISION")
+    revision_repo = os.environ.get("PPU_CI_HF_MODEL_REVISION_REPO")
+    if (
+        revision is not None
+        and revision_repo is not None
+        and effective["hf_model_id"] != revision_repo
+    ):
+        revision = None
     uses_cache_ref = revision is None and "PPU_CI_HF_CACHE_ROOT" in os.environ
     if revision is None and not uses_cache_ref:
+        recipe_doc = _load_yaml(recipe)
+        default_hf_id = recipe_doc.get("ppu", {}).get("hf_model_id") or recipe_doc.get(
+            "model", {}
+        ).get("model_id")
+        if (
+            effective["variant"] != "default"
+            or effective["hf_model_id"] != default_hf_id
+        ):
+            raise ValueError(
+                "container model mount only supports the default recipe checkpoint"
+            )
         model_path = os.environ["PPU_RECIPE_CONTAINER_MODEL"]
     else:
         phase("model_cache_check")
         model_path, snapshot_revision = cached_model_path(
-            recipe_ppu["hf_model_id"], revision
+            effective["hf_model_id"], revision
         )
     assets.write_text(
-        json.dumps({name: model_path for name in recipe_ppu["assets"].values()})
+        json.dumps({name: model_path for name in effective["assets"].values()})
     )
 
     resolve = dict(
@@ -470,6 +488,9 @@ def run(policy_path, tier, queue_s):
     if (
         config["ppu_count"] != expected_width
         or policy["model_id"] != config["model_id"]
+        or config["hf_model_id"] != effective["hf_model_id"]
+        or config["resolved_model"] != model_path
+        or config["resolved_tokenizer"] != model_path
     ):
         raise ValueError("incorrect recipe identity or device width")
     result = {

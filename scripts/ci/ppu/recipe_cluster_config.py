@@ -12,6 +12,24 @@ from pathlib import Path
 
 BACKEND_SHA = "96e25147971f5d2a04d828f8ad508cae38a4fa8a"
 CONFIG_NAME = ".sglang-recipe-ci-v0523"
+PINNED_MODEL_REVISION_SPECS = {
+    "glm-5.3": (
+        "PPU_CI_GLM53_MODEL_REVISION",
+        "T-HEAD/GLM-5.3-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken",
+    ),
+    "glm-5.3-tp4": (
+        "PPU_CI_GLM53_MODEL_REVISION",
+        "T-HEAD/GLM-5.3-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken",
+    ),
+    "deepseek-v4-flash": (
+        "PPU_CI_DSV4_FLASH_MODEL_REVISION",
+        "T-HEAD/DeepSeek-V4-Flash-0731-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken",
+    ),
+    "deepseek-v4-flash-tp8": (
+        "PPU_CI_DSV4_FLASH_MODEL_REVISION",
+        "T-HEAD/DeepSeek-V4-Flash-0731-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken",
+    ),
+}
 SETTINGS = {
     "PPU_CI_K8S_STAGE_ROOT",
     "PPU_CI_K8S_PRIVATE_WORKER_ROOT",

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import argparse
 import contextlib
+import copy
 import io
 import json
 import os
@@ -15,14 +17,26 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import yaml
 from ppu_recipe import (
+    DEFAULT_AUTHORING_DOC,
+    DEFAULT_MATRIX_DOC,
     DEFAULT_POLICY_ROOT,
     REPO_ROOT,
     ValidationError,
     _load_yaml,
+    _scan_text,
+    iter_recipe_catalog_entries,
+)
+from ppu_recipe import main as ppu_recipe_main
+from ppu_recipe import (
+    render_ci_matrix_markdown,
     resolve_recipe,
+    substitute_validation_placeholders,
+    validate_flags_with_parser,
     validate_paths,
     validate_policy_structure,
+    validate_serving_recipe_structure,
 )
 from recipe_bundle import sha256, wheel_inventory
 from recipe_cluster_config import BACKEND_SHA, CONFIG_NAME, load_settings
@@ -2634,6 +2648,1433 @@ exit 1
                             f"{filename}:{job_id}",
                         )
             self.assertEqual(candidate_count, expected_candidate_count, filename)
+
+
+def _sample_sglang_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="sglang", allow_abbrev=False)
+    for flag in (
+        "--model-path",
+        "--tokenizer-path",
+        "--served-model-name",
+        "--host",
+        "--port",
+        "--tp-size",
+        "--tensor-parallel-size",
+        "--dp-size",
+        "--data-parallel-size",
+        "--pp-size",
+        "--pipeline-parallel-size",
+        "--ep-size",
+        "--expert-parallel-size",
+        "--ep",
+        "--attn-dp-size",
+        "--attention-data-parallel-size",
+        "--attn-cp-size",
+        "--attention-context-parallel-size",
+        "--moe-dense-tp-size",
+        "--page-size",
+        "--mem-fraction-static",
+        "--chunked-prefill-size",
+        "--max-prefill-tokens",
+        "--max-running-requests",
+        "--context-length",
+        "--cuda-graph-max-bs-decode",
+        "--dtype",
+        "--kv-cache-dtype",
+        "--attention-backend",
+        "--prefill-attention-backend",
+        "--decode-attention-backend",
+        "--dsa-prefill-backend",
+        "--dsa-decode-backend",
+        "--dsv4-prefill-backend",
+        "--moe-a2a-backend",
+        "--deepep-mode",
+        "--moe-runner-backend",
+        "--tool-call-parser",
+        "--reasoning-parser",
+        "--speculative-algorithm",
+        "--speculative-num-steps",
+        "--speculative-eagle-topk",
+        "--speculative-num-draft-tokens",
+        "--speculative-draft-model-quantization",
+        "--linear-attn-prefill-backend",
+        "--linear-attn-decode-backend",
+        "--linear-attn-verify-backend",
+        "--mamba-ssm-dtype",
+        "--mamba-radix-cache-strategy",
+        "--nnodes",
+        "--node-rank",
+        "--dist-init-addr",
+        "--nccl-init-addr",
+        "--dist-timeout",
+        "--watchdog-timeout",
+        "--disaggregation-mode",
+        "--disaggregation-transfer-backend",
+        "--disaggregation-ib-device",
+        "--disaggregation-bootstrap-port",
+        "--load-format",
+        "--json-model-override-args",
+        "--cp-strategy",
+        "--schedule-policy",
+        "--load-balance-method",
+    ):
+        parser.add_argument(flag)
+    for bflag in (
+        "--trust-remote-code",
+        "--no-trust-remote-code",
+        "--disable-custom-all-reduce",
+        "--disable-shared-experts-fusion",
+        "--disable-prefill-cuda-graph",
+        "--disable-overlap-schedule",
+        "--disable-radix-cache",
+        "--enable-metrics",
+        "--enable-dp-lm-head",
+        "--ple-offload-embedding",
+        "--enable-prefill-cp",
+        "--enable-deepseek-v4-fp4-indexer",
+    ):
+        parser.add_argument(bflag, action="store_true")
+    return parser
+
+
+class PresetCatalogContractTest(unittest.TestCase):
+    def test_resolve_recipe_reports_enabled_features(self):
+        glm_recipe = REPO_ROOT / "test/ppu/recipes/zai-org/GLM-5.3.yaml"
+        glm_policy = DEFAULT_POLICY_ROOT / "models/glm-5.3.yaml"
+
+        self.assertEqual(
+            resolve_recipe(glm_recipe, policy_path=glm_policy, tier="fast_sanity")[
+                "enabled_features"
+            ],
+            [],
+        )
+        self.assertEqual(
+            resolve_recipe(glm_recipe, preset="prefill")["enabled_features"],
+            ["tool_calling", "reasoning"],
+        )
+        self.assertEqual(
+            resolve_recipe(glm_recipe, preset="decode")["enabled_features"],
+            ["tool_calling", "reasoning", "spec_decoding"],
+        )
+
+    def test_checked_in_recipe_matrix_doc_is_up_to_date_and_enforces_band(self):
+        expected = render_ci_matrix_markdown()
+        self.assertTrue(DEFAULT_MATRIX_DOC.is_file())
+        actual = DEFAULT_MATRIX_DOC.read_text(encoding="utf-8")
+        self.assertEqual(actual, expected)
+        self.assertEqual(_scan_text(actual, context="test/ppu/README.md"), [])
+        self.assertIn("## PR CI (`fast_sanity`)", actual)
+        self.assertIn("## Nightly CI (`model_sanity`)", actual)
+
+        fast_section, nightly_section = actual.split(
+            "## Nightly CI (`model_sanity`)", 1
+        )
+        for entry in select("fast_sanity", "")["include"]:
+            self.assertIn(f"[`{entry['model']}`]", fast_section)
+        for entry in select("model_sanity", "")["include"]:
+            self.assertIn(f"[`{entry['model']}`]", nightly_section)
+
+        glm_policy = DEFAULT_POLICY_ROOT / "models/glm-5.3.yaml"
+
+        def load_policy_with_different_band(path):
+            doc = _load_yaml(path)
+            if path == glm_policy:
+                doc["accuracy_gate"]["golden_band_abs"] = 0.03
+            return doc
+
+        with patch(
+            "ppu_recipe._load_yaml", side_effect=load_policy_with_different_band
+        ):
+            self.assertEqual(render_ci_matrix_markdown(), actual)
+
+        with tempfile.TemporaryDirectory() as root:
+            tmp_dir = Path(root)
+            missing = tmp_dir / "missing.md"
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                self.assertEqual(
+                    ppu_recipe_main(
+                        ["render-matrix", "--output", str(missing), "--check"]
+                    ),
+                    1,
+                )
+            self.assertIn("matrix doc missing", stderr.getvalue())
+
+    def test_authoring_guide_and_catalog_render_stay_in_sync(self):
+        self.assertTrue(DEFAULT_AUTHORING_DOC.is_file())
+        authoring = DEFAULT_AUTHORING_DOC.read_text(encoding="utf-8")
+        self.assertEqual(_scan_text(authoring, context="test/ppu/AUTHORING.md"), [])
+        for required_token in (
+            "[README.md](README.md)",
+            "`zhenwu_m890`",
+            "`zhenwu_810e`",
+            "`prefill`",
+            "`decode`",
+            "`decode_ep`",
+            "`pd_prefill` + `pd_decode`",
+            "`{master_addr}`",
+            "`{master_port}`",
+            "`{node_rank}`",
+            "`{kv_ip}`",
+            "`{kv_port}`",
+            "`{ib_devices}`",
+            "`SGLANG_HOST_IP`",
+        ):
+            self.assertIn(required_token, authoring)
+
+        matrix = render_ci_matrix_markdown()
+        self.assertIn("[AUTHORING.md](AUTHORING.md)", matrix)
+        self.assertIn(
+            "## Registered Serving Presets (Benchmark & Disagg Catalog)", matrix
+        )
+        _, catalog_section = matrix.split(
+            "## Registered Serving Presets (Benchmark & Disagg Catalog)", 1
+        )
+        self.assertIn("`Qwen3.8-27B.yaml`", catalog_section)
+        self.assertIn("`zhenwu_810e` / 2 / `single_node`", catalog_section)
+        self.assertIn("`fp8` (`fp8`)", catalog_section)
+        self.assertIn("`bf16_810e` (`bf16`)", catalog_section)
+        self.assertIn("`multi_node_ep` (4x8)", catalog_section)
+        self.assertIn("`pd_disagg` (prefill)", catalog_section)
+        self.assertIn("`pd_disagg` (decode)", catalog_section)
+        self.assertEqual(ppu_recipe_main(["render-matrix", "--check"]), 0)
+
+    def test_glm53_reference_exemplar_expands_all_variants_and_four_scenarios(self):
+        glm_path = REPO_ROOT / "test/ppu/recipes/zai-org/GLM-5.3.yaml"
+        entries = iter_recipe_catalog_entries(glm_path)
+        self.assertEqual(
+            [(e["variant"], e["preset"], e["hardware"]) for e in entries],
+            [
+                ("default", None, "zhenwu_m890"),
+                ("default", "prefill", "zhenwu_m890"),
+                ("default", "decode", "zhenwu_m890"),
+                ("default", "decode_ep", "zhenwu_m890"),
+                ("default", "pd_prefill", "zhenwu_m890"),
+                ("default", "pd_decode", "zhenwu_m890"),
+                ("fp8", None, "zhenwu_m890"),
+                ("fp8", "prefill", "zhenwu_m890"),
+                ("fp8", "decode", "zhenwu_m890"),
+                ("fp8", "decode_ep", "zhenwu_m890"),
+                ("fp8", "pd_prefill", "zhenwu_m890"),
+                ("fp8", "pd_decode", "zhenwu_m890"),
+                ("bf16_810e", None, "zhenwu_810e"),
+                ("bf16_810e", "prefill", "zhenwu_810e"),
+            ],
+        )
+        report = validate_paths(
+            [glm_path],
+            sglang_parser_mode="required",
+            parser=_sample_sglang_parser(),
+        )
+        self.assertTrue(report["parser_checked"])
+        self.assertEqual(report["checked_combinations"], 14)
+
+        fp8 = resolve_recipe(glm_path, variant="fp8", preset="decode")
+        self.assertEqual(fp8["hardware"], "zhenwu_m890")
+        self.assertEqual(fp8["ppu_count"], 8)
+        self.assertEqual(
+            fp8["hf_model_id"],
+            "zai-org/GLM-5.3",
+        )
+        self.assertEqual(fp8["golden_model_key"], "glm_5_3_fp8")
+        self.assertEqual(fp8["served_name"], "glm-5.3-fp8")
+        self.assertEqual(
+            fp8["enabled_features"], ["tool_calling", "reasoning", "spec_decoding"]
+        )
+
+        bf16_810e = resolve_recipe(glm_path, variant="bf16_810e", preset="prefill")
+        self.assertEqual(bf16_810e["hardware"], "zhenwu_810e")
+        self.assertEqual(bf16_810e["ppu_count"], 16)
+        self.assertEqual(
+            bf16_810e["hf_model_id"],
+            "zai-org/GLM-5.3-BF16",
+        )
+        self.assertEqual(bf16_810e["golden_model_key"], "glm_5_3_bf16_810e")
+        self.assertEqual(
+            bf16_810e["flags"][bf16_810e["flags"].index("--mem-fraction-static") + 1],
+            "0.90",
+        )
+        self.assertNotIn("--speculative-algorithm", bf16_810e["flags"])
+
+        glm_doc = _load_yaml(glm_path)
+        for bad_variants in ({}, None):
+            bad = copy.deepcopy(glm_doc)
+            bad["presets"] = {}
+            if bad_variants is None:
+                bad.pop("variants", None)
+            else:
+                bad["variants"] = bad_variants
+            with self.assertRaisesRegex(
+                ValidationError, "variants must be a non-empty mapping"
+            ):
+                validate_serving_recipe_structure(bad, context="bad_variants")
+
+    def test_hardware_precision_binding_and_portable_bf16(self):
+        qwen_path = REPO_ROOT / "test/ppu/recipes/Qwen/Qwen3.8-27B.yaml"
+        qwen_doc = _load_yaml(qwen_path)
+        qwen_entries = iter_recipe_catalog_entries(qwen_path, qwen_doc)
+        self.assertEqual(
+            [(e["variant"], e["preset"], e["hardware"]) for e in qwen_entries],
+            [
+                ("default", None, "zhenwu_m890"),
+                ("default", None, "zhenwu_810e"),
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shutil.copytree(REPO_ROOT / "test/ppu", root / "test/ppu")
+            small_bf16 = copy.deepcopy(qwen_doc)
+            small_bf16["hardware_overrides"] = {
+                "zhenwu_810e": {"extra_args": ["--max-running-requests", "64"]}
+            }
+            small_bf16["presets"] = {
+                "prefill": {
+                    "hardware": "zhenwu_m890",
+                    "args": ["--chunked-prefill-size", "8192"],
+                },
+                "decode": {
+                    "hardware": "zhenwu_810e",
+                    "args": ["--chunked-prefill-size", "2048"],
+                },
+            }
+            rec_path = root / "test/ppu/recipes/Qwen/Qwen3.8-27B.yaml"
+            rec_path.write_text(yaml.safe_dump(small_bf16, sort_keys=False))
+
+            with (
+                patch("ppu_recipe.REPO_ROOT", root),
+                patch("recipe_select.REPO_ROOT", root),
+            ):
+                report = validate_paths(
+                    [rec_path],
+                    sglang_parser_mode="required",
+                    parser=_sample_sglang_parser(),
+                )
+                self.assertEqual(report["checked_combinations"], 4)
+                decode_810e = resolve_recipe(rec_path, preset="decode")
+                self.assertEqual(decode_810e["hardware"], "zhenwu_810e")
+                self.assertIn("--max-running-requests", decode_810e["flags"])
+
+                pol_810e = _load_yaml(root / "test/ppu/policy/models/qwen3.8-27b.yaml")
+                pol_810e["hardware"] = "zhenwu_810e"
+                pol_810e["tiers"]["fast_sanity"]["preset"] = "decode"
+                (root / "test/ppu/policy/models/qwen3.8-27b-810e.yaml").write_text(
+                    yaml.safe_dump(pol_810e, sort_keys=False)
+                )
+                validate_policy_structure(pol_810e, context="pol_810e", base_dir=root)
+                selected = {m["model"] for m in select("fast_sanity", "")["include"]}
+                self.assertIn("qwen3.8-27b", selected)
+                self.assertNotIn("qwen3.8-27b-810e", selected)
+                with self.assertRaisesRegex(
+                    ValueError, "targets hardware 'zhenwu_810e'"
+                ):
+                    select("fast_sanity", "qwen3.8-27b-810e")
+
+            for hw, bad_prec in (
+                ("zhenwu_m890", "w8a8_int8"),
+                ("zhenwu_810e", "mxfp4"),
+                ("zhenwu_810e", "fp8"),
+            ):
+                bad_var = copy.deepcopy(qwen_doc)
+                bad_var["variants"]["default"] = {
+                    "precision": bad_prec,
+                    "hardware": hw,
+                }
+                with self.assertRaisesRegex(ValidationError, "only allows bf16 or"):
+                    validate_serving_recipe_structure(bad_var, context="cross_bind")
+
+            pinned_m890 = copy.deepcopy(small_bf16)
+            pinned_m890["variants"]["default"]["hardware"] = "zhenwu_m890"
+            with self.assertRaisesRegex(
+                ValidationError, "matches no compatible variant"
+            ):
+                validate_serving_recipe_structure(pinned_m890, context="orphan_810e")
+
+    def test_policy_model_id_spoofing_variant_selection_and_shared_stage_presets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shutil.copytree(REPO_ROOT / "test/ppu", root / "test/ppu")
+            with (
+                patch("ppu_recipe.REPO_ROOT", root),
+                patch("recipe_select.REPO_ROOT", root),
+            ):
+                spoof = _load_yaml(root / "test/ppu/policy/models/qwen3.8-27b.yaml")
+                spoof["model_id"] = "zai-org/GLM-5.3"
+                spoof_path = root / "test/ppu/policy/models/spoof-qwen.yaml"
+                spoof_path.write_text(yaml.safe_dump(spoof, sort_keys=False))
+                with self.assertRaisesRegex(
+                    ValidationError, "policy model_id 'zai-org/GLM-5.3' does not match"
+                ):
+                    validate_policy_structure(spoof, context="spoof", base_dir=root)
+                with self.assertRaisesRegex(
+                    ValidationError, "policy model_id 'zai-org/GLM-5.3' does not match"
+                ):
+                    select("fast_sanity", "")
+                spoof_path.unlink()
+
+                fp8_pol = _load_yaml(root / "test/ppu/policy/models/glm-5.3.yaml")
+                fp8_pol["variant"] = "fp8"
+                fp8_pol["tiers"] = {"fast_sanity": fp8_pol["tiers"]["fast_sanity"]}
+                fp8_pol_path = root / "test/ppu/policy/models/glm-5.3-fp8.yaml"
+                fp8_pol_path.write_text(yaml.safe_dump(fp8_pol, sort_keys=False))
+                validate_policy_structure(fp8_pol, context="fp8_pol", base_dir=root)
+                fp8_res = resolve_recipe(
+                    root / "test/ppu/recipes/zai-org/GLM-5.3.yaml",
+                    policy_path=fp8_pol_path,
+                    tier="fast_sanity",
+                )
+                self.assertEqual(fp8_res["model_id"], "zai-org/GLM-5.3")
+                self.assertEqual(
+                    fp8_res["hf_model_id"],
+                    "zai-org/GLM-5.3",
+                )
+
+                bad_ms = _load_yaml(
+                    root / "test/ppu/policy/models/deepseek-v4-flash-tp8.yaml"
+                )
+                bad_ms["tiers"]["model_sanity"]["stages"][1].pop("preset", None)
+                with self.assertRaisesRegex(
+                    ValidationError, "all shared-server stages must agree on preset"
+                ):
+                    validate_policy_structure(bad_ms, context="bad_ms", base_dir=root)
+
+    def test_recipe_boundary_and_redaction_counterexamples(self):
+        base = _load_yaml(REPO_ROOT / "test/ppu/recipes/Qwen/Qwen3.8-27B.yaml")
+
+        for bad_args, pattern in (
+            (["--disable-radix-cache"], "framework runner owns --disable-radix-cache"),
+            (["--enable-metrics"], "framework runner owns --enable-metrics"),
+            (["--load-format", "dummy"], "framework runner owns --load-format"),
+            (
+                ["--model-path", "Qwen/Qwen3.8-27B"],
+                "framework runner owns --model-path",
+            ),
+            (["--tp_size", "2"], "canonical hyphenated spelling"),
+            (["--enable-dp-attention"], "deprecated flag --enable-dp-attention"),
+            (["--mem-fraction-static", "0"], "--mem-fraction-static must be in"),
+            (["--mem-fraction-static", "1.2"], "--mem-fraction-static must be in"),
+            (["--mem-fraction-static", "nan"], "--mem-fraction-static must be in"),
+            (
+                ["--json-model-override-args", '{"num_hidden_layers": 2}'],
+                "layer override must come from the test policy",
+            ),
+            (
+                ["--disaggregation-ib-device", "mlx5_" + "bond_0"],
+                "matched nic_device",
+            ),
+        ):
+            with self.subTest(bad_args=bad_args):
+                doc = copy.deepcopy(base)
+                doc["model"]["base_args"] = [*doc["model"]["base_args"], *bad_args]
+                with self.assertRaisesRegex(ValidationError, pattern):
+                    validate_serving_recipe_structure(doc, context="bad_flag")
+
+        for bad_env, pattern in (
+            ({"SGLANG_USE_MODELSCOPE": "1"}, "must not be set in recipe"),
+            ({"SGLANG_WARMUP_TIMEOUT": "3600"}, "must not be set in recipe"),
+            ({"DG_USE_MOE_DYNAMIC_TILE": "1"}, "must be listed in ppu.external_env"),
+            ({"SGLANG_MODEL_DIR": "/" + "cpfs/models/demo"}, "matched local_path"),
+        ):
+            with self.subTest(bad_env=bad_env):
+                doc = copy.deepcopy(base)
+                doc["model"]["base_env"] = bad_env
+                with self.assertRaisesRegex(ValidationError, pattern):
+                    validate_serving_recipe_structure(doc, context="bad_env")
+
+    def test_sglang_multinode_ep_and_parallelism_invariants(self):
+        glm_path = REPO_ROOT / "test/ppu/recipes/zai-org/GLM-5.3.yaml"
+        glm_doc = _load_yaml(glm_path)
+
+        test_ip_a = ".".join(("198", "51", "100", "10"))
+        ep_res = resolve_recipe(glm_path, preset="decode_ep")
+        self.assertEqual(ep_res["ppu_count"], 32)
+        sub_flags, _ = substitute_validation_placeholders(
+            ep_res["flags"],
+            ep_res["server_env"],
+            values={"master_addr": test_ip_a, "master_port": 29600, "node_rank": 3},
+        )
+        self.assertEqual(
+            sub_flags[sub_flags.index("--dist-init-addr") + 1], f"{test_ip_a}:29600"
+        )
+        self.assertEqual(sub_flags[sub_flags.index("--node-rank") + 1], "3")
+        validate_flags_with_parser(
+            _sample_sglang_parser(), sub_flags, context="decode_ep_nondefault"
+        )
+
+        ipv6_doc = copy.deepcopy(glm_doc)
+        ep_args = ipv6_doc["presets"]["decode_ep"]["args"]
+        ep_args[ep_args.index("--dist-init-addr") + 1] = "[{master_addr}]:{master_port}"
+        validate_serving_recipe_structure(ipv6_doc, context="ipv6_dist_init")
+
+        for bad_single_args, pat in (
+            (["--nnodes", "4", "--node-rank", "0"], "must not set multi-node flag"),
+            (["--disaggregation-mode", "prefill"], "must not set disaggregation flag"),
+            (["--kv-transfer-config", "{}"], "must not set disaggregation flag"),
+        ):
+            bad = copy.deepcopy(glm_doc)
+            bad["presets"]["decode"]["args"] = bad_single_args
+            with self.assertRaisesRegex(ValidationError, pat):
+                validate_serving_recipe_structure(bad, context="bad_single")
+
+        no_tp32 = copy.deepcopy(glm_doc)
+        no_tp32["presets"]["decode_ep"].pop("tp", None)
+        with self.assertRaisesRegex(ValidationError, "must be divisible|must match"):
+            validate_serving_recipe_structure(no_tp32, context="no_tp32")
+
+        no_ep = copy.deepcopy(glm_doc)
+        ep_a = no_ep["presets"]["decode_ep"]["args"]
+        idx_a2a = ep_a.index("--moe-a2a-backend")
+        ep_a[idx_a2a + 1] = "none"
+        with self.assertRaisesRegex(
+            ValidationError, "requires effective expert parallelism"
+        ):
+            validate_serving_recipe_structure(no_ep, context="no_ep")
+
+        for bad_addr in (
+            "{master_addr}",
+            "http://{master_addr}:{master_port}",
+            "{master_addr}:{master_port}/init",
+        ):
+            bad = copy.deepcopy(glm_doc)
+            args = bad["presets"]["decode_ep"]["args"]
+            args[args.index("--dist-init-addr") + 1] = bad_addr
+            with self.assertRaisesRegex(
+                ValidationError, "missing required placeholder|--dist-init-addr"
+            ):
+                validate_serving_recipe_structure(bad, context="bad_dist_addr")
+
+        bad_dp = copy.deepcopy(glm_doc)
+        bad_dp["presets"]["decode"]["args"] = [
+            "--dp-size",
+            "2",
+            "--attn-dp-size",
+            "2",
+        ]
+        bad_dp["presets"]["decode"]["topology"]["devices_per_node"] = 16
+        with self.assertRaisesRegex(
+            ValidationError, "--dp-size .* and --attn-dp-size .* cannot both"
+        ):
+            validate_serving_recipe_structure(bad_dp, context="bad_dp_attn_dp")
+
+    def test_sglang_mooncake_pd_disagg_and_pr397_1p1d_shape(self):
+        glm_path = REPO_ROOT / "test/ppu/recipes/zai-org/GLM-5.3.yaml"
+        glm_doc = _load_yaml(glm_path)
+
+        kv_ip_a = ".".join(("198", "51", "100", "10"))
+        kv_ip_b = ".".join(("198", "51", "100", "20"))
+        prefill = resolve_recipe(glm_path, preset="pd_prefill")
+        p_flags, p_env = substitute_validation_placeholders(
+            prefill["flags"],
+            prefill["server_env"],
+            values={
+                "kv_ip": kv_ip_a,
+                "kv_port": 18998,
+                "ib_devices": "rdma0,rdma1,rdma2,rdma3",
+            },
+        )
+        self.assertEqual(p_env["SGLANG_HOST_IP"], kv_ip_a)
+        self.assertEqual(p_flags[p_flags.index("--disaggregation-mode") + 1], "prefill")
+        self.assertEqual(
+            p_flags[p_flags.index("--disaggregation-ib-device") + 1],
+            "rdma0,rdma1,rdma2,rdma3",
+        )
+        self.assertEqual(
+            int(p_flags[p_flags.index("--disaggregation-bootstrap-port") + 1]), 18998
+        )
+
+        decode = resolve_recipe(glm_path, preset="pd_decode")
+        d_flags, d_env = substitute_validation_placeholders(
+            decode["flags"],
+            decode["server_env"],
+            values={"kv_ip": kv_ip_b, "ib_devices": "rdma4,rdma5"},
+        )
+        self.assertEqual(d_env["SGLANG_HOST_IP"], kv_ip_b)
+        self.assertEqual(d_flags[d_flags.index("--disaggregation-mode") + 1], "decode")
+        self.assertNotIn("--disaggregation-bootstrap-port", d_flags)
+
+        dsv41_doc = _load_yaml(
+            REPO_ROOT / "test/ppu/recipes/deepseek-ai/DeepSeek-V4.1-Flash.yaml"
+        )
+        dsv41_1p1d = copy.deepcopy(dsv41_doc)
+        dsv41_1p1d["presets"] = {
+            "pd_prefill": {
+                "hardware": "zhenwu_m890",
+                "topology": {
+                    "kind": "pd_disagg",
+                    "nodes": 1,
+                    "devices_per_node": 4,
+                    "role": "prefill",
+                },
+                "tp": 4,
+                "args": [
+                    "--enable-prefill-cp",
+                    "--cp-strategy",
+                    "interleave",
+                    "--attn-cp-size",
+                    "4",
+                    "--moe-a2a-backend",
+                    "megamoe",
+                    "--moe-dense-tp-size",
+                    "1",
+                    "--disaggregation-mode",
+                    "prefill",
+                    "--disaggregation-transfer-backend",
+                    "mooncake",
+                    "--disaggregation-ib-device",
+                    "{ib_devices}",
+                    "--disaggregation-bootstrap-port",
+                    "{kv_port}",
+                    "--json-model-override-args",
+                    '{"vision_n_layers":0}',
+                ],
+                "env": {
+                    "MC_NUM_QP_PER_EP": "4",
+                    "MOONCAKE_PROTOCOL": "rdma",
+                    "SGLANG_HOST_IP": "{kv_ip}",
+                },
+            },
+            "pd_decode": {
+                "hardware": "zhenwu_m890",
+                "topology": {
+                    "kind": "pd_disagg",
+                    "nodes": 1,
+                    "devices_per_node": 4,
+                    "role": "decode",
+                },
+                "tp": 4,
+                "args": [
+                    "--attn-dp-size",
+                    "4",
+                    "--enable-dp-lm-head",
+                    "--moe-a2a-backend",
+                    "megamoe",
+                    "--moe-dense-tp-size",
+                    "1",
+                    "--disaggregation-mode",
+                    "decode",
+                    "--disaggregation-transfer-backend",
+                    "mooncake",
+                    "--disaggregation-ib-device",
+                    "{ib_devices}",
+                    "--json-model-override-args",
+                    '{"vision_n_layers":0}',
+                ],
+                "env": {
+                    "MC_NUM_QP_PER_EP": "4",
+                    "MOONCAKE_PROTOCOL": "rdma",
+                    "SGLANG_HOST_IP": "{kv_ip}",
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            rec_file = Path(tmp) / "DeepSeek-V4.1-Flash-1P1D.yaml"
+            rec_file.write_text(yaml.safe_dump(dsv41_1p1d, sort_keys=False))
+            rep = validate_paths(
+                [rec_file],
+                sglang_parser_mode="required",
+                parser=_sample_sglang_parser(),
+            )
+            self.assertEqual(rep["checked_combinations"], 3)
+            self.assertEqual(
+                resolve_recipe(rec_file, preset="pd_prefill")["ppu_count"], 4
+            )
+            self.assertEqual(
+                resolve_recipe(rec_file, preset="pd_decode")["ppu_count"], 4
+            )
+
+        unpaired = copy.deepcopy(glm_doc)
+        unpaired["presets"].pop("pd_decode")
+        with self.assertRaisesRegex(ValidationError, "must be declared as a pair"):
+            validate_serving_recipe_structure(unpaired, context="unpaired")
+
+        vllm_env = copy.deepcopy(glm_doc)
+        vllm_env["presets"]["pd_decode"]["env"]["VLLM_HOST_IP"] = "{kv_ip}"
+        with self.assertRaisesRegex(ValidationError, "does not read VLLM_HOST_IP"):
+            validate_serving_recipe_structure(vllm_env, context="vllm_env")
+
+        decode_port = copy.deepcopy(glm_doc)
+        decode_port["presets"]["pd_decode"]["args"].extend(
+            ["--disaggregation-bootstrap-port", "{kv_port}"]
+        )
+        with self.assertRaisesRegex(
+            ValidationError, "pd_decode must not set --disaggregation-bootstrap-port"
+        ):
+            validate_serving_recipe_structure(decode_port, context="decode_port")
+
+        wrong_role = copy.deepcopy(glm_doc)
+        d_args = wrong_role["presets"]["pd_decode"]["args"]
+        d_args[d_args.index("--disaggregation-mode") + 1] = "prefill"
+        with self.assertRaisesRegex(
+            ValidationError, "requires --disaggregation-mode='decode'"
+        ):
+            validate_serving_recipe_structure(wrong_role, context="wrong_role")
+
+    def test_single_node_selector_skips_multinode_pd_810e_and_oversized_policies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shutil.copytree(REPO_ROOT / "test/ppu", root / "test/ppu")
+            base_pol = _load_yaml(root / "test/ppu/policy/models/glm-5.3.yaml")
+            base_pol["tiers"] = {"fast_sanity": base_pol["tiers"]["fast_sanity"]}
+
+            glm_rec_path = root / "test/ppu/recipes/zai-org/GLM-5.3.yaml"
+            glm_doc = _load_yaml(glm_rec_path)
+            glm_doc["variants"]["w8a8_int8"] = {
+                "precision": "w8a8_int8",
+                "hardware": "zhenwu_810e",
+                "topology": {
+                    "kind": "single_node",
+                    "nodes": 1,
+                    "devices_per_node": 16,
+                },
+                "hf_model_id": "zai-org/GLM-5.3-BF16",
+                "extra_args": ["--tp-size", "16"],
+            }
+            glm_doc["presets"]["tp8"] = {
+                "hardware": "zhenwu_m890",
+                "topology": {"kind": "single_node", "nodes": 1, "devices_per_node": 16},
+                "tp": 16,
+            }
+            glm_doc["presets"]["model_sanity"] = {
+                "hardware": "zhenwu_m890",
+                "topology": {"kind": "single_node", "nodes": 1, "devices_per_node": 1},
+                "tp": 1,
+            }
+            glm_rec_path.write_text(yaml.safe_dump(glm_doc, sort_keys=False))
+
+            extra_policies = {
+                "glm-5.3-decode-ep": {"preset": "decode_ep"},
+                "glm-5.3-pd-prefill": {"preset": "pd_prefill"},
+                "glm-5.3-810e": {
+                    "hardware": "zhenwu_810e",
+                    "variant": "w8a8_int8",
+                    "preset": "prefill",
+                },
+                "glm-5.3-tp16": {"preset": "tp8"},
+                "glm-5.3-tp1": {"preset": "model_sanity"},
+            }
+            for slug, overrides in extra_policies.items():
+                pol = copy.deepcopy(base_pol)
+                if "hardware" in overrides:
+                    pol["hardware"] = overrides["hardware"]
+                if "variant" in overrides:
+                    pol["variant"] = overrides["variant"]
+                pol["tiers"]["fast_sanity"]["preset"] = overrides["preset"]
+                (root / f"test/ppu/policy/models/{slug}.yaml").write_text(
+                    yaml.safe_dump(pol, sort_keys=False)
+                )
+
+            with (
+                patch("ppu_recipe.REPO_ROOT", root),
+                patch("recipe_select.REPO_ROOT", root),
+            ):
+                auto_selected = select("fast_sanity", "")["include"]
+                self.assertEqual(len(auto_selected), 13)
+                auto_keys = {item["model"] for item in auto_selected}
+                for slug in extra_policies:
+                    self.assertNotIn(slug, auto_keys)
+
+                with self.assertRaisesRegex(
+                    ValueError, "requires topology 'multi_node_ep'"
+                ):
+                    select("fast_sanity", "glm-5.3-decode-ep")
+                with self.assertRaisesRegex(
+                    ValueError, "requires topology 'pd_disagg'"
+                ):
+                    select("fast_sanity", "glm-5.3-pd-prefill")
+                with self.assertRaisesRegex(
+                    ValueError, "targets hardware 'zhenwu_810e'"
+                ):
+                    select("fast_sanity", "glm-5.3-810e")
+                with self.assertRaisesRegex(
+                    ValueError, "requires 16 devices, exceeding single-node"
+                ):
+                    select("fast_sanity", "glm-5.3-tp16")
+                with self.assertRaisesRegex(
+                    ValueError, "unsupported cluster topology for policy glm-5.3-tp1"
+                ):
+                    select("fast_sanity", "glm-5.3-tp1")
+                with self.assertRaisesRegex(
+                    ValueError, "unsupported cluster topology for policy glm-5.3-tp1"
+                ):
+                    cluster_width(
+                        root / "test/ppu/policy/models/glm-5.3-tp1.yaml",
+                        "fast_sanity",
+                        max_devices=8,
+                    )
+
+                admitted = select("fast_sanity", "glm-5.3-tp16", max_devices=16)[
+                    "include"
+                ]
+                self.assertEqual(admitted, [{"model": "glm-5.3-tp16", "ppu_count": 16}])
+
+    def test_runner_binds_effective_variant_checkpoint_assets_and_revision(self):
+        rev_mxfp4 = "a" * 40
+        rev_fp8 = "b" * 40
+        base_glm = _load_yaml(REPO_ROOT / "test/ppu/recipes/zai-org/GLM-5.3.yaml")
+        mxfp4_id = base_glm["ppu"]["hf_model_id"]
+        fp8_id = base_glm["variants"]["fp8"]["hf_model_id"]
+        mxfp4_asset = base_glm["ppu"]["assets"]["model"]
+        fp8_asset = base_glm["variants"]["fp8"]["assets"]["model"]
+        fp8_golden = base_glm["variants"]["fp8"]["golden_model_key"]
+
+        def _make_snapshot(cache_root: Path, repo_id: str, revision: str) -> Path:
+            folder = f"models--{repo_id.replace('/', '--')}"
+            repo_dir = cache_root / folder
+            (repo_dir / "refs").mkdir(parents=True, exist_ok=True)
+            (repo_dir / "refs/main").write_text(revision)
+            snap = repo_dir / "snapshots" / revision
+            snap.mkdir(parents=True, exist_ok=True)
+            for name in ("config.json", "tokenizer.json"):
+                (snap / name).write_text("{}")
+            (snap / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": {"w": "weight.safetensors"}})
+            )
+            (snap / "weight.safetensors").write_bytes(b"fixture")
+            return snap.resolve()
+
+        for inherit_assets in (False, True):
+            with (
+                self.subTest(inherit_assets=inherit_assets),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                root = Path(tmp)
+                shutil.copytree(REPO_ROOT / "test/ppu", root / "test/ppu")
+                cache_root = root / "hf_cache"
+                snap_mxfp4 = _make_snapshot(cache_root, mxfp4_id, rev_mxfp4)
+                snap_fp8 = _make_snapshot(cache_root, fp8_id, rev_fp8)
+                snapshots = {
+                    (mxfp4_id, rev_mxfp4): str(snap_mxfp4),
+                    (fp8_id, rev_fp8): str(snap_fp8),
+                }
+
+                glm_rec_path = root / "test/ppu/recipes/zai-org/GLM-5.3.yaml"
+                if inherit_assets:
+                    glm_doc = _load_yaml(glm_rec_path)
+                    glm_doc["variants"]["fp8"].pop("assets", None)
+                    glm_rec_path.write_text(yaml.safe_dump(glm_doc, sort_keys=False))
+
+                pol = _load_yaml(root / "test/ppu/policy/models/glm-5.3.yaml")
+                pol["variant"] = "fp8"
+                pol["tiers"] = {"fast_sanity": pol["tiers"]["fast_sanity"]}
+                pol_path = root / "test/ppu/policy/models/glm-5.3-fp8.yaml"
+                pol_path.write_text(yaml.safe_dump(pol, sort_keys=False))
+
+                results_dir = root / "artifacts/results"
+                results_dir.mkdir(parents=True)
+                captured_configs = []
+
+                @contextlib.contextmanager
+                def fake_server(config, label, result_dict, timeout):
+                    captured_configs.append((config, label, timeout))
+                    result_dict["cold_start_s"] = 0.5
+                    yield
+
+                def fake_download(*, repo_id, revision, cache_dir, local_files_only):
+                    self.assertTrue(local_files_only)
+                    self.assertEqual(Path(cache_dir), cache_root)
+                    return snapshots[(repo_id, revision)]
+
+                fake_hf_modules = {
+                    "huggingface_hub": SimpleNamespace(snapshot_download=fake_download),
+                    "huggingface_hub.file_download": SimpleNamespace(
+                        repo_folder_name=lambda *, repo_id, repo_type: (
+                            f"models--{repo_id.replace('/', '--')}"
+                        )
+                    ),
+                    "huggingface_hub.utils": SimpleNamespace(
+                        validate_repo_id=lambda repo_id: None
+                    ),
+                }
+                clean_env = {
+                    k: v
+                    for k, v in os.environ.items()
+                    if k
+                    not in {
+                        "PPU_CI_HF_MODEL_REVISION",
+                        "PPU_RECIPE_CONTAINER_MODEL",
+                    }
+                }
+                clean_env.update(
+                    {
+                        "PPU_CI_HF_CACHE_ROOT": str(cache_root),
+                        "HF_HUB_CACHE": str(cache_root),
+                        "RECIPE_PPU_COUNT": "8",
+                    }
+                )
+                with (
+                    patch.dict(os.environ, clean_env, clear=True),
+                    patch.dict(sys.modules, fake_hf_modules),
+                    patch("ppu_recipe.REPO_ROOT", root),
+                    patch("recipe_select.REPO_ROOT", root),
+                    patch("recipe_runner.REPO_ROOT", root),
+                    patch("recipe_runner.RESULTS", results_dir),
+                    patch("recipe_runner.phase"),
+                    patch("recipe_runner.server", side_effect=fake_server),
+                    patch("recipe_runner.probes") as mock_probes,
+                ):
+                    admitted = select("fast_sanity", "glm-5.3-fp8")["include"]
+                    self.assertEqual(
+                        admitted, [{"model": "glm-5.3-fp8", "ppu_count": 8}]
+                    )
+                    summary = run(pol_path, "fast_sanity", 1.0)
+                    mock_probes.assert_called_once()
+                    self.assertEqual(len(captured_configs), 1)
+                    cfg, _, _ = captured_configs[0]
+                    self.assertEqual(cfg["variant"], "fp8")
+                    self.assertEqual(cfg["hf_model_id"], fp8_id)
+                    self.assertEqual(cfg["golden_model_key"], fp8_golden)
+                    self.assertEqual(cfg["resolved_model"], str(snap_fp8))
+                    self.assertEqual(cfg["resolved_tokenizer"], str(snap_fp8))
+                    self.assertNotEqual(cfg["resolved_model"], str(snap_mxfp4))
+                    argv = cfg["argv"]
+                    self.assertEqual(
+                        argv[argv.index("--model-path") + 1], str(snap_fp8)
+                    )
+                    self.assertEqual(
+                        argv[argv.index("--tokenizer-path") + 1], str(snap_fp8)
+                    )
+                    assets_written = json.loads(
+                        (results_dir.parent / "assets.json").read_text()
+                    )
+                    expected_asset_key = mxfp4_asset if inherit_assets else fp8_asset
+                    self.assertEqual(
+                        assets_written, {expected_asset_key: str(snap_fp8)}
+                    )
+                    expected_fp8_digest = resolve_recipe(
+                        glm_rec_path,
+                        policy_path=pol_path,
+                        tier="fast_sanity",
+                        assets_map_path=results_dir.parent / "assets.json",
+                        served_model_name="recipe-model",
+                        cache_revision=rev_fp8,
+                    )["config_digest"]
+                    wrong_mxfp4_digest = resolve_recipe(
+                        glm_rec_path,
+                        policy_path=pol_path,
+                        tier="fast_sanity",
+                        assets_map_path=results_dir.parent / "assets.json",
+                        served_model_name="recipe-model",
+                        cache_revision=rev_mxfp4,
+                    )["config_digest"]
+                    self.assertEqual(summary["config_digest"], expected_fp8_digest)
+                    self.assertNotEqual(summary["config_digest"], wrong_mxfp4_digest)
+
+                    with patch.dict(
+                        os.environ,
+                        {
+                            "PPU_RECIPE_CONTAINER_MODEL": str(snap_mxfp4),
+                            "RECIPE_PPU_COUNT": "8",
+                        },
+                        clear=True,
+                    ):
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            "container model mount only supports the default recipe checkpoint",
+                        ):
+                            run(pol_path, "fast_sanity", 1.0)
+
+    def test_exact_topology_placeholder_identity_and_per_gpu_ib_map(self):
+        glm_doc = _load_yaml(REPO_ROOT / "test/ppu/recipes/zai-org/GLM-5.3.yaml")
+
+        # 1. --node-rank "{node_rank}0" or prefixed rank must fail closed.
+        for bad_rank in ("{node_rank}0", "0{node_rank}", "rank-{node_rank}"):
+            bad = copy.deepcopy(glm_doc)
+            args = bad["presets"]["decode_ep"]["args"]
+            args[args.index("--node-rank") + 1] = bad_rank
+            with self.assertRaisesRegex(
+                ValidationError,
+                "numeric topology placeholder|--node-rank to be exact",
+            ):
+                validate_serving_recipe_structure(bad, context="bad_rank")
+
+        # 2. Multi-node rank substitution preserves exact identity for all ranks 0..3.
+        ep_resolved = resolve_recipe(
+            REPO_ROOT / "test/ppu/recipes/zai-org/GLM-5.3.yaml", preset="decode_ep"
+        )
+        for expected_rank in range(4):
+            sub_flags, _ = substitute_validation_placeholders(
+                ep_resolved["flags"],
+                ep_resolved["server_env"],
+                values={"node_rank": expected_rank},
+            )
+            self.assertEqual(
+                sub_flags[sub_flags.index("--node-rank") + 1], str(expected_rank)
+            )
+
+        # 3. --dist-init-addr digit concatenation or prefix must fail; IPv6 bracket form passes.
+        for bad_addr in (
+            "{master_addr}:{master_port}0",
+            "prefix-{master_addr}:{master_port}",
+        ):
+            bad = copy.deepcopy(glm_doc)
+            args = bad["presets"]["decode_ep"]["args"]
+            args[args.index("--dist-init-addr") + 1] = bad_addr
+            with self.assertRaisesRegex(
+                ValidationError,
+                "numeric topology placeholder|--dist-init-addr to be exact",
+            ):
+                validate_serving_recipe_structure(bad, context="bad_dist")
+
+        ipv6_ok = copy.deepcopy(glm_doc)
+        ep_args = ipv6_ok["presets"]["decode_ep"]["args"]
+        ep_args[ep_args.index("--dist-init-addr") + 1] = "[{master_addr}]:{master_port}"
+        validate_serving_recipe_structure(ipv6_ok, context="ipv6_dist")
+
+        # 4. PD placeholder exactness: SGLANG_HOST_IP, bootstrap port, and IB device map.
+        bad_ip = copy.deepcopy(glm_doc)
+        bad_ip["presets"]["pd_prefill"]["env"]["SGLANG_HOST_IP"] = "host-{kv_ip}"
+        with self.assertRaisesRegex(
+            ValidationError, "SGLANG_HOST_IP to be exact '\\{kv_ip\\}'"
+        ):
+            validate_serving_recipe_structure(bad_ip, context="bad_kv_ip")
+
+        bad_port = copy.deepcopy(glm_doc)
+        p_args = bad_port["presets"]["pd_prefill"]["args"]
+        p_args[p_args.index("--disaggregation-bootstrap-port") + 1] = "{kv_port}0"
+        with self.assertRaisesRegex(
+            ValidationError,
+            "numeric topology placeholder|--disaggregation-bootstrap-port to be exact",
+        ):
+            validate_serving_recipe_structure(bad_port, context="bad_kv_port")
+
+        for bad_ib in (
+            "nic_{ib_devices}",
+            '{"0":"rdma0","1":"{ib_devices}"}',
+            '{"0":"{ib_devices}","1":"{ib_devices}"}',
+            '{"gpu0":"{ib_devices}"}',
+        ):
+            bad_ib_doc = copy.deepcopy(glm_doc)
+            ib_args = bad_ib_doc["presets"]["pd_prefill"]["args"]
+            ib_args[ib_args.index("--disaggregation-ib-device") + 1] = bad_ib
+            with self.assertRaisesRegex(
+                ValidationError,
+                "--disaggregation-ib-device|missing required placeholder",
+            ):
+                validate_serving_recipe_structure(bad_ib_doc, context="bad_ib")
+
+        per_gpu_ib = copy.deepcopy(glm_doc)
+        ib_args = per_gpu_ib["presets"]["pd_prefill"]["args"]
+        ib_args[ib_args.index("--disaggregation-ib-device") + 1] = json.dumps(
+            {str(gpu_id): "{ib_devices}" for gpu_id in range(8)},
+            separators=(",", ":"),
+        )
+        validate_serving_recipe_structure(per_gpu_ib, context="per_gpu_ib")
+
+    def test_cluster_revision_pin_applies_only_to_default_mxfp4_variant(self):
+        from recipe_cluster_config import PINNED_MODEL_REVISION_SPECS
+
+        rev_mxfp4 = "c" * 40
+        rev_fp8 = "b" * 40
+        base_glm = _load_yaml(REPO_ROOT / "test/ppu/recipes/zai-org/GLM-5.3.yaml")
+        base_dsv4 = _load_yaml(
+            REPO_ROOT / "test/ppu/recipes/deepseek-ai/DeepSeek-V4-Flash.yaml"
+        )
+        mxfp4_id = base_glm["ppu"]["hf_model_id"]
+        fp8_id = base_glm["variants"]["fp8"]["hf_model_id"]
+        self.assertEqual(
+            PINNED_MODEL_REVISION_SPECS["glm-5.3"],
+            ("PPU_CI_GLM53_MODEL_REVISION", mxfp4_id),
+        )
+        self.assertEqual(
+            PINNED_MODEL_REVISION_SPECS["deepseek-v4-flash"],
+            ("PPU_CI_DSV4_FLASH_MODEL_REVISION", base_dsv4["ppu"]["hf_model_id"]),
+        )
+
+        if not all(shutil.which(tool) for tool in ("jq", "sha256sum")):
+            return
+
+        # End-to-end launcher (stdlib-only python3 without PyYAML) -> USER_ENV_JSON -> worker run()
+        # across all YAML representations (quoted key, flow JSON recipe, dual-level HF ID replacement,
+        # plus default MXFP4 positive control).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            workspace = root / "checkout"
+            staging = root / "staging"
+            retained = root / "retained"
+            tools = root / "bin"
+            cache_root = root / "cache"
+            backend = workspace / ".ppu-infra/cluster-run/scripts"
+            payloads = workspace / "wheels"
+            for folder in (staging, retained, tools, cache_root, backend, payloads):
+                folder.mkdir(parents=True)
+            retained.chmod(0o700)
+            scripts = workspace / "scripts/ci/ppu"
+            shutil.copytree(REPO_ROOT / "scripts/ci/ppu", scripts)
+            shutil.copytree(REPO_ROOT / "test/ppu", workspace / "test/ppu")
+
+            for repo_id, rev in ((mxfp4_id, rev_mxfp4), (fp8_id, rev_fp8)):
+                repo_dir = cache_root / f"models--{repo_id.replace('/', '--')}"
+                (repo_dir / "refs").mkdir(parents=True, exist_ok=True)
+                (repo_dir / "refs/main").write_text(rev)
+                snap = repo_dir / "snapshots" / rev
+                snap.mkdir(parents=True, exist_ok=True)
+                for name in ("config.json", "tokenizer.json"):
+                    (snap / name).write_text("{}")
+                (snap / "model.safetensors.index.json").write_text(
+                    json.dumps({"weight_map": {"w": "weight.safetensors"}})
+                )
+                (snap / "weight.safetensors").write_bytes(b"fixture")
+
+            expected_mxfp4_snap = str(
+                (
+                    cache_root
+                    / f"models--{mxfp4_id.replace('/', '--')}"
+                    / "snapshots"
+                    / rev_mxfp4
+                ).resolve()
+            )
+            expected_fp8_snap = str(
+                (
+                    cache_root
+                    / f"models--{fp8_id.replace('/', '--')}"
+                    / "snapshots"
+                    / rev_fp8
+                ).resolve()
+            )
+
+            result_fixture = dict(fast_result(), model="glm-5.3")
+            (scripts / "recipe_bundle.py").write_text("# Verified separately\n")
+            (payloads / "recipe-manifest.json").write_text(
+                json.dumps({"recipe_tree_sha256": result_fixture["recipe_tree_sha256"]})
+            )
+            (workspace / "fixture.json").write_text(
+                json.dumps(
+                    {
+                        "outcome": "pass",
+                        "parser_checked": True,
+                        "sse_verified": True,
+                        "cold_start_s": 3.0,
+                        "queue_s": 0,
+                        "layer_override": None,
+                        "config_digest": result_fixture["config_digest"],
+                    }
+                )
+            )
+            (tools / "git").write_text(
+                f'#!/bin/bash\ncase "$1" in -C) echo {BACKEND_SHA};; '
+                f"*) echo {result_fixture['source_sha']};; esac\n"
+            )
+            # Wrap python3 with -S to prove run_recipe_cluster.sh requires zero third-party site-packages.
+            (tools / "python3").write_text(
+                f'#!/bin/bash\nexec "{sys.executable}" -S "$@"\n'
+            )
+            kube_content = json.dumps(
+                {
+                    "status": {
+                        "containerStatuses": [
+                            {
+                                "name": "worker",
+                                "imageID": "docker-pullable://registry.internal/team/sglang"
+                                + result_fixture["runtime_image"],
+                            }
+                        ]
+                    }
+                }
+            )
+            (tools / "kubectl").write_text(
+                f"#!/bin/bash\nif [[ \"$*\" == *'get pod '* ]]; then echo '{kube_content}'; fi\n"
+            )
+            (tools / "timeout").write_text('#!/bin/bash\nshift\nexec "$@"\n')
+            for tool in tools.iterdir():
+                tool.chmod(0o700)
+            captured_env_file = root / "captured-user-env.json"
+            (backend / "submit.sh").write_text(
+                f'printf "%s" "$USER_ENV_JSON" > "{captured_env_file}"\n'
+                'printf "job_status=scheduled\\nstart_time=1\\ndeadline=2\\nqueue_duration_seconds=4\\n" >> "$GITHUB_OUTPUT"\n'
+            )
+            (backend / "monitor.sh").write_text(
+                'mkdir -p "$PPU_CI_WORKER_ARTIFACT_DIR/results"\n'
+                'cp fixture.json "$PPU_CI_WORKER_ARTIFACT_DIR/results/summary.json"\n'
+                'echo job_status=succeeded >> "$GITHUB_OUTPUT"\n'
+            )
+            (backend / "cleanup.sh").write_text(
+                'unlink "$SOURCE_STAGE_DIR"\nrmdir "$(dirname "$SOURCE_STAGE_DIR")"\n'
+            )
+            export_env = {
+                **os.environ,
+                "PATH": os.pathsep.join((str(tools), os.environ["PATH"])),
+                "TIER": "fast_sanity",
+                "MODEL_KEY": "glm-5.3",
+                "RECIPE_PPU_COUNT": "8",
+                "GITHUB_OUTPUT": str(root / "gha-output"),
+                "PPU_PUBLIC_SUMMARY": str(root / "gha-summary"),
+                "GITHUB_WORKSPACE": str(workspace),
+                "RUNNER_TEMP": str(root / "runner-temp"),
+                "GITHUB_RUN_ID": "88",
+                "GITHUB_RUN_ATTEMPT": "1",
+                "PPU_CI_K8S_CONFIG_SHA256": "",
+                "PPU_CI_K8S_LOADED_CONFIG_SHA256": "",
+                "PPU_CI_PRIVATE_RESULTS_ROOT": str(retained),
+                "PPU_CI_K8S_PRIVATE_WORKER_ROOT": str(retained),
+                "PPU_CI_K8S_STAGE_ROOT": str(staging),
+                "PPU_CI_SOURCE_SHA": result_fixture["source_sha"],
+                "PPU_CI_JIT_ROOT": str(root / "jit"),
+                "PPU_CI_HF_CACHE_ROOT": str(cache_root),
+                "PPU_CI_GLM53_MODEL_REVISION": rev_mxfp4,
+                "PPU_CI_K8S_RUNTIME_DIGEST": "registry.internal/team/sglang"
+                + result_fixture["runtime_image"],
+            }
+
+            proc = subprocess.run(
+                ["bash", str(scripts / "run_recipe_cluster.sh")],
+                cwd=workspace,
+                env=export_env,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            user_env = json.loads(captured_env_file.read_text())
+            self.assertEqual(user_env["PPU_CI_HF_MODEL_REVISION"], rev_mxfp4)
+            self.assertEqual(user_env["PPU_CI_HF_MODEL_REVISION_REPO"], mxfp4_id)
+
+            fake_hf = {
+                "huggingface_hub": SimpleNamespace(
+                    snapshot_download=lambda *, repo_id, revision, cache_dir, local_files_only: (
+                        str(
+                            (
+                                Path(cache_dir)
+                                / f"models--{repo_id.replace('/', '--')}"
+                                / "snapshots"
+                                / revision
+                            ).resolve(strict=True)
+                        )
+                    )
+                ),
+                "huggingface_hub.file_download": SimpleNamespace(
+                    repo_folder_name=lambda *, repo_id, repo_type: (
+                        f"models--{repo_id.replace('/', '--')}"
+                    )
+                ),
+                "huggingface_hub.utils": SimpleNamespace(
+                    validate_repo_id=lambda repo_id: None
+                ),
+            }
+
+            pol_path = workspace / "test/ppu/policy/models/glm-5.3.yaml"
+            rec_path = workspace / "test/ppu/recipes/zai-org/GLM-5.3.yaml"
+            orig_pol = _load_yaml(pol_path)
+            orig_pol["tiers"] = {"fast_sanity": orig_pol["tiers"]["fast_sanity"]}
+            orig_rec = _load_yaml(rec_path)
+
+            def _run_worker(case_name: str):
+                worker_results = root / f"worker-{case_name}/results"
+                worker_results.mkdir(parents=True, exist_ok=True)
+                captured_cfgs = []
+
+                @contextlib.contextmanager
+                def fake_server(config, label, result_dict, timeout):
+                    captured_cfgs.append(config)
+                    result_dict["cold_start_s"] = 0.25
+                    yield
+
+                worker_env = {**user_env, "HF_HUB_CACHE": str(cache_root)}
+                with (
+                    patch.dict(os.environ, worker_env, clear=True),
+                    patch.dict(sys.modules, fake_hf),
+                    patch("ppu_recipe.REPO_ROOT", workspace),
+                    patch("recipe_runner.REPO_ROOT", workspace),
+                    patch("recipe_runner.RESULTS", worker_results),
+                    patch("recipe_runner.phase"),
+                    patch("recipe_runner.server", side_effect=fake_server),
+                    patch("recipe_runner.probes"),
+                ):
+                    summary = run(pol_path, "fast_sanity", 0.0)
+                self.assertEqual(summary["outcome"], "pass")
+                self.assertEqual(len(captured_cfgs), 1)
+                return captured_cfgs[0], summary
+
+            # Case 0: Default MXFP4 policy keeps pinned MXFP4 snapshot.
+            pol_path.write_text(yaml.safe_dump(orig_pol, sort_keys=False))
+            rec_path.write_text(yaml.safe_dump(orig_rec, sort_keys=False))
+            cfg0, _ = _run_worker("default")
+            self.assertEqual(cfg0["hf_model_id"], mxfp4_id)
+            self.assertEqual(cfg0["resolved_model"], expected_mxfp4_snap)
+
+            # Case 1: Quoted "variant": fp8 key in block YAML.
+            pol_path.write_text(
+                '"variant": fp8\n' + yaml.safe_dump(orig_pol, sort_keys=False)
+            )
+            cfg1, _ = _run_worker("quoted_key")
+            self.assertEqual(cfg1["hf_model_id"], fp8_id)
+            self.assertEqual(cfg1["resolved_model"], expected_fp8_snap)
+
+            # Case 2: Full JSON/flow recipe overriding variants.default.hf_model_id.
+            pol_path.write_text(yaml.safe_dump(orig_pol, sort_keys=False))
+            flow_rec = copy.deepcopy(orig_rec)
+            flow_rec["variants"]["default"]["hf_model_id"] = fp8_id
+            rec_path.write_text(json.dumps(flow_rec))
+            cfg2, _ = _run_worker("json_recipe")
+            self.assertEqual(cfg2["hf_model_id"], fp8_id)
+            self.assertEqual(cfg2["resolved_model"], expected_fp8_snap)
+
+            # Case 3: Both ppu.hf_model_id and variants.default.hf_model_id replaced with FP8.
+            dual_rec = copy.deepcopy(orig_rec)
+            dual_rec["ppu"]["hf_model_id"] = fp8_id
+            dual_rec["variants"]["default"]["hf_model_id"] = fp8_id
+            rec_path.write_text(yaml.safe_dump(dual_rec, sort_keys=False))
+            cfg3, _ = _run_worker("dual_hf_id")
+            self.assertEqual(cfg3["hf_model_id"], fp8_id)
+            self.assertEqual(cfg3["resolved_model"], expected_fp8_snap)
+
+    def test_review_regressions_canonical_topology_pd_pairs_rank_ranges_and_digests(
+        self,
+    ):
+        glm_path = REPO_ROOT / "test/ppu/recipes/zai-org/GLM-5.3.yaml"
+        glm_doc = _load_yaml(glm_path)
+
+        bad_decode_ep = copy.deepcopy(glm_doc)
+        bad_decode_ep["presets"]["decode_ep"] = {"hardware": "zhenwu_m890", "tp": 8}
+        with self.assertRaisesRegex(
+            ValidationError, "preset 'decode_ep' requires topology.kind='multi_node_ep'"
+        ):
+            validate_serving_recipe_structure(bad_decode_ep, context="bad_decode_ep")
+
+        for single_slot in ("prefill", "decode"):
+            bad_single_slot = copy.deepcopy(glm_doc)
+            bad_single_slot["presets"][single_slot] = copy.deepcopy(
+                glm_doc["presets"]["decode_ep"]
+            )
+            with self.assertRaisesRegex(ValidationError, "single_node"):
+                validate_serving_recipe_structure(
+                    bad_single_slot, context=f"bad_{single_slot}"
+                )
+
+        disjoint_pd = copy.deepcopy(glm_doc)
+        disjoint_pd["presets"]["pd_prefill"]["variants"] = ["default"]
+        disjoint_pd["presets"]["pd_decode"]["variants"] = ["fp8"]
+        with self.assertRaisesRegex(
+            ValidationError,
+            "pd_prefill and pd_decode must resolve to identical \\(variant, hardware\\) targets",
+        ):
+            validate_serving_recipe_structure(disjoint_pd, context="disjoint_pd")
+
+        bad_page = copy.deepcopy(glm_doc)
+        bad_page["presets"]["pd_decode"]["args"] = [
+            *bad_page["presets"]["pd_decode"]["args"],
+            "--page-size",
+            "128",
+        ]
+        with self.assertRaisesRegex(ValidationError, "--page-size mismatch"):
+            validate_serving_recipe_structure(bad_page, context="bad_pd_page")
+
+        ok_page = copy.deepcopy(bad_page)
+        ok_page["presets"]["pd_prefill"]["args"] = [
+            *ok_page["presets"]["pd_prefill"]["args"],
+            "--page-size",
+            "128",
+        ]
+        validate_serving_recipe_structure(ok_page, context="ok_pd_page")
+
+        bad_kv_dtype = copy.deepcopy(glm_doc)
+        bad_kv_dtype["presets"]["pd_decode"]["args"] = [
+            *bad_kv_dtype["presets"]["pd_decode"]["args"],
+            "--kv-cache-dtype",
+            "fp8_e5m2",
+        ]
+        with self.assertRaisesRegex(ValidationError, "--kv-cache-dtype mismatch"):
+            validate_serving_recipe_structure(bad_kv_dtype, context="bad_pd_kv_dtype")
+
+        bad_backend = copy.deepcopy(glm_doc)
+        d_args = bad_backend["presets"]["pd_decode"]["args"]
+        d_args[d_args.index("--disaggregation-transfer-backend") + 1] = "nixl"
+        with self.assertRaisesRegex(
+            ValidationError, "must use the same --disaggregation-transfer-backend"
+        ):
+            validate_serving_recipe_structure(bad_backend, context="bad_pd_backend")
+
+        fake_prefill = copy.deepcopy(glm_doc)
+        for role in ("pd_prefill", "pd_decode"):
+            r_args = fake_prefill["presets"][role]["args"]
+            r_args[r_args.index("--disaggregation-transfer-backend") + 1] = "fake"
+        with self.assertRaisesRegex(
+            ValidationError, "pd_prefill does not support .* 'fake'"
+        ):
+            validate_serving_recipe_structure(fake_prefill, context="fake_prefill")
+
+        bad_tp12_pp2 = copy.deepcopy(glm_doc)
+        bad_tp12_pp2["presets"]["decode_ep"] = {
+            "hardware": "zhenwu_m890",
+            "topology": {"kind": "multi_node_ep", "nodes": 3, "devices_per_node": 8},
+            "tp": 12,
+            "args": [
+                "--pp-size",
+                "2",
+                "--ep-size",
+                "12",
+                "--nnodes",
+                "3",
+                "--node-rank",
+                "{node_rank}",
+                "--dist-init-addr",
+                "{master_addr}:{master_port}",
+            ],
+        }
+        with self.assertRaisesRegex(
+            ValidationError, "assigns 12 workers per node|rank assignment incompatible"
+        ):
+            validate_serving_recipe_structure(bad_tp12_pp2, context="bad_tp12_pp2")
+
+        ok_tp8_pp3 = copy.deepcopy(bad_tp12_pp2)
+        ok_tp8_pp3["presets"]["decode_ep"]["tp"] = 8
+        ok_tp8_pp3["presets"]["decode_ep"]["args"] = [
+            "--pp-size",
+            "3",
+            "--ep-size",
+            "8",
+            "--nnodes",
+            "3",
+            "--node-rank",
+            "{node_rank}",
+            "--dist-init-addr",
+            "{master_addr}:{master_port}",
+        ]
+        validate_serving_recipe_structure(ok_tp8_pp3, context="ok_tp8_pp3")
+
+        bad_auto_pol = _load_yaml(DEFAULT_POLICY_ROOT / "models/glm-5.3.yaml")
+        bad_auto_pol["tiers"]["fast_sanity"]["layer_override"] = "auto"
+        with self.assertRaisesRegex(
+            ValidationError, "invalid fast sanity weight or layer policy"
+        ):
+            validate_policy_structure(bad_auto_pol, context="bad_auto_pol")
+        with self.assertRaisesRegex(
+            ValidationError, "layer_override must be a positive int or None"
+        ):
+            resolve_recipe(glm_path, layer_override="auto")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            rec_a = copy.deepcopy(glm_doc)
+            rec_b = copy.deepcopy(glm_doc)
+            rec_b["variants"]["fp8"]["assets"]["tokenizer"] = "glm-5.3-custom-tok"
+            rec_a_path = tmp_dir / "rec_a.yaml"
+            rec_b_path = tmp_dir / "rec_b.yaml"
+            rec_a_path.write_text(yaml.safe_dump(rec_a, sort_keys=False))
+            rec_b_path.write_text(yaml.safe_dump(rec_b, sort_keys=False))
+            assets_map = tmp_dir / "assets.yaml"
+            assets_map.write_text(
+                yaml.safe_dump(
+                    {
+                        "glm-5.3-fp8": "/models/glm-fp8",
+                        "glm-5.3-custom-tok": "/models/glm-tok",
+                    }
+                )
+            )
+            res_a = resolve_recipe(
+                rec_a_path, variant="fp8", assets_map_path=assets_map
+            )
+            res_b = resolve_recipe(
+                rec_b_path, variant="fp8", assets_map_path=assets_map
+            )
+            self.assertNotEqual(
+                res_a["resolved_tokenizer"], res_b["resolved_tokenizer"]
+            )
+            self.assertNotEqual(res_a["config_digest"], res_b["config_digest"])
+
+        with self.assertRaisesRegex(ValidationError, "invalid JSON"):
+            substitute_validation_placeholders(
+                ["--json-model-override-args", "{not-json"], {}
+            )
 
 
 if __name__ == "__main__":
