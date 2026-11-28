@@ -148,21 +148,22 @@ struct TopKPagedParams {
     }
     return transform;
   }
-  SGL_DEVICE TopKProblem problem(uint32_t batch_id, uint32_t seq_len) const {
-    return TopKProblem{
+  SGL_DEVICE TopKProblem<> problem(uint32_t batch_id, uint32_t seq_len) const {
+    return TopKProblem<>{
         .in = scores + batch_id * score_stride,
         .out = page_indices + batch_id * out_stride,
         .topk = topk,
         .seq_len = seq_len,
     };
   }
-  SGL_DEVICE TopKProblem problem(uint32_t batch_id) const {
+  SGL_DEVICE TopKProblem<> problem(uint32_t batch_id) const {
     return this->problem(batch_id, static_cast<uint32_t>(seq_lens[batch_id]));
   }
 };
 
+template <typename InT>
 struct TopKRaggedParams {
-  float* __restrict__ scores;  // NOTE: may write
+  InT* __restrict__ scores;  // NOTE: may write
   const int32_t* __restrict__ seq_lens;
   const int32_t* __restrict__ row_starts;
   const int32_t* __restrict__ out_offsets;
@@ -218,7 +219,7 @@ kpool_expand(uint32_t num_pools, uint32_t topk, int32_t* out, const PageTransfor
 }
 
 template <bool kPDL, TopKMode kMode>
-SGL_DEVICE void trivial_transform(const TopKProblem& problem, const PageTransform& transform) {
+SGL_DEVICE void trivial_transform(const TopKProblem<>& problem, const PageTransform& transform) {
   device::PDLWaitPrimary<kPDL>();
   device::PDLTriggerSecondary<kPDL>();
   if constexpr (kMode == TopKMode::KPOOL) {
@@ -238,7 +239,7 @@ SGL_DEVICE void trivial_transform(const TopKProblem& problem, const PageTransfor
 }
 
 template <TopKMode kMode>
-SGL_DEVICE void paged_transform(const TopKProblem& problem, int32_t* out, const PageTransform& transform) {
+SGL_DEVICE void paged_transform(const TopKProblem<>& problem, int32_t* out, const PageTransform& transform) {
   static_assert(kMode != TopKMode::INDICES, "paged_transform requires page-table output");
   static_assert(kMaxTopK % kBlockSize == 0);
   if constexpr (kMode == TopKMode::KPOOL) {
@@ -265,9 +266,9 @@ using RaggedSmem = impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Sm
  * `score[row_start : row_start + seq_len]`: writes each selected column plus
  * `offset` into `out`. The head mask is explained at `topk_ragged_kernel`.
  */
-template <bool kPDL>
+template <bool kPDL, typename InT>
 SGL_DEVICE void ragged_window_topk(
-    float* score,
+    InT* score,
     const uint32_t row_start,
     const uint32_t seq_len,
     const uint32_t topk,
@@ -282,11 +283,11 @@ SGL_DEVICE void ragged_window_topk(
     device::PDLWaitPrimary<kPDL>();
     static_assert(kVecSize <= kBlockSize, "not enough threads ");
     if (const auto tx = threadIdx.x; tx < rem) {
-      score[row_start - rem + tx] = impl::padding_value();
+      score[row_start - rem + tx] = device::cast<InT>(impl::padding_value());
     }
   }
   using device::topk::broadcast;
-  const auto problem = TopKProblem{
+  const auto problem = TopKProblem<InT>{
       .in = score + (row_start - rem),
       .out = out,
       .topk = topk,
@@ -330,8 +331,8 @@ SGL_DEVICE void ragged_window_topk(
  *     reordering.
  * It must however land after the PDL wait, or the indexer overwrites it.
  */
-template <bool kPDL>
-TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams params) {
+template <bool kPDL, typename InT>
+TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams<InT> params) {
   device::enable_smem_spilling();
   const auto bx = blockIdx.x;
   // issue all metadata prefetch ahead of time
@@ -399,7 +400,7 @@ SGL_DEVICE void ragged_select_transform(
     int32_t* s_topk_indices,
     RaggedSmem* smem) {
   constexpr uint32_t kVecSize = impl::TopKStreaming::kVecSize;
-  auto problem = TopKProblem{
+  auto problem = TopKProblem<>{
       .in = score + row_start,
       .out = out,
       .topk = topk,
@@ -544,7 +545,7 @@ TOPK_KERNEL void topk_candidate_kernel(const __grid_constant__ TopKCandidatePara
   constexpr uint32_t kBlockPositions = Candidate::kBlockPositions;
   const auto num_blocks = (seq_len + kBlockPositions - 1) / kBlockPositions;
   const auto kept = min(num_blocks, params.blocks_stride);
-  const auto problem = TopKProblem{
+  const auto problem = TopKProblem<>{
       .in = params.scores + bx * params.score_stride,
       .out = out,
       .topk = topk,
@@ -939,7 +940,7 @@ struct TopKSplit : impl::TopKRadixBase<12> {
   }
 
   SGL_DEVICE static void
-  histogram_chunk(const TopKProblem& problem, Chunk chunk, uint32_t* __restrict__ row_hist, Smem* smem) {
+  histogram_chunk(const TopKProblem<>& problem, Chunk chunk, uint32_t* __restrict__ row_hist, Smem* smem) {
     const auto tx = threadIdx.x;
     init_histogram(smem->histogram, tx);
     __syncthreads();
@@ -966,7 +967,7 @@ struct TopKSplit : impl::TopKRadixBase<12> {
   /// and committed with one global atomic per block: the threshold bin is
   /// unbounded, and per-candidate global atomics serialize on one address.
   SGL_DEVICE static void select_chunk(
-      const TopKProblem& problem,
+      const TopKProblem<>& problem,
       Chunk chunk,
       const uint32_t* __restrict__ row_hist,
       SplitCounters* __restrict__ ctr,
@@ -1062,7 +1063,7 @@ struct TopKSplit : impl::TopKRadixBase<12> {
   /// Fill the slots the threshold bin has to break ties for, staging the ties
   /// into LDS first since handle_tie's ranking pass is all-to-all. `problem`
   /// must be the whole row: an overflowing bin is re-derived by rescanning it.
-  SGL_DEVICE static void finish_ties(const TopKProblem& problem, const impl::TieValue* ties, Smem* smem) {
+  SGL_DEVICE static void finish_ties(const TopKProblem<>& problem, const impl::TieValue* ties, Smem* smem) {
     const auto tx = threadIdx.x;
     uint32_t above_count, tie_count;
     const bool zero_ties = is_zero_bin(smem->v_lo) && smem->tie_nonzero == 0;
@@ -1578,6 +1579,10 @@ struct TopKKernel {
    * \brief Ragged (prefill) variant of `transform`: per-row window, additive
    * output transform, no page table and no plan.
    *
+   * `scores` may be float32 or bfloat16: the params and kernel are templated on
+   * the input type and a bf16 vector is widened to float on load, so the
+   * selection itself is unchanged and the caller's fp32 copy disappears.
+   *
    * `scores` is written in place: the <= 3 columns the 16-byte-aligned read base
    * pulls in ahead of each row's window are masked out (see
    * `topk_ragged_kernel`). They are invalid for that row, and the buffer has no
@@ -1601,11 +1606,28 @@ struct TopKKernel {
     auto device_ = SymbolicDevice{};
     device_.set_options<kDLGPU>();
 
-    TensorMatcher({B, L})  // score
-        .with_strides({S, 1})
-        .with_dtype<float>()
-        .with_device(device_)
-        .verify(scores);
+    // scores may be fp32 (legacy) or bf16 (the fp8-KV ragged prefill path, where
+    // the indexer emits bf16 and the fp32 copy is what we want to avoid).
+    const bool scores_bf16 =
+        scores.dtype().code == kDLBfloat && scores.dtype().bits == 16;
+    const bool scores_f32 =
+        scores.dtype().code == kDLFloat && scores.dtype().bits == 32;
+    RuntimeCheck(scores_bf16 || scores_f32, "scores must be float32 or bfloat16");
+    // Bind B/L/S with the score tensor's real dtype before any unwrap below.
+    if (scores_bf16) {
+      TensorMatcher({B, L})
+          .with_strides({S, 1})
+          .with_dtype<bf16_t>()
+          .with_device(device_)
+          .verify(scores);
+    } else {
+      TensorMatcher({B, L})
+          .with_strides({S, 1})
+          .with_dtype<float>()
+          .with_device(device_)
+          .verify(scores);
+    }
+
     TensorMatcher({B})  // seq_lens
         .with_dtype<int32_t>()
         .with_device(device_)
@@ -1631,18 +1653,26 @@ struct TopKKernel {
     const auto topk = static_cast<uint32_t>(K.unwrap());
     RuntimeCheck(topk > 0 && topk <= kMaxTopK, "topk must be in (0, 2048]");
 
-    const auto params = TopKRaggedParams{
-        .scores = static_cast<float*>(scores.data_ptr()),
-        .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
-        .row_starts = row_starts_ptr,
-        .out_offsets = static_cast<const int32_t*>(out_offsets.data_ptr()),
-        .topk_indices = static_cast<int32_t*>(topk_indices.data_ptr()),
-        .score_stride = S.unwrap(),
-        .topk = topk,
+    auto launch = [&](auto tag) {
+      using InT = decltype(tag);
+      const auto params = TopKRaggedParams<InT>{
+          .scores = static_cast<InT*>(scores.data_ptr()),
+          .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
+          .row_starts = row_starts_ptr,
+          .out_offsets = static_cast<const int32_t*>(out_offsets.data_ptr()),
+          .topk_indices = static_cast<int32_t*>(topk_indices.data_ptr()),
+          .score_stride = S.unwrap(),
+          .topk = topk,
+      };
+      LaunchKernel(static_cast<uint32_t>(B.unwrap()), kBlockSize, device_.unwrap())
+          .config({.use_pdl = kUsePDL})
+          .launch(topk_ragged_kernel<kUsePDL, InT>, params);
     };
-    LaunchKernel(static_cast<uint32_t>(B.unwrap()), kBlockSize, device_.unwrap())
-        .config({.use_pdl = kUsePDL})
-        .launch(topk_ragged_kernel<kUsePDL>, params);
+    if (scores_bf16) {
+      launch(bf16_t{});
+    } else {
+      launch(float{});
+    }
   }
 
   /**
