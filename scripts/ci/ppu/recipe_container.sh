@@ -31,13 +31,10 @@ cleanup() {
 trap cleanup EXIT
 python3 -I -B "$checker" snapshot "$artifact_dir/dependencies-before.json"
 if [[ "$skip_wheel_install" == false ]]; then
-    triton_kernels_backup=$(mktemp -d)
-    cleanup_dirs+=("$triton_kernels_backup")
-    python3 -I -B "$checker" backup-triton-kernels "$triton_kernels_backup"
     # The release image owns the SDK, PyTorch, DeepGEMM, FlashMLA and EvalScope.
     python3 -I -B -m pip uninstall -y sgl-kernel >/dev/null 2>&1 || true
     python3 -I -B -m pip install --no-deps --no-index --force-reinstall "$wheel_dir/"*.whl
-    python3 -I -B "$checker" restore-triton-kernels "$triton_kernels_backup"
+    python3 -I -B "$checker" check-triton-kernels
     missing=$(python3 -I -B "$checker" missing-wheels "$wheel_dir/runtime-deps")
     if [[ -n "$missing" ]]; then
         mapfile -t extra <<< "$missing"

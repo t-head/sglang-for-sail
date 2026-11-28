@@ -67,9 +67,17 @@ _FLASHINFER_REPO = _RepoInfo(
     git_shallow=False,
 )
 
+_TRITON_REPO = _RepoInfo(
+    name="triton",
+    git_repository="https://github.com/triton-lang/triton",
+    git_tag="5f3f125e8f63c24613f1f73b937442864f263f94",
+    git_shallow=False,
+)
+
 ALL_REPOS = [
     _ACTLIZE_REPO,
     _FLASHINFER_REPO,
+    _TRITON_REPO,
 ]
 
 
@@ -504,6 +512,29 @@ class _CustomBuildExt(BuildExtension):
 # ======================= Package Discovery ======================= #
 _packages = find_namespace_packages(where="python")
 _package_dir = {"": "python"}
+_triton_kernels_root = _TRITON_REPO.source_dir / "python" / "triton_kernels"
+_triton_license = _TRITON_REPO.source_dir / "LICENSE"
+if (
+    not (
+        _triton_kernels_root / "triton_kernels" / "numerics_details" / "mxfp.py"
+    ).is_file()
+    or not _triton_license.is_file()
+):
+    raise RuntimeError(
+        "triton_kernels source and license are required for the SAIL wheel"
+    )
+_triton_packages = find_namespace_packages(
+    where=str(_triton_kernels_root),
+    include=["triton_kernels", "triton_kernels.*"],
+)
+for package in _triton_packages:
+    _package_dir[package] = os.path.relpath(
+        _triton_kernels_root / package.replace(".", os.sep), root
+    )
+_packages += _triton_packages
+_triton_wheel_license = root / "build" / "licenses" / "LICENSE.triton"
+_triton_wheel_license.parent.mkdir(parents=True, exist_ok=True)
+shutil.copyfile(_triton_license, _triton_wheel_license)
 
 
 # ======================= Setup ======================= #
@@ -512,6 +543,7 @@ setup(
     version=_get_version(),
     packages=_packages,
     package_dir=_package_dir,
+    license_files=["LICENSE", os.path.relpath(_triton_wheel_license, root)],
     ext_modules=ext_modules,
     cmdclass={"build_ext": _CustomBuildExt.with_options(use_ninja=True)},
     options={"bdist_wheel": {"py_limited_api": "cp310"}},
