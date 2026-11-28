@@ -62,6 +62,7 @@ def _jit_qsa_indexer_module(
         cuda_wrappers=[
             ("q_prep", f"qsa_index_q_prep<{args}>"),
             ("k_compress", f"qsa_index_k_compress<{args}>"),
+            ("k_interleave_compress", f"qsa_index_k_interleave_compress<{args}>"),
         ],
     )
 
@@ -188,6 +189,58 @@ def qsa_index_k_compress_store(
         weight,
         write_locs,
         compressed_k_buffer,
+        compress_ratio,
+        rotary_dim,
+        eps,
+    )
+
+
+def qsa_index_k_interleave_compress_store(
+    gathered_k: torch.Tensor,
+    member_rows: torch.Tensor,
+    positions: torch.Tensor,
+    pending_slots: torch.Tensor,
+    pending_keys: torch.Tensor,
+    pending_rope: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    axis_map: torch.Tensor,
+    weight: torch.Tensor,
+    write_locs: torch.Tensor,
+    compressed_k: torch.Tensor,
+    cp_size: int,
+    ring_size: int,
+    compress_ratio: int,
+    rotary_dim: int,
+    eps: float,
+    is_neox_style: bool,
+) -> None:
+    """Store pending state and compress directly from rank-major CP all-gather.
+
+    ``gathered_k`` is contiguous [cp_size * local_rows, head_dim], including
+    per-rank tail padding. ``member_rows`` (int64 group starts), ``positions``
+    (int64 [tokens, 3]) and ``pending_slots`` (int64 [tokens]) use logical
+    sequence order. ``write_locs`` is the existing int32 compression plan.
+    The reserved request-zero ring is left untouched; live pending slots
+    must be unique. Compression reads gathered K, independently of ring stores.
+    All compute/ring tensors share BF16 or FP16 dtype; compressed K may be FP8.
+    """
+    module = _jit_qsa_indexer_module(
+        gathered_k.dtype, compressed_k.dtype, weight.shape[0], is_neox_style
+    )
+    module.k_interleave_compress(
+        gathered_k,
+        member_rows,
+        positions,
+        pending_slots,
+        pending_keys,
+        pending_rope,
+        cos_sin_cache,
+        axis_map,
+        weight,
+        write_locs,
+        compressed_k,
+        cp_size,
+        ring_size,
         compress_ratio,
         rotary_dim,
         eps,

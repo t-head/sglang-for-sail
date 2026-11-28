@@ -77,8 +77,12 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
     profile = parse_qsa_profile(hf_config)
     if cfg.qsa_indexer_dtype == "fp8_e4m3":
         # fp8 scoring runs on TileLang fp8 GEMMs, validated on Hopper and Blackwell.
+        from sglang.srt.utils.device import get_device_sm, is_sail
+
         platform = get_platform()
-        if not (platform.is_cuda and (platform.is_sm90 or platform.is_sm100)):
+        cuda_fp8 = platform.is_cuda and (platform.is_sm90 or platform.is_sm100)
+        sail_fp8 = is_sail() and get_device_sm() == 89
+        if not (cuda_fp8 or sail_fp8):
             raise ValueError(
                 "--qsa-indexer-dtype fp8_e4m3 requires a CUDA SM90/SM100 GPU"
             )

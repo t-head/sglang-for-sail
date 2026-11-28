@@ -55,7 +55,14 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
             "CP-TP group sharing requires --attn-cp-size == --tp-size, got "
             f"attn_cp_size={view.attn_cp_size}, tp_size={cfg.tp_size}."
         )
-    strategy = "interleave" if arch in _INTERLEAVE_MODELS else "zigzag"
+    qwen_interleave_moe = (
+        arch == "Qwen4ExpForConditionalGeneration"
+        and cfg.cp_strategy == "interleave"
+        and view.moe_a2a_backend == "megamoe"
+    )
+    strategy = (
+        "interleave" if arch in _INTERLEAVE_MODELS or qwen_interleave_moe else "zigzag"
+    )
     if cfg.cp_strategy != strategy:
         raise ValueError(f"CP-TP group sharing requires --cp-strategy {strategy}.")
 
@@ -91,16 +98,25 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
     }
     if arch == "Qwen4ExpForConditionalGeneration" or is_kimi_linear:
         unsupported |= {
+            # On the TP-only path:
             # The MoE runs TP experts on rows gathered over the TP group.
-            # Waterfill turns on DeepEP and EP after this hook.
-            "ep-size > 1": view.ep_size > 1,
-            "moe-a2a-backend": view.moe_a2a_backend != "none",
+            "ep-size > 1": not qwen_interleave_moe and view.ep_size > 1,
+            "moe-a2a-backend": (
+                not qwen_interleave_moe and view.moe_a2a_backend != "none"
+            ),
+            # Waterfill can turn on DeepEP and EP after this hook.
             "enable-waterfill": cfg.enable_waterfill,
             "pp-size > 1": cfg.pp_size > 1,
             # Prefill only: a decode node serves plain TP.
-            "disaggregation-mode decode": cfg.disaggregation_mode == "decode",
+            "disaggregation-mode decode": (
+                not qwen_interleave_moe and cfg.disaggregation_mode == "decode"
+            ),
         }
-        if is_kimi_linear:
+        if qwen_interleave_moe:
+            unsupported["disaggregation-mode != null"] = (
+                cfg.disaggregation_mode != "null"
+            )
+        elif is_kimi_linear:
             unsupported |= {
                 "attn-dp-size > 1": view.attn_dp_size > 1,
                 "disaggregation-mode != null": cfg.disaggregation_mode != "null",
