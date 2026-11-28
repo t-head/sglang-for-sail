@@ -1637,6 +1637,7 @@ class MQALayer(MqaAttentionBase):
         from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
             interleave_output_columns,
             interleave_query_rows,
+            prepare_sail_wo_a,
             quantize_wo_a,
         )
 
@@ -1677,18 +1678,22 @@ class MQALayer(MqaAttentionBase):
         if _is_sail:
             # PPU DeepGEMM has no per-32 UE8M0 einsum, so MegaAttention emits one
             # fp32 scale per (token, wv group) and wo_a runs as per-token x
-            # per-channel fp8_einsum. wo_a was dequantized to bf16 on load; requantize
-            # it per output channel and permute the contraction dim to the
-            # kernel's [16 tiles][8 heads][32] order.
-            weight = self.wo_a.weight.data
-            assert weight.dtype == torch.bfloat16 and weight.shape[0] == G * R, (
-                "PPU MegaAttention needs a bf16 [G*R, D] wo_a, got "
-                f"{weight.dtype} {tuple(weight.shape)}"
+            # per-channel fp8_einsum. Preserve checkpoint FP8 values and scales;
+            # only BF16 weights need quantization. Both paths use the kernel's
+            # [16 tiles][8 heads][32] contraction order.
+            w_fp8, w_scale = prepare_sail_wo_a(
+                self.wo_a.weight.data,
+                getattr(self.wo_a, "weight_scale", None),
+                G,
+                R,
             )
-            w_fp8, w_scale = sglang_per_token_quant_fp8(weight)
-            w_fp8 = interleave_output_columns(w_fp8.view(G, R, -1))
-            self.mega_wo_a = (w_fp8, w_scale.view(G, R, 1))
-            self.mega_wo_a_recipe = (1, 1, weight.shape[-1])
+            if self.mega_wo_a is None:
+                self.mega_wo_a = (w_fp8, w_scale)
+            else:
+                # Captured graphs own these addresses across weight reloads.
+                self.mega_wo_a[0].copy_(w_fp8)
+                self.mega_wo_a[1].copy_(w_scale)
+            self.mega_wo_a_recipe = (1, 1, w_fp8.shape[-1])
         else:
             wo_a = self.wo_a.weight.view(G, R, -1)
             self.mega_wo_a = quantize_wo_a(interleave_output_columns(wo_a))
