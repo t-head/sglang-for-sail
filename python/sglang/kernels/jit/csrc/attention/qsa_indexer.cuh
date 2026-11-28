@@ -12,6 +12,7 @@
 
 #include <tvm/ffi/container/tensor.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <type_traits>
 
@@ -283,6 +284,16 @@ struct QsaIndexKCompressParams {
   int32_t rotary_dim;
   int32_t num_groups;
   float eps;
+  // Interleave prefill reads raw rank-major K; pending writes never feed
+  // compression in this launch. Logical RoPE rows stay in sequence order.
+  const int64_t* member_rows;
+  const int64_t* pending_slots;
+  void* pending_keys;
+  int64_t* pending_rope;
+  int32_t num_tokens;
+  int32_t local_tokens;
+  int32_t cp_size;
+  int32_t ring_size;
 };
 
 /**
@@ -290,7 +301,7 @@ struct QsaIndexKCompressParams {
  * MRoPE at the group-start position, store into the compressed cache.
  * One warp per group.
  */
-template <typename T, typename TOut, int kHeadDim, bool kIsNeox, bool kUsePDL>
+template <typename T, typename TOut, int kHeadDim, bool kIsNeox, bool kUsePDL, bool kInterleave = false>
 __global__
 __launch_bounds__(128) void qsa_index_k_compress_kernel(const QsaIndexKCompressParams __grid_constant__ params) {
   using namespace device;
@@ -299,15 +310,39 @@ __launch_bounds__(128) void qsa_index_k_compress_kernel(const QsaIndexKCompressP
   const uint32_t warp = threadIdx.x / kWarpThreads;
   const uint32_t lane = threadIdx.x % kWarpThreads;
   const uint32_t group = blockIdx.x * 4 + warp;
+  device::PDLWaitPrimary<kUsePDL>();
+  if constexpr (kInterleave) {
+    // Each warp also visits R logical tokens. Only the unfinished group of
+    // each request owns live ring slots; [0, ring_size) is discard storage.
+    for (int32_t r = 0; r < params.compress_ratio; ++r) {
+      const int64_t token = static_cast<int64_t>(group) * params.compress_ratio + r;
+      if (token < params.num_tokens) {
+        const int64_t slot = params.pending_slots[token];
+        if (slot >= params.ring_size) {
+          const int64_t src = (token % params.cp_size) * params.local_tokens + token / params.cp_size;
+          vec_t v;
+          v.load(static_cast<const T*>(params.key_state_buffer) + src * kHeadDim, lane);
+          v.store(static_cast<T*>(params.pending_keys) + slot * kHeadDim, lane);
+          if (lane < 3) {
+            params.pending_rope[slot * 3 + lane] = params.rope_position_buffer[token * 3 + lane];
+          }
+        }
+      }
+    }
+  }
   if (group >= static_cast<uint32_t>(params.num_groups)) {
     return;
   }
   __shared__ T smem_rows[4][kHeadDim];
 
-  device::PDLWaitPrimary<kUsePDL>();
-
-  const int32_t* locs = params.group_locs + group * params.compress_ratio;
-  const int32_t loc0 = locs[0];
+  const int32_t* locs = nullptr;
+  int64_t loc0;
+  if constexpr (kInterleave) {
+    loc0 = params.member_rows[group];
+  } else {
+    locs = params.group_locs + group * params.compress_ratio;
+    loc0 = locs[0];
+  }
 
   // fp32 mean over the group, rounded to the storage dtype exactly like
   // average_pool_qsa_keys (float().mean(dim=1).to(dtype)).
@@ -315,9 +350,16 @@ __launch_bounds__(128) void qsa_index_k_compress_kernel(const QsaIndexKCompressP
   {
     float acc[kPerLane];
     for (int32_t r = 0; r < params.compress_ratio; ++r) {
+      int64_t src;
+      if constexpr (kInterleave) {
+        const int64_t token = min(loc0 + r, static_cast<int64_t>(params.num_tokens - 1));
+        src = (token % params.cp_size) * params.local_tokens + token / params.cp_size;
+      } else {
+        src = locs[r];
+      }
       vec_t v;
       v.load(
-          static_cast<const T*>(params.key_state_buffer) + static_cast<int64_t>(locs[r]) * kHeadDim,
+          static_cast<const T*>(params.key_state_buffer) + src * kHeadDim,
           lane);  // offset is in vector units
 #pragma unroll
       for (int i = 0; i < kPerLane; ++i) {
@@ -499,6 +541,82 @@ void qsa_index_k_compress(
   };
   LaunchKernel(static_cast<uint32_t>(div_ceil(num_groups, 4)), 128, device.unwrap())
       .enable_pdl(kUsePDL)(qsa_index_k_compress_kernel<T, TOut, kHeadDim, kIsNeox, kUsePDL>, params);
+}
+
+/// \brief Fuse interleave raw-K addressing, pending-ring writes and compression.
+template <typename T, typename TOut, int kHeadDim, bool kIsNeox, bool kUsePDL>
+void qsa_index_k_interleave_compress(
+    tvm::ffi::TensorView gathered_k,
+    tvm::ffi::TensorView member_rows,
+    tvm::ffi::TensorView positions,
+    tvm::ffi::TensorView pending_slots,
+    tvm::ffi::TensorView pending_keys,
+    tvm::ffi::TensorView pending_rope,
+    tvm::ffi::TensorView cos_sin_cache,
+    tvm::ffi::TensorView axis_map,
+    tvm::ffi::TensorView weight,
+    tvm::ffi::TensorView write_locs,
+    tvm::ffi::TensorView compressed_k,
+    int64_t cp_size,
+    int64_t ring_size,
+    int64_t compress_ratio,
+    int64_t rotary_dim,
+    float eps) {
+  using namespace host;
+  auto device = SymbolicDevice{};
+  device.set_options<kDLGPU>();
+  auto rows = SymbolicSize{"gathered_rows"};
+  auto tokens = SymbolicSize{"tokens"};
+  auto groups = SymbolicSize{"groups"};
+  auto slots = SymbolicSize{"pending_slots"};
+  auto cache_rows = SymbolicSize{"cos_sin_cache_rows"};
+  auto compressed_slots = SymbolicSize{"compressed_slots"};
+  TensorMatcher({rows, kHeadDim}).with_dtype<T>().with_device(device).ensure_alignment(16).verify(gathered_k);
+  TensorMatcher({groups}).with_dtype<int64_t>().with_device(device).verify(member_rows);
+  TensorMatcher({tokens, 3}).with_dtype<int64_t>().with_device(device).verify(positions);
+  TensorMatcher({tokens}).with_dtype<int64_t>().with_device(device).verify(pending_slots);
+  TensorMatcher({slots, kHeadDim}).with_dtype<T>().with_device(device).ensure_alignment(16).verify(pending_keys);
+  TensorMatcher({slots, 3}).with_dtype<int64_t>().with_device(device).verify(pending_rope);
+  TensorMatcher({cache_rows, rotary_dim}).with_dtype<fp32_t>().with_device(device).verify(cos_sin_cache);
+  TensorMatcher({rotary_dim / 2}).with_dtype<int32_t>().with_device(device).verify(axis_map);
+  TensorMatcher({kHeadDim}).with_dtype<T>().with_device(device).verify(weight);
+  TensorMatcher({groups}).with_dtype<int32_t>().with_device(device).verify(write_locs);
+  TensorMatcher({compressed_slots, kHeadDim}).with_dtype<TOut>().with_device(device).verify(compressed_k);
+  CHECK_HOST(cp_size > 0 && rows.unwrap() % cp_size == 0 && tokens.unwrap() <= rows.unwrap())
+      << "qsa_index_k_interleave_compress: invalid interleave shape";
+  CHECK_HOST(compress_ratio > 0 && compress_ratio <= 16 && ring_size >= compress_ratio)
+      << "qsa_index_k_interleave_compress: invalid compression or ring size";
+  CHECK_HOST(rotary_dim > 0 && rotary_dim % 2 == 0 && rotary_dim <= kHeadDim)
+      << "qsa_index_k_interleave_compress: invalid rotary_dim";
+  if (tokens.unwrap() == 0) {
+    CHECK_HOST(groups.unwrap() == 0) << "empty input has compression groups";
+    return;
+  }
+  const auto params = QsaIndexKCompressParams{
+      .key_state_buffer = gathered_k.data_ptr(),
+      .group_locs = nullptr,
+      .rope_position_buffer = static_cast<const int64_t*>(positions.data_ptr()),
+      .cos_sin_cache = static_cast<const float*>(cos_sin_cache.data_ptr()),
+      .axis_map = static_cast<const int32_t*>(axis_map.data_ptr()),
+      .weight = weight.data_ptr(),
+      .write_locs = static_cast<const int32_t*>(write_locs.data_ptr()),
+      .compressed_k_buffer = compressed_k.data_ptr(),
+      .compress_ratio = static_cast<int32_t>(compress_ratio),
+      .rotary_dim = static_cast<int32_t>(rotary_dim),
+      .num_groups = static_cast<int32_t>(groups.unwrap()),
+      .eps = eps,
+      .member_rows = static_cast<const int64_t*>(member_rows.data_ptr()),
+      .pending_slots = static_cast<const int64_t*>(pending_slots.data_ptr()),
+      .pending_keys = pending_keys.data_ptr(),
+      .pending_rope = static_cast<int64_t*>(pending_rope.data_ptr()),
+      .num_tokens = static_cast<int32_t>(tokens.unwrap()),
+      .local_tokens = static_cast<int32_t>(rows.unwrap() / cp_size),
+      .cp_size = static_cast<int32_t>(cp_size),
+      .ring_size = static_cast<int32_t>(ring_size),
+  };
+  const int64_t work = std::max(groups.unwrap(), div_ceil(tokens.unwrap(), compress_ratio));
+  LaunchKernel(static_cast<uint32_t>(div_ceil(work, int64_t{4})), 128, device.unwrap())
+      .enable_pdl(kUsePDL)(qsa_index_k_compress_kernel<T, TOut, kHeadDim, kIsNeox, kUsePDL, true>, params);
 }
 
 }  // namespace sglang

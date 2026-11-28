@@ -607,7 +607,7 @@ class QSAIndexer(MultiPlatformOp):
         indexer_metadata,
         global_rope_positions: torch.Tensor,
     ) -> torch.Tensor:
-        """Prefill CP: score only this rank's zigzag query rows.
+        """Prefill CP: score only this rank's query rows.
 
         ``hidden_states``/``positions`` are the local (padded) rows and their
         RoPE positions. Index q/k are projected for the local rows only; the raw
@@ -619,14 +619,18 @@ class QSAIndexer(MultiPlatformOp):
         with the local query rows the sparse attention consumes.
         """
         strategy = get_cp_strategy()
-        if strategy is None or strategy.kind != ContextParallelStrategyKind.ZIGZAG:
+        if strategy is None or strategy.kind not in (
+            ContextParallelStrategyKind.ZIGZAG,
+            ContextParallelStrategyKind.INTERLEAVE,
+        ):
             strategy_name = strategy.name if strategy is not None else "none"
-            raise NotImplementedError(
-                "QSA prefill CP only supports the zigzag strategy; "
-                f"got {strategy_name}."
-            )
+            raise NotImplementedError(f"Unsupported QSA prefill CP: {strategy_name}.")
         meta = forward_batch.attn_cp_metadata
-        num_local = int(meta.total_q_prev_tokens + meta.total_q_next_tokens)
+        if strategy.kind == ContextParallelStrategyKind.INTERLEAVE:
+            local_lengths = meta.per_rank_logical_token or meta.per_rank_actual_token
+            num_local = local_lengths[strategy.cp_rank]
+        else:
+            num_local = int(meta.total_q_prev_tokens + meta.total_q_next_tokens)
         global_logical = getattr(forward_batch, "positions", None)
         global_logical = (
             global_logical[0] if global_logical.ndim == 2 else global_logical
@@ -641,33 +645,78 @@ class QSAIndexer(MultiPlatformOp):
         positions = (
             positions[:, :num_local] if positions.ndim == 2 else positions[:num_local]
         )
+        pool = indexer_metadata.token_to_kv_pool
         # Use the compressed-cache dtype for Q. Leaving cache_loc unset defers
-        # the ring store until raw local K has been gathered into global order.
-        q, token_k, _ = self.project_qk(
-            hidden_states,
-            positions,
-            pool=indexer_metadata.token_to_kv_pool,
-        )
-        # Raw keys of all new tokens in global packed order: the ring store
-        # and compression use the global write plan unchanged. Cached prefix
-        # groups already reside in the compressed-K pool on every rank.
-        token_k_local = token_k.reshape(num_local, -1).contiguous()
-        token_k_full = cp_materialize_global_token_order(
-            token_k_local, forward_batch
-        ).reshape(-1, self.index_kv_heads, self.index_head_dim)
+        # the ring store until the raw keys have been all-gathered.
+        q, token_k, _ = self.project_qk(hidden_states, positions, pool=pool)
+        token_k_local = token_k.reshape(
+            num_local, self.index_kv_heads * self.index_head_dim
+        ).contiguous()
         global_rope = (
             global_rope_positions[:, :num_global]
             if global_rope_positions.ndim == 2
             else global_rope_positions[:num_global]
         )
-        self.update_key_state_and_compress(
-            token_k_full,
-            global_logical,
-            global_rope,
-            indexer_metadata,
-            state_slots=indexer_metadata.pending_ring_slots,
-            state_stored=False,
-        )
+        if (
+            strategy.kind == ContextParallelStrategyKind.INTERLEAVE
+            and meta.gather_index is None
+            and indexer_metadata.compress_member_rows is not None
+            and indexer_metadata.pending_ring_slots is not None
+            and indexer_metadata.write_locs is not None
+            and self.compress_ratio <= 16
+            and token_k_local.dtype == pool.index_state_dtype
+            and self._use_fused_compress(pool)
+        ):
+            from sglang.kernels.ops.attention.qsa_indexer import (
+                qsa_index_k_interleave_compress_store,
+            )
+            from sglang.srt.layers.cp.interleave import attn_cp_interleave_gather
+            from sglang.srt.layers.cp.padding import pad_local_rows
+
+            # Keep AG's rank-major storage. The fused consumer applies the
+            # logical transpose while reading, without a global K copy.
+            gathered_k = attn_cp_interleave_gather(
+                pad_local_rows(token_k_local, meta, dim=0)
+            )
+            rope_matrix = indexer_metadata.extend_rope_matrix
+            if rope_matrix is None:
+                rope_matrix = build_rope_position_matrix(global_rope, num_global)
+            pending_keys = pool.get_qsa_key_state_buffer(self.layer_id)
+            compressed_k = pool.get_qsa_compressed_k_buffer(self.layer_id)
+            qsa_index_k_interleave_compress_store(
+                gathered_k,
+                indexer_metadata.compress_member_rows,
+                rope_matrix,
+                indexer_metadata.pending_ring_slots,
+                pending_keys.view(pending_keys.shape[0], -1),
+                pool.qsa_rope_position_buffer,
+                self.rotary_emb.cos_sin_cache,
+                self._rope_axis_map(gathered_k.device),
+                self.k_layernorm.weight.data,
+                indexer_metadata.write_locs,
+                compressed_k.view(compressed_k.shape[0], -1),
+                strategy.cp_size,
+                pool.qsa_compress_ratio,
+                self.compress_ratio,
+                self.rotary_emb.rotary_dim,
+                self.k_layernorm.variance_epsilon,
+                self.rotary_emb.is_neox_style,
+            )
+        else:
+            # Raw keys of all new tokens in global packed order: the ring store
+            # and compression use the global write plan unchanged. Cached prefix
+            # groups already reside in the compressed-K pool on every rank.
+            token_k_full = cp_materialize_global_token_order(
+                token_k_local, forward_batch
+            ).reshape(-1, self.index_kv_heads, self.index_head_dim)
+            self.update_key_state_and_compress(
+                token_k_full,
+                global_logical,
+                global_rope,
+                indexer_metadata,
+                state_slots=indexer_metadata.pending_ring_slots,
+                state_stored=False,
+            )
         compressed_keys, row_starts, row_ends, sequence_lengths = (
             indexer_metadata.get_prefill_mqa_inputs(
                 self.layer_id, local_logical, query_sequence_ids=local_sequence_ids

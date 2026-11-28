@@ -49,6 +49,7 @@ from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_ver
 from sglang.srt.layers.cp.utils import (
     ContextParallelStrategyKind,
     cp_materialize_global_token_order,
+    cp_shard_hidden_states,
     get_cp_strategy,
     is_cp_active,
 )
@@ -1897,8 +1898,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         topk_indices: torch.Tensor,
         save_kv_cache: bool,
     ) -> torch.Tensor:
-        """Prefill CP: this rank holds the query rows of its two zigzag blocks
-        (all heads) and the K/V of the same rows. All-gather new K/V into global
+        """Prefill CP runs rank-local queries against global K/V.
+
+        All-gather new K/V into global
         token order (also written to the KV pool so decode sees every token),
         prepend each request's cached prefix from the replicated local KV pool
         (or the KV-shard scratch), then run the chunk-prefill sparse kernel
@@ -1908,12 +1910,13 @@ class QwenSparseAttnBackend(AttentionBackend):
         ``topk_indices`` are per-request logical positions exactly as in the
         non-CP path."""
         strategy = get_cp_strategy()
-        if strategy is None or strategy.kind != ContextParallelStrategyKind.ZIGZAG:
+        if strategy is None or strategy.kind not in (
+            ContextParallelStrategyKind.ZIGZAG,
+            ContextParallelStrategyKind.INTERLEAVE,
+        ):
             strategy_name = strategy.name if strategy is not None else "none"
-            raise NotImplementedError(
-                "QSA prefill CP only supports the zigzag strategy; "
-                f"got {strategy_name}."
-            )
+            raise NotImplementedError(f"Unsupported QSA prefill CP: {strategy_name}.")
+        interleaved = strategy.kind == ContextParallelStrategyKind.INTERLEAVE
         meta = forward_batch.attn_cp_metadata
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         num_output_rows = q.shape[0]
@@ -1931,12 +1934,66 @@ class QwenSparseAttnBackend(AttentionBackend):
             self.kv_layers.layer(layer.layer_id).store(
                 layer, forward_batch.out_cache_loc, k_full, v_full
             )
-        num_local_rows = int(meta.total_q_prev_tokens + meta.total_q_next_tokens)
+        if interleaved:
+            local_lengths = meta.per_rank_logical_token or meta.per_rank_actual_token
+            num_local_rows = local_lengths[strategy.cp_rank]
+        else:
+            num_local_rows = int(meta.total_q_prev_tokens + meta.total_q_next_tokens)
         q = q[:num_local_rows].contiguous()
         indices = topk_indices[:num_local_rows].to(torch.int32).contiguous()
+        if (
+            interleaved
+            and save_kv_cache
+            and q.is_cuda
+            and is_sail()
+            and self._kv_shard_pool is None
+            and envs.SGLANG_QSA_USE_FLASHATTN.get()
+        ):
+            from sglang.kernels.ops.attention.qsa_flashattn import sparse_qsa_flashattn
+
+            flash_attn_with_kvcache = _resolve_ppu_fa3_qsa_with_kvcache()
+            if flash_attn_with_kvcache is None:
+                raise RuntimeError(
+                    "SGLANG_QSA_USE_FLASHATTN requires the SAIL FlashAttention QSA extension"
+                )
+            row_to_batch = cp_shard_hidden_states(
+                metadata.token_to_batch_idx, forward_batch
+            )[:num_local_rows].contiguous()
+            cache = self.token_to_kv_pool.layer_router.read(layer.layer_id)
+            output = sparse_qsa_flashattn(
+                q,
+                cache.key(),
+                cache.value(),
+                indices,
+                layer.scaling,
+                req_to_token=self.req_to_token,
+                row_to_batch=row_to_batch,
+                req_indices=metadata.row_req_pool_indices,
+                seq_lens=metadata.sequence_lengths,
+                flash_attn_with_kvcache=flash_attn_with_kvcache,
+            )
+            if pending is not None:
+                get_stream("qsa_cp_kv").wait_stream(torch.cuda.current_stream())
+            return self._pad_extend_output(output, num_output_rows)
         seq_lens = [int(x) for x in forward_batch.seq_lens_cpu[: meta.bs]]
         extend_lens = [int(x) for x in forward_batch.extend_seq_lens_cpu[: meta.bs]]
         prefix_lens = [seq - extend for seq, extend in zip(seq_lens, extend_lens)]
+        device_seq_lens = metadata.sequence_lengths[: meta.bs]
+        if interleaved:
+            q_stride = strategy.cp_size
+            ends = forward_batch.extend_seq_lens[: meta.bs].cumsum(0, dtype=torch.int32)
+            local_ends = (ends + q_stride - 1 - strategy.cp_rank) // q_stride
+            cu_q = F.pad(local_ends, (1, 0))
+            # Causal positions within each request advance by CP size. Set
+            # the upper bound to the visible length at its last local query.
+            last_local_row = (local_ends - 1) * q_stride + strategy.cp_rank
+            kv_lens = device_seq_lens - (ends - 1 - last_local_row)
+            max_q = (max(extend_lens, default=0) + q_stride - 1) // q_stride
+        else:
+            q_stride = 1
+            cu_q = meta.cu_seqlens_q_combined_tensor
+            kv_lens = meta.kv_len_combined_tensor
+            max_q = meta.max_seqlen_q_combined
         # Both cached-prefix paths read the pool getters, which expose the
         # shard scratch during a sharded extend. Address it by scratch row.
         slot_table = (
@@ -1955,10 +2012,11 @@ class QwenSparseAttnBackend(AttentionBackend):
                 pool.layer_router.read(layer.layer_id).value(),
                 slot_table[: meta.bs],
                 indices,
-                meta.cu_seqlens_q_combined_tensor,
-                meta.kv_len_combined_tensor,
+                cu_q,
+                kv_lens,
                 layer.scaling,
-                max_q=meta.max_seqlen_q_combined,
+                max_q=max_q,
+                q_stride=q_stride,
             )
             if pending is not None:
                 # Keep the prefetched K/V alive through the cache write above.
@@ -1996,19 +2054,19 @@ class QwenSparseAttnBackend(AttentionBackend):
         # one entry per (request, prev block) then per (request, next block);
         # the kernel reads cu_k[e] as the request's K base row only.
         # Built on device: a host list -> device copy would sync every layer.
-        device_seq_lens = metadata.sequence_lengths[: meta.bs]
         k_base = torch.cumsum(device_seq_lens, 0, dtype=torch.int32) - device_seq_lens
-        cu_k = torch.cat([k_base, k_base])
+        cu_k = k_base if interleaved else torch.cat([k_base, k_base])
         output = sparse_gqa_fwd_interface_triton_ck(
             q,
             k_full,
             v_full,
             indices,
-            meta.cu_seqlens_q_combined_tensor,
+            cu_q,
             cu_k,
-            meta.kv_len_combined_tensor,
+            kv_lens,
             layer.scaling,
-            max_q=meta.max_seqlen_q_combined,
+            max_q=max_q,
+            q_stride=q_stride,
         )
         if pending is not None:
             # The gathered K/V live in the side stream's pool; order their

@@ -201,6 +201,7 @@ def _sparse_gqa_chunk_prefill(
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     SLOT_INDICES: tl.constexpr,
+    Q_STRIDE: tl.constexpr = 1,
 ):
     """One query row x one KV head group over its ``topk`` selected tokens.
 
@@ -221,7 +222,7 @@ def _sparse_gqa_chunk_prefill(
     else:
         k_start = tl.load(cu_k + batch).to(tl.int64)
     kv_len = tl.load(kv_lens + batch).to(tl.int64)
-    visible = query_relative + kv_len - (q_end - q_start) + 1
+    visible = kv_len - (q_end - q_start - query_relative - 1) * Q_STRIDE
     row_topk = tl.minimum(topk, visible)
     row_limit = tl.minimum(topk, ((row_topk + BLOCK_N - 1) // BLOCK_N) * BLOCK_N)
     offs_h = tl.arange(0, BLOCK_M)
@@ -384,7 +385,8 @@ def pack_qsa_prefill_kv(
 
 
 def sparse_gqa_fwd_interface_triton_ck(
-    q, k, v, indices, cu_q, cu_k, kv_lens, scale, max_q: Optional[int] = None
+    q, k, v, indices, cu_q, cu_k, kv_lens, scale, max_q: Optional[int] = None,
+    *, q_stride: int = 1,
 ):
     k, v = k.contiguous(), v.contiguous()
     total_q, num_q_heads, head_dim = q.shape
@@ -428,6 +430,7 @@ def sparse_gqa_fwd_interface_triton_ck(
         BLOCK_N=block_n,
         HEAD_DIM=head_dim,
         SLOT_INDICES=False,
+        Q_STRIDE=q_stride,
         num_warps=warps,
         num_stages=stages,
     )
@@ -517,7 +520,8 @@ def _resolve_prefill_slots(
 
 
 def sparse_gqa_paged_prefill_triton(
-    q, k_cache, v_cache, slot_table, indices, cu_q, kv_lens, scale, *, max_q
+    q, k_cache, v_cache, slot_table, indices, cu_q, kv_lens, scale, *, max_q,
+    q_stride: int = 1,
 ):
     """Chunk-prefill sparse attention that reads K/V in place from the KV pool.
 
@@ -593,6 +597,7 @@ def sparse_gqa_paged_prefill_triton(
         BLOCK_N=block_n,
         HEAD_DIM=head_dim,
         SLOT_INDICES=True,
+        Q_STRIDE=q_stride,
         num_warps=warps,
         num_stages=stages,
     )

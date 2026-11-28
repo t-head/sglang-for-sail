@@ -2763,6 +2763,7 @@ class Envs:
     # paths. Requires a flash_attn_interface build with QSA support; falls
     # back to the original paths otherwise.
     SGLANG_SAIL_QSA_FA3_SPARSE_ATTN = EnvBool(False)
+    SGLANG_QSA_USE_FLASHATTN = EnvBool(False)
     # QSA indexer prefill scoring: route the weight-free MQA logits through
     # the SAIL DeepGEMM fp8_mqa_avg_logits kernel (q/k are quantized to
     # fp8 e4m3 on the fly, dequant scales ride the kernel's q_scale/k_scales)
