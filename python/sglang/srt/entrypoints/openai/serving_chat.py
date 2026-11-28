@@ -1826,6 +1826,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     request.tool_choice,
                     parallel_tool_calls=request.parallel_tool_calls,
                     thinking_mode=xgrammar_reasoning,
+                    response_channel_open=(
+                        self.chat_encoding_spec == "kimi_k3" and not thinking_mode
+                    ),
                 )
                 if (
                     tool_call_constraint is not None

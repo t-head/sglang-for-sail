@@ -43,6 +43,14 @@ _ISSUE_ALIGNED_COLS = 93184
 
 
 class TestDSV4PagedIndexerMetadata(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        platform = patch(
+            "sglang.srt.layers.attention.dsv4.metadata.is_sail", return_value=False
+        )
+        platform.start()
+        self.addCleanup(platform.stop)
+
     def test_sm120_fp4_forces_deep_gemm_metadata(self):
         expected = torch.tensor([[0, 0], [1, 0]], dtype=torch.int32)
         deep_gemm = SimpleNamespace(
@@ -300,6 +308,12 @@ class TestDSV4TopKDispatch(CustomTestCase):
 
 
 class TestDSV4NonPagedIndexer(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        platform = patch(f"{_INDEXER}.is_sail", return_value=False)
+        platform.start()
+        self.addCleanup(platform.stop)
+
     def _is_eligible(self, **overrides):
         backend = SimpleNamespace(hisparse_coordinator=None)
         c4_indexer = SimpleNamespace(use_fp4_indexer=overrides.get("fp4", False))
@@ -740,6 +754,12 @@ class TestMqaLogitsBudgetArithmetic(CustomTestCase):
 
 
 class TestPagedIndexerMetadataChunking(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        platform = patch(f"{_METADATA}.is_sail", return_value=False)
+        platform.start()
+        self.addCleanup(platform.stop)
+
     """The schedule list and the top-k plan list must be built over the exact
     row chunks the indexer loops over; a mismatch would silently score rows
     with another chunk's schedule."""
@@ -989,7 +1009,7 @@ class TestDeepSelectFullTopKDecode(CustomTestCase):
         indexer.use_deep_select_decode = False
 
         with (
-            patch.object(mod, "decode_scores", return_value=data),
+            patch.object(mod, "decode_score_chunks", return_value=iter([data])),
             patch.object(mod, "topk_page_transform") as page_transform,
             patch.object(mod, "select_decode") as select_decode,
         ):
@@ -1006,6 +1026,15 @@ class TestChunkedPagedDecode(CustomTestCase):
 
     num_rows, width = 5, 16
     chunks = [slice(0, 2), slice(2, 4), slice(4, 5)]
+
+    def setUp(self):
+        super().setUp()
+        platform = patch(
+            "sglang.srt.layers.attention.dsv4.v41_indexer.scoring.is_sail",
+            return_value=False,
+        )
+        platform.start()
+        self.addCleanup(platform.stop)
 
     def _inputs(self):
         from sglang.srt.layers.attention.dsv4.v41_indexer import DecodeInputs
@@ -1082,7 +1111,7 @@ class TestChunkedPagedDecode(CustomTestCase):
         with (
             patch.object(mod, "get_deep_gemm_decode_data", return_value=data),
             patch.object(mod, "deep_gemm_fp4_paged_mqa_logits", deep_gemm),
-            patch.object(mod, "topk_transform_paged_from_metadata", topk),
+            patch.object(mod, "topk_transform_paged", topk),
             patch.object(
                 mod,
                 "candidate_row_lens",
@@ -1113,7 +1142,20 @@ class TestChunkedPagedDecode(CustomTestCase):
         ):
             table = backend.publish_decode(inputs)
 
-        self._assert_chunked_calls(deep_gemm, topk)
+        self.assertEqual(deep_gemm.call_count, len(self.chunks))
+        for call, plan in zip(deep_gemm.call_args_list, self.plans):
+            self.assertIs(call.args[5], plan)
+        self.assertEqual(len(topk.call_args_list), len(self.chunks))
+        for call, rows in zip(topk.call_args_list, self.chunks):
+            # V1 receives real per-chunk views, not metadata/rows keyword args.
+            self.assertEqual(call.args[0].shape[0], rows.stop - rows.start)
+            self.assertEqual(
+                call.args[3].data_ptr(), inputs.out_page_indices[rows].data_ptr()
+            )
+            torch.testing.assert_close(
+                call.args[1],
+                inputs.paged_metadata.compressed_seq_lens[rows].reshape(-1),
+            )
         self.assertEqual(table.blocks.shape, (self.num_rows, backend.topk_blocks))
         self.assertEqual(table.phys_blocks.shape, table.blocks.shape)
         self.assertEqual(table.valid_lens.shape, (self.num_rows,))
@@ -1139,6 +1181,15 @@ class TestChunkedPagedDecode(CustomTestCase):
 
 class TestGroupedVerifyRows(CustomTestCase):
     """Static verify rows reach the paged logits kernel as one request per block."""
+
+    def setUp(self):
+        super().setUp()
+        platform = patch(
+            "sglang.srt.layers.attention.dsv4.v41_indexer.scoring.is_sail",
+            return_value=False,
+        )
+        platform.start()
+        self.addCleanup(platform.stop)
 
     def _args(self, rows_per_request, rows=slice(None), indices=None):
         from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (
@@ -1211,6 +1262,14 @@ class TestGroupedVerifyRows(CustomTestCase):
 
 
 class TestCandidateIndexerGating(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        platform = patch(
+            "sglang.srt.layers.attention.dsv4.v41_indexer.is_sail", return_value=False
+        )
+        platform.start()
+        self.addCleanup(platform.stop)
+
     def test_candidate_indexer_gating(self):
         from sglang.srt.layers.attention.dsv4 import v41_indexer
         from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
@@ -1241,10 +1300,12 @@ class TestCandidateIndexerGating(CustomTestCase):
                     prefill, decode = make(topk_blocks, block_size)
                 self.assertIsInstance(prefill, DenseBlocksBackend)
                 self.assertIsInstance(decode, DenseBlocksBackend)
-        # Blackwell without DeepGEMM's sparse logits fails instead of falling back.
+        # Blackwell without DeepGEMM's sparse logits warns and serves dense blocks
+        # instead of failing startup.
         with sm100(True), patch(flag, False):
-            with self.assertRaises(RuntimeError):
-                make(2048, 8)
+            prefill, decode = make(2048, 8)
+        self.assertIsInstance(prefill, DenseBlocksBackend)
+        self.assertIsInstance(decode, DenseBlocksBackend)
 
 
 if __name__ == "__main__":

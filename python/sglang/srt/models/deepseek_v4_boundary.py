@@ -61,6 +61,8 @@ class ReadState(msgspec.Struct):
     stats: object = None
     stats_stream: object = None
     call: object = None
+    # MegaMHC asks the live batch whether this seam may fuse its boundary.
+    batch: object = None
 
 
 class HcUpdate:
@@ -95,6 +97,7 @@ class HcUpdate:
                 next=next,
                 world_size=self.layer.self_attn.attn_tp_size,
                 precomputed=state.stats,
+                forward_batch=state.batch,
             )
         return mhc.run_moe_post(
             hc,
@@ -104,6 +107,7 @@ class HcUpdate:
             next=next if state.call.allow_cross_layer_fusion else None,
             world_size=self.layer.mlp.tp_size,
             precomputed=state.stats,
+            forward_batch=state.batch,
         )
 
     def update(self, output, state):
@@ -245,6 +249,7 @@ class HcReadCall(HcRead):
                 stats=stats,
                 stats_stream=stream,
                 call=self.call,
+                batch=self.batch,
             )
         fn, scale, base = self._parameters()
         x, post, comb, norm_fused = layer.hc_pre(
@@ -263,7 +268,9 @@ class HcReadCall(HcRead):
                 )
             else:
                 x = norm(x)
-        return x, ReadState(residual, post, comb, quantized, call=self.call)
+        return x, ReadState(
+            residual, post, comb, quantized, call=self.call, batch=self.batch
+        )
 
     def _parameters(self):
         layer = self.layer
@@ -317,7 +324,9 @@ class HcReadCall(HcRead):
                         )
                     else:
                         x = norm(x)
-                return x, ReadState(streams, post, comb, quantized, call=self.call)
+                return x, ReadState(
+                    streams, post, comb, quantized, call=self.call, batch=self.batch
+                )
         return self.read(update.update(value, residual), norm)
 
 

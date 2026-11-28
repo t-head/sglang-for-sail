@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 import pytest
 import torch
 
@@ -23,9 +25,9 @@ def _reference_grouped_gemma_rmsnorm(
     return x_norm * (1.0 + weight.to(compute_dtype))
 
 
-# Tolerances are at the output-dtype quantization floor, measured against the
-# fp64 reference on 4xB300 (sm103): bf16 max rel err 3.9e-3 (1 ulp), fp16
-# 4.9e-4 (0.5 ulp). The kernel computes in fp32 like the eager reference.
+# Preserve output-dtype tolerances while keeping the oracle in FP64. Rounding
+# the reference to BF16 can add a full-ULP discrepancy at a rounding boundary;
+# the kernel itself computes in FP32, like the eager implementation.
 _TOLERANCES = {
     torch.bfloat16: dict(rtol=5e-3, atol=5e-3),
     torch.float16: dict(rtol=1e-3, atol=1e-3),
@@ -36,6 +38,7 @@ _TOLERANCES = {
 @pytest.mark.parametrize(
     "num_tokens,hidden_size,group_size",
     [
+        (0, 10240, 2560),  # idle DP rank in the PLE forward path
         (1, 10240, 2560),  # production shape (HC 4 x 2560)
         (7, 10240, 2560),
         (128, 10240, 2560),
@@ -55,23 +58,81 @@ def test_grouped_gemma_rmsnorm_correctness(
     out = grouped_gemma_rmsnorm(x, weight, group_size, eps)
     expected = _reference_grouped_gemma_rmsnorm(
         x, weight, group_size, eps, compute_dtype=torch.float64
-    ).to(dtype)
+    )
 
-    torch.testing.assert_close(out, expected, **_TOLERANCES[dtype])
+    assert out.dtype == dtype
+    torch.testing.assert_close(out.to(torch.float64), expected, **_TOLERANCES[dtype])
 
 
-def test_grouped_gemma_rmsnorm_out_param():
-    x = torch.randn(64, 10240, dtype=torch.bfloat16, device="cuda")
+@pytest.mark.parametrize("num_tokens", [0, 64])
+def test_grouped_gemma_rmsnorm_out_param(num_tokens):
+    x = torch.randn(num_tokens, 10240, dtype=torch.bfloat16, device="cuda")
     weight = torch.randn(10240, dtype=torch.bfloat16, device="cuda") * 0.2
     out = torch.empty_like(x)
 
     result = grouped_gemma_rmsnorm(x, weight, 2560, 1e-6, out=out)
     expected = _reference_grouped_gemma_rmsnorm(
         x, weight, 2560, 1e-6, compute_dtype=torch.float64
-    ).to(x.dtype)
+    )
 
+    assert result.dtype == x.dtype
     assert result.data_ptr() == out.data_ptr()
-    torch.testing.assert_close(result, expected, **_TOLERANCES[x.dtype])
+    torch.testing.assert_close(
+        result.to(torch.float64), expected, **_TOLERANCES[x.dtype]
+    )
+
+
+def test_grouped_gemma_rmsnorm_bad_group_size():
+    x = torch.randn(4, 10240, dtype=torch.bfloat16, device="cuda")
+    weight = torch.zeros(10240, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(RuntimeError, match="group_size"):
+        grouped_gemma_rmsnorm(x, weight, 1000, 1e-6)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("use_out", [False, True])
+def test_grouped_gemma_rmsnorm_empty_without_jit(dtype, use_out):
+    """Idle input must work even when the JIT compiler is unavailable."""
+    x = torch.empty((0, 10240), dtype=dtype, device="cuda")
+    weight = torch.empty((10240,), dtype=dtype, device="cuda")
+    backing = torch.full((1, 10240), 7, dtype=dtype, device="cuda")
+    out = backing[:0] if use_out else None
+    with patch(
+        "sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm."
+        "_jit_grouped_gemma_rmsnorm_module",
+        side_effect=AssertionError("Empty input must not request a JIT module"),
+    ):
+        result = grouped_gemma_rmsnorm(x, weight, 2560, out=out)
+    assert result.shape == x.shape
+    assert result.dtype == dtype
+    assert result.device == x.device
+    if use_out:
+        assert result.is_set_to(out)
+        torch.testing.assert_close(backing, torch.full_like(backing, 7))
+
+
+@pytest.mark.parametrize(
+    "dtype,group_size,error",
+    [
+        (torch.float32, 2560, "Unsupported dtype"),
+        (torch.bfloat16, 0, "Unsupported group_size"),
+        (torch.bfloat16, -512, "Unsupported group_size"),
+        (torch.bfloat16, 1000, "Unsupported group_size"),
+    ],
+)
+def test_grouped_gemma_rmsnorm_empty_validates_args(dtype, group_size, error):
+    """Skipping compilation must preserve the operator's argument errors."""
+    x = torch.empty((0, 10240), dtype=dtype, device="cuda")
+    weight = torch.empty((10240,), dtype=dtype, device="cuda")
+    with (
+        patch(
+            "sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm."
+            "_jit_grouped_gemma_rmsnorm_module",
+            side_effect=AssertionError("Empty input must not request a JIT module"),
+        ),
+        pytest.raises(RuntimeError, match=error),
+    ):
+        grouped_gemma_rmsnorm(x, weight, group_size)
 
 
 if __name__ == "__main__":

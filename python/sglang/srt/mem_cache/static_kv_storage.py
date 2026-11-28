@@ -756,6 +756,14 @@ class StaticKVStorage:
             return self._owner_region
         return self._states().regions[sub_pool]
 
+    @property
+    def mamba_state_shard_on_attn_cp(self) -> bool:
+        state = self._allocator.state
+        pool = getattr(self._allocator.get_kvcache(), "mamba_pool", None)
+        if pool is None and state is not None:
+            pool = state.pool
+        return bool(getattr(pool, "state_shard_on_attn_cp", False))
+
     def wire_entries(self) -> Tuple[WireEntry, ...]:
         return self._states().wire_entries
 
@@ -1096,13 +1104,41 @@ def _static_state_entries(
             if getattr(token_to_kv_pool, "use_dsa", False):
                 dsa_pool = token_to_kv_pool.full_kv_pool
                 dsa_ptrs, dsa_lens, dsa_item_lens = dsa_pool.get_state_buf_infos()
+                draft_dsa_pool = None
+                if draft_token_to_kv_pool is not None:
+                    draft_dsa_pool = (
+                        draft_token_to_kv_pool.layer_router.wrapped_view()
+                        or draft_token_to_kv_pool
+                    )
+                dsa_layer_ids = None
+                if isinstance(draft_dsa_pool, DSATokenToKVPool):
+                    if total_kv_layers is None:
+                        raise ValueError(
+                            "Hybrid DSA draft state transfer requires total_kv_layers"
+                        )
+                    dp, dl, di = draft_dsa_pool.get_state_buf_infos()
+                    dsa_ptrs += dp
+                    dsa_lens += dl
+                    dsa_item_lens += di
+                    dsa_layer_ids = list(
+                        token_to_kv_pool.full_attention_layer_id_mapping
+                    ) + remap_draft_layer_ids(
+                        list(range(draft_dsa_pool.layer_num)), total_kv_layers
+                    )
                 add(
                     StateType.DSA,
                     dsa_ptrs,
                     dsa_lens,
                     dsa_item_lens,
+                    layer_ids=dsa_layer_ids,
                 )
-                append_dsa_tail(dsa_pool)
+                if isinstance(draft_dsa_pool, DSATokenToKVPool):
+                    tp, tl, ti = dsa_pool.get_compress_tail_buf_infos()
+                    dp, dl, di = draft_dsa_pool.get_compress_tail_buf_infos()
+                    if tp or dp:
+                        add(StateType.DSA_TAIL, tp + dp, tl + dl, ti + di)
+                else:
+                    append_dsa_tail(dsa_pool)
             if isinstance(token_to_kv_pool, QSATokenToKVPool):
                 qsa_ptrs, qsa_lens, qsa_item_lens = (
                     token_to_kv_pool.get_qsa_pending_state_buf_infos()

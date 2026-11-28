@@ -64,6 +64,7 @@ def _jit_topk_v2_module(deterministic: bool = False, bf16_scores: bool = False):
     args = make_cpp_args(arch.cuda is not None and arch.supports_pdl)
     kernel = f"TopKKernel<{args}>"
     wrappers = [
+        ("topk_transform_candidate_blocks", f"{kernel}::transform_candidate_blocks"),
         ("topk_transform_paged", f"{kernel}::transform_paged"),
         ("topk_transform_ragged", f"{kernel}::transform_ragged"),
         ("topk_transform_packed", f"{kernel}::transform_packed"),
@@ -117,14 +118,58 @@ def topk_transform_bf16_small(
     )
 
 
+@cache_once
+def _jit_topk_prefill_module(topk: int):
+    return load_jit(
+        make_name("topk_prefill"),
+        str(topk),
+        cuda_files=["deepseek_v4/topk_prefill.cuh"],
+        cuda_wrappers=[
+            ("top_k_per_row_prefill", "TopKPrefillKernel::transform"),
+        ],
+        extra_cuda_cflags=[f"-DSGL_TOPK={topk}"],
+    )
+
+
+@cache_once
+def _jit_topk_prefill_bf16_module(topk: int):
+    return load_jit(
+        make_name("topk_prefill_bf16"),
+        str(topk),
+        cuda_files=["deepseek_v4/topk_prefill_bf16.cuh"],
+        cuda_wrappers=[
+            ("top_k_per_row_prefill_bf16", "TopKPrefillBF16Kernel::transform"),
+        ],
+        extra_cuda_cflags=[f"-DSGL_TOPK={topk}"],
+    )
+
+
+@cache_once
+def _jit_topk_bf16_module():
+    args = make_cpp_args(is_arch_support_pdl())
+    return load_jit(
+        make_name("topk_bf16"),
+        *args,
+        cuda_files=["deepseek_v4/topk_bf16.cuh"],
+        cuda_wrappers=[("topk_transform", f"TopK512BF16Kernel<{args}>::transform")],
+    )
+
+
 def topk_transform_paged(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
-    page_tables: torch.Tensor,
+    page_tables: Optional[torch.Tensor],
     out_page_indices: torch.Tensor,
     page_size: int,
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
+    """V1 float32 top-k (k <= 2048), with optional page-table transform.
+
+    On the CUDA/PPU JIT path, ``page_tables=None`` writes raw positions into
+    ``out_page_indices`` without allocating an identity page table or a v2 plan.
+    """
+    if page_tables is None and (is_hip_runtime() or is_xpu()):
+        raise NotImplementedError("V1 raw-index output requires the CUDA/PPU JIT path")
     if is_hip_runtime():
         torch.ops.sgl_kernel.deepseek_v4_topk_transform_512(
             scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
@@ -513,4 +558,99 @@ def topk_transform_sparse(
     published blocks as pool slots / 8, compressed positions for logical ids."""
     topk_transform_bf16_small(
         logits, valid_lens, blocks, out_indices, CANDIDATE_BLOCK_SIZE
+    )
+
+
+def top_k_per_row_prefill(
+    scores: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    module = _jit_topk_prefill_module(out_page_indices.shape[1])
+    module.top_k_per_row_prefill(
+        scores,
+        row_starts,
+        row_ends,
+        page_tables,
+        out_page_indices,
+        page_size,
+        out_raw_indices,
+    )
+
+
+def topk_transform_512_bf16(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    module = _jit_topk_bf16_module()
+    module.topk_transform(
+        scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
+    )
+
+
+def top_k_per_row_prefill_bf16(
+    scores: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    """Top-K per row for prefill with bf16 scores input.
+
+    Uses streaming cp.async pipeline for long sequences (>16K).
+    """
+    module = _jit_topk_prefill_bf16_module(out_page_indices.shape[1])
+    module.top_k_per_row_prefill_bf16(
+        scores,
+        row_starts,
+        row_ends,
+        page_tables,
+        out_page_indices,
+        page_size,
+        out_raw_indices,
+    )
+
+
+def topk_transform_candidates(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    blocks: torch.Tensor,
+    *,
+    out_offsets: torch.Tensor,
+    out_indices: torch.Tensor,
+) -> None:
+    """Ragged top-k restricted to each row's candidate blocks.
+
+    Row ``i`` selects the top-k of the columns ``blocks[i]`` name -- block ``b``
+    covering columns ``8 b .. 8 b + 7`` of ``scores[i]``, read only where they are
+    below ``seq_lens[i]`` -- and writes ``column + out_offsets[i]`` into
+    ``out_indices[i]``, ``-1`` padded. ``blocks`` is int32 ``[rows, num_blocks]``,
+    ``-1`` past each row's block count; at most 2048 blocks.
+
+    This is the second level of the two-level indexer. Restricted to the blocks
+    of a block-max top-k over the same scores, its result equals the full
+    ``topk_transform_ragged_v2`` of those scores whenever
+    ``k = out_indices.shape[1]`` is smaller than the block count (the newest block is forced): the k best positions
+    occupy at most k blocks, and every one of them outranks the blocks left out.
+
+    NOTE: unlike ``topk_transform_ragged_v2`` this does not write ``scores``.
+    """
+    if is_xpu():
+        raise NotImplementedError("candidate top-k requires the CUDA/PPU JIT path")
+    if blocks.shape[1] <= out_indices.shape[1]:
+        raise ValueError(
+            "candidate block count must exceed top-k: one slot reserves the newest block"
+        )
+    _jit_topk_v2_module().topk_transform_candidate_blocks(
+        scores, seq_lens, blocks, out_offsets, out_indices
     )

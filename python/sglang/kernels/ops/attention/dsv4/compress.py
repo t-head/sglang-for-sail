@@ -52,6 +52,7 @@ def _jit_compress_norm_rope_module(
     bf16_store: bool,
     layout: KVLayout,
     fp8_2buff: bool = False,
+    int8_indexer: bool = False,
 ) -> Module:
     args = make_cpp_args(
         dtype,
@@ -62,6 +63,7 @@ def _jit_compress_norm_rope_module(
         bf16_store,
         layout.cpp_name,
         is_arch_support_pdl(),
+        int8_indexer,
     )
     cuda_wrappers = [("forward", f"FusedNormRopeKernel<{args}>::forward")]
     if head_dim == 128:
@@ -515,6 +517,10 @@ def compress_norm_rope_store(
             use_fp4,
         )
     else:
+        from sglang.kernels.ops.attention.dsa.triton_kernel import (
+            use_sail_dsv4_int8_indexer,
+        )
+
         module = _jit_compress_norm_rope_module(
             kv.dtype,
             kv.shape[-1],
@@ -523,6 +529,7 @@ def compress_norm_rope_store(
             bf16_store,
             layout,
             fp8_2buff,
+            kv.shape[-1] == 128 and not use_fp4 and use_sail_dsv4_int8_indexer(),
         )
         if use_fp4:
             fn, extra = module.forward_fp4, ()

@@ -256,8 +256,12 @@ class Glm5NextTextConfig(PretrainedConfig):
 
     @property
     def mamba2_cache_params(self) -> KimiLinearCacheParams:
-        from sglang.srt.runtime_context import linear_attn_tp_size
+        from sglang.srt.runtime_context import get_parallel, linear_attn_tp_size
 
+        use_prefill_cp = (
+            get_parallel().enable_cp_tp_group_sharing
+            and get_parallel().attn_cp_size > 1
+        )
         shape = KimiLinearStateShape.create(
             tp_world_size=linear_attn_tp_size(),
             num_heads=self.linear_attn_config["num_heads"],
@@ -265,7 +269,11 @@ class Glm5NextTextConfig(PretrainedConfig):
             conv_kernel_size=self.linear_attn_config["short_conv_kernel_size"],
         )
 
-        return KimiLinearCacheParams(shape=shape, layers=self.linear_layer_ids)
+        return KimiLinearCacheParams(
+            shape=shape,
+            layers=self.linear_layer_ids,
+            state_shard_on_attn_cp=use_prefill_cp,
+        )
 
 
 class Glm5NextVisionConfig(GlmOcrVisionConfig):

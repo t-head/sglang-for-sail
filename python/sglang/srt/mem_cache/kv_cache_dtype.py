@@ -8,7 +8,7 @@ from sglang.srt.mem_cache.platform_kv_cache_dtype import (
     registered_kv_cache_storage_dtype,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.utils import is_hip
+from sglang.srt.utils.device import is_hip, is_sail
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -113,6 +113,22 @@ def configure_kv_cache_dtype(
         kv_cache_dtype = model_dtype
         # "auto" is the tag for an unquantized pool; backends gate descale on it.
         kv_cache_dtype_str = "auto"
+
+    if (
+        is_draft_worker
+        and is_dflash
+        and is_sail()
+        and speculative_draft_attention_backend == "flashmla"
+        and kv_cache_dtype != model_dtype
+    ):
+        logger.info(
+            "PPU DFLASH FlashMLA draft: overriding KV cache dtype %s -> %s "
+            "(sliding-window sparse attention requires compute-dtype KV).",
+            kv_cache_dtype,
+            model_dtype,
+        )
+        kv_cache_dtype = model_dtype
+        resolved_kv_cache_dtype = "auto"
 
     return kv_cache_dtype_str, kv_cache_dtype
 

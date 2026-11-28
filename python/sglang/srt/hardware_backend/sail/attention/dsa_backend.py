@@ -91,7 +91,10 @@ class SailDeepseekSparseAttnBackend(DeepseekSparseAttnBackend):
             flashmla_metadata = self.forward_metadata.flashmla_metadata
             assert flashmla_metadata is not None
             assert flashmla_metadata.flashmla_metadata is not None
-            flashmla_metadata.flashmla_metadata.have_initialized = False
+            metadata = flashmla_metadata.flashmla_metadata
+            metadata.have_initialized = False
+            metadata.tile_scheduler_metadata = None
+            metadata.num_splits = None
 
 
 class SailDeepseekSparseAttnMultiStepBackend(DeepseekSparseAttnMultiStepBackend):

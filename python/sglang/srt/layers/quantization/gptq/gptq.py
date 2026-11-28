@@ -20,7 +20,7 @@ from sglang.srt.layers.quantization.utils import (
     get_scalar_types,
     resolve_dynamic_fused_shards,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_sail
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 from .schemes import (
@@ -663,6 +663,13 @@ class GPTQMarlinConfig(_GPTQCheckpointMixin, QuantizationConfig):
         )
 
         if isinstance(layer, FusedMoE):
+            if layer.num_experts > 32 and is_sail():
+                from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
+
+                # For MoEs with many experts the moe_wna16 kernel is faster
+                return MoeWNA16Config.from_config(self.full_config).get_quant_method(
+                    layer, prefix
+                )
             return GPTQMarlinMoEMethod(self)
         handled, unquant_method = self._resolve_unquantized_linear_method(layer, prefix)
         if handled:

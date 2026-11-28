@@ -262,6 +262,12 @@ del _mod, _fn
 # Kernels introduced with Kimi-K3, inventoried by logical operator group.
 for _mod, _fn, _backend, _device in [
     ("attn_res", "attn_res_fused_tma", KernelBackend.JIT, CapabilityRequirement.CUDA),
+    (
+        "attn_res",
+        "attn_res_fused_sm8x",
+        KernelBackend.TRITON,
+        CapabilityRequirement.CUDA,
+    ),
     ("attn_res_hip", "attn_res_hip", KernelBackend.TRITON, CapabilityRequirement.HIP),
     (
         "kda_decode_mtp",
@@ -396,6 +402,21 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+for _mod, _fn in [
+    ("dsa.indexer_k", "fused_k_indexer_norm_rope_store_mxfp4"),
+    ("dsa.indexer_q", "fused_q_indexer_rope_first_fp4_quant"),
+    ("dsa.indexer_q", "fused_q_indexer_rope_first_int8_quant"),
+]:
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.attention.{_mod}:{_fn}",
+            capabilities=CUDA_ONLY,
+        )
+    )
+del _mod, _fn
+
 register_kernel(
     KernelSpec(
         op="attention.fused_rope_wo_a_bf16",
@@ -449,7 +470,11 @@ register_kernel(
     )
 )
 
-for _fn in ("fp4_index_logits_paged", "finish_paged_indexer_topk"):
+for _fn in (
+    "fp4_index_logits_paged",
+    "finish_paged_indexer_topk",
+    "store_index_k_norm_rope_fp4",
+):
     register_kernel(
         KernelSpec(
             op=f"attention.{_fn}",
@@ -765,5 +790,52 @@ register_kernel(
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.attention.dsa.head_gate:indexer_q_quant_head_gate",
         capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="attention.topk_transform_candidates",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsv4.topk:topk_transform_candidates",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="attention.topk_transform_candidates",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsv4.topk:topk_transform_candidates",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="attention.qsa_fp8_avg_mqa_prefill",
+        backend=KernelBackend.DEEPGEMM,
+        target="sglang.kernels.ops.attention.qsa.deep_gemm_avg:deep_gemm_fp8_avg_mqa_prefill",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+
+register_kernel(
+    KernelSpec(
+        op="attention.bf16_head_gate_q_scale",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsa.head_gate:bf16_head_gate_q_scale",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 0))}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.sail_deep_select_ragged",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsa.deep_select:topk_transform_ragged",
+        # Triton packing plus the SAIL DeepSelect wheel; selected only by SAIL
+        # BF16 runtime callers, not a claim of NVIDIA or wheel availability.
+        capabilities=CUDA_ONLY,
     )
 )

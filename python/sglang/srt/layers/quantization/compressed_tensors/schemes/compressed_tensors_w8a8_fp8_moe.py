@@ -7,6 +7,7 @@ import torch
 from compressed_tensors.quantization import QuantizationStrategy
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
     FlashInferTrtllmFp8MoeQuantInfo,
@@ -27,7 +28,8 @@ from sglang.srt.layers.quantization.utils import (
     swap_w13_to_w31,
 )
 from sglang.srt.layers.utils.common import set_weight_attrs
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.runtime_context import get_exec, process_model_config
+from sglang.srt.utils import get_bool_env_var, is_hip, is_sail
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -53,6 +55,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         self.weight_quant = weight_quant
         self.input_quant = input_quant
         self.use_flashinfer_trtllm = get_moe_runner_backend().is_flashinfer_trtllm()
+        self.use_ppu_mega_moe = is_sail() and get_moe_a2a_backend().is_megamoe()
 
         per_tensor = (
             self.weight_quant.strategy == QuantizationStrategy.TENSOR
@@ -62,6 +65,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             self.weight_quant.strategy == QuantizationStrategy.CHANNEL
             and self.input_quant.strategy == QuantizationStrategy.TOKEN
         )
+        if self.use_ppu_mega_moe and (not per_channel or not input_quant.dynamic):
+            raise ValueError(
+                "PPU FP8 MegaMoE requires channelwise weights and dynamic "
+                "per-token activation quantization."
+            )
         if not (per_tensor or per_channel):
             assert self.weight_quant.strategy == QuantizationStrategy.BLOCK
             self.weight_block_size = self.weight_quant.block_structure
@@ -76,6 +84,39 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 "For FP8 Fused MoE layer, we require either per tensor or "
                 "channelwise, dynamic per token quantization."
             )
+
+        if self.use_ppu_mega_moe:
+            architectures = process_model_config().hf_config.architectures
+            if architectures[0] not in (
+                "MiniMaxM3SparseForCausalLM",
+                "MiniMaxM3SparseForConditionalGeneration",
+            ):
+                raise ValueError(
+                    "PPU compressed-tensors FP8 MegaMoE currently supports only "
+                    "MiniMax M3 architectures with no ordinary-runner fallback."
+                )
+            offload = get_exec().offload
+            if offload.cpu_offload_gb > 0 or offload.offload_group_size > 0:
+                raise ValueError(
+                    "PPU FP8 MegaMoE does not support CPU or layer-group weight "
+                    "offloading; disable --cpu-offload-gb and --offload-group-size."
+                )
+            backend = get_moe_runner_backend()
+            if not (backend.is_auto() or backend.is_deep_gemm()):
+                raise ValueError(
+                    "PPU FP8 MegaMoE calls DeepGEMM directly; use "
+                    "--moe-runner-backend auto or deep_gemm."
+                )
+            try:
+                from deep_gemm import (  # noqa: F401
+                    fp8_fp8_mega_moe,
+                    transform_weights_for_fp8_mega_moe,
+                )
+            except ImportError as exc:
+                raise ValueError(
+                    "PPU FP8 MegaMoE requires a DeepGEMM build exposing "
+                    "fp8_fp8_mega_moe and transform_weights_for_fp8_mega_moe."
+                ) from exc
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -94,6 +135,24 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         params_dtype = torch.float8_e4m3fn
+
+        if self.use_ppu_mega_moe:
+            from sglang.srt.layers.moe.mega_moe import check_mega_moe_shapes
+
+            if extra_weight_attrs.get("with_bias", False):
+                raise ValueError("PPU FP8 MegaMoE does not support expert bias.")
+            if layer.num_fused_shared_experts:
+                raise ValueError("PPU FP8 MegaMoE requires separate shared experts.")
+            check_mega_moe_shapes(
+                hidden=hidden_size,
+                intermediate=intermediate_size_per_partition,
+                mma_type="fp8xfp8_channelwise",
+            )
+            layer._mega_moe_mma_type = "fp8xfp8_channelwise"
+            layer._derived_weight_cache_error = (
+                "Online weight updates are not supported for PPU FP8 MegaMoE "
+                "repacked experts. Restart the server with the new checkpoint."
+            )
 
         if self.block_quant:
             assert self.weight_block_size is not None
@@ -242,6 +301,10 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module | FusedMoE) -> None:
+        if self.use_ppu_mega_moe:
+            self._prepare_ppu_mega_moe_weights(layer)
+            return
+
         # Fp8 moe kernels require a single activation scale.
         # We take the max of all the scales in case they differ.
         if self.static_input_scales:
@@ -349,26 +412,80 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 requires_grad=False,
             )
 
+    def _prepare_ppu_mega_moe_weights(self, layer: torch.nn.Module) -> None:
+        if layer._mega_moe_weights_built:
+            return
+        from deep_gemm import transform_weights_for_fp8_mega_moe
+
+        # Checkpoint rows are [gate; up]. DeepGEMM interleaves both E4M3
+        # rows and their FP32 channel scales in groups of eight, without
+        # requantization. Keep the registered parameters as the owning storage
+        # so EPLB moves the same tensors that the kernel consumes.
+        l1, l2 = transform_weights_for_fp8_mega_moe(
+            (layer.w13_weight.data, layer.w13_weight_scale.data),
+            (layer.w2_weight.data, layer.w2_weight_scale.data),
+            quantization="channelwise",
+        )
+        layer.w13_weight.data = l1[0]
+        layer.w13_weight_scale.data = l1[1]
+        layer.w2_weight.data = l2[0]
+        layer.w2_weight_scale.data = l2[1]
+        layer.mega_l1_weights = l1
+        layer.mega_l2_weights = l2
+        layer._mega_moe_weights_built = True
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        if self.use_ppu_mega_moe:
+            if (
+                not moe_runner_config.is_gated
+                or moe_runner_config.apply_router_weight_on_input
+            ):
+                raise ValueError(
+                    "PPU FP8 MegaMoE requires gated experts and router weights "
+                    "applied at combine, not on input."
+                )
+            self.runner = None
+            return
+
+        from sglang.srt.layers import deep_gemm_wrapper
+
         moe_runner_backend = get_moe_runner_backend()
-        if moe_runner_backend.is_auto():
+        if (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and is_sail()
+            and (
+                get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+            )
+        ):
+            moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
+        elif moe_runner_backend.is_auto():
             if (
                 _use_aiter
                 and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
                 and get_moe_a2a_backend().supports_aiter()
             ):
                 moe_runner_backend = MoeRunnerBackend.AITER
+            elif (
+                envs.SGLANG_SAIL_DEEPGEMM_MOE.get()
+                and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+                and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            ):
+                moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
+
+        if moe_runner_backend.is_deep_gemm():
+            import sglang.srt.layers.moe.moe_runner.ppu_deepgemm_moe  # noqa: F401 – triggers @register_fused_func
 
         if (
             moe_runner_backend.is_aiter()
             or moe_runner_backend.is_triton()
             or moe_runner_backend.is_flashinfer_trtllm()
             or moe_runner_backend.is_flashinfer_trtllm_routed()
+            or moe_runner_backend.is_deep_gemm()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
@@ -380,9 +497,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-
-        x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
+        if self.use_ppu_mega_moe:
+            raise RuntimeError(
+                "PPU FP8 MegaMoE weights must run through the model's MegaMoE "
+                "forward path; the ordinary MoE runner cannot consume this layout."
+            )
 
         moe_runner_config = self.moe_runner_config
 
@@ -431,7 +550,24 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 quant_info = self.get_triton_quant_info(layer)
             return self.runner.run(dispatch_output, quant_info)
         else:
-            return self.runner.run(dispatch_output, self.get_triton_quant_info(layer))
+            if self.runner.runner_backend.is_deep_gemm():
+                from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+                    DeepGemmMoeQuantInfo,
+                )
+
+                quant_info = DeepGemmMoeQuantInfo(
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    use_fp8=True,
+                    per_channel_quant=self.weight_quant.strategy
+                    == QuantizationStrategy.CHANNEL,
+                    w13_scale=layer.w13_weight_scale,
+                    w2_scale=layer.w2_weight_scale,
+                    block_shape=None,
+                )
+            else:
+                quant_info = self.get_triton_quant_info(layer)
+            return self.runner.run(dispatch_output, quant_info)
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
         # Shared with FusedMoEWithLoRA so both runners use the same base quantization.

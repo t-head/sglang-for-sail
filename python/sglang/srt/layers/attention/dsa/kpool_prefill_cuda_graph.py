@@ -3,6 +3,7 @@
 import torch
 
 from sglang.srt.layers.cp.interleave import is_interleave_extend
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
 )
@@ -22,6 +23,14 @@ def _kpool_indexer_prefill_with_output(
     # Metadata, write counts and cache destinations change between requests.
     # Resolve the live batch inside the eager break, never from capture args.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
+    if (
+        forward_batch.forward_mode.is_extend_without_speculative()
+        and forward_batch._original_forward_mode == ForwardMode.IDLE
+    ):
+        # DP sync fabricates an EXTEND batch for idle ranks. Its metadata may
+        # still describe capture rows; there are no live cache writes or picks.
+        output.fill_(-1)
+        return
     n = forward_batch.extend_num_tokens
     num_logical = sum(forward_batch.extend_seq_lens_cpu)
     if is_interleave_extend(forward_batch):

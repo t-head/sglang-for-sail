@@ -7,8 +7,9 @@ import tilelang.language as T
 import torch
 
 from sglang.kernels.arch import current_arch
+from sglang.kernels.jit.utils.compile.flags import filter_hgcc_cuda_flags
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
-from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_sail
 
 tilelang.set_log_level("WARNING")
 
@@ -47,6 +48,7 @@ elif hasattr(tilelang.PassConfigKey, "TL_ENABLE_FAST_MATH"):
 _is_hip = is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 _is_fp8_fnuz = is_fp8_fnuz()
+from sglang.srt.utils import get_device_sm
 
 BF16 = "bfloat16"
 FP8 = "float8_e4m3fnuz" if _is_fp8_fnuz else "float8_e4m3fn"
@@ -139,6 +141,32 @@ def sparse_attention_fwd_kernel_v1(
 
     H_per_block = padded_H if REPLICATE_H == 1 else 64
 
+    ppu_backend = is_sail()
+    if ppu_backend:
+        # PPU MMA uses m16n16. FullRow can leave warps idle for a small QK
+        # tile while PV uses the entire CTA, giving their per-head scalars
+        # incompatible replication layouts. Pick the largest thread budget
+        # for which both GEMMs use every warp with the same row partition.
+        max_m_warps = H_per_block // 16
+        for warps in range(threads // 32, 0, -1):
+            m_warps = min(max_m_warps, warps)
+            n_warps = warps // m_warps
+            if (
+                m_warps * n_warps == warps
+                and H_per_block % (16 * m_warps) == 0
+                and BI % (16 * n_warps) == 0
+                and D % (16 * n_warps) == 0
+            ):
+                threads = warps * 32
+                break
+        else:
+            raise ValueError(
+                "PPU sparse MLA requires a full-warp m16n16 partition for QK and PV"
+            )
+
+    # Use one policy for QK, tail QK, and PV at specialization time.
+    gemm_policy = T.GemmWarpPolicy.FullRow if ppu_backend else T.GemmWarpPolicy.FullCol
+
     @T.prim_func
     def main(
         Q: T.Tensor(q_shape, dtype),  # type: ignore
@@ -211,7 +239,7 @@ def sparse_attention_fwd_kernel_v1(
                     KV_shared,
                     acc_s,
                     transpose_B=True,
-                    policy=T.GemmWarpPolicy.FullCol,
+                    policy=gemm_policy,
                 )
                 if has_tail:
                     T.gemm(
@@ -219,7 +247,7 @@ def sparse_attention_fwd_kernel_v1(
                         K_tail_shared,
                         acc_s,
                         transpose_B=True,
-                        policy=T.GemmWarpPolicy.FullCol,
+                        policy=gemm_policy,
                     )
                 T.copy(m_i, m_i_prev)
                 T.reduce_max(acc_s, m_i, dim=1, clear=False)
@@ -236,7 +264,7 @@ def sparse_attention_fwd_kernel_v1(
                     acc_o[h_i, d_i] = acc_o[h_i, d_i] * alpha[h_i]
 
                 T.copy(acc_s, S_shared)
-                T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullCol)
+                T.gemm(S_shared, KV_shared, acc_o, policy=gemm_policy)
 
             # Rescale
             for h_i, d_i in T.Parallel(H_per_block, D):
@@ -250,9 +278,8 @@ def sparse_attention_fwd_kernel_v1(
     return main
 
 
-@tilelang.jit(
-    out_idx=[-1],
-    compile_flags=[
+def _sparse_attention_v2_compile_flags() -> list[str]:
+    flags = [
         "-O3",
         "-Wno-deprecated-declarations",
         "-U__CUDA_NO_HALF_OPERATORS__",
@@ -263,7 +290,15 @@ def sparse_attention_fwd_kernel_v1(
         "--expt-extended-lambda",
         "--ptxas-options=-v,--register-usage-level=10",
         "-DNDEBUG",
-    ],
+    ]
+    # TileLang compiles through its own backend, bypassing load_jit's filter.
+    # Preserve CUDA's ptxas tuning while using the same HGCC rules on SAIL.
+    return filter_hgcc_cuda_flags(flags) if is_sail() else flags
+
+
+@tilelang.jit(
+    out_idx=[-1],
+    compile_flags=_sparse_attention_v2_compile_flags(),
 )  # type: ignore
 def sparse_attention_fwd_kernel_v2(
     num_heads: int,
@@ -1246,6 +1281,12 @@ def tilelang_sparse_fwd(
             threads=threads,
         )
         out = kernel_combine(partial_o_batched, partial_lse_batched)
+    # v2 use tma, supported on sm90 or above only
+    elif get_device_sm() <= 89:
+        kernel = sparse_attention_fwd_kernel_v1(
+            num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, num_stages=1
+        )
+        out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))
     else:
         kernel_factory = (
             sparse_attention_fwd_kernel_v1

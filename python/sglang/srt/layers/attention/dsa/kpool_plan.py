@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
 
 import torch
 
@@ -19,7 +19,7 @@ from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.model_executor.forward_context import get_req_to_token_pool
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils import is_cuda, is_hip, is_npu, is_sail
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
@@ -107,13 +107,20 @@ class KPoolExtendPlan:
 @dataclass(frozen=True)
 class KPoolWritePlan:
     """``write_loc[b, p]`` is the compression destination for candidate closed
-    pool ``base_pool[b] + p``; the kernel decides which candidates closed."""
+    pool ``base_pool[b] + p``; the kernel decides which candidates closed.
+
+    ``plan_bs`` is the authoritative count of REAL requests this plan
+    describes. Consumers must size their launch grid from it and must NOT
+    re-derive a batch size from the forward's token count -- see
+    ``kpool_write_tail_and_maybe_compress`` for why.
+    """
 
     req: torch.Tensor
     write_start: torch.Tensor
     tail_logical_start: torch.Tensor
     write_loc: torch.Tensor  # int64 [B, max_closed_pools]
     num_draft_tokens: int
+    plan_bs: int
     pool_seqlens_per_q: Optional[torch.Tensor] = None
     seqlens_per_q: Optional[torch.Tensor] = None
     pool_schedule_metadata: Optional[torch.Tensor] = None
@@ -671,7 +678,12 @@ def _compute_pool_schedule_metadata(
     pool_seqlens: torch.Tensor,
     *,
     index_page_size: int,
+    schedule_builder: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> Optional[torch.Tensor]:
+    if is_sail():
+        return None
+    if schedule_builder is not None:
+        return schedule_builder(pool_seqlens.contiguous().view(-1, 1).clamp(min=1))
     if not is_cuda():
         return None
     deep_gemm = _get_deep_gemm()
@@ -693,6 +705,7 @@ def init_pooled_paged_mqa_metadata(
     physical_page_size: int,
     index_page_size: int,
     build_schedule_metadata: bool = True,
+    schedule_builder: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> DSAMetadata:
     if (
         not _is_kpool_layout_enabled(kpool, physical_page_size)
@@ -716,6 +729,7 @@ def init_pooled_paged_mqa_metadata(
         _compute_pool_schedule_metadata(
             pool_seqlens,
             index_page_size=index_page_size,
+            schedule_builder=schedule_builder,
         )
         if build_schedule_metadata
         else None
@@ -739,6 +753,7 @@ def update_pooled_paged_mqa_metadata(
     physical_page_size: int,
     index_page_size: int,
     build_schedule_metadata: bool = True,
+    schedule_builder: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> None:
     if (
         not _is_kpool_layout_enabled(kpool, physical_page_size)
@@ -778,6 +793,7 @@ def update_pooled_paged_mqa_metadata(
         new_schedule = _compute_pool_schedule_metadata(
             metadata.pooled_cache_seqlens_int32,
             index_page_size=index_page_size,
+            schedule_builder=schedule_builder,
         )
         if new_schedule is not None:
             metadata.pooled_paged_mqa_schedule_metadata.copy_(new_schedule)
@@ -818,6 +834,8 @@ def _alloc_kpool_write_plan_buffers(
             max_bs, max_closed_pools, dtype=torch.int64, device=device
         ),
         num_draft_tokens=num_draft_tokens,
+        # Freeze the batch size at planning time.
+        plan_bs=max_bs,
         **verify_extras,
     )
 
@@ -834,6 +852,7 @@ def init_kpool_write_plan_capture(
     index_page_size: int,
     is_v2: bool = False,
     build_schedule_metadata: bool = True,
+    schedule_builder: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> DSAMetadata:
     if not _is_kpool_layout_enabled(kpool, physical_page_size) or num_draft_tokens == 0:
         return metadata
@@ -850,6 +869,7 @@ def init_kpool_write_plan_capture(
         schedule = _compute_pool_schedule_metadata(
             plan.pool_seqlens_per_q,
             index_page_size=index_page_size,
+            schedule_builder=schedule_builder,
         )
         plan = dataclasses.replace(plan, pool_schedule_metadata=schedule)
     if is_verify:
@@ -871,6 +891,7 @@ def update_kpool_write_plan(
     forward_mode: ForwardMode,
     index_page_size: int,
     effective_n_per_batch: Optional[torch.Tensor] = None,
+    schedule_builder: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> None:
     if not _is_kpool_layout_enabled(kpool, physical_page_size) or not (
         is_cuda() or is_hip() or is_npu()
@@ -913,6 +934,7 @@ def update_kpool_write_plan(
         new_schedule = _compute_pool_schedule_metadata(
             plan.pool_seqlens_per_q,
             index_page_size=index_page_size,
+            schedule_builder=schedule_builder,
         )
         if new_schedule is not None:
             plan.pool_schedule_metadata.copy_(new_schedule)
@@ -935,6 +957,7 @@ def init_kpool_write_plan(
     index_page_size: int,
     effective_n_per_batch: Optional[torch.Tensor] = None,
     build_schedule_metadata: bool = True,
+    schedule_builder: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> DSAMetadata:
     forward_mode = forward_batch.forward_mode
     is_verify = forward_mode.is_target_verify()
@@ -960,6 +983,7 @@ def init_kpool_write_plan(
         device=forward_batch.seq_lens.device,
         is_verify=is_verify or is_v2,
         index_page_size=index_page_size,
+        schedule_builder=schedule_builder,
         is_v2=is_v2,
         build_schedule_metadata=build_schedule_metadata,
     )
@@ -973,6 +997,7 @@ def init_kpool_write_plan(
         num_draft_tokens=num_draft_tokens,
         forward_mode=forward_mode,
         index_page_size=index_page_size,
+        schedule_builder=schedule_builder,
         effective_n_per_batch=effective_n_per_batch,
     )
     return metadata

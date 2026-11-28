@@ -5,6 +5,7 @@ DeepGEMM sparse table (``sparse_table``) or dense block ids (``dense_blocks``)."
 from __future__ import annotations
 
 import functools
+import logging
 from typing import TYPE_CHECKING, Tuple
 
 import torch
@@ -17,6 +18,7 @@ from sglang.kernels.ops.attention.dsv4.index_logits import (
     index_weights_dtype,
 )
 from sglang.srt.environ import envs
+from sglang.srt.utils.device import get_device_sm, is_sail
 
 from .full_topk import FullTopKIndexer
 from .types import (
@@ -31,6 +33,8 @@ from .types import (
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "CandidateMetadata",
@@ -66,6 +70,10 @@ def is_sm100_or_newer() -> bool:
     return current_arch().is_sm_at_least(10)
 
 
+def use_deep_gemm_fp4_indexer() -> bool:
+    return is_sail() or is_sm100_or_newer()
+
+
 @functools.cache
 def has_dense_fp4_indexer() -> bool:
     if not torch.cuda.is_available() or torch.version.cuda is None:
@@ -79,7 +87,13 @@ def has_dense_fp4_indexer() -> bool:
 
 @functools.cache
 def _use_deep_gemm_prefill() -> bool:
-    return is_sm100_or_newer() and has_dense_fp4_indexer()
+    from sglang.srt.layers.attention.dsv4.indexer_quant import use_dsv41_int8_indexer
+
+    return (
+        not use_dsv41_int8_indexer()
+        and use_deep_gemm_fp4_indexer()
+        and has_dense_fp4_indexer()
+    )
 
 
 @functools.cache
@@ -95,6 +109,8 @@ def make_full_topk_indexer(
     index_heads: int,
     index_topk: int,
 ) -> FullTopKIndexer:
+    from sglang.srt.layers.attention.dsv4.indexer_quant import use_dsv41_int8_indexer
+
     # Prefill top-k from the sampled-threshold fp4 indexer (kernels/ops/attention/dsa/litetopk_prefill) where it
     # reproduces the DeepGEMM path: bf16 head weights, 32 or 64 index heads, a supported top-k.
     use_prefill_lite_topk = (
@@ -109,7 +125,8 @@ def make_full_topk_indexer(
         token_to_kv_pool=token_to_kv_pool,
         req_to_token=req_to_token,
         use_deep_gemm_prefill=_use_deep_gemm_prefill() or _use_sm90_prefill_scores(),
-        use_deep_gemm_decode=is_sm100_or_newer(),
+        use_deep_gemm_decode=use_deep_gemm_fp4_indexer()
+        and not use_dsv41_int8_indexer(),
         use_prefill_lite_topk=use_prefill_lite_topk,
     )
 
@@ -122,6 +139,9 @@ def make_candidate_indexer(
     candidate_topk_blocks: int,
     candidate_block_size: int,
 ) -> Tuple[PrefillCandidates, DecodeCandidates]:
+    from sglang.srt.layers.attention.dsv4.indexer_quant import (
+        use_dsv41_int8_indexer,
+    )
     from sglang.srt.runtime_context import get_parallel
 
     from .dense_blocks import DenseBlocksBackend
@@ -141,12 +161,14 @@ def make_candidate_indexer(
             and envs.SGLANG_OPT_DSV41_SM90_DEEPGEMM_PREFILL.get()
         ),
     )
+    # The sparse table path packs FP4 index-K; an INT8 pool stores 132-byte
+    # slots, and the dense backend dispatches on indexer.use_int8 itself.
+    if use_dsv41_int8_indexer():
+        return dense_blocks, dense_blocks
     # Without candidate blocks no layer is a candidate source or consumer.
-    # Stays strict SM100 on purpose: the sparse-table path needs DeepGEMM's
-    # paged sparse mqa-logits, whose kernels assert arch == 10, so widening
-    # this gate would only turn the dense-blocks fallback into a startup
-    # RuntimeError on SM120 (see #49173).
-    if not is_sm100() or candidate_topk_blocks <= 0:
+    # Native sparse-table kernels remain strict SM100; SAIL uses vendor SM89+.
+    supports_sparse = get_device_sm() >= 89 if is_sail() else is_sm100()
+    if not supports_sparse or candidate_topk_blocks <= 0:
         return dense_blocks, dense_blocks
 
     from sglang.srt.layers.deep_gemm_wrapper.configurer import (
@@ -154,10 +176,12 @@ def make_candidate_indexer(
     )
 
     if not DEEPGEMM_PAGED_SPARSE_MQA_LOGITS:
-        raise RuntimeError(
-            "the candidate indexer needs DeepGEMM's paged sparse MQA logits "
-            "(sgl-deep-gemm >= 0.2.0 with SGLANG_ENABLE_JIT_DEEPGEMM on)"
+        logger.warning(
+            "Candidate indexer requested but DeepGEMM has no paged sparse MQA "
+            "logits API (sgl-deep-gemm >= 0.2.0 with "
+            "SGLANG_ENABLE_JIT_DEEPGEMM on); falling back to dense blocks."
         )
+        return dense_blocks, dense_blocks
     from .sparse_table import SparseTableBackend
 
     sparse_table = SparseTableBackend(

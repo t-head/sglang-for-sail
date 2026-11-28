@@ -1287,6 +1287,13 @@ class Glm4MoeForCausalLM(nn.Module):
 
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
     fused_shared_experts_architecture = "GlmMoeDsaForCausalLM"
+    # Mapping from fused module names to their component weight names.
+    # Required for quantization configs to correctly identify
+    # which layers should be skipped based on the exclude_modules/ignore list.
+    packed_modules_mapping = {
+        "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
 
     @classmethod
     def num_fusable_shared_experts(cls, hf_config) -> int:
@@ -1301,13 +1308,17 @@ class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
 
 
 class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
+    packed_modules_mapping = {
+        "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
     # ModelConfig rewrites a GLM draft's architecture to this class's own name,
     # so the inherited DeepSeek name would never match what the gate compares.
     fused_shared_experts_architecture = "GlmMoeDsaForCausalLMNextN"
-    # GLM-5.2's MTP layer index differs from DeepSeek's (61), so the inherited
-    # substr mapping would wrongly rewrite GLM's real layer-61 weights.
-    # exclude_layers remapping for the MTP layer is handled explicitly in
-    # _resolve_nextn_quant_config below instead.
+    # The MTP index is model-specific, and its special weights live outside
+    # model.decoder. Resolve both kinds of prefix on a private draft quant
+    # config instead of applying DeepSeek's fixed layer-61 mapper globally.
     hf_to_sglang_mapper = WeightsMapper()
 
     _NEXTN_SPEC_WEIGHT_NAMES = ("shared_head.norm", "eh_proj", "enorm", "hnorm")
@@ -1381,7 +1392,33 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
         return super().load_weights(weights)
 
     def _resolve_nextn_quant_config(self, config, quant_config):
-        if quant_config is None or quant_config.get_name() != "quark":
+        if quant_config is None:
+            return None
+
+        quant_method = quant_config.get_name()
+        if quant_method == "mxfp4":
+            # Serialized MXFP4 checkpoints can keep dense layers in FP8 and
+            # selected modules in BF16. Their lists use checkpoint names,
+            # while the draft decoder is built under model.decoder.
+            quant_config = copy.copy(quant_config)
+            layer_prefix = f"model.layers.{config.num_hidden_layers}"
+            for field in ("fp8_channelwise_layers", "ignored_layers"):
+                names = getattr(quant_config, field)
+                if names is not None:
+                    setattr(
+                        quant_config,
+                        field,
+                        [
+                            self._map_mtp_ckpt_name(name, layer_prefix)
+                            if name == layer_prefix
+                            or name.startswith(layer_prefix + ".")
+                            else name
+                            for name in names
+                        ],
+                    )
+            return quant_config
+
+        if quant_method != "quark":
             return quant_config
 
         # The caller reuses this QuarkConfig for the target model and lm_head,

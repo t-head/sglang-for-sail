@@ -484,7 +484,7 @@ class ExecKernel(msgspec.Struct):
     ] = False
     enable_fp4_indexer: A[
         bool,
-        "Use FP4 queries and index-K cache in the DSA lightning indexer of DeepSeek-V3.2-style sparse attention, ERNIE 5.5 Flash's MLA layers included; requires SM100. DeepSeek V4's C4 indexer has its own switch, --enable-deepseek-v4-fp4-indexer. Default keeps the FP8 indexer.",
+        "Use FP4 queries and index-K cache in the DSA lightning indexer of DeepSeek-V3.2-style sparse attention, ERNIE 5.5 Flash's MLA layers included; requires SM100 or T-HEAD SAIL SM89+. DeepSeek V4's C4 indexer has its own switch, --enable-deepseek-v4-fp4-indexer. Default keeps the FP8 indexer on native CUDA; SAIL retains its FP4 index-cache environment setting.",
     ] = False
     enable_dsa_fp4_indexer: A[
         bool,
@@ -1011,6 +1011,7 @@ class ExecMoe(msgspec.Struct):
     ] = None
     init_expert_location: A[str, "Initial location of EP experts."] = "trivial"
     enable_eplb: A[bool, "Enable EPLB algorithm"] = False
+    enable_eplb_async: A[bool, "Enable EPLB async copy algorithm"] = False
     eplb_algorithm: A[str, "Chosen EPLB algorithm"] = "auto"
     eplb_rebalance_num_iterations: A[
         int, "Number of iterations to automatically trigger a EPLB re-balance."

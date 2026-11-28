@@ -5,10 +5,15 @@ the same call interface as sgl_fa3 (the CUDA FA3 wheel) so that the rest of SGLa
 can use SAIL flash attention transparently.
 """
 
+import inspect
 from typing import Optional, Union
 
 import torch
 from sgl_kernel.debug_utils import maybe_wrap_debug_kernel
+
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa_nvtx import in_sparse_range
+from sglang.srt.runtime_context import get_buffer
 
 try:
     from flash_attn_interface import flash_attn_varlen_func as _fa_varlen_func
@@ -19,6 +24,36 @@ except ImportError:
         "Cannot import flash-attention for SAIL. "
         "Please check your installation: pip install flash-attn-3."
     )
+
+# Upstream sglang added the ``only_qv`` mode (models with qk_rope_head_dim == 0,
+# e.g. GLM-5.x DSA) after this PPU wrapper was written. Probe whether the vendor
+# library already understands the kwarg; otherwise the wrapper emulates it with
+# zero placeholders (see flash_attn_with_kvcache below).
+try:
+    _FA_KVCACHE_SUPPORTS_ONLY_QV = (
+        "only_qv" in inspect.signature(_fa_with_kvcache).parameters
+    )
+except (TypeError, ValueError):
+    # Compiled extension without signature introspection: assume the kwarg is
+    # unsupported and use the emulation path.
+    _FA_KVCACHE_SUPPORTS_ONLY_QV = False
+
+# Head dim of the synthetic K cache allocated for the emulated only_qv mode.
+_ONLY_QV_K_HEAD_DIM = 64
+# Zero-filled K-cache placeholders reused across calls, keyed by
+# (kv blocks shape, k_head_dim, dtype, device). Entries stay referenced so
+# CUDA-graph replays keep reading valid memory.
+
+
+SGLANG_PROFILE_NVTX = envs.SGLANG_PROFILE_NVTX.get()
+SGLANG_PROFILE_NVTX_PRINT_SEQLEN = envs.SGLANG_PROFILE_NVTX_PRINT_SEQLEN.get()
+if SGLANG_PROFILE_NVTX:
+    try:
+        from torch.cuda.nvtx import range_pop as th_nvtx_range_pop
+        from torch.cuda.nvtx import range_push as th_nvtx_range_push
+    except ImportError as e:
+        SGLANG_PROFILE_NVTX = False
+        SGLANG_PROFILE_NVTX_PRINT_SEQLEN = False
 
 
 def get_scheduler_metadata(
@@ -115,48 +150,134 @@ def flash_attn_with_kvcache(
         raise NotImplementedError(
             "FA4 is not available on SAIL: flash_attn_with_kvcache not implemented."
         )
+
     if only_qv:
-        raise NotImplementedError(
-            "only_qv is not supported by the SAIL FA3 interface: "
-            "flash_attn_with_kvcache not implemented."
+        # Callers pass q=None / k_cache=None in only_qv mode (qk_rope_head_dim
+        # == 0, e.g. GLM-5.x DSA) and expect the scores to come solely from
+        # qv @ v_cache^T. Substitute zero-filled placeholders so the
+        # q @ k_cache^T term contributes exactly zero. Upstream sgl-kernel can
+        # use uninitialized placeholders because its kernel skips the K matmul
+        # entirely in only_qv mode; without that kernel path zeros are
+        # required for correctness. The pool-sized K placeholder is cached so
+        # the allocation and zero-fill happen only once per shape.
+        if qv is None:
+            raise ValueError("only_qv=True requires qv to be provided")
+        if q is None or not _FA_KVCACHE_SUPPORTS_ONLY_QV:
+            q = qv.new_zeros((*qv.shape[:-1], _ONLY_QV_K_HEAD_DIM))
+        if k_cache is None or not _FA_KVCACHE_SUPPORTS_ONLY_QV:
+            placeholders = get_buffer("sail.fa3.only_qv_k_placeholders", dict)
+            key = (*v_cache.shape[:-1], q.shape[-1], qv.dtype, qv.device)
+            k_cache = placeholders.get(key)
+            if k_cache is None:
+                k_cache = qv.new_zeros((*v_cache.shape[:-1], q.shape[-1]))
+                placeholders[key] = k_cache
+        if softmax_scale is None:
+            softmax_scale = qv.shape[-1] ** -0.5
+
+    # Fail fast on an int8 KV cache: up-casting with .to(bfloat16) would copy
+    # and lose FA3's in-place cache updates, so require bf16 or the DSA backend.
+    if k_cache is not None and k_cache.dtype == torch.int8:
+        raise ValueError(
+            "PPU FA3 received k_cache with dtype=int8. PPU flash_attn_with_kvcache "
+            "only supports bf16 KV cache. Using .to(bfloat16) would create a copy "
+            "that loses FA3's in-place cache updates. Please use bf16 KV cache or "
+            "route int8 models through the DSA backend instead."
+        )
+    if v_cache is not None and v_cache.dtype == torch.int8:
+        raise ValueError(
+            "PPU FA3 received v_cache with dtype=int8. PPU flash_attn_with_kvcache "
+            "only supports bf16 KV cache. Using .to(bfloat16) would create a copy "
+            "that loses FA3's in-place cache updates. Please use bf16 KV cache or "
+            "route int8 models through the DSA backend instead."
         )
 
     attention_chunk = 0 if attention_chunk is None else int(attention_chunk)
 
-    return _fa_with_kvcache(
-        q=q,
-        k_cache=k_cache,
-        v_cache=v_cache,
-        k=k,
-        v=v,
-        qv=qv,
-        rotary_cos=rotary_cos,
-        rotary_sin=rotary_sin,
-        cache_seqlens=cache_seqlens,
-        cache_batch_idx=cache_batch_idx,
-        cache_leftpad=cache_leftpad,
-        page_table=page_table,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k_new=cu_seqlens_k_new,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        rotary_seqlens=rotary_seqlens,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        window_size=window_size,
-        attention_chunk=attention_chunk,
-        softcap=softcap,
-        rotary_interleaved=rotary_interleaved,
-        scheduler_metadata=scheduler_metadata,
-        num_splits=num_splits,
-        pack_gqa=pack_gqa,
-        sm_margin=sm_margin,
-        return_softmax_lse=return_softmax_lse,
-        s_aux=sinks,
-    )
+    if SGLANG_PROFILE_NVTX and not in_sparse_range():
+        if cu_seqlens_q is not None:
+            batch_size = len(cu_seqlens_q) - 1
+        else:
+            batch_size = 0
+        if page_table is not None:
+            num_blocks = k_cache.shape[-4]
+            page_block_size = k_cache.shape[-3]
+            page_table_flag = 1
+        else:
+            num_blocks = 0
+            page_block_size = 0
+            page_table_flag = 0
+
+        if torch.cuda.is_current_stream_capturing():
+            nvtx_message = f"[FW_FMHA] --format=flash_attn_{ver},Forward,type:D,seqlen_q:{max_seqlen_q},head_dim:{q.shape[-1]},head_dim_value:{k_cache.shape[-1]},num_heads_k:{k_cache.shape[-2]},num_heads:{q.shape[-2]},batch_size:{batch_size},data_type:{q.dtype},window_size_left:{window_size[0]},window_size_right:{window_size[1]},softcap:{softcap},paged_kv:{page_table_flag}"
+        else:
+            if SGLANG_PROFILE_NVTX_PRINT_SEQLEN:
+                cu_seqlens_q_list = (
+                    cu_seqlens_q.flatten().cpu().tolist()
+                    if cu_seqlens_q is not None
+                    else "[]"
+                )
+                nvtx_message = f"[FW_FMHA] --format=flash_attn_{ver},Forward,type:P,seqlen_q:{max_seqlen_q},head_dim:{q.shape[-1]},head_dim_value:{k_cache.shape[-1]},num_heads_k:{k_cache.shape[-2]},num_heads:{q.shape[-2]},batch_size:{batch_size},data_type:{q.dtype},window_size_left:{window_size[0]},window_size_right:{window_size[1]},softcap:{softcap},paged_kv:{page_table_flag},num_blocks:{num_blocks},page_block_size:{page_block_size},cu_seqlens_q:{cu_seqlens_q_list}"
+            else:
+                nvtx_message = f"[FW_FMHA] --format=flash_attn_{ver},Forward,type:P,seqlen_q:{max_seqlen_q},head_dim:{q.shape[-1]},head_dim_value:{k_cache.shape[-1]},num_heads_k:{k_cache.shape[-2]},num_heads:{q.shape[-2]},batch_size:{batch_size},data_type:{q.dtype},window_size_left:{window_size[0]},window_size_right:{window_size[1]},softcap:{softcap},paged_kv:{page_table_flag}"
+        th_nvtx_range_push(nvtx_message)
+
+    try:
+        result = _fa_with_kvcache(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            k=k,
+            v=v,
+            qv=qv,
+            rotary_cos=rotary_cos,
+            rotary_sin=rotary_sin,
+            cache_seqlens=cache_seqlens,
+            cache_batch_idx=cache_batch_idx,
+            cache_leftpad=cache_leftpad,
+            page_table=page_table,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k_new=cu_seqlens_k_new,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            rotary_seqlens=rotary_seqlens,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            attention_chunk=attention_chunk,
+            softcap=softcap,
+            rotary_interleaved=rotary_interleaved,
+            scheduler_metadata=scheduler_metadata,
+            num_splits=num_splits,
+            pack_gqa=pack_gqa,
+            sm_margin=sm_margin,
+            return_softmax_lse=return_softmax_lse,
+            s_aux=sinks,
+            # Forward only_qv when the vendor library understands it; q / k_cache
+            # were already normalized to placeholders above for the emulation path.
+            **({"only_qv": only_qv} if _FA_KVCACHE_SUPPORTS_ONLY_QV else {}),
+        )
+    except RuntimeError as e:
+        # The vendor library gates the q_v (MLA/DSA absorb-decode) path on
+        # Hopper GPUs; translate its message into an actionable one instead
+        # of letting it surface as a cryptic crash deep in CUDA-graph capture.
+        if "q_v" in str(e) and "hopper" in str(e).lower():
+            raise RuntimeError(
+                "PPU flash_attn_with_kvcache does not support q_v (the vendor "
+                "fa3 library gates the MLA/DSA absorb-decode q_v path on "
+                "Hopper GPUs). For DSA models run with --dsa-decode-backend "
+                "flashmla_kv (the PPU default; remove any explicit "
+                "--dsa-decode-backend fa3), and for dense-MLA models use "
+                "--decode-attention-backend flashmla."
+            ) from e
+        raise
+
+    if SGLANG_PROFILE_NVTX and not in_sparse_range():
+        th_nvtx_range_pop()
+
+    return result
 
 
 @maybe_wrap_debug_kernel
@@ -197,10 +318,12 @@ def flash_attn_varlen_func(
         raise NotImplementedError(
             "FA4 is not available on SAIL: flash_attn_varlen_func not implemented."
         )
+
     if only_qv:
+        # No current caller passes it on the varlen path; fail loudly instead
+        # of silently dropping the flag if that ever changes.
         raise NotImplementedError(
-            "only_qv is not supported by the SAIL FA3 interface: "
-            "flash_attn_varlen_func not implemented."
+            "only_qv is not implemented for PPU flash_attn_varlen_func"
         )
 
     if softmax_scale is None:
@@ -210,7 +333,27 @@ def flash_attn_varlen_func(
 
     attention_chunk = 0 if attention_chunk is None else int(attention_chunk)
 
-    return _fa_varlen_func(
+    if SGLANG_PROFILE_NVTX and not in_sparse_range():
+        if torch.cuda.is_current_stream_capturing():
+            nvtx_message = f"[FW_FMHA] --format=flash_attn_{ver},Forward,type:D,seqlen_q:{max_seqlen_q},head_dim:{q.shape[-1]},head_dim_value:{v.shape[-1]},num_heads_k:{k.shape[-2]},num_heads:{q.shape[-2]},batch_size:{len(cu_seqlens_q) - 1},seqlen_k:{max_seqlen_k},data_type:{q.dtype},window_size_left:{window_size[0]},window_size_right:{window_size[1]},softcap:{softcap}"
+        else:
+            if SGLANG_PROFILE_NVTX_PRINT_SEQLEN:
+                cu_seqlens_q_list = (
+                    cu_seqlens_q.flatten().cpu().tolist()
+                    if cu_seqlens_q is not None
+                    else "[]"
+                )
+                cu_seqlens_k_list = (
+                    cu_seqlens_k.flatten().cpu().tolist()
+                    if cu_seqlens_k is not None
+                    else "[]"
+                )
+                nvtx_message = f"[FW_FMHA] --format=flash_attn_{ver},Forward,type:P,seqlen_q:{max_seqlen_q},head_dim:{q.shape[-1]},head_dim_value:{v.shape[-1]},num_heads_k:{k.shape[-2]},num_heads:{q.shape[-2]},batch_size:{len(cu_seqlens_q) - 1},seqlen_k:{max_seqlen_k},data_type:{q.dtype},window_size_left:{window_size[0]},window_size_right:{window_size[1]},softcap:{softcap},cu_seqlens_q:{cu_seqlens_q_list},cu_seqlens_k:{cu_seqlens_k_list}"
+            else:
+                nvtx_message = f"[FW_FMHA] --format=flash_attn_{ver},Forward,type:P,seqlen_q:{max_seqlen_q},head_dim:{q.shape[-1]},head_dim_value:{v.shape[-1]},num_heads_k:{k.shape[-2]},num_heads:{q.shape[-2]},batch_size:{len(cu_seqlens_q) - 1},seqlen_k:{max_seqlen_k},data_type:{q.dtype},window_size_left:{window_size[0]},window_size_right:{window_size[1]},softcap:{softcap}"
+        th_nvtx_range_push(nvtx_message)
+
+    result = _fa_varlen_func(
         q=q,
         k=k,
         v=v,
@@ -235,3 +378,8 @@ def flash_attn_varlen_func(
         return_attn_probs=return_softmax_lse,
         s_aux=sinks,
     )
+
+    if SGLANG_PROFILE_NVTX and not in_sparse_range():
+        th_nvtx_range_pop()
+
+    return result

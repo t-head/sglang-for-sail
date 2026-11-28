@@ -231,15 +231,19 @@ def is_cpu() -> bool:
     return is_host_cpu_x86() or is_host_cpu_arm64()
 
 
-@lru_cache(maxsize=1)
-def is_musa() -> bool:
-    if not hasattr(torch.version, "musa") or torch.version.musa is None:
-        return False
+# Resolve the optional adapter before tracing, retaining the original version
+# prerequisite so non-MUSA builds never import it merely for detection.
+_MUSA_VERSION = getattr(torch.version, "musa", None)
+if _MUSA_VERSION is not None:
     try:
         import torchada  # noqa: F401
     except ImportError:
-        return False
-    return True
+        _MUSA_VERSION = None
+
+
+@lru_cache(maxsize=1)
+def is_musa() -> bool:
+    return _MUSA_VERSION is not None
 
 
 @lru_cache(maxsize=1)
@@ -1099,6 +1103,9 @@ def is_mnnvl_fabric_device() -> bool:
     by NVML: the GPU has completed NVLink fabric registration."""
     if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
         return False
+    # SAIL forwards the fabric capability hint to its PCCL-backed runtime.
+    if is_sail():
+        return True
     name = (torch.cuda.get_device_name(0) or "").upper()
     if any(tag in name for tag in ("GB200", "GB300")):
         return True

@@ -17,10 +17,23 @@ def make_name(name: str) -> str:
 
 @cache_once
 def _jit_mask_topk_module():
+    args = make_cpp_args(is_arch_support_pdl())
     return load_jit(
         make_name("mask_topk"),
+        *args,
         cuda_files=["deepseek_v4/hash_topk.cuh"],
-        cuda_wrappers=[("run", "MaskKernel::run")],
+        cuda_wrappers=[("run", f"MaskKernel<{args}>::run")],
+    )
+
+
+@cache_once
+def _jit_mask_topk_cast_to_i64_module():
+    args = make_cpp_args(is_arch_support_pdl())
+    return load_jit(
+        make_name("mask_topk_cast_to_i64"),
+        *args,
+        cuda_files=["deepseek_v4/hash_topk.cuh"],
+        cuda_wrappers=[("run", f"MaskCastInt64Kernel<{args}>::run")],
     )
 
 
@@ -81,7 +94,20 @@ def _jit_silu_mul_quant_varlen_module(
 
 
 def mask_topk_ids(topk_ids: torch.Tensor, num_token_non_padded: torch.Tensor):
+    if topk_ids.numel() == 0:
+        return
     return _jit_mask_topk_module().run(topk_ids, num_token_non_padded)
+
+
+def mask_topk_ids_to_int64(
+    topk_ids: torch.Tensor, num_token_non_padded: torch.Tensor
+) -> torch.Tensor:
+    """Fused (mask padded region + cast int32->int64) for EP dispatchers."""
+    out = torch.empty_like(topk_ids, dtype=torch.int64)
+    if out.numel() == 0:
+        return out
+    _jit_mask_topk_cast_to_i64_module().run(topk_ids, out, num_token_non_padded)
+    return out
 
 
 def hash_topk(

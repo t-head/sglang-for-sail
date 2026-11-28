@@ -53,6 +53,64 @@ def interleave_output_columns(w: torch.Tensor) -> torch.Tensor:
     return w.view(*w.shape[:-1], 8, 16, 32).transpose(-3, -2).reshape(w.shape)
 
 
+def prepare_sail_wo_a(
+    weight: torch.Tensor,
+    weight_scale: Optional[torch.Tensor],
+    groups: int,
+    rank: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prepare per-channel FP8 wo_a without requantizing an FP8 checkpoint.
+
+    SAIL's channelwise linear processor transposes [G*R, D] to [D, G*R].
+    Setup can run on either side of that processor during load/reload. Only
+    the contraction dimension is permuted; each output row keeps its scale.
+    """
+    rows = groups * rank
+    if weight.ndim != 2:
+        raise ValueError("PPU MegaAttention wo_a must be a matrix")
+    # Shape determines orientation unless both axes equal G*R. Keep the
+    # unit-stride hint for square views, where shape alone would lose a transpose.
+    if weight.shape[0] == rows and (weight.shape[1] != rows or weight.stride(1) == 1):
+        row_weight = weight
+    elif weight.shape[1] == rows and (weight.shape[0] != rows or weight.stride(0) == 1):
+        row_weight = weight.t()
+    else:
+        raise ValueError(
+            f"PPU MegaAttention wo_a expected [G*R, D] or its transpose, "
+            f"got shape={tuple(weight.shape)}, stride={weight.stride()}"
+        )
+    if row_weight.shape[1] != 4096:
+        raise ValueError("PPU MegaAttention wo_a requires D=8*512=4096")
+
+    if weight.dtype == torch.bfloat16:
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            sglang_per_token_quant_fp8,
+        )
+
+        w_fp8, scale = sglang_per_token_quant_fp8(row_weight.contiguous())
+    elif weight.dtype == torch.float8_e4m3fn:
+        if (
+            weight_scale is None
+            or weight_scale.dtype != torch.float32
+            or weight_scale.numel() != rows
+            or weight_scale.device != weight.device
+        ):
+            raise ValueError(
+                "PPU MegaAttention FP8 wo_a requires one FP32 weight_scale "
+                "per output channel on the weight device"
+            )
+        w_fp8, scale = row_weight, weight_scale
+    else:
+        raise ValueError(f"Unsupported PPU MegaAttention wo_a dtype: {weight.dtype}")
+
+    # Own the buffers: later linear postprocessing/reload must not mutate a
+    # graph's projection weights or leave scales aliased to loader storage.
+    w_fp8 = interleave_output_columns(w_fp8.reshape(groups, rank, 4096))
+    return w_fp8.contiguous().clone(), scale.reshape(
+        groups, rank, 1
+    ).contiguous().clone()
+
+
 def quantize_wo_a(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     groups, rank, _ = weight.shape
     return sglang_per_token_group_quant_fp8(

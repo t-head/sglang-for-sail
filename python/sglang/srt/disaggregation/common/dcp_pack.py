@@ -113,6 +113,7 @@ def init_dcp_pack_buffers(
     *,
     device_type: str,
     include_draft: bool = False,
+    deregister_fn=None,
 ) -> List[StagingBuffer]:
     from sglang.srt.disaggregation.common.staging_handler import (
         _bare_device_type,
@@ -144,10 +145,24 @@ def init_dcp_pack_buffers(
     custom_mem_pool, _ = _get_custom_mem_pool(device)
 
     buffers = []
-    for _ in range(count):
-        buf = StagingBuffer(size_bytes, device, gpu_id, custom_mem_pool=custom_mem_pool)
-        register_fn(buf.get_ptr(), buf.get_size())
-        buffers.append(buf)
+    try:
+        for _ in range(count):
+            buf = StagingBuffer(
+                size_bytes, device, gpu_id, custom_mem_pool=custom_mem_pool
+            )
+            register_fn(buf.get_ptr(), buf.get_size())
+            buffers.append(buf)
+    except Exception:
+        if deregister_fn is not None:
+            for registered_buf in reversed(buffers):
+                try:
+                    deregister_fn(registered_buf.get_ptr())
+                except Exception:
+                    logger.warning(
+                        "Failed to deregister DCP pack buffer during rollback",
+                        exc_info=True,
+                    )
+        raise
     logger.info(
         "PD DCP pack buffers allocated: %d x %.1f MB (max_tokens=%d)",
         count,

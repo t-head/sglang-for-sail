@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-phase=${1:?Usage: build_and_test.sh build|test}
+phase=${1:?Usage: build_and_test.sh build|test|legacy}
 case "$phase" in
-    build|test) ;;
+    build|test|legacy) ;;
     *) printf 'Unknown phase: %s\n' "$phase" >&2; exit 2 ;;
 esac
 : "${PPU_CI_ARTIFACT_DIR:?}"
@@ -103,8 +103,10 @@ fi
 : "${PPU_CI_TARGET_MODEL_PATH:?}"
 : "${PPU_CI_EAGLE3_MODEL_PATH:?}"
 : "${PPU_CI_DFLASH_MODEL_PATH:?}"
-: "${PPU_CI_MLA_MODEL_PATH:?}"
-: "${PPU_CI_SMALL_MODEL_PATH:?}"
+if [[ "$phase" == test ]]; then
+    : "${PPU_CI_MLA_MODEL_PATH:?}"
+    : "${PPU_CI_SMALL_MODEL_PATH:?}"
+fi
 : "${PPU_CI_EVAL_CACHE:?}"
 export HOME
 HOME=$(mktemp -d)
@@ -134,8 +136,12 @@ trap 'exit 143' TERM
 
 python3 "$repo/scripts/ci/ppu/check_ppu_environment.py"
 python3 -c 'import torch; print("Runtime Torch:", torch.__version__, "SAIL build marker:", getattr(torch.version, "sail", None)); assert torch.cuda.device_count() == 1'
+triton_kernels_backup="$HOME/triton-kernels-backup"
+python3 "$checker" backup-triton-kernels "$triton_kernels_backup"
 python3 -m pip uninstall -y sgl-kernel
 python3 -m pip install --no-deps --no-index --force-reinstall "$wheel_dir/"*.whl
+python3 "$checker" restore-triton-kernels "$triton_kernels_backup"
+rm -rf -- "$triton_kernels_backup"
 missing_wheels=$(python3 "$checker" missing-wheels "$wheel_dir/runtime-deps")
 if [[ -n "$missing_wheels" ]]; then
     mapfile -t runtime_wheels <<< "$missing_wheels"
@@ -158,7 +164,14 @@ PY
 python3 "$repo/scripts/ci/ppu/prepare_runtime.py"
 
 cd "$artifacts"
-python3 "$repo/test/run_suite.py" --hw ppu --suite extra-test-1-gpu-ppu --timeout-per-file 1200 \
-    2>&1 | tee "$artifacts/sanity.log"
-# Require every registered PPU model sanity file to pass.
-grep -Fxq 'Test Summary: 5/5 passed' "$artifacts/sanity.log"
+if [[ "$phase" == legacy ]]; then
+    python3 "$repo/scripts/ci/ppu/run_speculative_sanity.py" \
+        2>&1 | tee "$artifacts/sanity.log"
+    # Require both speculative sanity files in legacy Pod mode.
+    grep -Fxq 'Test Summary: 2/2 passed' "$artifacts/sanity.log"
+else
+    python3 "$repo/test/run_suite.py" --hw ppu --suite extra-test-1-gpu-ppu --timeout-per-file 1200 \
+        2>&1 | tee "$artifacts/sanity.log"
+    # Require five model sanity files, seven kernel regressions and the DSA unit file.
+    grep -Fxq 'Test Summary: 13/13 passed' "$artifacts/sanity.log"
+fi

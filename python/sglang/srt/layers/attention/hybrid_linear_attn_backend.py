@@ -51,11 +51,21 @@ from sglang.srt.runtime_context import get_exec, get_memory, get_spec
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import is_pin_memory_available
+from sglang.srt.utils.device import is_sail
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.graph_variants import AttentionGraphVariants
     from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+
+# Add for nvtx profiling
+SGLANG_PROFILE_NVTX = envs.SGLANG_PROFILE_NVTX.get()
+if SGLANG_PROFILE_NVTX:
+    try:
+        from torch.cuda.nvtx import range_pop as th_nvtx_range_pop
+        from torch.cuda.nvtx import range_push as th_nvtx_range_push
+    except ImportError as e:
+        SGLANG_PROFILE_NVTX = False
 
 logger = logging.getLogger(__name__)
 _validate_mamba_replay_state_indices = (
@@ -65,6 +75,7 @@ _validate_mamba_replay_state_indices = (
 
 class MambaAttnBackendBase(AttentionBackend):
     supports_mis: bool = False
+    reuse_prefill_initial_state_mask: bool = False
 
     @classmethod
     def validate_mis_support(cls, server_args) -> None:
@@ -241,6 +252,7 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_end_locs = None
         track_ssm_recompute_dst = None
         logical_num_tokens = None
+        prefill_has_initial_state = None
         track_mask_indices = None
 
         # Padded rows carry req-pool row 0, which maps to the reserved mamba
@@ -370,6 +382,12 @@ class MambaAttnBackendBase(AttentionBackend):
                     if retrieve_next_token is not None:
                         retrieve_parent_token = torch.empty_like(retrieve_next_token)
             else:
+                if (
+                    self.reuse_prefill_initial_state_mask
+                    and is_sail()
+                    and forward_batch.extend_prefix_lens is not None
+                ):
+                    prefill_has_initial_state = forward_batch.extend_prefix_lens > 0
                 query_start_loc = torch.empty(
                     (bs + 1,), dtype=torch.int32, device=self.device
                 )
@@ -408,6 +426,7 @@ class MambaAttnBackendBase(AttentionBackend):
         return ForwardMetadata(
             query_start_loc=query_start_loc,
             logical_num_tokens=logical_num_tokens,
+            prefill_has_initial_state=prefill_has_initial_state,
             mamba_track_mask_indices=track_mask_indices,
             mamba_cache_indices=mamba_cache_indices,
             replayssm_ring_indices=replayssm_ring_indices,
@@ -453,6 +472,10 @@ class MambaAttnBackendBase(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self.forward_metadata = self._forward_metadata(forward_batch)
+
+    def _prefill_has_initial_state(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        mask = getattr(self.forward_metadata, "prefill_has_initial_state", None)
+        return forward_batch.extend_prefix_lens > 0 if mask is None else mask
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
@@ -1153,7 +1176,10 @@ class MambaAttnBackendBase(AttentionBackend):
         if forward_metadata.has_mamba_track_mask:
             # Triton always returns h; FlashInfer returns it only when checkpoints
             # were requested. Aligned-only tracking reads the final state below.
-            if forward_metadata.track_ssm_h_src.numel() > 0:
+            if (
+                forward_metadata.track_ssm_h_src is not None
+                and forward_metadata.track_ssm_h_src.numel() > 0
+            ):
                 if h_track_buf is not None:
                     ssm_states[forward_metadata.track_ssm_h_dst] = h_track_buf[
                         forward_metadata.track_ssm_h_batch_src
@@ -1412,6 +1438,14 @@ class HybridLinearAttnBackend(AttentionBackend):
             and not mode.is_draft_extend_v2()
         )
 
+    @staticmethod
+    def _is_rewritten_idle(forward_batch: ForwardBatch) -> bool:
+        """Whether DP sync rewrote a logical IDLE batch for SSM verification."""
+        return (
+            getattr(forward_batch, "_original_forward_mode", None) == ForwardMode.IDLE
+            and not forward_batch.forward_mode.is_idle()
+        )
+
     def linear_extend_in_graph(self) -> bool:
         """Whether the linear layers of the prefill being captured run inside
         the graph (no eager break)."""
@@ -1467,6 +1501,12 @@ class HybridLinearAttnBackend(AttentionBackend):
             # DRAFT_EXTEND_V2 runs only full-attn layers in the draft model; skip
             # linear/mamba metadata (it requires query_start_loc).
             self.full_attn_backend.init_forward_metadata(forward_batch)
+            return
+        if self._is_rewritten_idle(forward_batch):
+            # Hybrid speculative DP rewrites IDLE to TARGET_VERIFY so linear
+            # ReplaySSM can participate in synchronization. The empty rank has no
+            # full-attention metadata, so FlashMLA/other MHA backends must be skipped.
+            self.linear_attn_backend.init_forward_metadata(forward_batch)
             return
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata(forward_batch)
@@ -1537,7 +1577,14 @@ class HybridLinearAttnBackend(AttentionBackend):
             return self.full_attn_backend.forward_decode(
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
             )
-        return self.linear_attn_backend.forward_decode(
+        if SGLANG_PROFILE_NVTX:
+            a_shape = getattr(a, "shape", None)
+            b_shape = getattr(b, "shape", None)
+            mixed_qvk_shape = getattr(mixed_qkv, "shape", None)
+            th_nvtx_range_push(
+                f"[FW_FLA] op:forward_decode,type:D,mixed_qkv:{mixed_qvk_shape},a:{a_shape},b:{b_shape}"
+            )
+        output = self.linear_attn_backend.forward_decode(
             q=q,
             k=k,
             v=v,
@@ -1549,6 +1596,9 @@ class HybridLinearAttnBackend(AttentionBackend):
             b=b,
             **kwargs,
         )
+        if SGLANG_PROFILE_NVTX:
+            th_nvtx_range_pop()
+        return output
 
     def forward_extend(
         self,
@@ -1567,7 +1617,15 @@ class HybridLinearAttnBackend(AttentionBackend):
             return self.full_attn_backend.forward_extend(
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
             )
-        return self.linear_attn_backend.forward_extend(
+        if SGLANG_PROFILE_NVTX:
+            a_shape = getattr(a, "shape", None)
+            b_shape = getattr(b, "shape", None)
+            mixed_qvk_shape = getattr(mixed_qkv, "shape", None)
+            th_nvtx_range_push(
+                f"[FW_FLA] op:forward_extend,type:P,mixed_qkv:{mixed_qvk_shape},a:{a_shape},b:{b_shape}"
+            )
+
+        output = self.linear_attn_backend.forward_extend(
             q=q,
             k=k,
             v=v,
@@ -1579,6 +1637,9 @@ class HybridLinearAttnBackend(AttentionBackend):
             b=b,
             **kwargs,
         )
+        if SGLANG_PROFILE_NVTX:
+            th_nvtx_range_pop()
+        return output
 
     def forward(
         self,
@@ -1605,10 +1666,15 @@ class HybridLinearAttnBackend(AttentionBackend):
 
         if forward_batch.forward_mode.is_idle():
             if is_linear_attn:
-                return mixed_qkv.new_empty(
+                return mixed_qkv.new_zeros(
                     mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim
                 )
-            return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+            return q.new_zeros(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+        elif self._is_rewritten_idle(forward_batch) and not is_linear_attn:
+            # Rewritten idle batches can carry physical DP-padding rows. Their
+            # attention contribution must be zero; uninitialized rows would flow
+            # through o_proj/residual and poison the rank-synchronous MLP result.
+            return q.new_zeros(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
         elif dispatch_mode.is_decode():
             return self.forward_decode(
                 layer,

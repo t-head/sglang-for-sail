@@ -24,9 +24,9 @@ SGL_DEVICE uint32_t exact_key(float x) {
 // Exact radix top-k over finite scores. A threshold bin that fits the stash
 // keeps the original two-stash refinement; a larger one is refined by rescanning
 // the input. Unfilled output slots stay -1.
-template <int BlockSize, int OutputCapacity, int StashEntries>
+template <int BlockSize, int OutputCapacity, int StashEntries, typename ScoreT = float>
 SGL_DEVICE void
-select(const float* __restrict__ input, int32_t* __restrict__ output, int row_start, int length, int topk) {
+select(const ScoreT* __restrict__ input, int32_t* __restrict__ output, int row_start, int length, int topk) {
   static_assert(BlockSize >= kRadix + 1, "the block must initialize the complete radix histogram");
   static_assert(OutputCapacity <= StashEntries, "top-k output must fit in one shared-memory stash");
 

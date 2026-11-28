@@ -236,6 +236,7 @@ class TestKPoolStreamScheduling(unittest.TestCase):
             index_kpool_compress=True,
             block_size=128,
             scale_fmt=None,
+            use_int8=False,
             _get_q_k_bf16=prepare_qk,
         )
         indexer._can_overlap_prefill = MethodType(
@@ -462,8 +463,9 @@ def _chunk_backend(*, topk, index_topk=4, index_kpool=4):
         alt_stream=None,
         _topk_from_kpool_logits=topk,
         _get_index_k_read_buffer=lambda pool, layer_id: None,
-        _fp8_mqa_logits=IndexerKPool._fp8_mqa_logits,
+        use_int8=False,
     )
+    backend._fp8_mqa_logits = MethodType(IndexerKPool._fp8_mqa_logits, backend)
     backend._kpool_topk_by_row_chunks = MethodType(
         IndexerKPool._kpool_topk_by_row_chunks, backend
     )
@@ -472,6 +474,19 @@ def _chunk_backend(*, topk, index_topk=4, index_kpool=4):
 
 def _fp8_zeros(*shape):
     return torch.zeros(shape, dtype=torch.uint8).view(torch.float8_e4m3fn)
+
+
+def _query_tensor(*, use_int8, rows, width):
+    """Query tensor matching the route under test.
+
+    Production sets ``use_int8`` and the query dtype together (``per_token_quant_int8``
+    produces ``torch.int8``), and the unified sail entry point dispatches on
+    ``q.dtype`` instead of the flag.  Building the fixture the same way keeps both
+    dispatches in agreement, so a route mismatch cannot hide behind the stub.
+    """
+    if use_int8:
+        return torch.zeros((rows, width), dtype=torch.int8)
+    return _fp8_zeros(rows, width)
 
 
 def _fake_aiter_modules():
@@ -515,6 +530,9 @@ def _chunking_patches(*, rows_per_chunk, kv_pool, rocm=False):
         stack.enter_context(
             patch.object(indexer_module, "_should_fuse_kpool_topk", return_value=True)
         )
+        # These cases model CUDA/ROCm libraries; the separate PPU contract
+        # harness below explicitly selects and verifies the SAIL path.
+        stack.enter_context(patch.object(indexer_module, "is_sail", return_value=False))
         stack.enter_context(patch.object(indexer_module, "is_hip", return_value=rocm))
         if rocm:
             stack.enter_context(patch.dict(sys.modules, _fake_aiter_modules()))
@@ -642,6 +660,448 @@ class TestKPoolPlanChunking(CustomTestCase):
             rtol=0,
             atol=0,
         )
+
+
+def _clean_logits_backend(*, topk, index_topk=4, index_kpool=4, use_int8=False):
+    """Harness for the ragged call site, with the production method bound.
+
+    ``_fp8_mqa_logits`` became an instance method when the PPU int8 shim landed
+    (it reads ``self.use_int8``), so the SimpleNamespace-based harness has to bind
+    it explicitly; the method itself is never mocked - only the kernel libraries
+    below it are.
+    """
+    backend = SimpleNamespace(
+        index_topk=index_topk,
+        index_kpool=index_kpool,
+        alt_stream=None,
+        use_int8=use_int8,
+        _topk_from_kpool_logits=topk,
+        _get_index_k_read_buffer=lambda pool, layer_id: None,
+    )
+    backend._fp8_mqa_logits = lambda **kwargs: IndexerKPool._fp8_mqa_logits(
+        backend, **kwargs
+    )
+    backend._kpool_topk_by_row_chunks = MethodType(
+        IndexerKPool._kpool_topk_by_row_chunks, backend
+    )
+    return backend
+
+
+def _clean_logits_probing_library(*, expected, calls, record=None, rocm=False):
+    """DeepGEMM/AITER stand-ins that *validate* the flags instead of ignoring it.
+
+    The previous stubs accepted ``clean_logits`` and dropped it, so a return to
+    the value that aborts PPU startup was invisible on CPU.  These stubs raise on
+    anything other than the platform's contract value (and on a non-bool), and
+    keep encoding each row's own weight so the resulting top-k output is still
+    checked end to end.
+
+    ``record`` additionally traces *how* the kernel was reached: the unified sail
+    entry point always passes ``max_seqlen_k`` (0 for the ragged shape) together
+    with the weights it hands over, while a direct DeepGEMM call passes neither.
+    That is what distinguishes the delegated ragged path from the legacy direct
+    one at the kernel boundary, without mock-checking the call site itself.
+    """
+
+    def check(flag, kernel):
+        calls.append((kernel, flag))
+        if not isinstance(flag, bool):
+            raise AssertionError(f"{kernel}: clean_logits must be a bool, got {flag!r}")
+        if flag is not expected:
+            raise AssertionError(
+                f"{kernel}: clean_logits={flag!r} violates the contract for this "
+                f"platform; the indexer must pass {expected!r} "
+                f"(PPU rejects True at the host boundary of both MQA logits kernels)"
+            )
+
+    def note(value, kernel, weights):
+        if value is not None and value != 0:
+            raise AssertionError(
+                f"{kernel}: the ragged indexer must not request a packed width, "
+                f"got max_seqlen_k={value!r} (only the MXFP4 path takes a positive one)"
+            )
+        if record is not None:
+            record.append((value, weights.dtype))
+
+    def logits_for(q, w, num_k):
+        # Same row encoding as _fake_deep_gemm: a mis-offset q/weights slice
+        # shows up in the top-k output.
+        return w[:, :1].expand(q.shape[0], num_k).clone()
+
+    def fp8_mqa_logits(q, kv, w, ks, ke, clean_logits, max_seqlen_k=None):
+        check(clean_logits, "fp8_mqa_logits")
+        note(max_seqlen_k, "fp8_mqa_logits", w)
+        return logits_for(q, w, kv[0].shape[0])
+
+    def int8_mqa_logits(q, kv, w, ks, ke, clean_logits, max_seqlen_k=None):
+        check(clean_logits, "int8_mqa_logits")
+        note(max_seqlen_k, "int8_mqa_logits", w)
+        return logits_for(q, w, kv[0].shape[0])
+
+    if rocm:
+        kernel = ModuleType("aiter.ops.triton.fp8_mqa_logits")
+
+        def aiter_fp8_mqa_logits(q, k, scale, w, starts, ends, clean_logits):
+            check(clean_logits, "aiter.fp8_mqa_logits")
+            return logits_for(q, w, k.shape[0])
+
+        kernel.fp8_mqa_logits = aiter_fp8_mqa_logits
+        aiter_modules = {
+            "aiter": ModuleType("aiter"),
+            "aiter.ops": ModuleType("aiter.ops"),
+            "aiter.ops.triton": ModuleType("aiter.ops.triton"),
+            "aiter.ops.triton.fp8_mqa_logits": kernel,
+        }
+        refuse = _refuse_deep_gemm
+        deep_gemm = SimpleNamespace(
+            fp8_mqa_logits=refuse,
+            int8_mqa_logits=refuse,
+        )
+        return deep_gemm, aiter_modules
+    return (
+        SimpleNamespace(fp8_mqa_logits=fp8_mqa_logits, int8_mqa_logits=int8_mqa_logits),
+        None,
+    )
+
+
+@contextmanager
+def _clean_logits_patches(*, is_sail_value, deep_gemm, aiter_modules=None):
+    """Chunking harness plus the platform detection the call site consults."""
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch.object(indexer_module, "deep_gemm", deep_gemm, create=True)
+        )
+        # On PPU the ragged logits go through the unified entry point, which
+        # imports deep_gemm from mqa_logits_utils rather than from this module;
+        # sys.modules makes the same stub answer both routes, so neither arm can
+        # silently reach a real library.
+        stack.enter_context(patch.dict(sys.modules, {"deep_gemm": deep_gemm}))
+        stack.enter_context(
+            patch.object(
+                indexer_module,
+                "_mqa_logits_row_chunks",
+                partial(_row_chunks, rows_per_chunk=None),
+            )
+        )
+        stack.enter_context(
+            patch.object(indexer_module, "get_token_to_kv_pool", return_value=object())
+        )
+        stack.enter_context(
+            patch.object(indexer_module, "_should_fuse_kpool_topk", return_value=True)
+        )
+        stack.enter_context(patch.object(indexer_module, "is_hip", return_value=False))
+        # The one site the change set touches is `clean_logits=not is_sail()`.
+        stack.enter_context(
+            patch.object(indexer_module, "is_sail", return_value=is_sail_value)
+        )
+        if aiter_modules is not None:
+            stack.enter_context(patch.dict(sys.modules, aiter_modules))
+        yield
+
+
+class TestKPoolRaggedCleanLogitsContract(CustomTestCase):
+    """``clean_logits`` must follow the platform contract at the kernel boundary.
+
+    DeepGEMM-for-sail's realigned quantized-logits entry points reject
+    ``clean_logits=True`` on PPU with a hard TORCH_CHECK, so the framework has to
+    send ``False`` there (PPU path) while CUDA/ROCm keep the upstream ``True``.
+    On PPU the ragged kpool path now hands over to the unified
+    ``mqa_logits_utils.sail_mqa_logits`` entry point, which fixes
+    ``clean_logits=False`` itself and dispatches FP8/INT8 on ``q.dtype``; the
+    non-PPU call site still derives the flag from ``is_sail()``.  Both routes and
+    both platforms are pinned here - on CPU only, through the production method
+    ``IndexerKPool._fp8_mqa_logits`` (never mocked) down to the kernel libraries.
+    """
+
+    TOPK = 4
+    NUM_REQ_SLOTS = 8
+
+    def _reference_rows(self):
+        return _expected_rows(
+            pool_lens=torch.arange(1, 4, dtype=torch.int32),
+            index=torch.arange(3, dtype=torch.int32),
+            width=self.TOPK,
+        )
+
+    def _drive(
+        self,
+        *,
+        is_sail_value,
+        use_int8,
+        expected_flag,
+        weights_dtype=torch.float32,
+        delegate=None,
+    ):
+        n_real = 3
+        total_k_rows = 16
+        page_table = torch.arange(self.NUM_REQ_SLOTS * 8, dtype=torch.int32).reshape(
+            self.NUM_REQ_SLOTS, 8
+        )
+        plan = SimpleNamespace(
+            seq_lens_expanded=torch.full((n_real,), 8, dtype=torch.int32),
+            pooled_seq_lens_expanded=torch.arange(1, n_real + 1, dtype=torch.int32),
+            ragged_q_ks=torch.zeros(n_real, dtype=torch.int32),
+            ragged_q_ke=torch.full((n_real,), total_k_rows, dtype=torch.int32),
+            ragged_total_k_rows=total_k_rows,
+            ragged_k_u8=torch.zeros((total_k_rows, 4), dtype=torch.uint8),
+            ragged_k_scale=torch.zeros((total_k_rows, 1), dtype=torch.float32),
+            ragged_concat_page_table=torch.zeros(total_k_rows, dtype=torch.int32),
+            ragged_paged_page_table=page_table,
+            ragged_paged_page_table_row_index=torch.arange(n_real, dtype=torch.int32),
+        )
+        metadata = SimpleNamespace(
+            attn_metadata=SimpleNamespace(
+                kpool_extend_plan=plan,
+                topk_indices_offset=torch.arange(n_real, dtype=torch.int32) + 100,
+            ),
+            topk_transform_method=TopkTransformMethod.PAGED,
+        )
+        weights = torch.arange(1, n_real + 1, dtype=weights_dtype).reshape(n_real, 1, 1)
+        q_fp8 = _query_tensor(use_int8=use_int8, rows=n_real, width=4)
+        calls = []
+        record = []
+        deep_gemm, aiter_modules = _clean_logits_probing_library(
+            expected=expected_flag, calls=calls, record=record
+        )
+        backend = _clean_logits_backend(
+            topk=_encoding_topk(width=self.TOPK, calls=[]),
+            index_topk=self.TOPK,
+            use_int8=use_int8,
+        )
+        with ExitStack() as stack:
+            stack.enter_context(
+                _clean_logits_patches(
+                    is_sail_value=is_sail_value,
+                    deep_gemm=deep_gemm,
+                    aiter_modules=aiter_modules,
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "sglang.srt.layers.attention.dsa.kpool_fp8_index."
+                    "gather_index_k_scale_prefix_into",
+                    lambda **kwargs: None,
+                )
+            )
+            if delegate is not None:
+                # Only the kpool-side name is replaced: the entry point is the
+                # thing under test here, so the stub library must stay untouched.
+                stack.enter_context(
+                    patch.object(
+                        indexer_module, "sail_mqa_logits", delegate, create=True
+                    )
+                )
+            result = IndexerKPool._get_topk_ragged_kpool_plan(
+                backend,
+                forward_batch=None,
+                layer_id=0,
+                q_fp8=q_fp8,
+                weights=weights,
+                metadata=metadata,
+            )
+        return result, calls, record
+
+    def test_ppu_sends_false_to_the_fp8_kernel(self):
+        result, calls, record = self._drive(
+            is_sail_value=True, use_int8=False, expected_flag=False
+        )
+        self.assertEqual(calls, [("fp8_mqa_logits", False)])
+        # The delegated call is the one that names the packed width explicitly.
+        self.assertEqual(record, [(0, torch.float32)])
+        torch.testing.assert_close(result, self._reference_rows(), rtol=0, atol=0)
+
+    def test_ppu_sends_false_to_the_int8_kernel(self):
+        result, calls, record = self._drive(
+            is_sail_value=True, use_int8=True, expected_flag=False
+        )
+        self.assertEqual(calls, [("int8_mqa_logits", False)])
+        self.assertEqual(record, [(0, torch.float32)])
+        torch.testing.assert_close(result, self._reference_rows(), rtol=0, atol=0)
+
+    def test_non_ppu_retains_true_on_both_kernels(self):
+        for use_int8, kernel in ((False, "fp8_mqa_logits"), (True, "int8_mqa_logits")):
+            with self.subTest(use_int8=use_int8):
+                result, calls, record = self._drive(
+                    is_sail_value=False, use_int8=use_int8, expected_flag=True
+                )
+                self.assertEqual(calls, [(kernel, True)])
+                # Off PPU DeepGEMM is still called directly, so no packed width
+                # is ever named and the ragged shape stays as it was.
+                self.assertEqual(record, [(None, torch.float32)])
+                torch.testing.assert_close(
+                    result, self._reference_rows(), rtol=0, atol=0
+                )
+
+    def test_kernel_stub_rejects_the_flag_that_aborts_ppu_startup(self):
+        """Negative control: the gate is not vacuous.
+
+        Feeding the value the pre-fix call site used on PPU must be refused by
+        the kernel stub - exactly the situation the change set removes.
+        """
+        for kernel in ("fp8_mqa_logits", "int8_mqa_logits"):
+            for bad in (True, None, 1):
+                with self.subTest(kernel=kernel, flag=bad):
+                    calls = []
+                    deep_gemm, _ = _clean_logits_probing_library(
+                        expected=False, calls=calls
+                    )
+                    fn = getattr(deep_gemm, kernel)
+                    q = _fp8_zeros(2, 4)
+                    kv = (torch.zeros((16, 4), dtype=torch.uint8), torch.zeros((16, 1)))
+                    w = torch.arange(1, 3, dtype=torch.float32).reshape(2, 1, 1)
+                    with self.assertRaises(AssertionError):
+                        fn(q, kv, w, None, None, clean_logits=bad)
+            # The ragged shape must never ask for a packed width either.
+            for width in (32, -1):
+                with self.subTest(kernel=kernel, max_seqlen_k=width):
+                    calls = []
+                    deep_gemm, _ = _clean_logits_probing_library(
+                        expected=False, calls=calls
+                    )
+                    fn = getattr(deep_gemm, kernel)
+                    q = _fp8_zeros(2, 4)
+                    kv = (torch.zeros((16, 4), dtype=torch.uint8), torch.zeros((16, 1)))
+                    w = torch.arange(1, 3, dtype=torch.float32).reshape(2, 1, 1)
+                    with self.assertRaises(AssertionError):
+                        fn(q, kv, w, None, None, clean_logits=False, max_seqlen_k=width)
+
+    def test_sail_delegates_ragged_logits_to_the_unified_entry_point(self):
+        """Negative control for the delegation itself.
+
+        On PPU the ragged path must reach DeepGEMM only through the unified entry
+        point: with the entry point replaced, the kernel stubs may not see a call
+        at all, and the weights must arrive exactly as the caller handed them over
+        (no dtype widening on the way, which the INT8 contract forbids).
+        """
+        seen = []
+
+        def delegate(q, kv, weights, starts, ends, *, max_seqlen_k=0):
+            seen.append((q.dtype, kv, weights, weights.dtype, max_seqlen_k))
+            return weights[:, :1].expand(q.shape[0], kv[0].shape[0]).clone()
+
+        for use_int8, dtype in ((False, torch.float8_e4m3fn), (True, torch.int8)):
+            with self.subTest(use_int8=use_int8):
+                seen.clear()
+                result, calls, record = self._drive(
+                    is_sail_value=True,
+                    use_int8=use_int8,
+                    expected_flag=False,
+                    delegate=delegate,
+                )
+                self.assertEqual(len(seen), 1)
+                # Nothing reached the kernel libraries directly.
+                self.assertEqual(calls, [])
+                self.assertEqual(record, [])
+                seen_dtype, kv, weights, weights_dtype, width = seen[0]
+                self.assertIs(seen_dtype, dtype)
+                self.assertEqual(weights_dtype, torch.float32)
+                self.assertEqual(width, 0)
+                # The entry point takes the KV pair as one tuple, as the paged
+                # branch already does.
+                self.assertIsInstance(kv, tuple)
+                self.assertEqual(len(kv), 2)
+                torch.testing.assert_close(
+                    result, self._reference_rows(), rtol=0, atol=0
+                )
+
+    def test_sail_delegation_keeps_the_caller_weights_dtype(self):
+        """The INT8 route honors the caller's weights dtype, unchanged.
+
+        ``sail_mqa_logits`` keeps ``weights.dtype`` for INT8 (only FP8 pins FP32),
+        so a caller-side cast would silently change what the kernel is handed -
+        the ragged kpool weights are FP32 today, and this pins that a bf16 caller
+        still arrives as bf16.
+        """
+        result, calls, record = self._drive(
+            is_sail_value=True,
+            use_int8=True,
+            expected_flag=False,
+            weights_dtype=torch.bfloat16,
+        )
+        self.assertEqual(calls, [("int8_mqa_logits", False)])
+        self.assertEqual(record, [(0, torch.bfloat16)])
+        torch.testing.assert_close(result, self._reference_rows(), rtol=0, atol=0)
+
+    def test_ppu_flag_is_rechecked_for_every_row_chunk(self):
+        """Chunked rows must each consult the platform, not the first chunk only."""
+        n_real = 3
+        total_k_rows = 16
+        plan = SimpleNamespace(
+            seq_lens_expanded=torch.full((n_real,), 8, dtype=torch.int32),
+            pooled_seq_lens_expanded=torch.arange(1, n_real + 1, dtype=torch.int32),
+            ragged_q_ks=torch.zeros(n_real, dtype=torch.int32),
+            ragged_q_ke=torch.full((n_real,), total_k_rows, dtype=torch.int32),
+            ragged_total_k_rows=total_k_rows,
+            ragged_k_u8=torch.zeros((total_k_rows, 4), dtype=torch.uint8),
+            ragged_k_scale=torch.zeros((total_k_rows, 1), dtype=torch.float32),
+            ragged_concat_page_table=torch.zeros(total_k_rows, dtype=torch.int32),
+            ragged_paged_page_table=torch.arange(
+                self.NUM_REQ_SLOTS * 8, dtype=torch.int32
+            ).reshape(self.NUM_REQ_SLOTS, 8),
+            ragged_paged_page_table_row_index=torch.arange(n_real, dtype=torch.int32),
+        )
+        metadata = SimpleNamespace(
+            attn_metadata=SimpleNamespace(
+                kpool_extend_plan=plan,
+                topk_indices_offset=torch.arange(n_real, dtype=torch.int32) + 100,
+            ),
+            topk_transform_method=TopkTransformMethod.PAGED,
+        )
+        calls = []
+        record = []
+        deep_gemm, _ = _clean_logits_probing_library(
+            expected=False, calls=calls, record=record
+        )
+        backend = _clean_logits_backend(topk=_encoding_topk(width=self.TOPK, calls=[]))
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(indexer_module, "deep_gemm", deep_gemm, create=True)
+            )
+            # The delegated route resolves deep_gemm inside mqa_logits_utils.
+            stack.enter_context(patch.dict(sys.modules, {"deep_gemm": deep_gemm}))
+            stack.enter_context(
+                patch.object(
+                    indexer_module,
+                    "_mqa_logits_row_chunks",
+                    partial(_row_chunks, rows_per_chunk=2),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    indexer_module, "get_token_to_kv_pool", return_value=object()
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    indexer_module, "_should_fuse_kpool_topk", return_value=True
+                )
+            )
+            stack.enter_context(
+                patch.object(indexer_module, "is_hip", return_value=False)
+            )
+            stack.enter_context(
+                patch.object(indexer_module, "is_sail", return_value=True)
+            )
+            stack.enter_context(
+                patch(
+                    "sglang.srt.layers.attention.dsa.kpool_fp8_index."
+                    "gather_index_k_scale_prefix_into",
+                    lambda **kwargs: None,
+                )
+            )
+            IndexerKPool._get_topk_ragged_kpool_plan(
+                backend,
+                forward_batch=None,
+                layer_id=0,
+                q_fp8=_fp8_zeros(n_real, 4),
+                weights=torch.arange(1, n_real + 1, dtype=torch.float32).reshape(
+                    n_real, 1, 1
+                ),
+                metadata=metadata,
+            )
+        self.assertEqual(calls, [("fp8_mqa_logits", False)] * 2)
+        # Every chunk goes through the unified entry point, not just the first.
+        self.assertEqual(record, [(0, torch.float32)] * 2)
 
 
 def _causal_seq_lens(*, q_lens, seq_lens):

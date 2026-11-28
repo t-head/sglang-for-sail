@@ -66,6 +66,7 @@ from sglang.srt.utils.device import (
     is_confidential_compute,
     is_fi_a2a_supported,
     is_gfx95_supported,
+    is_sail,
     xpu_has_xmx_support,
 )
 
@@ -458,10 +459,18 @@ def supports_mamba_cache_extra_buffer(view: Any, hf_config: Any) -> bool:
     if get_platform().is_xpu:
         return False
     spec = get_linear_attn_spec(hf_config)
-    if hf_config.architectures[0] in _MAMBA_EXTRA_BUFFER_ARCHS or (
+    model_arch = hf_config.architectures[0]
+    if model_arch in _MAMBA_EXTRA_BUFFER_ARCHS or (
         spec is not None and spec.support_mamba_cache_extra_buffer
     ):
-        return view.linear_attn_backend == "triton"
+        return view.linear_attn_backend == "triton" or (
+            model_arch
+            in (
+                "KimiK3ForConditionalGeneration",
+                "KimiK31ForConditionalGeneration",
+            )
+            and view.linear_attn_backend == "flashkda"
+        )
     return False
 
 
@@ -491,7 +500,11 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
     declared: Dict[str, Any] = {"uses_mamba_radix_cache": True}
     if view.mamba_radix_cache_strategy == "auto":
         wants_overlap = not view.disable_overlap_schedule
-        wants_paging = view.page_size is not None and view.page_size > 1
+        wants_paging = (
+            (view.page_size is not None and view.page_size > 1)
+            or view.attention_backend == "flashmla"
+            or view.decode_attention_backend == "flashmla"
+        )
         if (wants_overlap or wants_paging) and supports_mamba_cache_extra_buffer(
             view, hf_config
         ):
@@ -807,6 +820,8 @@ _KIMI_K31_DSA_BACKEND = "flashmla_kv"
 _KIMI_K31_DSA_BACKENDS = ("flashmla_kv", "trtllm", "prims_ts")
 # ROCm: the Triton kernels dequantize the same fp8_ds_mla rows and run BF16 dots.
 _KIMI_K31_DSA_BACKEND_HIP = "triton"
+if is_sail():
+    _KIMI_K31_DSA_BACKENDS += ("flashmla_sparse",)
 
 
 def _kimi_k31_kv_cache_dtype(view: Any) -> dict:
@@ -847,7 +862,9 @@ def _kimi_k31_dsa_backends(view: Any) -> dict:
     # Both phases read one KV pool (and PD peers exchange it), so an unset
     # phase follows the set one.
     chosen = {getattr(view, f) for f in fields} - {None}
-    if len(chosen) > 1:
+    if len(chosen) > 1 and (
+        not is_sail() or not chosen <= {"flashmla_sparse", "flashmla_kv"}
+    ):
         raise ValueError(
             "Kimi-K3.1 needs the same --dsa-prefill-backend and "
             "--dsa-decode-backend (flashmla_kv and trtllm / prims_ts use "
@@ -870,7 +887,9 @@ def _kimi_k31_dsa_backends(view: Any) -> dict:
         )
     declared = {f: backend for f in fields if getattr(view, f) is None}
     logger.warning(
-        "Set DSA backends for Kimi-K3.1: prefill=%s, decode=%s.", backend, backend
+        "Set DSA backends for Kimi-K3.1: prefill=%s, decode=%s.",
+        view.dsa_prefill_backend,
+        view.dsa_decode_backend,
     )
     return declared
 
@@ -1861,7 +1880,6 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
 
 @register_post_process
 def _a2a_backend_overrides(view: Any) -> dict:
-
     moe_a2a_backend = view.moe_a2a_backend
     if view.enable_waterfill and moe_a2a_backend not in ("deepep", "megamoe"):
         logger.warning(

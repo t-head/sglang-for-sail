@@ -1305,9 +1305,10 @@ class Glm5NextModel(nn.Module):
 
 
 class Glm5NextForConditionalGeneration(nn.Module):
+    # Layer-name suffix matching also handles self_attn.qkv without rewriting
+    # qkv_conv1d or an already normalized qkv_proj name on a second mapping.
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_substr={
-            "model.visual": "visual",
             **(
                 {
                     # ModelSlim W8A8 checkpoint naming variants.
@@ -1321,8 +1322,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
         },
         orig_to_new_prefix={
             "model.language_model.": "model.",
+            "model.visual": "visual",
         },
-        orig_to_new_suffix={".attn.qkv": ".attn.qkv_proj"},
+        orig_to_new_suffix={"attn.qkv": "attn.qkv_proj"},
     )
     packed_modules_mapping = {
         "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],

@@ -10,6 +10,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.embeddings.engram_gather import _E8M0_ZERO, _dequant_rows
+from sglang.srt.utils.device import get_device_sm, is_sail
 
 
 @triton.jit
@@ -27,6 +28,7 @@ def _engram_gather_peer_kernel(
     LOG2_WORLD: tl.constexpr,
     E8M0_ZERO: tl.constexpr,
     MXFP4: tl.constexpr,
+    DECODE_E4M3_BYTES: tl.constexpr,
 ):
     tok = tl.program_id(0).to(tl.int64)
     cols = tl.program_id(1) * ROWS + tl.arange(0, ROWS)
@@ -52,6 +54,7 @@ def _engram_gather_peer_kernel(
         BLK,
         E8M0_ZERO,
         MXFP4,
+        DECODE_E4M3_BYTES,
     )
     # -0 becomes +0, as the zero-fill + sum of the sharded lookup leaves it, so the
     # two lookups agree bit for bit.
@@ -102,6 +105,7 @@ def engram_gather_peer(
             LOG2_WORLD=world.bit_length() - 1,
             E8M0_ZERO=_E8M0_ZERO,
             MXFP4=mxfp4,
+            DECODE_E4M3_BYTES=is_sail() and get_device_sm() < 89,
             num_warps=4,
         )
     return out

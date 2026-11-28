@@ -79,10 +79,11 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
 )
-from sglang.srt.utils.device import get_compiler_backend
+from sglang.srt.utils.device import get_compiler_backend, is_sail
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_sail = is_sail()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 _is_gfx95 = is_hip() and is_gfx95_supported()
@@ -675,9 +676,19 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
                 algo_label="DFLASH" if is_dflash else None
             )
             # The other MLA backends ignore a layer's sliding window.
-            if sliding_window_size > -1 and draft_attention_backend not in (
-                "triton",
-                *DFLASH_MLA_ONLY_DRAFT_BACKENDS,
+            sail_flashmla = is_sail() and draft_attention_backend == "flashmla"
+            if sail_flashmla and attn_type != AttentionType.DECODER:
+                raise ValueError(
+                    "SAIL FlashMLA sliding-window drafts require causal attention."
+                )
+            if (
+                sliding_window_size > -1
+                and not sail_flashmla
+                and draft_attention_backend
+                not in (
+                    "triton",
+                    *DFLASH_MLA_ONLY_DRAFT_BACKENDS,
+                )
             ):
                 raise ValueError(
                     "DFLASH mla sliding_attention layers require "
@@ -969,7 +980,11 @@ class DFlashGroupedConv(nn.Module):
 
     def _convolve(self, hidden_states, delta, side: int) -> torch.Tensor:
         # NVIDIA only: the Triton kernel is not validated on ROCm.
-        if _is_cuda and hidden_states.is_cuda and hidden_states.dim() == 2:
+        if (
+            (_is_cuda or _is_sail)
+            and hidden_states.is_cuda
+            and hidden_states.dim() == 2
+        ):
             return dflash_grouped_conv(
                 hidden_states=hidden_states,
                 delta=delta,

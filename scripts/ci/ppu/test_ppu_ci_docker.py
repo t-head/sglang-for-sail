@@ -16,14 +16,12 @@ from pathlib import Path
 
 import yaml
 
-from sglang.test.test_utils import CustomTestCase
-
 if sys.platform == "linux":
     import fcntl
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "scripts/ci/ppu/run_test.sh"
-WORKFLOW = REPO / ".github/workflows/pr-test-ppu.yml"
+WORKFLOW = REPO / ".github/workflows/pr-test-ppu-extra.yml"
 # Finish before GitHub's ~7.5s SIGINT + 2.5s SIGTERM force-kill window.
 CANCELLATION_BUDGET = 7.5
 SHA = "a" * 40
@@ -160,7 +158,7 @@ else:
     sys.platform == "linux" and shutil.which("flock"),
     "The Docker host launcher requires Linux and util-linux flock",
 )
-class TestPPUCIDocker(CustomTestCase):
+class TestPPUCIDocker(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ppu-docker-test-")
         self.addCleanup(self.temp.cleanup)
@@ -532,7 +530,8 @@ class TestPPUCIDocker(CustomTestCase):
         step = next(
             step
             for step in workflow["jobs"]["ppu-sanity"]["steps"]
-            if step.get("name") == "Run the PPU model sanity suite in isolated Docker"
+            if step.get("name")
+            == "Run PPU sanity and kernel regressions in isolated Docker"
         )
         env = {
             **self.env,

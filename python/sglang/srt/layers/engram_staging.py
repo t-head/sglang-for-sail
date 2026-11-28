@@ -42,10 +42,7 @@ class EngramRowStager:
     ):
         self.hasher = hasher
         # fp8 and e8m0 have no CPU index_select; the gather moves bytes.
-        self.tables = [
-            (e.weight.data.view(torch.uint8), e.scale.data.view(torch.uint8))
-            for e in embeds
-        ]
+        self.embeds = list(embeds)
         self.device = device
         self.pool = ThreadPoolExecutor(_GATHER_THREADS)
         # The schedule stream waits on the running forward (the WAR barrier), so
@@ -85,7 +82,8 @@ class EngramRowStager:
             return None
         ids, _ = self.hasher.hash_windows(*windows)
         staged = []
-        for layer, (weight, scale) in enumerate(self.tables):
+        for layer, embed in enumerate(self.embeds):
+            weight, scale = embed.staging_views()
             layer_ids = ids[:, layer].reshape(-1)
             rows = self._gather(weight, layer_ids)
             scales = self._gather(scale, layer_ids)

@@ -16,6 +16,7 @@ from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
 from sglang.srt.runtime_context import get_exec
+from sglang.srt.utils.device import is_sail
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -92,6 +93,8 @@ class Fp4Indexer(Indexer):
         weights: torch.Tensor,
         ks: torch.Tensor,
         ke: torch.Tensor,
+        *,
+        force_unfused_topk: bool = False,
     ) -> torch.Tensor:
         from deep_gemm import fp8_fp4_mqa_logits
 
@@ -100,7 +103,7 @@ class Fp4Indexer(Indexer):
         if q_fp4.shape[1] > num_heads:
             q_sf = torch.nn.functional.pad(q_sf, (0, q_fp4.shape[1] - num_heads))
         k, k_scale = kv
-        return fp8_fp4_mqa_logits(
+        logits = fp8_fp4_mqa_logits(
             (q_fp4, q_sf),
             (k.view(torch.int8), k_scale.view(torch.int32)),
             weights,
@@ -108,6 +111,7 @@ class Fp4Indexer(Indexer):
             ke,
             clean_logits=False,
         )
+        return logits.float() if force_unfused_topk else logits
 
     def _write_index_k_cache(
         self,
@@ -129,4 +133,7 @@ class Fp4Indexer(Indexer):
 
 
 def dsa_indexer_cls() -> Type[Indexer]:
+    if is_sail():
+        # The base Indexer owns PPU MXFP4 dispatch; Fp4Indexer is SM100-specific.
+        return Indexer
     return Fp4Indexer if get_exec().kernel.enable_fp4_indexer else Indexer

@@ -1,8 +1,11 @@
+import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from sglang.srt.layers.attention import dsa_backend
+from sglang.srt.layers.attention.dsa import dsa_metadata_manager
 from sglang.srt.layers.attention.dsa.dsa_backend_kpool import (
     DeepseekSparseAttnBackendKPoolMixin,
 )
@@ -27,6 +30,128 @@ def _make_backend(prefill_impl: str, *, fp8_kv_cache: bool):
     backend.dsa_kv_cache_store_fp8 = fp8_kv_cache
     backend.dsa_prefill_impl = prefill_impl
     return backend
+
+
+def _make_graph_backend(dcp_size, dcp_rank, *, query_rows=2, context_capacity=65536):
+    backend = _make_backend("fa3", fp8_kv_cache=False)
+    backend.device = torch.device("cpu")
+    backend.attn_dcp_size = dcp_size
+    backend.dsa_shards_index_k = dcp_size > 1
+    backend.attn_dcp_rank = dcp_rank
+    backend.physical_page_size = 64
+    backend.real_page_span = 64 * dcp_size
+    backend.dsa_index_topk = 2048
+    backend.dsa_index_kpool = 1
+    backend.speculative_num_draft_tokens = 2
+    backend.dsa_drop_wide_page_table = False
+    backend.dsa_decode_impl = "fa3"
+    backend.enable_auto_select_prefill_impl = False
+    backend._is_in_breakable_cuda_graph = lambda: False
+    backend._is_in_tc_piecewise_cuda_graph = lambda: False
+    backend._get_device_sm = lambda: 100
+    backend._is_blackwell = lambda: True
+    backend.dsa_topk_backend = dsa_backend.DSATopKBackend.TORCH
+    backend.req_to_token = torch.zeros((2, context_capacity), dtype=torch.int32)
+    backend._arange_buf = torch.arange(query_rows + 1, dtype=torch.int32)
+    backend.decode_cuda_graph_metadata = {
+        "page_table": torch.zeros((query_rows, context_capacity), dtype=torch.int32),
+        "cu_seqlens_q": backend._arange_buf,
+    }
+    return backend
+
+
+@pytest.mark.parametrize(
+    "dcp_size,dcp_rank,expected",
+    [(1, 0, [65536, 65536]), (8, 0, [1, 1025]), (8, 7, [0, 1024])],
+)
+def test_capture_keeps_dcp_visible_lengths(monkeypatch, dcp_size, dcp_rank, expected):
+    """Schedule capacity must not become the local TopK's visible key count."""
+    backend = _make_graph_backend(dcp_size, dcp_rank)
+    # Isolate the external DeepGEMM scheduler; metadata construction stays real.
+    backend._build_paged_mqa_schedule_metadata = lambda lengths, request_indices=None: (
+        lengths.clone()
+    )
+    monkeypatch.setattr(dsa_backend, "is_cuda", lambda: True)
+    seq = torch.tensor([1, 8193], dtype=torch.int32)
+    backend._build_forward_metadata_cuda_graph(
+        2, None, torch.arange(2), seq, seq, ForwardMode.DECODE, None
+    )
+
+    metadata = backend.forward_metadata
+    torch.testing.assert_close(
+        metadata.paged_mqa_ctx_lens_2d,
+        torch.tensor(expected, dtype=torch.int32)[:, None],
+    )
+    torch.testing.assert_close(
+        metadata.paged_mqa_schedule_metadata,
+        torch.full((2, 1), 65536, dtype=torch.int32),
+    )
+
+
+def test_ppu_fp4_verify_refreshes_captured_mqa_schedule(monkeypatch):
+    """A change in padding must refresh the schedule and owners in place."""
+    backend = _make_graph_backend(1, 0, query_rows=4, context_capacity=64)
+    backend.token_to_kv_pool = SimpleNamespace(use_fp4_indexer=True)
+    backend.num_indexer_heads = 32
+    backend.indexer_head_dim = 128
+    monkeypatch.setattr(dsa_backend, "is_cuda", lambda: True)
+    monkeypatch.setattr(dsa_backend, "_is_sail", True)
+    monkeypatch.setattr(
+        dsa_backend, "get_platform", lambda: SimpleNamespace(is_sm100=False)
+    )
+    # Use the tensor copy fallback for precomputed metadata on CPU.
+    monkeypatch.setattr(dsa_metadata_manager, "_is_hip", True)
+    monkeypatch.setitem(
+        sys.modules,
+        "deep_gemm",
+        SimpleNamespace(
+            get_num_sms=lambda: 39,
+            get_paged_mqa_logits_metadata=lambda lengths, *args, **kwargs: (
+                lengths.clone()
+            ),
+        ),
+    )
+
+    mode = ForwardMode.TARGET_VERIFY
+    reqs = torch.arange(2)
+    seq = torch.tensor([6, 10], dtype=torch.int32)
+    backend._build_forward_metadata_cuda_graph(2, 4, reqs, seq, seq, mode, None)
+    metadata = backend.forward_metadata
+    schedule = metadata.paged_mqa_schedule_metadata
+    assert isinstance(schedule, dsa_backend.SailPagedMQAMetadata)
+    owners = torch.tensor([0, 0, 1, 1], dtype=torch.int32)
+    torch.testing.assert_close(schedule.indices, owners)
+    addresses = schedule.tensor.data_ptr(), schedule.indices.data_ptr()
+
+    for lengths, expected_owners in (
+        ([7, 8, 0, 0], [0, 0, -3, -4]),
+        ([0, 0, 11, 12], [-1, -2, 1, 1]),
+    ):
+        expanded = torch.tensor(lengths, dtype=torch.int32)
+        cache_seqlens = expanded[1::2].contiguous()
+        replay = dsa_backend.PrecomputedMetadata(
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_k=dsa_backend.compute_cu_seqlens(cache_seqlens),
+            req_pool_indices=reqs,
+            page_indices=torch.zeros((4, 12), dtype=torch.int32),
+            real_page_table=None,
+            seqlens_expanded=expanded,
+            dsa_cache_seqlens=expanded,
+            dsa_cu_seqlens_k=dsa_backend.compute_cu_seqlens(expanded),
+            seqlens_expanded_size=4,
+            max_len=12,
+            max_seqlen_k=12,
+        )
+        backend.init_forward_metadata_replay_cuda_graph_from_precomputed(
+            2, replay, mode
+        )
+        assert backend.forward_metadata.paged_mqa_schedule_metadata is schedule
+        assert (schedule.tensor.data_ptr(), schedule.indices.data_ptr()) == addresses
+        torch.testing.assert_close(schedule.tensor, expanded[:, None])
+        torch.testing.assert_close(
+            schedule.indices, torch.tensor(expected_owners, dtype=torch.int32)
+        )
+        torch.testing.assert_close(metadata.token_to_batch_idx, owners)
 
 
 @pytest.mark.parametrize(
@@ -191,7 +316,10 @@ def test_pad_topk_width_does_not_share_a_buffer_across_different_real_widths():
     )
 
 
-def test_kpool_tail_guard_admits_q8_for_prefill_only():
+def test_kpool_tail_guard_admits_q8_for_prefill_only(monkeypatch):
+    from sglang.srt.layers.attention.dsa import dsa_backend_kpool
+
+    monkeypatch.setattr(dsa_backend_kpool, "is_sail", lambda: False)
     backend = SimpleNamespace(
         dsa_index_kpool=4, device_sm_major=9, dsa_kv_cache_store_fp8=False
     )

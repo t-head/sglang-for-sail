@@ -59,6 +59,14 @@ from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.utils.auth import admin_auth_headers
 from sglang.srt.utils.network import resolve_base_url, resolve_host_port
 
+try:
+    from model_prof import start_active_profile
+except ImportError:
+
+    def start_active_profile():
+        pass
+
+
 _EMBEDDING_UNSUPPORTED_DATASETS = {"image", "mmmu", "mooncake"}
 
 TERM_PLOTLIB_AVAILABLE = (importlib.util.find_spec("termplotlib") is not None) and (
@@ -1408,6 +1416,7 @@ async def benchmark(
     mooncake_num_rounds=1,
     profile_prefill_url: Optional[List[str]] = None,
     profile_decode_url: Optional[List[str]] = None,
+    skip_first_concurrency: bool = False,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -1435,10 +1444,17 @@ async def benchmark(
     # From https://github.com/vllm-project/vllm/pull/9390
     semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
 
-    async def limited_request_func(request_func_input, pbar):
+    async def limited_request_func(request_func_input, pbar, task_id):
         if semaphore is None:
             return await request_func(request_func_input=request_func_input, pbar=pbar)
         async with semaphore:
+            if skip_first_concurrency:
+                if task_id == 2 * max_concurrency:
+                    print(f"Start active profiling with request id: {task_id}")
+                    start_active_profile()
+                elif task_id == 1:
+                    print("Start active profiling")
+                    start_active_profile()
             return await request_func(request_func_input=request_func_input, pbar=pbar)
 
     # Warmup
@@ -1498,6 +1514,7 @@ async def benchmark(
                 limited_request_func(
                     request_func_input=test_input,
                     pbar=None,
+                    task_id=-1,
                 )
             )
         )
@@ -1559,6 +1576,7 @@ async def benchmark(
     # Run all requests
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
+    task_id = 0
     pbar_total = len(input_requests)
     if (
         backend == "sglang" and is_mooncake
@@ -1622,9 +1640,12 @@ async def benchmark(
 
         tasks.append(
             asyncio.create_task(
-                limited_request_func(request_func_input=request_func_input, pbar=pbar)
+                limited_request_func(
+                    request_func_input=request_func_input, pbar=pbar, task_id=task_id
+                )
             )
         )
+        task_id += 1
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
     if is_multi_turn:
         outputs = [x for output in outputs for x in output]
@@ -2233,6 +2254,7 @@ def run_benchmark(args_: argparse.Namespace):
             mooncake_num_rounds=args.mooncake_num_rounds,
             profile_prefill_url=getattr(args, "profile_prefill_url", None),
             profile_decode_url=getattr(args, "profile_decode_url", None),
+            skip_first_concurrency=getattr(args, "skip_first_concurrency", False),
         )
     )
 
@@ -2880,6 +2902,13 @@ def cli_main():
         default=None,
         help="Response-stream parsing threads for --rust-client. "
         "Defaults to the available parallelism.",
+    )
+    parser.add_argument(
+        "--skip-first-concurrency",
+        action="store_true",
+        help="Trigger optional model_prof active profiling at request IDs 1 and "
+        "2 * max_concurrency. Warmup requests are excluded from these triggers; "
+        "reported benchmark statistics still include all measured requests.",
     )
     args = parser.parse_args()
     if args.rust_worker_threads is not None and not args.rust_client:

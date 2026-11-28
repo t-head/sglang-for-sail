@@ -1,4 +1,5 @@
 import unittest
+from itertools import product
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -194,6 +195,7 @@ class TestTrackMambaStateDtype(CustomTestCase):
         )
         batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
+            extend_seq_lens_cpu=[2, 2],
             extend_prefix_lens=torch.tensor([0, 64]),
         )
         qkv = torch.arange(24, dtype=torch.float32).view(4, 6)
@@ -211,9 +213,16 @@ class TestTrackMambaStateDtype(CustomTestCase):
             track_ssm_final_src=torch.tensor([6]),
             track_ssm_final_dst=torch.tensor([5]),
         )
-        for snapshot in (False, True):
+        for snapshot, with_intermediate in product((False, True), repeat=2):
             for contiguous in (True, False):
-                with self.subTest(snapshot=snapshot, contiguous=contiguous):
+                with self.subTest(
+                    snapshot=snapshot,
+                    contiguous=contiguous,
+                    with_intermediate=with_intermediate,
+                ):
+                    metadata.track_ssm_h_src = (
+                        torch.tensor([0]) if with_intermediate else None
+                    )
                     backend = object.__new__(GDNAttnBackend)
                     backend.forward_metadata = metadata
                     backend.mis_metadata = None
@@ -236,7 +245,8 @@ class TestTrackMambaStateDtype(CustomTestCase):
                         self.assertEqual(kwargs["layer_id"], layer.layer_id)
                         self.assertIs(kwargs["A_log"], layer.A_log)
                         self.assertIs(kwargs["dt_bias"], layer.dt_bias)
-                        self.assertTrue(kwargs["needs_track_state"])
+                        self.assertEqual(kwargs["needs_track_state"], with_intermediate)
+                        self.assertEqual(kwargs["seq_lens_cpu"], [2, 2])
                         self.assertIs(
                             kwargs["extend_prefix_lens"], batch.extend_prefix_lens
                         )
@@ -248,7 +258,7 @@ class TestTrackMambaStateDtype(CustomTestCase):
                             kwargs["ssm_states"].is_contiguous(), contiguous
                         )
                         kwargs["ssm_states"][kwargs["cache_indices"]] = 5
-                        if snapshot:
+                        if snapshot and with_intermediate:
                             self.assertIs(
                                 kwargs["track_chunk_idx"], metadata.track_chunk_idx
                             )
@@ -288,7 +298,11 @@ class TestTrackMambaStateDtype(CustomTestCase):
                     )
                     self.assertTrue(torch.all(conv_states[indices] == 7))
                     self.assertTrue(torch.all(ssm_states[[6, 2, 5]] == 5))
-                    expected = DOUBLE_ROUND_PROBE if snapshot else 2.0
+                    expected = (
+                        (DOUBLE_ROUND_PROBE if snapshot else 2.0)
+                        if with_intermediate
+                        else 0.0
+                    )
                     self.assertTrue(torch.all(ssm_states[4] == expected))
 
 
@@ -387,6 +401,23 @@ class TestKdaCutedslVerifyStateDtypeGate(CustomTestCase):
         self.assertFalse(
             self._can_run(self._states(torch.float32), snapshot_dtype=torch.bfloat16)
         )
+
+
+class TestGDNFinalOnlyTracking(CustomTestCase):
+    def test_missing_intermediate_source_keeps_final_tracking(self):
+        metadata = ForwardMetadata(
+            query_start_loc=torch.tensor([0, 1]),
+            mamba_cache_indices=torch.tensor([1]),
+            has_mamba_track_mask=True,
+            track_ssm_h_src=None,
+            track_ssm_final_src=torch.tensor([1]),
+            track_ssm_final_dst=torch.tensor([2]),
+        )
+        states = torch.tensor([[[[0.0]]], [[[7.0]]], [[[0.0]]]])
+        MambaAttnBackendBase._track_mamba_state_extend(
+            None, None, None, states, metadata
+        )
+        torch.testing.assert_close(states[2], states[1])
 
 
 if __name__ == "__main__":

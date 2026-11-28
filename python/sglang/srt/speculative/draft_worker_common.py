@@ -52,7 +52,10 @@ def resolve_draft_worker_attention_backend(*, algo_label: Optional[str] = None) 
         draft_backend, _ = attention_backends()
     if draft_backend is None:
         return platform_fallback
-    if algo_label == "DFLASH" and draft_backend in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
+    mla_draft_backends = (
+        ("flashmla",) if get_platform().is_sail else DFLASH_MLA_ONLY_DRAFT_BACKENDS
+    )
+    if algo_label == "DFLASH" and draft_backend in mla_draft_backends:
         return draft_backend
     if draft_backend not in DRAFT_ATTENTION_BACKEND_CHOICES:
         fallback = platform_fallback

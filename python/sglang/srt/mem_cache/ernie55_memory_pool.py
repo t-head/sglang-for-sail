@@ -36,7 +36,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
-from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.runtime_context import get_spec
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
@@ -106,7 +106,7 @@ class Ernie5_5TokenToKVPool(DeepSeekV4TokenToKVPool):
             mla_kv_lora_rank=hf_config.hybrid_mla_kv_lora_rank,
             mla_qk_rope_head_dim=hf_config.hybrid_mla_qk_rope_head_dim,
             index_head_dim=hf_config.index_head_dim,
-            use_fp4_indexer=get_exec().kernel.enable_fp4_indexer,
+            use_fp4_indexer=DSATokenToKVPool.use_fp4_indexer_for_current_platform(),
         )
 
     def __init__(
@@ -247,7 +247,7 @@ class Ernie5_5PoolConfigurator(DSV4PoolConfigurator):
 
     def __init__(self, kvc: KVCacheConfigurator):
         self._hf_config = kvc.model_config.hf_config
-        self.use_fp4_indexer = get_exec().kernel.enable_fp4_indexer
+        self.use_fp4_indexer = DSATokenToKVPool.use_fp4_indexer_for_current_platform()
         stage = range(kvc.layer_info.start_layer, kvc.layer_info.end_layer)
         self._num_mla_layers = sum(i in stage for i in kvc.model_config.mla_layer_ids)
         # The MTP draft is one MLA layer, priced here instead of by inflation.

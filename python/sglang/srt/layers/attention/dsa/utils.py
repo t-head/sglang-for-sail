@@ -26,6 +26,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_musa
 from sglang.srt.utils.common import ceil_div
+from sglang.srt.utils.device import is_sail
 
 logger = logging.getLogger(__name__)
 
@@ -205,7 +206,9 @@ def is_dsa_enable_prefill_cp():
 
     # Generic prefill CP derives activation from the runtime topology and model
     # architecture.
-    if get_parallel().attn_cp_size <= 1:
+    if get_parallel().attn_cp_size <= 1 or (
+        is_sail() and not get_parallel().enable_prefill_cp
+    ):
         return False
     from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
 

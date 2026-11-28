@@ -14,6 +14,7 @@ from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import PlatformCapabilities, SRTPlatform
 
 _ZW_TAG = "ZW"
+_ZW810E_NAME = "ZW810E"
 
 
 @lru_cache(maxsize=1)
@@ -40,3 +41,20 @@ class SailSRTPlatform(SailDeviceMixin, SRTPlatform):
         piecewise_graph=True,
         supports_pynccl=True,
     )
+
+    def is_zw810e(self) -> bool:
+        return _ZW810E_NAME in self.get_device_name()
+
+    def get_device_num_tensorcores(self, device_id: int = 0) -> int:
+        if _ZW810E_NAME in self.get_device_name(device_id):
+            return 20
+        return super().get_device_num_tensorcores(device_id)
+
+
+if is_sail_available():
+    import sglang.srt.hardware_backend.sail.attention.ops_hooks  # noqa: F401
+    import sglang.srt.hardware_backend.sail.attention.ppu_deep_select_hooks  # noqa: F401
+    import sglang.srt.hardware_backend.sail.attention.ppu_mhc_prenorm_hooks  # noqa: F401
+    import sglang.srt.hardware_backend.sail.attention.ppu_msa_hook  # noqa: F401
+    import sglang.srt.hardware_backend.sail.moe.deepep_hooks  # noqa: F401
+    import sglang.srt.hardware_backend.sail.ppu_cuda_graph_hooks  # noqa: F401

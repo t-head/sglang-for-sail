@@ -3,9 +3,12 @@
 import unittest
 from array import array
 from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.managers.req_types import FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.mem_cache.allocation import ensure_mamba_capacity
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.registry import keep_full_kv_only
 from sglang.srt.mem_cache.static_kv_storage import acquire_rows
@@ -55,6 +58,28 @@ def _request(req_to_token_pool, allocator, tokens, rid):
 
 
 class TestDecodeStateFreeRadix(CustomTestCase):
+    def test_request_only_tree_has_no_mamba_component(self):
+        cache, _, _ = _state_free_cache()
+        self.assertFalse(cache.is_mamba_enabled)
+        self.assertNotIn(ComponentType.MAMBA, cache.components)
+        self.assertTrue(cache.request_mamba_only)
+        self.assertTrue(cache.supports_mamba())
+        self.assertEqual(cache.mamba_evictable_size(), 0)
+
+    def test_state_shortage_does_not_evict_full_kv(self):
+        cache, _, pool = _state_free_cache()
+        # The shared allocator and request-state APIs are exercised by existing
+        # lifecycle tests; pin the no-tree-state eviction decision independently.
+        state = SimpleNamespace(
+            pending_request_slots=lambda pool, req: 1,
+            slots=SimpleNamespace(slots_fit=lambda needed: False),
+        )
+        fake_pool = SimpleNamespace(holds_state_slots=True, binds_row_units=False)
+        with patch.object(
+            cache, "evict_for_alloc", side_effect=AssertionError("evicted")
+        ):
+            self.assertFalse(ensure_mamba_capacity(fake_pool, state, [object()], cache))
+
     def test_finished_request_is_cached_and_frees_its_slot(self):
         cache, allocator, req_to_token_pool = _state_free_cache()
         mamba_free = req_to_token_pool.mamba_allocator.available_size()

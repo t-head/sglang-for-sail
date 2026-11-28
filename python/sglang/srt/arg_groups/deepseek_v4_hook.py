@@ -113,6 +113,29 @@ def _resolve_engram_config(server_args: ServerArgs) -> None:
     logger.info("DeepSeek-V4.1 Engram tables: %s", config)
 
 
+def _dsv41_dspark_pd_parallelism_supported(cfg) -> bool:
+    if cfg.disaggregation_mode not in ("prefill", "decode") or cfg.dcp_size != 1:
+        return False
+
+    # CP size may still be implicit at this validation slot; the CP hook declares
+    # it later from tp_size. Only the canonical prefill interleave strategy is
+    # inside the validated transfer layout.
+    prefill_cp = (
+        cfg.disaggregation_mode == "prefill"
+        and cfg.enable_prefill_cp
+        and cfg.cp_strategy == "interleave"
+    )
+    has_cp = cfg.enable_prefill_cp or cfg.attn_cp_size != 1
+    if has_cp and not prefill_cp:
+        return False
+
+    # Attention DP is admitted on either role as long as both servers agree on
+    # the block size and the target/draft KV layout; the PD handshake enforces
+    # that. Each attention-DP rank owns whole requests, so no head sharding
+    # crosses the transfer.
+    return True
+
+
 def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None:
     """Apply DeepSeek V4 environment defaults, request limits, and validation."""
     cfg = resolving_view(server_args)
@@ -144,13 +167,18 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         )
 
     if cfg.dsv4_attn_backend == "flashmla_mega":
-        from sglang.srt.utils.device import is_sm100_supported
+        from sglang.srt.utils.device import is_sail, is_sm100_supported
 
+        # Per-token FP32 output scales require exactly SM89 in this SAIL build.
+        ppu_mega = is_sail() and get_platform().device_sm == 89
         assert (
             model_config_of(server_args).hf_config.model_type == "deepseek_v41"
             and cfg.device == "cuda"
-            and is_sm100_supported()
-        ), "--dsv4-attn-backend flashmla_mega requires DeepSeek-V4.1 on SM100/SM103."
+            and ((not is_sail() and is_sm100_supported()) or ppu_mega)
+        ), (
+            "--dsv4-attn-backend flashmla_mega requires DeepSeek-V4.1 on "
+            "SM100/SM103 or SAIL (PPU) SM89."
+        )
 
     if cfg.dsv4_attn_backend == "trtllm":
         from sglang.srt.utils.device import is_sm100_supported
@@ -212,8 +240,29 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
             )
 
 
+def _sail_sparse_prefill_cp_supported(cfg) -> bool:
+    from sglang.srt.utils.device import is_sail
+
+    if not is_sail():
+        return False
+    from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
+        use_dsv4_q8kv8_sparse_prefill,
+    )
+
+    return (
+        cfg.enable_prefill_cp
+        and cfg.cp_strategy == "interleave"
+        and cfg.dp_size == 1
+        and cfg.tp_size > 1
+        and cfg.moe_a2a_backend in ("none", "deepep", "megamoe", "mori")
+        and not use_dsv4_q8kv8_sparse_prefill(cfg.dsv4_prefill_backend)
+    )
+
+
 def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     """Validate DeepSeek V4 context-parallel configuration."""
+    from sglang.srt.utils.device import is_sail
+
     cfg = resolving_view(server_args)
     if not cfg.enable_prefill_cp:
         return
@@ -267,17 +316,29 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         assert cfg.attn_dp_size == 1, (
             "For round-robin split mode, dp attention is not supported."
         )
-        assert cfg.tp_size <= 8, (
-            "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
-        )
+        if is_sail():
+            if cfg.tp_size > 8:
+                logger.warning(
+                    f"Context parallel with tp_size={cfg.tp_size} (> 8) bypasses "
+                    "the legacy CP size limit on SAIL. Verify the actual topology "
+                    "and cross-machine precision before deployment."
+                )
+        else:
+            assert cfg.tp_size <= 8, (
+                "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+            )
     supported_a2a_backends = ("none", "deepep", "megamoe", "mori", "ascend_ops")
     if cfg.moe_a2a_backend not in supported_a2a_backends:
         raise ValueError(
             f"DeepSeekV4 CP supports moe_a2a_backend in {supported_a2a_backends}, "
             f"got {cfg.moe_a2a_backend!r}."
         )
-    if model_config_of(server_args).hf_config.model_type != "deepseek_v41":
-        # The CP-aware sparse prefill chunk cache is validated on V4.1 only.
+    if model_config_of(
+        server_args
+    ).hf_config.model_type != "deepseek_v41" and not _sail_sparse_prefill_cp_supported(
+        cfg
+    ):
+        # Keep native policy; the SAIL interleave layout supports sparse prefill.
         logger.warning(
             "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL because DeepSeekV4 "
             "context parallelism is enabled."
@@ -332,6 +393,18 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             "DeepSeek-V4.1 TRT-LLM requires --cuda-graph-backend-prefill "
             "disabled or breakable"
         )
+
+    from sglang.srt.layers.attention.dsv4.indexer_quant import (
+        dsv41_requires_int8_indexer,
+    )
+
+    if dsv41_requires_int8_indexer():
+        if cfg.enable_deepseek_v4_fp4_indexer:
+            raise ValueError(
+                "DeepSeek-V4.1 on PPU below SM89 requires the INT8 indexer; "
+                "remove --enable-deepseek-v4-fp4-indexer."
+            )
+        logger.info("DeepSeek-V4.1 on PPU below SM89: using INT8 low-ratio indexer")
     if cfg.enable_encoder_swa_bounded_replay:
         incompatible = (
             (
@@ -402,24 +475,14 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             read_ragged_verify_mode,
         )
 
-        # CP size may still be implicit here; validate_deepseek_v4_cp resolves it.
-        supported_prefill_cp = (
-            cfg.disaggregation_mode == "prefill"
-            and cfg.enable_prefill_cp
-            and cfg.cp_strategy == "interleave"
-        )
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
             or cfg.disaggregation_transfer_backend not in ("mooncake", "nixl", "mori")
-            or (
-                (cfg.enable_prefill_cp or cfg.attn_cp_size != 1)
-                and not supported_prefill_cp
-            )
-            or cfg.dcp_size != 1
+            or not _dsv41_dspark_pd_parallelism_supported(cfg)
         ):
             raise ValueError(
-                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, NIXL, "
-                "or MoRI, DCP=1, and CP=1 on decode. Prefill CP requires "
+                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, NIXL or MoRI, "
+                "DCP=1, and CP=1 on decode. Prefill CP requires "
                 "--enable-prefill-cp with the interleave strategy. "
                 "DP attention is supported when "
                 "both servers use the same block size and target/draft KV layout."

@@ -14,8 +14,32 @@ from typing import Optional, Tuple, Union
 
 import flash_mla
 import torch
-from flash_mla import fused_norm_rope_attn_rope_cast as _mega
 from flash_mla.flash_mla_interface import FlashMLASchedMeta
+
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa_nvtx import flashmla_kv_leaf_nvtx, in_sparse_range
+
+SGLANG_PROFILE_NVTX = envs.SGLANG_PROFILE_NVTX.get()
+SGLANG_PROFILE_NVTX_PRINT_SEQLEN = envs.SGLANG_PROFILE_NVTX_PRINT_SEQLEN.get()
+if SGLANG_PROFILE_NVTX:
+    try:
+        from torch.cuda.nvtx import range_pop as th_nvtx_range_pop
+        from torch.cuda.nvtx import range_push as th_nvtx_range_push
+    except ImportError:
+        SGLANG_PROFILE_NVTX = False
+
+try:
+    from flash_mla import fused_norm_rope_attn_rope_cast as _mega
+
+    _mega_import_error = None
+except ImportError as e:
+    _mega = None
+    _mega_import_error = e
+
+_MEGA_IMPORT_ERROR = ImportError(
+    "This flash_mla has no MegaAttention (fused_norm_rope_attn_rope_cast); "
+    "install a wheel providing MegaAttention to use these entry points."
+)
 
 # 512 fp8 values + 4 fp32 scales; the V4.1 formats have the same size, which is
 # why the tensor-metadata API (it predates V4.1) reads such a cache as V3.2.
@@ -56,9 +80,14 @@ def get_mla_metadata(
     num_heads_q: Optional[int] = None,
     is_fp8_kvcache: bool = False,
     topk: Optional[int] = None,
+    topk_length: Optional[torch.Tensor] = None,
 ) -> Tuple[Union[torch.Tensor, FlashMLASchedMeta], Optional[torch.Tensor]]:
     """Without ``cache_seqlens``, an empty ``FlashMLASchedMeta`` that the first
     decode call fills; with it, the legacy split-KV schedule as tensors."""
+    if topk_length is not None:
+        raise NotImplementedError(
+            "Per-item scheduler topk_length is a SAIL backend contract."
+        )
     if cache_seqlens is None:
         return flash_mla.get_mla_metadata()[0], None
     assert num_q_tokens_per_head_k is not None
@@ -74,6 +103,7 @@ def get_mla_metadata(
     )
 
 
+@flashmla_kv_leaf_nvtx
 def flash_mla_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -133,28 +163,45 @@ def flash_mla_with_kvcache(
             and k_cache.shape[-1] == _V32_NO_ROPE_BYTES_PER_TOKEN
         ):
             kv_format = "V32_NO_ROPE"
-    return flash_mla.flash_mla_with_kvcache(
-        q=q,
-        k_cache=k_cache,
-        block_table=block_table,
-        cache_seqlens=cache_seqlens,
-        head_dim_v=head_dim_v,
-        tile_scheduler_metadata=sched_meta,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        is_fp8_kvcache=is_fp8_kvcache,
-        indices=indices,
-        attn_sink=attn_sink,
-        extra_k_cache=extra_k_cache,
-        extra_indices_in_kvcache=extra_indices_in_kvcache,
-        topk_length=topk_length,
-        extra_topk_length=extra_topk_length,
-        use_legacy=use_legacy,
-        kv_format=kv_format,
-        descale_q=descale_q,
-        descale_k=descale_k,
-        **extra,
-    )
+    if SGLANG_PROFILE_NVTX and not in_sparse_range():
+        mode = "D" if torch.cuda.is_current_stream_capturing() else "P"
+        message = (
+            f"[FW_FMHA] --format=MLA,Forward,type:{mode},"
+            f"seqlen_q:{q.shape[-3] if q.dim() == 4 else 1},"
+            f"head_dim:{q.shape[-1]},head_dim_v:{head_dim_v},"
+            f"num_heads_kv:{k_cache.shape[-2]},num_heads:{q.shape[-2]},"
+            f"batch_size:{q.shape[0]},data_type:{q.dtype},causal:{causal}"
+        )
+        if mode == "P" and SGLANG_PROFILE_NVTX_PRINT_SEQLEN:
+            lengths = cache_seqlens.tolist() if cache_seqlens is not None else None
+            message += f",cu_seqlens_k:{lengths}"
+        th_nvtx_range_push(message)
+    try:
+        return flash_mla.flash_mla_with_kvcache(
+            q=q,
+            k_cache=k_cache,
+            block_table=block_table,
+            cache_seqlens=cache_seqlens,
+            head_dim_v=head_dim_v,
+            tile_scheduler_metadata=sched_meta,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            is_fp8_kvcache=is_fp8_kvcache,
+            indices=indices,
+            attn_sink=attn_sink,
+            extra_k_cache=extra_k_cache,
+            extra_indices_in_kvcache=extra_indices_in_kvcache,
+            topk_length=topk_length,
+            extra_topk_length=extra_topk_length,
+            use_legacy=use_legacy,
+            kv_format=kv_format,
+            descale_q=descale_q,
+            descale_k=descale_k,
+            **extra,
+        )
+    finally:
+        if SGLANG_PROFILE_NVTX and not in_sparse_range():
+            th_nvtx_range_pop()
 
 
 def flash_mla_sparse_fwd(
@@ -199,6 +246,8 @@ def flash_mla_mega_prefill(
     use_legacy: bool = True,
 ) -> Tuple[torch.Tensor, ...]:
     """MegaAttention prefill over a bf16 ``kv``: (out_fp8, out_sf, max_logits, lse)."""
+    if _mega_import_error is not None:
+        raise _MEGA_IMPORT_ERROR from _mega_import_error
     return _mega.prefill(
         token_positions=positions,
         cos_sin_cache=cos_sin_cache,
@@ -234,6 +283,8 @@ def flash_mla_mega_decode(
     use_legacy: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """MegaAttention decode over a paged cache: (out_fp8, out_sf, lse)."""
+    if _mega_import_error is not None:
+        raise _MEGA_IMPORT_ERROR from _mega_import_error
     return _mega.decode(
         token_positions=positions,
         cos_sin_cache=cos_sin_cache,

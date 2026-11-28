@@ -98,6 +98,21 @@ class SiluAndMulOp(BaseFusedOp):
 
 _SILU_AND_MUL = register_fused_op(SiluAndMulOp(), __name__, "_SILU_AND_MUL")
 
+# SAIL CUDA-compatible JIT; entry points enforce the vendor intrinsic guard.
+for _name in (
+    "silu_and_mul_post_quant_mxfp4",
+    "silu_and_mul_post_per_token_quant_fp8",
+    "silu_and_mul_masked_post_quant_mxfp4",
+):
+    register_kernel(
+        KernelSpec(
+            op=f"activation.{_name}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.activation.silu_mul_quant:{_name}",
+            capabilities=CUDA_ONLY,
+        )
+    )
+
 
 def silu_and_mul(
     input: torch.Tensor, out: Optional[torch.Tensor] = None
@@ -118,8 +133,23 @@ def situ_and_mul(
     return impl(input, out, beta, linear_beta, cast)
 
 
+def situ_and_mul_masked(
+    input: torch.Tensor,
+    out: Optional[torch.Tensor],
+    masked_m: torch.Tensor,
+    beta: float,
+    linear_beta: Optional[float],
+    topk: int = 8,
+    expected_m: Optional[int] = None,
+) -> torch.Tensor:
+    from .kimi_k3_situ_and_mul import situ_and_mul_masked as impl
+
+    return impl(input, out, masked_m, beta, linear_beta, topk, expected_m)
+
+
 __all__ = [
     "situ_and_mul",
+    "situ_and_mul_masked",
     "SiluAndMulOp",
     "silu_and_mul",
 ]
@@ -173,6 +203,14 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="activation.situ_and_mul_masked",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.activation.kimi_k3_situ_and_mul:situ_and_mul_masked",
+        capabilities=CUDA_ONLY,
+    )
+)
 
 
 # MXFP8-quantizing SwiGLU producers; registered for inventory.
@@ -212,5 +250,49 @@ register_kernel(
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.activation.silu_and_mul_block_quant:silu_and_mul_block_quant_two_group",
         capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
+    )
+)
+
+
+def situ_and_mul_post_quant_mxfp4(input, output, output_scale, beta, linear_beta):
+    from .kimi_k3_situ_and_mul import situ_and_mul_post_quant_mxfp4 as impl
+
+    return impl(input, output, output_scale, beta, linear_beta)
+
+
+def situ_and_mul_masked_post_quant_mxfp4(
+    input, output, output_scale, masked_m, beta, linear_beta, topk=8, expected_m=None
+):
+    from .kimi_k3_situ_and_mul import situ_and_mul_masked_post_quant_mxfp4 as impl
+
+    return impl(
+        input, output, output_scale, masked_m, beta, linear_beta, topk, expected_m
+    )
+
+
+__all__ += ["situ_and_mul_post_quant_mxfp4", "situ_and_mul_masked_post_quant_mxfp4"]
+for _fn in ("situ_and_mul_post_quant_mxfp4", "situ_and_mul_masked_post_quant_mxfp4"):
+    register_kernel(
+        KernelSpec(
+            op=f"activation.{_fn}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.activation.kimi_k3_situ_and_mul:{_fn}",
+            capabilities=CUDA_ONLY,
+        )
+    )
+del _fn
+
+
+# Masked SiLU+mul fused with per-token FP8 quantization. SAIL exposes a CUDA
+# device; the wrapper gates dispatch on is_sail().
+register_kernel(
+    KernelSpec(
+        op="activation.silu_and_mul_masked_post_per_token_quant_fp8",
+        backend=KernelBackend.JIT,
+        target=(
+            "sglang.kernels.ops.activation.silu_mul_quant:"
+            "silu_and_mul_masked_post_per_token_quant_fp8"
+        ),
+        capabilities=CUDA_ONLY,
     )
 )

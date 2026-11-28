@@ -547,10 +547,20 @@ class MiniMaxM3MoE(nn.Module):
         )
 
         if not is_mega_moe_experts_ready(self.experts):
-            raise RuntimeError(
-                "M3.1 NVFP4 MegaMoE weights are not ready on this device"
-            )
+            raise RuntimeError("M3.1 MegaMoE weights are not ready on this device")
         num_tokens = hidden_states.shape[0]
+        valid_rows = None
+        if (
+            getattr(self.experts, "_mega_moe_mma_type", None) == "fp8xfp8_channelwise"
+            and forward_batch.num_token_non_padded is not None
+        ):
+            # Graph replay keeps the bucket size but changes the live prefix.
+            # Clear padded NaNs before per-token quantization and shared MLPs.
+            valid_rows = (
+                torch.arange(num_tokens, device=hidden_states.device)
+                < forward_batch.num_token_non_padded
+            )
+            hidden_states = hidden_states.masked_fill(~valid_rows[:, None], 0)
         shared = self._forward_shared_experts(hidden_states) if num_tokens else None
         topk_ids = topk_weights = None
         if num_tokens:
@@ -565,6 +575,9 @@ class MiniMaxM3MoE(nn.Module):
                 ),
             )
             topk_ids, topk_weights = output.topk_ids, output.topk_weights
+            if valid_rows is not None:
+                topk_ids = topk_ids.masked_fill(~valid_rows[:, None], -1)
+                topk_weights = topk_weights.masked_fill(~valid_rows[:, None], 0)
         if self.trtllm_decode_with_mega_moe and forward_batch.forward_mode.is_decode():
             if not num_tokens:
                 return hidden_states
@@ -581,8 +594,16 @@ class MiniMaxM3MoE(nn.Module):
             num_tokens=num_tokens,
             activation=self.experts._minimax_activation,
             activation_clamp=self.config.swiglu_limit,
+            activation_alpha=(
+                self.config.swiglu_alpha
+                if self.experts._minimax_activation == "swigluoai"
+                else None
+            ),
         )
-        return output + shared if shared is not None else output
+        output = output + shared if shared is not None else output
+        if valid_rows is not None:
+            output.masked_fill_(~valid_rows[:, None], 0)
+        return output
 
     def _forward_trtllm_decode(
         self,
@@ -1860,7 +1881,11 @@ class MiniMaxM3DecoderLayer(nn.Module):
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            if self.is_layer_sparse or _input_rows(hidden_states) != 0:
+            if self.is_layer_sparse:
+                hidden_states = self.mlp(
+                    hidden_states=hidden_states, forward_batch=forward_batch
+                )
+            elif _input_rows(hidden_states) != 0:
                 hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
         return ffn_exit.finish(hidden_states)
 

@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_row_bytes,
     mqa_logits_rows_per_chunk,
     mqa_logits_should_chunk,
+    sail_paged_mqa_metadata,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -22,7 +23,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
-from sglang.srt.utils import is_hip, is_sm120_supported, is_xpu
+from sglang.srt.utils import is_hip, is_sail, is_sm120_supported, is_xpu
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +89,7 @@ def plan_indexer_row_chunks(
     if budget_bytes is not None:
         need_chunk, budget_bytes = mqa_logits_should_chunk(
             num_rows=num_rows,
-            num_cols=num_cols,
+            num_cols=mqa_logits_row_bytes(num_cols) // 4 if is_sail() else num_cols,
             get_budget_bytes=lambda: budget_bytes,
             rocm=is_hip(),
         )
@@ -193,7 +194,11 @@ class PagedIndexerMetadata:
     rows_per_request: int = 1
     # Schedule DeepGEMM's current paged API: varlen rows grouped by request indices.
     deep_gemm_varlen: bool = False
+    q_fp8_shape: Optional[torch.Size] = None
+    q_dtype: Optional[torch.dtype] = None
+    request_indices: Optional[torch.Tensor] = None
     # A list when the dynamic-budget forward is row-chunked: one schedule per chunk.
+    build_paged_mqa_logits_metadata: bool = True
     deep_gemm_metadata: Any = field(init=False, repr=False)
     # The request of each query row of a chunk (all rows if unchunked) when the
     # schedule is varlen, else None; a shorter last chunk takes its prefix.
@@ -212,15 +217,73 @@ class PagedIndexerMetadata:
     )
 
     def __post_init__(self):
-        if (
-            is_hip() or is_xpu() or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+        if is_sail():
+            # Build PPU schedules once per forward/chunk, shared by all layers.
+            # Preserve the target's optional q_dtype API; legacy callers default
+            # to FP8, while the backend supplies the actual quantized dtype.
+            q_dtype = self.q_dtype or torch.float8_e4m3fn
+            num_rows = self.compressed_seq_lens.numel()
+            self.mqa_logits_budget_bytes = self._mqa_logits_budget(num_rows=num_rows)
+            self.rows_per_chunk = plan_indexer_row_chunks(
+                num_rows=num_rows,
+                num_cols=self.max_compressed_seq_len,
+                budget_bytes=self.mqa_logits_budget_bytes,
+                sm120_row_cap=None,
+            )
+
+            def build_schedule(rows):
+                if (
+                    self.q_fp8_shape is None
+                    or not self.build_paged_mqa_logits_metadata
+                    or rows.start == rows.stop
+                ):
+                    return None
+                if (
+                    q_dtype == torch.float8_e4m3fn
+                    and not self.force_deep_gemm_metadata
+                    and (
+                        envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+                        or envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
+                    )
+                ):
+                    return None
+                head_dim = self.q_fp8_shape[3]
+                indices = None
+                if q_dtype == torch.int8 and head_dim == 64:
+                    head_dim *= 2  # Packed MXFP4 storage width -> logical D.
+                    if self.request_indices is not None:
+                        indices = self.request_indices[rows]
+                return sail_paged_mqa_metadata(
+                    self.compressed_seq_lens[rows],
+                    self.compressed_page_size,
+                    self.q_fp8_shape[2],
+                    head_dim,
+                    q_dtype,
+                    indices,
+                )
+
+            if self.rows_per_chunk is not None:
+                self.deep_gemm_metadata = [
+                    build_schedule(rows)
+                    for rows in iter_row_chunks(
+                        num_rows=num_rows, rows_per_chunk=self.rows_per_chunk
+                    )
+                ]
+            else:
+                self.deep_gemm_metadata = build_schedule(slice(0, num_rows))
+        elif (
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            or is_xpu()
+            or is_hip()
+            or not self.build_paged_mqa_logits_metadata
         ) and not self.force_deep_gemm_metadata:
             self.deep_gemm_metadata = None
         else:
             import deep_gemm
 
             use_jit_indexer = (
-                not self.force_deep_gemm_metadata
+                not is_sail()
+                and not self.force_deep_gemm_metadata
                 and self.rows_per_request == 1
                 and (
                     envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
@@ -262,7 +325,8 @@ class PagedIndexerMetadata:
                     self.mqa_logits_budget_bytes,
                 )
             varlen = (
-                self.deep_gemm_varlen
+                not is_sail()
+                and self.deep_gemm_varlen
                 and not use_jit_indexer
                 and num_rows >= DEEP_GEMM_VARLEN_MIN_ROWS
                 and (self.rows_per_chunk or num_rows) <= DEEP_GEMM_VARLEN_MAX_ROWS
@@ -334,7 +398,12 @@ class PagedIndexerMetadata:
         if self.use_prefill_cuda_graph or not self.compressed_seq_lens.is_cuda:
             return None
         if not mqa_logits_needs_budget_check(
-            num_rows=num_rows, num_cols=self.max_compressed_seq_len
+            num_rows=num_rows,
+            num_cols=(
+                mqa_logits_row_bytes(self.max_compressed_seq_len) // 4
+                if is_sail()
+                else self.max_compressed_seq_len
+            ),
         ):
             return None
         if (
@@ -394,7 +463,7 @@ class PagedIndexerMetadata:
                 "deep_gemm_indices",
             ]
             assign_fields = ["nonpaged_plan"]
-        copy_fields += ["topk_metadata"]
+        copy_fields += ["topk_metadata", "request_indices"]
         assign_fields += [
             "rows_per_chunk",
             "mqa_logits_budget_bytes",
@@ -412,6 +481,9 @@ class PagedIndexerMetadata:
                 "use_topk_v2",
                 "rows_per_request",
                 "deep_gemm_varlen",
+                "build_paged_mqa_logits_metadata",
+                "q_fp8_shape",
+                "q_dtype",
             ],
             copy_fields=copy_fields,
             assign_fields=assign_fields,

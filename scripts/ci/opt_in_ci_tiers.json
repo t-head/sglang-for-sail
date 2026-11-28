@@ -38,7 +38,7 @@
   "ppu-extra": {
     "label": "run-ci-ppu-extra",
     "workflows": [
-      ".github/workflows/pr-test-ppu.yml"
+      ".github/workflows/pr-test-ppu-extra.yml"
     ]
   },
   "xeon-extra": {

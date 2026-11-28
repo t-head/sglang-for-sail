@@ -20,7 +20,7 @@ from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
 from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils import is_gfx95_supported, is_gfx942_supported, is_hip
-from sglang.srt.utils.device import is_gfx1250_supported, is_npu
+from sglang.srt.utils.device import is_gfx1250_supported, is_npu, is_sail
 
 _is_hip = is_hip()
 if _is_hip:
@@ -234,6 +234,37 @@ def _use_tilelang_mhc_post() -> bool:
 
 
 FP32 = "float32"
+
+# NVTX profiling helpers
+_has_nvtx = False
+try:
+    from torch.cuda.nvtx import range_pop as _nvtx_range_pop
+    from torch.cuda.nvtx import range_push as _nvtx_range_push
+
+    _has_nvtx = True
+except ImportError:
+    pass
+
+
+def _nvtx_push(label: str):
+    if _has_nvtx and envs.SGLANG_PROFILE_NVTX.get():
+        _nvtx_range_push(label)
+
+
+def _nvtx_pop():
+    if _has_nvtx and envs.SGLANG_PROFILE_NVTX.get():
+        _nvtx_range_pop()
+
+
+def _build_pass_configs():
+    configs = {
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
+    }
+    if envs.TL_MHC_PRE_BIG_FUSE_WITH_NORM_ENABLE_FAST_MATH.get():
+        configs[tilelang.PassConfigKey.TL_ENABLE_FAST_MATH] = True
+    return configs
 
 
 @tilelang.jit(pass_configs=pass_configs)
@@ -849,11 +880,7 @@ def prewarm_mhc_pre(
 
 
 @tilelang.jit(
-    pass_configs={
-        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-        tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
-    },
+    pass_configs=_build_pass_configs(),
 )
 def mhc_pre_big_fuse_with_norm_tilelang(
     gemm_out_mul,
@@ -876,6 +903,8 @@ def mhc_pre_big_fuse_with_norm_tilelang(
     hc_mult: int = 4,
     gemm_last_dim: int = -1,
     eps_outside_sqrt: bool = False,
+    num_stages_1st: int = envs.TL_MHC_PRE_BIG_FUSE_WITH_NORM_PIPELINED_NUM_STAGES_1ST.get(),
+    num_stages_2nd: int = envs.TL_MHC_PRE_BIG_FUSE_WITH_NORM_PIPELINED_NUM_STAGES_2ND.get(),
 ):
     """Fused mhc_pre big_fuse + RMSNorm of layer_input.
 
@@ -981,7 +1010,9 @@ def mhc_pre_big_fuse_with_norm_tilelang(
             sumsq_per_pos = T.alloc_fragment(hidden_block, T.float32)
             T.clear(sumsq_per_pos)
 
-            for i0_h in T.Pipelined(hidden_size // hidden_block, num_stages=3):
+            for i0_h in T.Pipelined(
+                hidden_size // hidden_block, num_stages=num_stages_1st
+            ):
                 xs = T.alloc_shared((hc_mult, hidden_block), T.bfloat16)
                 xl = T.alloc_fragment((hc_mult, hidden_block), T.float32)
                 T.copy(residual[i, 0, i0_h * hidden_block], xs)
@@ -1004,7 +1035,9 @@ def mhc_pre_big_fuse_with_norm_tilelang(
             rsqrt_norm = T.alloc_fragment(1, T.float32)
             rsqrt_norm[0] = T.rsqrt(sumsq[0] / hidden_size + norm_eps)
 
-            for i0_h in T.Pipelined(hidden_size // hidden_block, num_stages=2):
+            for i0_h in T.Pipelined(
+                hidden_size // hidden_block, num_stages=num_stages_2nd
+            ):
                 w_shared = T.alloc_shared(hidden_block, T.bfloat16)
                 w_local = T.alloc_fragment(hidden_block, T.float32)
                 T.copy(norm_weight[i0_h * hidden_block], w_shared)
@@ -1084,12 +1117,18 @@ def mhc_pre(
         )
 
     if _use_deep_gemm_hc_prenorm():
-        n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
+        if is_sail():
+            assert n_splits == 1, (
+                "PPU version deep_gemm.tf32_hc_prenorm_gemm doesn't support split-k"
+            )
+        else:
+            n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
 
-        gemm_out_mul = torch.empty(
+        alloc_buffer = torch.zeros if is_sail() else torch.empty
+        gemm_out_mul = alloc_buffer(
             n_splits, num_tokens, hc_mult3, dtype=torch.float32, device=residual.device
         )
-        gemm_out_sqrsum = torch.empty(
+        gemm_out_sqrsum = alloc_buffer(
             n_splits, num_tokens, dtype=torch.float32, device=residual.device
         )
 
@@ -1186,6 +1225,32 @@ def mhc_pre(
         )
         if not norm_weight_bf.is_contiguous():
             norm_weight_bf = norm_weight_bf.contiguous()
+
+        if envs.SGLANG_PROFILE_NVTX.get():
+            _nvtx_push(
+                f"mhc_pre_big_fuse_with_norm_tilelang,"
+                f"gemm_out_mul_{tuple(gemm_out_mul.shape)},"
+                f"gemm_out_sqrsum_{tuple(gemm_out_sqrsum.shape)},"
+                f"hc_scale_{tuple(hc_scale.shape)},"
+                f"hc_base_{tuple(hc_base.shape)},"
+                f"residual_{tuple(residual_flat.shape)},"
+                f"post_mix_{tuple(post_mix.shape)},"
+                f"comb_mix_{tuple(comb_mix.shape)},"
+                f"layer_input_{tuple(layer_input.shape)},"
+                f"norm_weight_{tuple(norm_weight_bf.shape)},"
+                f"hidden_size_{hidden_size},"
+                f"rms_eps_{rms_eps},"
+                f"hc_pre_eps_{hc_pre_eps},"
+                f"hc_sinkhorn_eps_{hc_sinkhorn_eps},"
+                f"hc_post_mult_value_{hc_post_mult_value},"
+                f"sinkhorn_repeat_{sinkhorn_repeat},"
+                f"norm_eps_{norm_eps},"
+                f"n_splits_{big_fuse_n_splits},"
+                f"hc_mult_{hc_mult},"
+                f"gemm_last_dim_{gemm_last_dim},"
+                f"dtype_residual_{residual_flat.dtype},"
+                f"dtype_gemm_out_mul_{gemm_out_mul.dtype}"
+            )
         mhc_pre_big_fuse_with_norm_tilelang(
             gemm_out_mul,
             gemm_out_sqrsum,
@@ -1208,6 +1273,7 @@ def mhc_pre(
             gemm_last_dim,
             eps_outside_sqrt,
         )
+        _nvtx_pop()
     else:
         mhc_pre_big_fuse_tilelang(
             gemm_out_mul,
@@ -1667,17 +1733,20 @@ def mhc_fused_post_pre(
     if num_tokens <= fma_token_threshold:
         tile_n = 2 if num_tokens < 8 else 3
         n_splits = 8 if (num_tokens < 8 and hidden_size <= 4096) else 4
+    elif is_sail() and _use_deep_gemm_hc_prenorm():
+        n_splits = 1
     else:
         n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
 
-    gemm_out_mul = torch.empty(
+    alloc_buffer = torch.zeros if is_sail() else torch.empty
+    gemm_out_mul = alloc_buffer(
         n_splits,
         num_tokens,
         hc_mult3,
         dtype=torch.float32,
         device=residual.device,
     )
-    gemm_out_sqrsum = torch.empty(
+    gemm_out_sqrsum = alloc_buffer(
         n_splits,
         num_tokens,
         dtype=torch.float32,
@@ -2723,7 +2792,7 @@ def hc_mix_stats_sinkhorn_deepgemm(
     assert x_flat.dtype == torch.bfloat16 and x_flat.is_contiguous()
     m, k = x_flat.shape
     mix = (2 + hc_mult) * hc_mult
-    slices = _hc_mix_deepgemm_slices(m)
+    slices = 1 if is_sail() else _hc_mix_deepgemm_slices(m)
     high, low = weight_parts
     assert high.shape == low.shape == (mix, k)
     dev = x_flat.device
@@ -2733,15 +2802,18 @@ def hc_mix_stats_sinkhorn_deepgemm(
     if m == 0:
         return pre, post, comb
 
-    mix_hi = torch.empty((slices, m, mix), dtype=torch.float32, device=dev)
-    mix_lo = torch.empty_like(mix_hi)
-    sq = torch.empty((slices, m), dtype=torch.float32, device=dev)
-    if current_arch().is_sm(10):
+    alloc_buffer = torch.zeros if is_sail() else torch.empty
+    mix_hi = alloc_buffer((slices, m, mix), dtype=torch.float32, device=dev)
+    mix_lo = alloc_buffer((slices, m, mix), dtype=torch.float32, device=dev)
+    sq = alloc_buffer((slices, m), dtype=torch.float32, device=dev)
+    if not is_sail() and current_arch().is_sm(10):
         tf32_hc_prenorm_gemm_dual(x_flat, high, low, mix_hi, mix_lo, sq, slices)
     else:
         tf32_hc_prenorm_gemm(x_flat, high, mix_hi, sq, slices)
-        # sq depends only on x_flat, so the second projection recomputes the same
-        # values; overwriting it avoids a throwaway (slices, m) scratch, 4 MiB at m=65536.
+        # The SAIL kernel accumulates sq; the second projection must recompute
+        # it from zero rather than adding a second copy of the same square sum.
+        if is_sail():
+            sq.zero_()
         tf32_hc_prenorm_gemm(x_flat, low, mix_lo, sq, slices)
     _hc_mix_reduce_sinkhorn_kernel[(m,)](
         mix_hi,

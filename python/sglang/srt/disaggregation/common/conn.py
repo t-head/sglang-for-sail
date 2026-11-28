@@ -423,10 +423,15 @@ class CommonKVManager(BaseKVManager):
         # state and linear-attention head shard r. It transfers as TP rank r of
         # a CP-1 prefill (see register_to_bootstrap), not as a CP replica.
         cp_tp_group_sharing = parallel.enable_cp_tp_group_sharing
+        # DSV4.1 CP materializes global token order before cache writes. Split the
+        # replicated page set across CP senders; request-scoped state remains
+        # canonical on CP rank 0 via _get_dsa_cache_transfer_skip_flags.
+        dsv41_dspark_pd = self.dsv41_spec_layout is not None
         self.enable_all_cp_ranks_for_transfer = not cp_tp_group_sharing and (
             envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
             or cp_sharded_prefill
             or hybrid_decode_pulls_all_ranks
+            or dsv41_dspark_pd
             # No sharded rank holds a full page, so every CP rank sends.
             or self.kv_shard_size > 1
         )
@@ -558,7 +563,9 @@ class CommonKVManager(BaseKVManager):
     ) -> Optional[List]:
         return state_indices
 
-    def _should_skip_cp_replicated_state_transfer(self) -> bool:
+    def _should_skip_cp_replicated_state_transfer(
+        self, *, include_cp_tp_shared_state: bool = False
+    ) -> bool:
         """Whether this prefill rank should omit CP-replicated state.
 
         Prefill CP materializes global token order before writing state pools, so
@@ -567,12 +574,17 @@ class CommonKVManager(BaseKVManager):
         exception because each CP rank owns different state layers. Page-sharded
         DSA indexer state likewise needs every owner; Mooncake filters its page
         lists before transfer instead of suppressing whole ranks.
+        ``include_cp_tp_shared_state`` checks replicated non-Mamba entries even
+        when CP-TP sharing makes the recurrent state itself rank-local.
         """
         return (
             self.attn_cp_size > 1
             and self.attn_cp_rank != 0
             and not get_parallel().enable_dsa_cache_layer_split
-            and not get_parallel().enable_cp_tp_group_sharing
+            and (
+                include_cp_tp_shared_state
+                or not get_parallel().enable_cp_tp_group_sharing
+            )
             and getattr(self, "kv_shard_size", 1) <= 1
         )
 
@@ -699,6 +711,7 @@ class CommonKVManager(BaseKVManager):
             max_tokens,
             device_type=get_device().device,
             include_draft=include_draft,
+            deregister_fn=getattr(self, "_deregister_staging_memory", None),
         )
         self._dcp_pack_max_tokens = max_tokens
 
@@ -1566,20 +1579,31 @@ class CommonKVManager(BaseKVManager):
                     "enable DSpark with the same block size and target/draft KV "
                     "layout. Upgrade both servers together."
                 )
-
-            decode_tp_size_aligns_prefill_world_size = (
-                info.attn_cp_size > 1
-                and (self.is_mla_backend or self.is_hybrid_mla_backend)
-                and self.attn_cp_size == 1
-                and info.attn_tp_size * info.attn_cp_size == self.attn_tp_size
-            )
+            if self.attn_cp_size != 1:
+                raise RuntimeError("DeepSeek-V4.1 DSpark PD requires Decode CP=1")
+            # MQA KV rows, target/draft SWA and C2 request state are not
+            # head-sharded. With attention TP=1 on both sides, prefill CP splits
+            # one request's pages while decode attention DP assigns whole requests;
+            # every decode request therefore waits for all prefill CP senders.
+            if self.attn_dp_size > 1 and self.attn_tp_size != 1:
+                raise RuntimeError(
+                    "DeepSeek-V4.1 DSpark PD with Decode attention DP requires "
+                    "attention TP=1"
+                )
+            prefill_attention_width = info.attn_tp_size * info.attn_cp_size
+            decode_attention_width = self.attn_tp_size * self.attn_dp_size
+            independent_cp_dp = info.attn_tp_size == self.attn_tp_size == 1
             if (
-                info.attn_tp_size != self.attn_tp_size
-                and not decode_tp_size_aligns_prefill_world_size
+                not independent_cp_dp
+                and prefill_attention_width != decode_attention_width
             ):
                 raise RuntimeError(
-                    "DeepSeek-V4.1 DSpark PD requires the same TP size on both "
-                    "servers (including prefill CP ranks for MLA)"
+                    "DeepSeek-V4.1 DSpark PD with attention TP>1 requires "
+                    "matching Prefill TP*CP and Decode attention TP*DP widths; "
+                    "independent CP/DP sizes require attention TP=1 on both "
+                    "servers: "
+                    f"prefill={info.attn_tp_size}x{info.attn_cp_size}, "
+                    f"decode={self.attn_tp_size}x{self.attn_dp_size}"
                 )
 
         # None (draftless PP stage, state-only draft) skips the check.

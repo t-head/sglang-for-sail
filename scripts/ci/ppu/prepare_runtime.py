@@ -9,6 +9,7 @@ MODEL_PATH_ENVS = {
     "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B": "PPU_CI_EAGLE3_MODEL_PATH",
     "z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat": "PPU_CI_DFLASH_MODEL_PATH",
 }
+OPTIONAL_MODEL_KEYS = {"PPU_CI_SMALL_MODEL_PATH"}
 
 
 def prepare_model_cache(hub, checkpoints):
@@ -43,7 +44,11 @@ def main():
 
     home = Path.home()
     hub = Path(os.environ["HF_HUB_CACHE"])
-    checkpoints = {model: os.environ[key] for model, key in MODEL_PATH_ENVS.items()}
+    checkpoints = {
+        model: os.environ[key]
+        for model, key in MODEL_PATH_ENVS.items()
+        if key not in OPTIONAL_MODEL_KEYS or os.environ.get(key)
+    }
     prepare_model_cache(hub, checkpoints)
     for model in checkpoints:
         hf_hub_download(model, "config.json", cache_dir=hub, local_files_only=True)

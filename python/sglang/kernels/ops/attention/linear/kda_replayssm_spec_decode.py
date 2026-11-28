@@ -364,6 +364,58 @@ def commit_kda_replayssm_after_verify(
     accepted prefix into the fp32 checkpoint, so `temporal` stays current. Conv
     still needs its usual accept-rollback.
     """
+    from sglang.kernels.jit.utils.common import is_sail_runtime as is_sail
+    from sglang.srt.environ import envs
+    from sglang.srt.utils.log_utils import print_info_once
+
+    # Use the public PLA entry point for both exact fold and conv rollback.
+    # Width-major conv pools are passed as views; no packing or copy-back.
+    if (
+        is_sail()
+        and ring_indices is None
+        and src_indices_raw is None
+        and envs.SGLANG_SAIL_PLA_CUDA.get()
+        and spec_state.temporal.dtype == torch.float32
+        and spec_state.temporal.shape[-2:] == (128, 128)
+        and spec_state.replayssm_rawv.dtype == torch.bfloat16
+        and spec_state.replayssm_rawk.dtype == torch.bfloat16
+        and spec_state.replayssm_g.dtype == torch.float32
+        and spec_state.replayssm_beta.dtype == torch.float32
+        and all(
+            t.is_contiguous() or t.transpose(-1, -2).is_contiguous()
+            for t in spec_state.conv
+        )
+        and all(
+            all(s > 0 for s in t.stride()) for t in spec_state.intermediate_conv_window
+        )
+        and 1 <= spec_state.replayssm_rawv.shape[-2] <= 32
+        and all(
+            t.is_contiguous()
+            for t in (
+                spec_state.temporal,
+                spec_state.replayssm_rawv,
+                spec_state.replayssm_rawk,
+                spec_state.replayssm_g,
+                spec_state.replayssm_beta,
+            )
+        )
+    ):
+        from pla.decode import kda_mtp_sglang
+
+        kda_mtp_sglang.commit_kda_replayssm_after_verify(
+            spec_state=spec_state,
+            state_batch_indices=state_batch_indices,
+            accept_lens=accept_lens,
+            last_correct_step_indices=last_correct_step_indices,
+            mamba_track_indices=mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            null_block_id=null_block_id,
+            conv_state_layout="width_dim",
+        )
+        print_info_once(
+            "USE PPU SAIL CUDA PLA kernel: commit_kda_replayssm_after_verify (direct layout)"
+        )
+        return
     from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
         fused_conv_window_scatter_with_mask,
     )

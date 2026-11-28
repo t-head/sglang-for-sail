@@ -20,11 +20,12 @@ from sglang.kernels.ops.quantization.fp4_fake_quant import (
     fake_quant_compressed_kv,
     fake_quant_fp4,
 )
+from sglang.srt.layers.attention.dsv4.indexer_quant import use_dsv41_int8_indexer
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.speculative.ragged_verify import ragged_verify_token_rows
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import is_gfx95_supported, is_sail
 
 
 def _fused_dsv41_kernels(x: torch.Tensor) -> bool:
@@ -112,11 +113,13 @@ def rope_tail(
 
 
 def fused_low_ratio_compress_supported() -> bool:
-    """The fused c1 / c2 / index-K decode kernels need sm90+ on CUDA or gfx950 on
-    ROCm; the answer also fixes the ratio-2 weight layout (`wkv_gate`, or `wkv`
-    plus `wgate`)."""
+    """The fused c1 / c2 / index-K kernels support PPU sm89, CUDA sm90+, or
+    gfx950 on ROCm; the answer also fixes the ratio-2 weight layout
+    (`wkv_gate`, or `wkv` plus `wgate`)."""
     if not torch.cuda.is_available():
         return False
+    if is_sail():
+        return torch.cuda.get_device_capability() == (8, 9)
     if torch.version.hip is not None:
         return is_gfx95_supported()
     return torch.cuda.get_device_capability()[0] >= 9
@@ -145,6 +148,7 @@ class DeepseekV41Compressor(nn.Module):
             if fused_compress is None
             else bool(fused_compress)
         )
+        self.use_fused_compress &= not use_dsv41_int8_indexer()
         self.use_fused_gate = compress_ratio > 1 and self.use_fused_compress
         if self.use_fused_gate:
             self.wkv_gate = nn.Linear(
@@ -203,9 +207,12 @@ def _tiny_gemm_max_m(n: int, k: int) -> int:
 
 
 class DeepseekV41Indexer(nn.Module):
-    """Scores compressed positions with a small fp4 side attention; only a
-    kv_source layer owns index keys. Projections are replicated across TP: every
-    rank scores with all heads, so the top-k needs no cross-rank reduction."""
+    """Scores compressed positions with FP4 or opt-in PPU INT8 side attention.
+    Only a kv_source layer owns index keys; other index sources read its cache.
+
+    The projections are replicated across TP, as in the c4 indexer: every rank
+    scores with all heads, so the decode kernel path needs no cross-rank
+    reduction and every rank selects the same top-k."""
 
     def __init__(
         self,
@@ -216,6 +223,7 @@ class DeepseekV41Indexer(nn.Module):
         prefix: str,
     ):
         super().__init__()
+        self.use_int8 = use_dsv41_int8_indexer()
         self.n_heads = config.index_n_heads
         self.n_local_heads = self.n_heads
         self.index_head_dim = config.index_head_dim
@@ -266,6 +274,8 @@ class DeepseekV41Indexer(nn.Module):
     def index_keys(self, latent: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
         """Pre-RoPE latents [n, D] -> fp4-rounded index keys [n, index_head_dim]."""
         k = self.k_norm(self.forward_wk(latent))
+        if self.use_int8:
+            return rope_tail(k, freqs, self.rope_head_dim)
         return _rope_fq4(k, freqs, self.rope_head_dim)
 
     def queries(
@@ -278,6 +288,12 @@ class DeepseekV41Indexer(nn.Module):
         fused RoPE launch)."""
         q, _ = self.wq_b(q_lora)
         q = q.view(q.shape[0], self.n_local_heads, self.index_head_dim)
+        if self.use_int8:
+            return rope_tail(
+                q,
+                freqs[positions] if positions is not None else freqs,
+                self.rope_head_dim,
+            )
         return _rope_fq4(q, freqs, self.rope_head_dim, positions=positions)
 
     def head_weights_raw(self, x: torch.Tensor) -> torch.Tensor:

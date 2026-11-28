@@ -181,6 +181,16 @@ def ragged_verify_compact_graphs_enabled(spec_algorithm: SpeculativeAlgorithm) -
     return ragged_verify_compact_enabled()
 
 
+SGLANG_PROFILE_NVTX = envs.SGLANG_PROFILE_NVTX.get()
+if SGLANG_PROFILE_NVTX:
+    try:
+        from torch.cuda.nvtx import range_pop as th_nvtx_range_pop
+        from torch.cuda.nvtx import range_push as th_nvtx_range_push
+
+    except ImportError as e:
+        SGLANG_PROFILE_NVTX = False
+
+
 def build_replay_fb_view(
     forward_batch: ForwardBatch,
     buffers: DecodeInputBuffers,
@@ -428,10 +438,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._resolve_attention_variant = self.attention_graph_variants.select
 
         # --- bucket sizes ---------------------------------------------
+        # DP-local draft reduce-scatter still requires attention-TP-aligned rows,
+        # even when the narrowed draft TP scope reports no gathered-buffer need.
+        gathered_buffer_required = self.require_gathered_buffer or (
+            self._forward_is_dp_local(model_runner)
+            and get_parallel().attn_dp_enabled
+            and self.captured_req_width % get_parallel().attn_tp_size != 0
+        )
+        self._capture_gathered_buffer_required = gathered_buffer_required
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
             model_runner,
             self.captured_req_width,
-            gathered_buffer_required=self.require_gathered_buffer,
+            gathered_buffer_required=gathered_buffer_required,
         )
         self.max_bs = max(self.capture_bs)
         if KTRANSFORMERS_AVAILABLE:
@@ -1329,7 +1347,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             _, self.compile_bs = get_batch_sizes_to_capture(
                 self.model_runner,
                 self.captured_req_width,
-                gathered_buffer_required=self.require_gathered_buffer,
+                gathered_buffer_required=self._capture_gathered_buffer_required,
             )
         profile_context = empty_context()
         # Holds the active torch profiler during capture so the backend can
@@ -1571,6 +1589,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     capture_inputs=None,
                     post_warmup_hook=post_warmup_hook,
                 )
+                self.deepep_adapter.capture_complete()
 
     def _set_dp_real_num_tokens(self, raw_num_token: int) -> None:
         # An idle DP rank replays a fabricated batch whose count may not reach
@@ -2120,6 +2139,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ) and fb_view.out_cache_loc is not None:
             fb_view.out_cache_loc = self.buffers.out_cache_loc[:num_tokens]
 
+    def _build_decode_replay_kv_len_nvtx_msg(self, forward_batch: ForwardBatch) -> str:
+        raw_bs = int(getattr(self, "raw_bs", 0) or 0)
+        capture_bs = int(getattr(self, "bs", 0) or 0)
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        kv_lens = (
+            seq_lens_cpu[:raw_bs].tolist()
+            if seq_lens_cpu is not None
+            else "unavailable (CPU mirror disabled)"
+        )
+        return (
+            "decode_cudagraph_kvlen "
+            f"raw_bs={raw_bs} capture_bs={capture_bs} kv_lens={kv_lens}"
+        )
+
     def execute(
         self,
         forward_batch: ForwardBatch,
@@ -2155,7 +2188,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if shared_read_ends is SharedReadEnds.PRE_REPLAY:
                 self._publish_read_done(in_graph=False)
 
+            if SGLANG_PROFILE_NVTX:
+                info = self._build_decode_replay_kv_len_nvtx_msg(forward_batch)
+                th_nvtx_range_push(info)
             output = self.backend.replay(self._replay_graph_key, forward_batch)
+            if SGLANG_PROFILE_NVTX:
+                th_nvtx_range_pop()
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:
                 self._publish_read_done(in_graph=True)

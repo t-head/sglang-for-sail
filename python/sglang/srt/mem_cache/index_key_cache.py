@@ -39,10 +39,10 @@ class IndexKeyCache:
 
     def _buffer_shape(self, num_pages: int) -> tuple[int, int]:
         pool = self.pool
-        return (
-            num_pages,
-            pool.page_size // pool.index_kpool * pool.index_bytes_per_token,
+        width = (
+            pool.index_head_dim if pool.use_bf16_indexer else pool.index_bytes_per_token
         )
+        return (num_pages, pool.page_size // pool.index_kpool * width)
 
     def _kernel_view(self, buffer: torch.Tensor) -> torch.Tensor:
         pool = self.pool
