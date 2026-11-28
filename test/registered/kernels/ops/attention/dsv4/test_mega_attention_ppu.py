@@ -222,6 +222,13 @@ class TestMegaAttentionPpu(CustomTestCase):
         ).to(torch.bfloat16)
         # As MQALayer.setup_mega_attention on PPU.
         w_fp8, w_scale = prepare_sail_wo_a(wo_a, None, GROUPS, O_LORA_RANK)
+        transposed_w, transposed_scale = prepare_sail_wo_a(
+            wo_a.t().contiguous(), None, GROUPS, O_LORA_RANK
+        )
+        self.assertTrue(
+            torch.equal(transposed_w.view(torch.uint8), w_fp8.view(torch.uint8))
+        )
+        self.assertTrue(torch.equal(transposed_scale, w_scale))
         for kind, topk in LAYER_KINDS:
             with self.subTest(layer=kind):
                 q, kv, indices, lens, positions, sink = _make_attention_inputs(
@@ -311,7 +318,9 @@ class TestMegaAttentionPpu(CustomTestCase):
                 torch.cuda.synchronize()
                 self.assertTrue(torch.equal(actual, captured))
                 pointers = tuple(t.data_ptr() for t in layer.mega_wo_a)
-                layer.wo_a.weight = weight.t()
+                layer.wo_a.weight = (
+                    weight.t().contiguous() if kind == "swa" else weight.t()
+                )
                 layer.wo_a.weight_scale = scale * 0.5
                 MQALayer.setup_mega_attention(layer)
                 self.assertEqual(pointers, tuple(t.data_ptr() for t in layer.mega_wo_a))

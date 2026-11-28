@@ -68,9 +68,11 @@ def prepare_sail_wo_a(
     rows = groups * rank
     if weight.ndim != 2:
         raise ValueError("PPU MegaAttention wo_a must be a matrix")
-    if weight.shape[0] == rows and weight.stride(1) == 1:
+    # Shape determines orientation unless both axes equal G*R. Keep the
+    # unit-stride hint for square views, where shape alone would lose a transpose.
+    if weight.shape[0] == rows and (weight.shape[1] != rows or weight.stride(1) == 1):
         row_weight = weight
-    elif weight.shape[1] == rows and weight.stride(0) == 1:
+    elif weight.shape[1] == rows and (weight.shape[0] != rows or weight.stride(0) == 1):
         row_weight = weight.t()
     else:
         raise ValueError(

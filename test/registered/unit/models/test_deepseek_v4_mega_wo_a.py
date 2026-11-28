@@ -33,18 +33,46 @@ class TestMegaWoA(CustomTestCase):
                 for lane in range(32)
             ]
         )
-        expected = self.weight.view(torch.uint8)[:, cols].reshape(2, 4, self.dim)
+        expected = self.weight.view(torch.uint8)[:, cols].reshape(
+            self.groups, self.rank, self.dim
+        )
         self.assertTrue(torch.equal(actual_w.view(torch.uint8), expected))
-        self.assertTrue(torch.equal(actual_s, self.scale.reshape(2, 4, 1)))
+        self.assertTrue(
+            torch.equal(actual_s, self.scale.reshape(self.groups, self.rank, 1))
+        )
         self.assertNotEqual(actual_s.data_ptr(), scale.data_ptr())
         self.assertNotEqual(actual_w.data_ptr(), weight.data_ptr())
 
     def test_checkpoint_and_processed_layouts(self):
+        for name, weight, scale in (
+            ("checkpoint", self.weight, self.scale),
+            ("transpose_view", self.weight.t(), self.scale.t()),
+            ("transpose_contiguous", self.weight.t().contiguous(), self.scale.t()),
+        ):
+            with self.subTest(layout=name):
+                self.assert_prepared(weight, scale)
+
+    def test_strided_checkpoint_and_processed_layouts(self):
+        storage = torch.empty(8, self.dim * 2, dtype=torch.uint8)
+        storage[:, ::2].copy_(self.weight.view(torch.uint8))
+        weight = storage[:, ::2].view(torch.float8_e4m3fn)
+        for processed in (False, True):
+            with self.subTest(processed=processed):
+                self.assert_prepared(weight.t() if processed else weight, self.scale)
+
+    def test_square_checkpoint_and_transpose_view(self):
+        # Both orientations have the same shape: removing every stride check
+        # would silently treat a transpose view as checkpoint rows.
+        self.groups, self.rank = 4, 1024
+        rows = self.groups * self.rank
+        row = torch.arange(rows, dtype=torch.int16)[:, None]
+        col = torch.arange(self.dim, dtype=torch.int16)[None]
+        self.weight = ((3 * row + col).remainder(31) - 15).to(torch.float8_e4m3fn)
+        self.scale = torch.arange(1, rows + 1, dtype=torch.float32).view(rows, 1)
         for processed in (False, True):
             with self.subTest(processed=processed):
                 self.assert_prepared(
-                    self.weight.t() if processed else self.weight,
-                    self.scale.t() if processed else self.scale,
+                    self.weight.t() if processed else self.weight, self.scale
                 )
 
     def test_fp8_does_not_requantize(self):
