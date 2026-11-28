@@ -7,6 +7,7 @@ as a per-token x per-channel FP8 einsum.
 """
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -204,11 +205,8 @@ class TestMegaAttentionPpu(CustomTestCase):
                 self.assertLess(_rel(actual, expected), MAX_REL_ONE_FP8)
 
     def test_wo_a_projection(self):
-        from sglang.kernels.ops.quantization.fp8_kernel import (
-            sglang_per_token_quant_fp8,
-        )
         from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
-            interleave_output_columns,
+            prepare_sail_wo_a,
         )
         from sglang.srt.models.deepseek_v4 import _fp8_wo_a_einsum
 
@@ -223,9 +221,7 @@ class TestMegaAttentionPpu(CustomTestCase):
             / 64
         ).to(torch.bfloat16)
         # As MQALayer.setup_mega_attention on PPU.
-        w_fp8, w_scale = sglang_per_token_quant_fp8(wo_a)
-        w_fp8 = interleave_output_columns(w_fp8.view(GROUPS, O_LORA_RANK, -1))
-        w_scale = w_scale.view(GROUPS, O_LORA_RANK, 1)
+        w_fp8, w_scale = prepare_sail_wo_a(wo_a, None, GROUPS, O_LORA_RANK)
         for kind, topk in LAYER_KINDS:
             with self.subTest(layer=kind):
                 q, kv, indices, lens, positions, sink = _make_attention_inputs(
@@ -255,6 +251,79 @@ class TestMegaAttentionPpu(CustomTestCase):
                 )
                 self.assertGreater(_cos(actual, expected), MIN_COS)
                 self.assertLess(_rel(actual, expected), MAX_REL_TWO_FP8)
+                print(
+                    f"BF16 wo_a {kind}: cos={_cos(actual, expected):.8f}, rel={_rel(actual, expected):.8f}"
+                )
+
+    def test_checkpoint_fp8_wo_a_projection_and_graph_reload(self):
+        from sglang.srt.models.deepseek_v4 import MQALayer, _fp8_wo_a_einsum
+
+        torch.manual_seed(12)
+        weight = (torch.randn(GROUPS * O_LORA_RANK, 4096, device="cuda") * 8).to(
+            torch.float8_e4m3fn
+        )
+        scale = torch.rand(GROUPS * O_LORA_RANK, 1, device="cuda") * 0.01 + 0.001
+        layer = SimpleNamespace(
+            use_mega_attention=True,
+            n_local_heads=HEADS,
+            n_local_groups=GROUPS,
+            o_lora_rank=O_LORA_RANK,
+            wo_a=SimpleNamespace(weight=weight, weight_scale=scale),
+            mega_wo_a=None,
+            _wq_b_uses_flashinfer_mxfp8=lambda: False,
+            _wq_b_is_ppu_per_channel_fp8=lambda: False,
+        )
+        MQALayer.setup_mega_attention(layer)
+        for kind, topk in LAYER_KINDS:
+            with self.subTest(layer=kind):
+                q, kv, indices, lens, positions, sink = _make_attention_inputs(topk, 13)
+                out_fp8, out_sf = self._mega_attention(
+                    q, kv, indices, lens, positions, sink
+                )
+
+                def project():
+                    return _fp8_wo_a_einsum(
+                        out_fp8[:, :GROUPS],
+                        out_sf[:, :GROUPS],
+                        *layer.mega_wo_a,
+                        recipe=layer.mega_wo_a_recipe,
+                    )
+
+                actual = project()
+                attention = _attention_cpu(
+                    q, kv, indices, lens, positions, sink, self.freqs_cis, self.scale
+                ).view(TOKENS, GROUPS, -1)
+                expected = torch.einsum(
+                    "tgd,grd->tgr",
+                    attention,
+                    (weight.float() * scale).view(GROUPS, O_LORA_RANK, 4096).cpu(),
+                )
+                self.assertGreater(_cos(actual.cpu(), expected), MIN_COS)
+                self.assertLess(_rel(actual.cpu(), expected), MAX_REL_ONE_FP8)
+                print(
+                    f"FP8 wo_a {kind}: cos={_cos(actual.cpu(), expected):.8f}, rel={_rel(actual.cpu(), expected):.8f}"
+                )
+                # Eager/Graph equality isolates replay from quantization error.
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    captured = project()
+                graph.replay()
+                torch.cuda.synchronize()
+                self.assertTrue(torch.equal(actual, captured))
+                pointers = tuple(t.data_ptr() for t in layer.mega_wo_a)
+                layer.wo_a.weight = weight.t()
+                layer.wo_a.weight_scale = scale * 0.5
+                MQALayer.setup_mega_attention(layer)
+                self.assertEqual(pointers, tuple(t.data_ptr() for t in layer.mega_wo_a))
+                graph.replay()
+                torch.cuda.synchronize()
+                self.assertTrue(torch.equal(project(), captured))
+                self.assertGreater(_cos(captured.cpu(), expected * 0.5), MIN_COS)
+                self.assertLess(_rel(captured.cpu(), expected * 0.5), MAX_REL_ONE_FP8)
+                # Restore before testing the next attention kernel.
+                layer.wo_a.weight = weight
+                layer.wo_a.weight_scale = scale
+                MQALayer.setup_mega_attention(layer)
 
 
 if __name__ == "__main__":
